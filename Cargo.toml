@@ -1,0 +1,31 @@
+[package]
+name = "agentctl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev]
+panic = "abort"
+split-debuginfo = "unpacked"
+codegen-units = 128
+debug = "line-tables-only"
+opt-level = 0
+lto = false
+incremental = true
+
+# Skip debug info for non-workspace dependencies; workspace crates keep line-tables-only.
+[profile.dev.package."*"]
+debug = false
+
+[profile.bench]
+debug = true

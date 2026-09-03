@@ -1,0 +1,30 @@
+# rustfmt configuration. The toolchain is stable (see rust-toolchain.toml), so
+# every option here is a stable option. Three unstable options previously lived
+# in this file — group_imports, imports_granularity, format_code_in_doc_comments
+# — and were removed with the move to stable. They were never in effect on
+# nightly either: rustfmt gates unstable config behind `unstable_features =
+# true`, which this file never set, so the effective values were always
+# "Preserve", "Preserve" and false. Dropping them changed no formatting.
+
+# Match the package edition so rustfmt parses 2024 syntax.
+edition = "2024"
+
+# Pin the formatting style itself, separately from the parse edition. On this
+# tree the pin is a byte-for-byte no-op (measured 2026-08-28); it exists so a
+# future toolchain moving the default style cannot reformat the tree overnight.
+style_edition = "2024"
+
+# rustfmt's own default, restated so the width every option below leans on is
+# stated here rather than remembered.
+max_width = 100
+
+# Every width heuristic (fn_call_width, chain_width, struct_lit_width, …)
+# follows max_width: whatever fits in 100 columns stays on one line. The
+# accepted cost is layout flips at the threshold — adding one argument can
+# re-flow a whole call between one line and many — so diffs run larger than
+# the edits that caused them.
+use_small_heuristics = "Max"
+
+# Always emit LF line endings regardless of platform or checkout state, so a
+# Windows checkout (or a stray CRLF file) cannot leak CRLF into the tree.
+newline_style = "Unix"
