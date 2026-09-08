@@ -30,7 +30,13 @@
 //! exclusion. That is invariant I12, and it is the conservative side of a
 //! trade whose other side is two processes rotating one refresh chain.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "consumed by lane D and lane C"))]
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "remaining items are consumed by W2 (accounts, import, doctor) and W3 (watch)"
+    )
+)]
 
 use std::ffi::OsStr;
 use std::fs::File;

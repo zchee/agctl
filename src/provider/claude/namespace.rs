@@ -41,7 +41,13 @@
 //! point at the same physical directory — and is never used for identity.
 //! Invariant I13: identity comes from the credentials, never from a path.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "consumed by lane D and lane C"))]
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "remaining items are consumed by W2 (accounts, import, doctor) and W3 (watch)"
+    )
+)]
 
 use std::io;
 use std::path::Path;

@@ -54,7 +54,13 @@
 //! resolves to "nothing to do" rather than to a replay of unknown data.
 //! [`resolve_pending`] implements the decision table from plan section 3.3.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "consumed by lane D and lane C"))]
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "remaining items are consumed by W2 (accounts, import, doctor) and W3 (watch)"
+    )
+)]
 
 use std::ffi::OsStr;
 use std::ffi::OsString;

@@ -17,7 +17,13 @@
 //! - [`foreign_activity`] answers "is somebody else using this namespace?".
 //! - [`location`] picks between the keychain and the file for one account.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "consumed by lane D and lane C"))]
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "remaining items are consumed by W2 (accounts, import, doctor) and W3 (watch)"
+    )
+)]
 
 pub mod file_store;
 pub mod foreign_activity;

@@ -30,7 +30,7 @@
 // suppression is scoped to the non-test build because the tests below do
 // exercise these items, and it is `expect` rather than `allow` so that it
 // starts warning — and gets deleted — the moment W1 makes it stale.
-#![cfg_attr(not(test), expect(dead_code, reason = "consumed by the W1 status wiring"))]
+#![cfg_attr(not(test), expect(dead_code, reason = "remaining items are consumed by W3 (watch)"))]
 
 use std::collections::BTreeMap;
 use std::io;

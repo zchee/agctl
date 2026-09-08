@@ -31,17 +31,17 @@ use std::time::Duration;
 use std::time::Instant;
 
 /// The environment variable that carries the active fault names.
-#[cfg(feature = "testing")]
+#[cfg(any(test, feature = "testing"))]
 pub const FAULT_ENV: &str = "AGENTCTL_FAULT";
 
 /// The environment variable naming the file whose appearance releases a
 /// [`Fault::pause_point`].
-#[cfg(feature = "testing")]
+#[cfg(any(test, feature = "testing"))]
 pub const FAULT_RESUME_ENV: &str = "AGENTCTL_FAULT_RESUME";
 
 /// How long a [`Fault::pause_point`] waits before giving up on its resume
 /// file, so a test that crashes without writing one cannot wedge a run.
-#[cfg(feature = "testing")]
+#[cfg(any(test, feature = "testing"))]
 pub const PAUSE_BUDGET: Duration = Duration::from_secs(10);
 
 /// How often a [`Fault::pause_point`] re-checks for its resume file.
@@ -62,7 +62,8 @@ impl Fault {
     /// The empty fault set: nothing is injected.
     ///
     /// This is what production code gets, and it is the only constructor that
-    /// exists without the `testing` feature.
+    /// exists in a build without the `testing` feature (the unit-test target
+    /// also sees the parsers, so a plain `cargo check --tests` compiles).
     pub fn none() -> Self {
         Self::default()
     }
@@ -73,7 +74,7 @@ impl Fault {
     /// empty entries are dropped, so `"rename_fail, hold_lock"` and
     /// `"rename_fail,hold_lock"` mean the same thing. An unset or empty
     /// variable yields the same value as [`Fault::none`].
-    #[cfg(feature = "testing")]
+    #[cfg(any(test, feature = "testing"))]
     pub fn from_env() -> Self {
         match std::env::var(FAULT_ENV) {
             Ok(raw) => Self::from_list(&raw),
@@ -82,7 +83,7 @@ impl Fault {
     }
 
     /// Parses a comma-separated fault list.
-    #[cfg(feature = "testing")]
+    #[cfg(any(test, feature = "testing"))]
     pub fn from_list(raw: &str) -> Self {
         let names: BTreeSet<String> =
             raw.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_owned).collect();

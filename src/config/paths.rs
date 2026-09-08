@@ -25,7 +25,13 @@
 //! that another tool may delete and recreate is a lock two processes can hold
 //! at once. Out of the namespace, never unlinked, the inode is stable.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "consumed by lane D and lane C"))]
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "remaining items are consumed by W2 (accounts, import, doctor) and W3 (watch)"
+    )
+)]
 
 use std::path::Component;
 use std::path::Path;

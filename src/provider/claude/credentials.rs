@@ -24,7 +24,13 @@
 //! digests instead of tokens; deriving it would have put access tokens in
 //! every `tracing` line that logged one.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "consumed by lane D and lane C"))]
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "remaining items are consumed by W2 (accounts, import, doctor) and W3 (watch)"
+    )
+)]
 
 use std::fmt;
 
