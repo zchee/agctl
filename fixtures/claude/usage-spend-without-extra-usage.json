@@ -1,0 +1,46 @@
+{
+  "_comment": "SYNTHETIC. Hand-written for plan section 3.8 and risk R14: the under-delivery case. The response carries no `extra_usage` key at all, while `spend` reports an enabled, non-zero balance. agentctl reads credits from `extra_usage` only (decision D-006), so the column reads `n/a` — and this is the one body that must produce a warning saying so, because otherwise a user with credits would be told nothing and see nothing. Not captured from the API.",
+  "five_hour": {
+    "utilization": 21.0,
+    "resets_at": "2026-09-08T03:29:59.817079+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null,
+    "locked_reason": null
+  },
+  "seven_day": null,
+  "limits": [
+    {
+      "kind": "session",
+      "group": "session",
+      "percent": 21,
+      "severity": "normal",
+      "resets_at": "2026-09-08T03:29:59.817079+00:00",
+      "scope": null,
+      "is_active": false
+    }
+  ],
+  "spend": {
+    "used": {
+      "amount_minor": 12500,
+      "currency": "USD",
+      "exponent": 2
+    },
+    "limit": {
+      "amount_minor": 50000,
+      "currency": "USD",
+      "exponent": 2
+    },
+    "percent": 25,
+    "severity": "normal",
+    "enabled": true,
+    "disabled_reason": null,
+    "cap": null,
+    "balance": null,
+    "auto_reload": null,
+    "disclaimer": "Usage credits cover you when you hit your plan limits. [Learn more](https://support.claude.com/articles/12429409)",
+    "can_purchase_credits": true,
+    "can_toggle": true
+  },
+  "member_dashboard_available": false
+}

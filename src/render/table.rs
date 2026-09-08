@@ -126,10 +126,10 @@ fn percent_cell(window: Option<&LimitWindow>) -> String {
 
 /// The credits cell (plan section 3.8).
 ///
-/// `n/a` is what every row reads in this build: the `extra_usage` parser
-/// lands in W2, so [`CreditsState::Unavailable`] is the only state produced
-/// so far. The other arms are written now because the cell format is what
-/// the W2 snapshot tests will assert against.
+/// Four shapes, and the difference between the last two is the point: `off`
+/// means the account has credits and switched them off, `n/a` means the
+/// response carried no `extra_usage` at all. Collapsing them would tell a
+/// user with credits enabled that they are disabled.
 fn credits_cell(credits: &CreditsState) -> String {
     match credits {
         CreditsState::Unavailable => "n/a".to_owned(),

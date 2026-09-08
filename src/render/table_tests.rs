@@ -1,10 +1,15 @@
 use jiff::Timestamp;
+use serde_json::Value;
+use serde_json::json;
 
 use super::*;
-use crate::usage::model::Credits;
-use crate::usage::model::Money;
+use crate::provider::claude::usage::credits_from_body;
 use crate::usage::model::clamp_percent;
 use crate::usage::model::percent_floor;
+
+/// The credits-enabled live capture, so the cell can be asserted against the
+/// figures a real account produces rather than against invented ones.
+const CREDITS_ON: &str = include_str!("../../fixtures/claude/usage-extra-usage-enabled.json");
 
 /// The fixed "now" every snapshot is rendered against, so a countdown is a
 /// constant rather than a moving target.
@@ -165,23 +170,53 @@ fn degraded_states_render_with_their_notes() {
     );
 }
 
+/// The credits state a usage body parses to.
+///
+/// Every credits cell in these tests goes through the real parser rather than
+/// a hand-built [`CreditsState`], so the snapshot pins a rendering that some
+/// response can actually produce — a cell format no body reaches is a format
+/// nobody is testing.
+fn parsed_credits(body: &Value) -> CreditsState {
+    let (credits, _) = credits_from_body(body);
+    credits
+}
+
+/// An `extra_usage` object wrapped in an otherwise-bare body.
+fn extra_usage(object: Value) -> Value {
+    json!({ "extra_usage": object })
+}
+
 #[test]
 fn the_credits_cell_covers_every_state_the_column_can_reach() {
-    // Plan AC23's cell formats. W1 only ever produces `n/a`; the rest are
-    // pinned now so the W2 parser lands against a fixed rendering.
-    let unavailable = CreditsState::Unavailable;
-    let off = CreditsState::Off { reason: Some("user disabled".to_owned()) };
-    let capped = CreditsState::On(Credits {
-        used: Some(Money { amount_minor: 1234, currency: "USD".to_owned(), exponent: 2 }),
-        limit: Some(Money { amount_minor: 5000, currency: "USD".to_owned(), exponent: 2 }),
-        percent: Some(25),
-    });
-    let uncapped = CreditsState::On(Credits {
-        used: Some(Money { amount_minor: 1234, currency: "USD".to_owned(), exponent: 2 }),
-        limit: None,
-        percent: None,
-    });
-    let unmeasured = CreditsState::On(Credits { used: None, limit: None, percent: None });
+    // Plan AC23's five cell formats, each from the body that produces it.
+    let unavailable = parsed_credits(&json!({}));
+    let off = parsed_credits(&extra_usage(
+        json!({"is_enabled": false, "disabled_reason": "user disabled"}),
+    ));
+    let capped = parsed_credits(&extra_usage(json!({
+        "is_enabled": true,
+        "monthly_limit": 5000,
+        "used_credits": 1234.0,
+        "utilization": 24.68,
+        "currency": "USD",
+        "decimal_places": 2,
+    })));
+    let uncapped = parsed_credits(&extra_usage(json!({
+        "is_enabled": true,
+        "monthly_limit": null,
+        "used_credits": 1234.0,
+        "utilization": null,
+        "currency": "USD",
+        "decimal_places": 2,
+    })));
+    let unmeasured = parsed_credits(&extra_usage(json!({
+        "is_enabled": true,
+        "monthly_limit": null,
+        "used_credits": null,
+        "utilization": null,
+        "currency": "USD",
+        "decimal_places": 2,
+    })));
 
     let rows: Vec<StatusRow> = [
         ("n/a", unavailable),
@@ -210,6 +245,20 @@ fn the_credits_cell_covers_every_state_the_column_can_reach() {
         "credits with no `used_credits` are unavailable, not an unlimited nothing:\n{rendered}"
     );
     insta::assert_snapshot!("credits_cells", rendered);
+}
+
+#[test]
+fn ac23_the_credits_enabled_capture_renders_the_figures_it_carries() {
+    // The one real body with credits on, straight through the parser and the
+    // renderer: used_credits 21956.0 of monthly_limit 500000 at utilization
+    // 4.3912. Kept out of the snapshot so the pinned cell formats stay
+    // byte-identical while the real figures are still asserted.
+    let body: Value = serde_json::from_str(CREDITS_ON).expect("the fixture is valid JSON");
+    let mut row = healthy_row("owner@example.com");
+    row.usage = Some(usage(healthy_windows(), parsed_credits(&body)));
+
+    let rendered = render(&report(vec![row], false));
+    assert!(rendered.contains("$219.56 / $5000.00 (4%)"), "got:\n{rendered}");
 }
 
 #[test]

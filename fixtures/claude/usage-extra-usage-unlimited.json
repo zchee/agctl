@@ -1,0 +1,72 @@
+{
+  "_comment": "SYNTHETIC. Hand-written for plan section 3.8 and AC22/AC23: credits enabled on an account with no monthly ceiling, so `monthly_limit` is null while `used_credits` is a real figure. The credits cell must read `$12.34 / Unlimited` — an absent ceiling is not a zero one. `utilization` is null because the server cannot compute a percentage of no limit, so no percentage is shown either. Derived from the shape of fixtures/claude/usage-extra-usage-enabled.json; the credit figures are invented. Not captured from the API.",
+  "five_hour": {
+    "utilization": 21.0,
+    "resets_at": "2026-09-08T03:29:59.817079+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null,
+    "locked_reason": null
+  },
+  "seven_day": {
+    "utilization": 35.0,
+    "resets_at": "2026-09-10T19:59:59.817101+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null,
+    "locked_reason": null
+  },
+  "extra_usage": {
+    "is_enabled": true,
+    "monthly_limit": null,
+    "used_credits": 1234.0,
+    "utilization": null,
+    "currency": "USD",
+    "decimal_places": 2,
+    "disabled_reason": null,
+    "user_disabled": false,
+    "spend_limit_reached": false,
+    "credits_ever_enabled": true,
+    "daily": null,
+    "weekly": null
+  },
+  "limits": [
+    {
+      "kind": "session",
+      "group": "session",
+      "percent": 21,
+      "severity": "normal",
+      "resets_at": "2026-09-08T03:29:59.817079+00:00",
+      "scope": null,
+      "is_active": false
+    },
+    {
+      "kind": "weekly_all",
+      "group": "weekly",
+      "percent": 35,
+      "severity": "normal",
+      "resets_at": "2026-09-10T19:59:59.817101+00:00",
+      "scope": null,
+      "is_active": false
+    }
+  ],
+  "spend": {
+    "used": {
+      "amount_minor": 1234,
+      "currency": "USD",
+      "exponent": 2
+    },
+    "limit": null,
+    "percent": null,
+    "severity": "normal",
+    "enabled": true,
+    "disabled_reason": null,
+    "cap": null,
+    "balance": null,
+    "auto_reload": null,
+    "disclaimer": "Usage credits cover you when you hit your plan limits. [Learn more](https://support.claude.com/articles/12429409)",
+    "can_purchase_credits": true,
+    "can_toggle": true
+  },
+  "member_dashboard_available": false
+}

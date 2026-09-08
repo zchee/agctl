@@ -50,6 +50,9 @@ use crate::provider::claude::usage::USAGE_PATH;
 use crate::secret::KeychainStatus;
 use crate::secret::fake_reader::FakeReader;
 use crate::secret::file_store::PENDING_META;
+use crate::usage::model::Credits;
+use crate::usage::model::CreditsState;
+use crate::usage::model::Money;
 
 const ACCT: &str = "11111111-2222-3333-4444-555555555555";
 const ORG: &str = "66666666-7777-8888-9999-000000000000";
@@ -58,6 +61,10 @@ const LIVE_SERVICE: &str = "Claude Code-credentials";
 
 /// The captured live body every successful fetch answers with.
 const USAGE_BODY: &str = include_str!("../../fixtures/claude/usage-2026-09-08.json");
+
+/// The captured live body from an account with extra-usage credits switched
+/// on (plan section 3.8).
+const CREDITS_BODY: &str = include_str!("../../fixtures/claude/usage-extra-usage-enabled.json");
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -1280,8 +1287,49 @@ fn the_rendered_table_carries_the_row_the_pass_produced() {
     assert!(rendered.contains("21%"), "the session window: got:\n{rendered}");
     assert!(rendered.contains("35%"), "the weekly window: got:\n{rendered}");
     assert!(rendered.contains("56%"), "the Fable window: got:\n{rendered}");
-    assert!(rendered.contains("n/a"), "credits are unavailable in W1: got:\n{rendered}");
+    // The captured account has never enabled credits, so `extra_usage`
+    // reports them switched off rather than saying nothing at all.
+    assert!(rendered.contains("off"), "credits are off for this account: got:\n{rendered}");
     assert!(!rendered.contains("sk-ant"), "no token material reaches the table");
+}
+
+#[test]
+fn credits_ride_on_the_same_response_the_windows_came_from() {
+    // Plan section 3.8: the credits column costs no extra request. One GET
+    // answers with the credits-enabled capture and the cell reads the
+    // figures that body carries — 21956 of 500000 minor units at 4.3912 %.
+    let store = store();
+    let server = MockServer::start();
+    let usage = server.mock(|when, then| {
+        when.method(GET).path(USAGE_PATH);
+        then.status(200).body(CREDITS_BODY);
+    });
+
+    write_credential_file(&store, &blob("sk-ant-oat01-a", "sk-ant-ort01-a", fresh_at()));
+    let config = owned_config(&store);
+    let found = discover_with(&store, &config, &FakeReader::unlocked());
+    let outcomes = pass(&store, &server, found, Setup::new(&server));
+
+    usage.assert_calls(1);
+
+    let row = owned_row(&outcomes);
+    let credits = &row.usage.as_ref().expect("the fetch succeeded").credits;
+    assert_eq!(
+        *credits,
+        CreditsState::On(Credits {
+            used: Some(Money { amount_minor: 21_956, currency: "USD".to_owned(), exponent: 2 }),
+            limit: Some(Money { amount_minor: 500_000, currency: "USD".to_owned(), exponent: 2 }),
+            percent: Some(4),
+        })
+    );
+
+    let report = Report {
+        rows: outcomes.iter().map(RowOutcome::to_status_row).collect(),
+        now: Timestamp::now(),
+        show_all: false,
+    };
+    let rendered = table::render(&report);
+    assert!(rendered.contains("$219.56 / $5000.00 (4%)"), "got:\n{rendered}");
 }
 
 #[test]

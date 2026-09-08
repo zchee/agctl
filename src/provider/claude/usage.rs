@@ -25,6 +25,21 @@
 //! empty success — it is what an API or console account looks like, and it
 //! gets its own state so the row says so (plan AC49).
 //!
+//! # Credits come from `extra_usage`, never from `spend`
+//!
+//! A response describes the same credit balance twice, in `extra_usage` and
+//! in `spend`, and the two disagree in shape and sometimes in value. Only
+//! `extra_usage` is read (decision D-006): it is the object the web UI drives
+//! its own credits panel from, so following it is what keeps agentctl and the
+//! site quoting the same number. `spend` is peeked at for exactly two
+//! contradiction checks and is otherwise passed through untouched, visible in
+//! `--raw` alone — parsing it into a second typed value would create a second
+//! answer to the same question and no rule for choosing between them.
+//!
+//! Both checks emit a [`tracing::warn`], because the failure they detect is
+//! silent otherwise: the column reads `n/a` or a stale figure while the
+//! server did send a number, and only `--raw` would show it.
+//!
 //! # No token is exposed here
 //!
 //! The bearer header comes from
@@ -41,6 +56,7 @@
 //! an HTTP concern. The 401 arrives here; the decision about it is made in
 //! [`crate::commands::status`].
 
+use std::fmt;
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -56,12 +72,17 @@ use crate::provider::claude::oauth::OauthClient;
 use crate::provider::claude::oauth::OauthError;
 use crate::provider::claude::oauth::TokenResponse;
 use crate::runtime::coordinator::Cancel;
+use crate::usage::model::Credits;
 use crate::usage::model::CreditsState;
+use crate::usage::model::DEFAULT_MONEY_EXPONENT;
 use crate::usage::model::LimitWindow;
+use crate::usage::model::MAX_MONEY_EXPONENT;
+use crate::usage::model::Money;
 use crate::usage::model::UsageSnapshot;
 use crate::usage::model::WindowKind;
 use crate::usage::model::clamp_percent;
 use crate::usage::model::percent_floor;
+use crate::usage::model::percent_round;
 
 /// Where the usage endpoint lives.
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -86,6 +107,14 @@ pub const MAX_BODY_BYTES: u64 = 1 << 22;
 
 /// The scope whose weekly window has a column of its own in the table.
 pub const HEADLINE_SCOPE: &str = "Fable";
+
+/// How far `extra_usage.utilization` and `spend.percent` may drift before the
+/// disagreement is worth a warning (risk R14).
+///
+/// One point, because the two are computed from the same balance at slightly
+/// different moments and rounded differently; anything larger means the
+/// column and the web UI would show materially different numbers.
+pub const PERCENT_AGREEMENT_TOLERANCE: f64 = 1.0;
 
 /// Redirects the base URL. Test seam only (plan section 3.9).
 #[cfg(feature = "testing")]
@@ -258,14 +287,227 @@ pub fn parse_usage(
         .as_object()
         .ok_or_else(|| format!("expected a JSON object, got {}", json_type_name(root)))?;
 
+    let (credits, warnings) = credits_from_body(root);
+    for warning in warnings {
+        // The enclosing `account` span (see `commands::status::run_account`)
+        // carries `account.id`, so the row is named without this function
+        // having to be told which one it is parsing.
+        tracing::warn!(
+            credits.warning = %warning,
+            "the credits column may not match the web UI for this account; \
+             `agentctl claude status --raw` shows what the server sent"
+        );
+    }
+
     Ok(UsageSnapshot {
         fetched_at,
         windows: normalize(object),
-        // Credits land in W2 (plan section 3.8, decision D-006). Until then
-        // the column reads `n/a`, which is true: this build has not looked.
-        credits: CreditsState::Unavailable,
+        credits,
         raw: keep_raw.then(|| root.clone()),
     })
+}
+
+/// Something the credits parser saw that the column cannot show.
+///
+/// Returned rather than logged so that [`credits_from_body`] stays a pure
+/// function a test can assert the whole list against (plan AC22);
+/// [`parse_usage`] is the single place that turns one of these into a
+/// `tracing::warn!`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CreditsWarning {
+    /// The response carried no `extra_usage`, but its `spend` object claims
+    /// the account has credits.
+    ///
+    /// This is the under-delivery case (risk R14) and the only detector for
+    /// it: the column will read `n/a` while the web UI shows a figure.
+    SpendWithoutExtraUsage,
+    /// `extra_usage.utilization` and `spend.percent` disagree by more than
+    /// [`PERCENT_AGREEMENT_TOLERANCE`].
+    PercentDisagrees {
+        /// What `extra_usage` said, unrounded.
+        extra_usage: f64,
+        /// What `spend` said.
+        spend: f64,
+    },
+    /// `decimal_places` was outside `0..=`[`MAX_MONEY_EXPONENT`].
+    ///
+    /// [`DEFAULT_MONEY_EXPONENT`] is used instead, so the figure is still
+    /// shown; the warning is what says the decimal point may be misplaced.
+    ExponentOutOfRange {
+        /// The value the server sent.
+        decimal_places: i64,
+    },
+}
+
+impl fmt::Display for CreditsWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SpendWithoutExtraUsage => f.write_str(
+                "the response carried no `extra_usage` but its `spend` object reports credits",
+            ),
+            Self::PercentDisagrees { extra_usage, spend } => write!(
+                f,
+                "`extra_usage.utilization` ({extra_usage}) and `spend.percent` ({spend}) \
+                 disagree by more than {PERCENT_AGREEMENT_TOLERANCE} point"
+            ),
+            Self::ExponentOutOfRange { decimal_places } => write!(
+                f,
+                "`decimal_places` was {decimal_places}, outside 0..={MAX_MONEY_EXPONENT}; \
+                 {DEFAULT_MONEY_EXPONENT} was assumed"
+            ),
+        }
+    }
+}
+
+/// Reads the credits column's figures out of a usage body (plan section 3.8).
+///
+/// `extra_usage` is the only source. Its absence is
+/// [`CreditsState::Unavailable`] rather than an error, because a response
+/// shape that predates the object is a real thing to meet and an account
+/// whose windows parsed fine should still get a row.
+///
+/// All the arithmetic here is checked: this project builds with
+/// `-C overflow-checks=off` (constraint C-006), and a wrapped or saturated
+/// money figure would be rendered as confidently as a correct one.
+pub fn credits_from_body(root: &Value) -> (CreditsState, Vec<CreditsWarning>) {
+    let mut warnings = Vec::new();
+    let object = root.as_object();
+    let spend = object.and_then(|object| object.get("spend")).and_then(Value::as_object);
+
+    // A non-object `extra_usage` — `null`, most often — is "the server said
+    // nothing", not a malformed document: the same key is `null` on every
+    // account that has never touched credits.
+    let Some(extra) =
+        object.and_then(|object| object.get("extra_usage")).and_then(Value::as_object)
+    else {
+        if spend.is_some_and(spend_reports_credits) {
+            warnings.push(CreditsWarning::SpendWithoutExtraUsage);
+        }
+        return (CreditsState::Unavailable, warnings);
+    };
+
+    // `is_enabled` is the one field fact F20 declares as a required boolean;
+    // an `extra_usage` object without it is not the declared shape, so it is
+    // reported as "no figure" rather than invented into an `On` with nothing in
+    // it. The `spend` under-delivery detector still runs for that case.
+    let enabled = match extra.get("is_enabled").and_then(Value::as_bool) {
+        Some(enabled) => enabled,
+        None => {
+            if spend.is_some_and(spend_reports_credits) {
+                warnings.push(CreditsWarning::SpendWithoutExtraUsage);
+            }
+            return (CreditsState::Unavailable, warnings);
+        }
+    };
+    if !enabled {
+        let reason = extra.get("disabled_reason").and_then(Value::as_str).map(str::to_owned);
+        return (CreditsState::Off { reason }, warnings);
+    }
+
+    let exponent = match extra.get("decimal_places").and_then(Value::as_i64) {
+        None => DEFAULT_MONEY_EXPONENT,
+        Some(places) => match u8::try_from(places).ok().filter(|p| *p <= MAX_MONEY_EXPONENT) {
+            Some(exponent) => exponent,
+            None => {
+                warnings.push(CreditsWarning::ExponentOutOfRange { decimal_places: places });
+                DEFAULT_MONEY_EXPONENT
+            }
+        },
+    };
+
+    // No currency is not USD: `Money` renders a bare figure for an empty
+    // code, which says "this many, in whatever the server meant" rather than
+    // inventing a symbol the server never sent.
+    let currency = extra.get("currency").and_then(Value::as_str).unwrap_or_default();
+
+    let utilization = extra.get("utilization").and_then(Value::as_f64);
+    if let Some(utilization) = utilization
+        && let Some(spend) = spend
+        && let Some(spend_percent) = spend.get("percent").and_then(Value::as_f64)
+        && utilization.is_finite()
+        && spend_percent.is_finite()
+        && (utilization - spend_percent).abs() > PERCENT_AGREEMENT_TOLERANCE
+    {
+        warnings.push(CreditsWarning::PercentDisagrees {
+            extra_usage: utilization,
+            spend: spend_percent,
+        });
+    }
+
+    let credits = Credits {
+        used: money(extra.get("used_credits"), currency, exponent),
+        limit: money(extra.get("monthly_limit"), currency, exponent),
+        percent: utilization.and_then(percent_round),
+    };
+    (CreditsState::On(credits), warnings)
+}
+
+/// Builds one [`Money`] from a minor-unit field, or `None` when it is absent
+/// or unreadable.
+fn money(value: Option<&Value>, currency: &str, exponent: u8) -> Option<Money> {
+    let amount_minor = minor_units(value?)?;
+    Some(Money { amount_minor, currency: currency.to_owned(), exponent })
+}
+
+/// Reads a minor-unit amount, which the endpoint spells as either an integer
+/// or a float.
+///
+/// The observed body sends `monthly_limit: 500000` and
+/// `used_credits: 21956.0` in the same object, so both spellings have to
+/// work. A float is rounded to the nearest whole minor unit and refused
+/// outright when it is not finite or does not fit an `i64`: `as` saturates
+/// silently, and an [`i64::MAX`] appearing in a money column is a worse
+/// answer than an em dash.
+fn minor_units(value: &Value) -> Option<i64> {
+    if let Some(exact) = value.as_i64() {
+        return Some(exact);
+    }
+
+    /// `i64::MIN`, which is exactly representable as an `f64` because it is
+    /// a power of two.
+    const MIN: f64 = -9_223_372_036_854_775_808.0;
+    /// One past `i64::MAX`. Exclusive, because `i64::MAX` itself is *not*
+    /// representable and rounds up to this value.
+    const PAST_MAX: f64 = 9_223_372_036_854_775_808.0;
+
+    let rounded = value.as_f64()?.round();
+    if !rounded.is_finite() || rounded < MIN || rounded >= PAST_MAX {
+        return None;
+    }
+    // Exact: the bounds above admit only whole numbers an `i64` holds.
+    Some(rounded as i64)
+}
+
+/// Whether a `spend` object is claiming this account has credits.
+///
+/// Not "any non-null field": every response carries a `spend.disclaimer` and
+/// a `spend.severity`, so a walk that counted prose would warn on every body
+/// that merely lacks `extra_usage`, and a warning that fires constantly is
+/// one nobody reads. What matters for the under-delivery case is whether
+/// `spend` reports a live figure — an enabled switch, a non-zero percentage
+/// or amount, or a ceiling — so those are what this looks at.
+///
+/// This is a peek, not a parse: nothing here is kept, and `spend` still
+/// reaches the user only through `--raw` (plan section 3.8).
+fn spend_reports_credits(spend: &Map<String, Value>) -> bool {
+    if spend.get("enabled").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    if ["limit", "balance", "cap"]
+        .iter()
+        .any(|key| spend.get(*key).is_some_and(|value| !value.is_null()))
+    {
+        return true;
+    }
+    if spend.get("percent").and_then(Value::as_f64).is_some_and(|percent| percent != 0.0) {
+        return true;
+    }
+    spend
+        .get("used")
+        .and_then(Value::as_object)
+        .and_then(|used| used.get("amount_minor"))
+        .and_then(Value::as_f64)
+        .is_some_and(|amount| amount != 0.0)
 }
 
 /// Maps a usage response body onto usage windows (plan section 3.3 step 4).

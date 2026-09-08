@@ -14,11 +14,14 @@
 //! the point (fact F21, plan AC1) — rounding half-up would show `36%` where
 //! the site shows `35%`.
 //!
-//! **Credits are `Unavailable` in this build, not absent.** [`CreditsState`],
-//! [`Credits`] and [`Money`] exist now and the column renders `n/a`; the
-//! `extra_usage` parser that fills them lands in W2 (plan section 3.8,
-//! decision D-006). Defining the types now is what keeps the renderer, the
-//! cache format and the JSON schema from being reshaped when it does.
+//! **Credits come from `extra_usage` alone.** [`CreditsState`] distinguishes
+//! "switched off" from "the response said nothing", because those are
+//! different facts about an account and only one of them is worth acting on.
+//! The parser that fills them is
+//! [`credits_from_body`](crate::provider::claude::usage::credits_from_body)
+//! (plan section 3.8, decision D-006); `spend` is never read into any of
+//! these types, so a figure this vocabulary cannot express survives only in
+//! `--raw`.
 
 use std::fmt;
 
@@ -31,6 +34,15 @@ use serde_json::Value;
 /// only currencies in play use 0, 2 or 3. Anything larger is clamped rather
 /// than rejected: a display type must not fail (plan AC24).
 pub const MAX_MONEY_EXPONENT: u8 = 6;
+
+/// The exponent assumed when the server sends none, or sends a nonsensical
+/// one.
+///
+/// Two, because every currency the endpoint has been observed to quote is a
+/// two-decimal one and because the alternative — refusing to show a figure
+/// the server did send — is worse than showing it with the wrong number of
+/// decimals (plan section 3.8).
+pub const DEFAULT_MONEY_EXPONENT: u8 = 2;
 
 /// One usage window, whatever the provider called it.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,31 +96,19 @@ pub enum WindowKind {
 /// What is known about an account's extra-usage credits.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CreditsState {
-    /// The response said nothing usable about credits. Rendered `n/a`.
+    /// The response carried no `extra_usage` object. Rendered `n/a`.
     ///
-    /// Every row is in this state in W1: the `extra_usage` parser lands in W2
-    /// (plan section 3.8).
+    /// Not the same as [`CreditsState::Off`]: this build looked and the
+    /// server said nothing, which is what an account on an older API shape
+    /// looks like. When `spend` nonetheless carried a figure, the parser has
+    /// already logged a warning pointing at `--raw` (risk R14).
     Unavailable,
     /// Credits exist for this account but are switched off.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "constructed by the extra_usage parser in W2 (plan section 3.8)"
-        )
-    )]
     Off {
-        /// The server's reason, when it gave one.
+        /// The server's `disabled_reason`, when it gave one.
         reason: Option<String>,
     },
     /// Credits are on, with the numbers below.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "constructed by the extra_usage parser in W2 (plan section 3.8)"
-        )
-    )]
     On(Credits),
 }
 
@@ -248,6 +248,24 @@ pub fn clamp_percent(value: f64) -> Option<f64> {
 pub fn percent_floor(value: f64) -> Option<u8> {
     let clamped = clamp_percent(value)?;
     Some(clamped.floor() as u8)
+}
+
+/// Rounds an already-clamped percentage to the nearest whole number.
+///
+/// Rounding, not flooring, and the difference from [`percent_floor`] is
+/// deliberate. A window percentage is floored because the web UI floors it
+/// and agentctl must never read a point above the site (fact F21). The
+/// credits figure is `extra_usage.utilization`, which plan section 3.8
+/// specifies as rounded; whether the site floors it too has not been
+/// observed, so the two helpers sit side by side and a later edit has to
+/// choose one rather than inherit whichever it happens to import.
+///
+/// The cast is exact for every input: [`clamp_percent`] has already rejected
+/// `NaN` and confined the value to `0.0..=100.0`, so the rounded result is a
+/// whole number in `0..=100`.
+pub fn percent_round(value: f64) -> Option<u8> {
+    let clamped = clamp_percent(value)?;
+    Some(clamped.round() as u8)
 }
 
 /// Formats the time until `target` as a compact countdown.

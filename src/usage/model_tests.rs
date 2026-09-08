@@ -30,6 +30,35 @@ fn clamp_percent_maps_the_ac24_vectors() {
 }
 
 #[test]
+fn ac24_percent_round_maps_the_same_vectors_to_the_nearest_whole_number() {
+    // Plan AC24, for the credits figure: -1, 100.4, 250, NaN -> 0, 100, 100,
+    // None. `utilization` already arrives as 0-100 (fact F23a), so it is
+    // rounded where it stands and never scaled.
+    let tests: [(f64, Option<u8>); 8] = [
+        (-1.0, Some(0)),
+        (0.0, Some(0)),
+        (0.4, Some(0)),
+        (4.3911999999999995, Some(4)),
+        (99.5, Some(100)),
+        (100.4, Some(100)),
+        (250.0, Some(100)),
+        (f64::NAN, None),
+    ];
+    for (input, expected) in tests {
+        assert_eq!(percent_round(input), expected, "percent_round({input})");
+    }
+}
+
+#[test]
+fn percent_round_and_percent_floor_disagree_where_it_matters() {
+    // The two exist side by side on purpose: a window percentage is floored
+    // so agentctl never reads a point above the web UI (fact F21), while
+    // plan section 3.8 specifies the credits figure as rounded.
+    assert_eq!(percent_floor(35.9), Some(35));
+    assert_eq!(percent_round(35.9), Some(36));
+}
+
+#[test]
 fn percent_floor_never_rounds_up() {
     // Fact F21: the web UI floors, so 35.9 must read 35 and not 36. Rounding
     // half-up here is what would put agentctl a point above the site.
@@ -73,6 +102,25 @@ fn money_never_panics_on_the_ac24_edges() {
             assert!(!rendered.is_empty(), "exponent {exponent}, amount {amount}");
             assert_eq!(rendered.starts_with('-'), amount < 0, "sign for {amount}");
         }
+    }
+}
+
+#[test]
+fn ac24_money_renders_each_exponent_the_endpoint_can_send() {
+    // Plan AC24: 0, 2, 3 and 6 decimal places, and a negative at each.
+    let tests: [(i64, u8, &str); 8] = [
+        (1234, 0, "$1234"),
+        (-1234, 0, "-$1234"),
+        (1234, 2, "$12.34"),
+        (-1234, 2, "-$12.34"),
+        (1234, 3, "$1.234"),
+        (-1234, 3, "-$1.234"),
+        (1234, MAX_MONEY_EXPONENT, "$0.001234"),
+        (-1234, MAX_MONEY_EXPONENT, "-$0.001234"),
+    ];
+    for (amount_minor, exponent, expected) in tests {
+        let money = Money { amount_minor, currency: "USD".to_owned(), exponent };
+        assert_eq!(money.to_string(), expected, "{amount_minor} at 10^-{exponent}");
     }
 }
 
