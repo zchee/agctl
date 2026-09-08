@@ -587,3 +587,243 @@ fn a_bare_dot_lock_is_not_a_legacy_lock_name() {
 fn now_ms() -> i64 {
     jiff::Timestamp::now().as_millisecond()
 }
+
+#[test]
+fn the_report_lists_foreign_items_and_says_they_are_never_read() {
+    // A `claude-switcher:*` item (fact F10) and `CLAUDE_CODE_OAUTH_TOKEN`
+    // (fact F19). Both exist on real machines, neither is agentctl's, and a
+    // user comparing `security dump-keychain` against this report should not
+    // have to guess whether agentctl is quietly using them.
+    let store = store();
+    let switcher = format!("{}someone@example.com", crate::secret::SWITCHER_SERVICE_PREFIX);
+    let reader = FakeReader::unlocked().with_entry(&switcher);
+    let env = EnvView { oauth_token_set: true, ..store.env.clone() };
+    let doctor = Doctor {
+        paths: &store.paths,
+        env: &env,
+        cancel: &store.cancel,
+        sample_interval: TEST_INTERVAL,
+    };
+
+    let mut io = Recorder::default();
+    report(&doctor, &reader, &store.ctx(), &mut io).expect("the report should succeed");
+    let text = io.text();
+
+    assert!(text.contains("foreign items (never read)"), "{text}");
+    assert!(text.contains(&switcher), "the switcher item is named:\n{text}");
+    assert!(text.contains("belongs to claude-switcher"), "{text}");
+    assert!(text.contains("CLAUDE_CODE_OAUTH_TOKEN"), "the environment token is named:\n{text}");
+    assert!(text.contains("short-circuits every credential store"), "{text}");
+    assert!(
+        !reader.reads().contains(&switcher),
+        "a foreign item is listed, never read: {:?}",
+        reader.reads()
+    );
+}
+
+#[test]
+fn the_foreign_section_says_none_when_there_is_nothing_foreign() {
+    // The section is always present, so its absence is never mistaken for
+    // "agentctl did not look".
+    let store = store();
+    let mut io = Recorder::default();
+    report(&store.doctor(), &FakeReader::unlocked(), &store.ctx(), &mut io)
+        .expect("the report should succeed");
+    let text = io.text();
+
+    assert!(text.contains("foreign items (never read)"), "{text}");
+    assert!(text.contains("foreign items (never read)\n  none"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// --remove-stale and symbolic links on the way to the artefact
+// ---------------------------------------------------------------------------
+
+/// Plants a real refresh lock outside the store, aged past the threshold.
+///
+/// This stands in for `~/.claude/.oauth_refresh.lock` — the file a live Claude
+/// Code session is holding, and the one invariant I11 exists to protect.
+fn plant_outside(at: &Path) -> PathBuf {
+    fs::create_dir_all(at).expect("the outside directory should be creatable");
+    let path = at.join(REFRESH_LOCK);
+    fs::write(&path, "{\"pid\":424242}").expect("the artefact should be writable");
+    backdate(&path, Duration::from_secs(120));
+    path
+}
+
+#[test]
+fn remove_stale_refuses_a_symlinked_organization_component() {
+    // `<root>/<acct>/<org>/.oauth_refresh.lock` spells a location under the
+    // namespace root and passes every lexical check, while `<org>` is a link
+    // to somebody else's directory. The final component is a real file, so the
+    // `lstat` sees nothing wrong either — only walking the chain with
+    // `O_NOFOLLOW` catches it.
+    let store = store();
+    let victim = plant_outside(&store.home.join(".claude"));
+
+    let acct_dir = store.paths.namespace_root().join(ACCT);
+    fs::create_dir_all(&acct_dir).expect("the account directory should be creatable");
+    std::os::unix::fs::symlink(store.home.join(".claude"), acct_dir.join(ORG))
+        .expect("the link should be creatable");
+
+    let path = store.ns_dir(ORG).join(REFRESH_LOCK);
+    let mut io = Recorder::default();
+    let err = remove_stale(&store.doctor(), &path, true, &mut io)
+        .expect_err("a symlinked namespace component is refused");
+
+    assert!(err.to_string().contains("symbolic link"), "{err}");
+    assert_eq!(err.exit_code(), crate::error::EXIT_FATAL, "nothing was removed, so exit 1");
+    assert!(victim.exists(), "the live session's lock is untouched: {}", victim.display());
+}
+
+#[test]
+fn remove_stale_refuses_a_symlinked_account_component() {
+    // The same attack one level up: `<acct>` is the link, so the artefact's
+    // whole parent chain is somebody else's.
+    let store = store();
+    let elsewhere = store.home.join("elsewhere");
+    let victim = plant_outside(&elsewhere.join(ORG));
+
+    fs::create_dir_all(store.paths.namespace_root()).expect("the root should be creatable");
+    std::os::unix::fs::symlink(&elsewhere, store.paths.namespace_root().join(ACCT))
+        .expect("the link should be creatable");
+
+    let path = store.ns_dir(ORG).join(REFRESH_LOCK);
+    let mut io = Recorder::default();
+    let err = remove_stale(&store.doctor(), &path, true, &mut io)
+        .expect_err("a symlinked account component is refused");
+
+    assert!(err.to_string().contains("symbolic link"), "{err}");
+    assert!(victim.exists(), "the file the link pointed at is untouched");
+}
+
+#[test]
+fn the_report_prints_a_legacy_lock_command_that_remove_stale_accepts() {
+    // The legacy lock is named after the *resolved* namespace (fact F17), and
+    // on macOS a temporary directory resolves through `/private` — so the
+    // canonical spelling does not begin with the namespace root as `Paths`
+    // spells it, and printing it produced a `--remove-stale` command this very
+    // build refused. The store here is deliberately reached through a symbolic
+    // link so the two spellings differ.
+    let dir = TempDir::new().expect("a temporary directory should be creatable");
+    let real = dir.path().join("real-config");
+    fs::create_dir_all(&real).expect("creatable");
+    let linked = dir.path().join("config-link");
+    std::os::unix::fs::symlink(&real, &linked).expect("the link should be creatable");
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).expect("creatable");
+
+    let paths = Paths::with_config_dir(linked);
+    paths.ensure_dirs().expect("the store directories should be creatable");
+    let store = Store {
+        _dir: dir,
+        home: home.clone(),
+        paths,
+        env: EnvView::with_home(home),
+        cancel: Cancel::new(),
+    };
+    record_owned(&store, ORG, None);
+    let ns_dir = store.ns_dir(ORG);
+    fs::create_dir_all(&ns_dir).expect("the namespace should be creatable");
+
+    // Written where Claude Code would write it: beside the *resolved*
+    // directory.
+    let canonical = namespace::canonical(&ns_dir).expect("the namespace resolves");
+    let mut legacy = canonical.clone().into_os_string();
+    legacy.push(LEGACY_LOCK_SUFFIX);
+    let legacy = PathBuf::from(legacy);
+    fs::write(&legacy, "{\"pid\":424242}").expect("writable");
+    backdate(&legacy, Duration::from_secs(120));
+    assert_ne!(canonical, ns_dir, "the fixture is only meaningful if the spellings differ");
+
+    let mut io = Recorder::default();
+    report(&store.doctor(), &FakeReader::unlocked(), &store.ctx(), &mut io)
+        .expect("the report should succeed");
+    let text = io.text();
+
+    let printed = text
+        .split_once("--remove-stale ")
+        .and_then(|(_, rest)| rest.split_once(" --yes"))
+        .map(|(path, _)| PathBuf::from(path))
+        .unwrap_or_else(|| panic!("the report offers a removal:\n{text}"));
+    assert!(
+        printed.starts_with(store.paths.namespace_root()),
+        "the printed path is the one the store spells, not the resolved one: {}",
+        printed.display()
+    );
+
+    // Taken verbatim, as a user would paste it.
+    let mut io = Recorder::default();
+    remove_stale(&store.doctor(), &printed, true, &mut io)
+        .expect("the command the report printed is the command the build accepts");
+    assert!(!legacy.exists(), "and it removed the artefact: {}", legacy.display());
+}
+
+#[test]
+fn the_report_hides_forgotten_services_behind_one_line() {
+    // Plan AC47: `accounts forget` means `doctor` stops reporting the service.
+    // A count stands in for it, so a user who forgot something and then went
+    // looking for it is told it is hidden rather than left to conclude the
+    // item is gone.
+    let store = store();
+    let forgotten = format!("{LIVE_SERVICE}-6cdd6b98");
+    let reader = FakeReader::unlocked()
+        .with_item(&forgotten, blob("sk-ant-oat01-other", now_ms() + 3_600_000).as_bytes());
+    AgentctlConfig::update(&store.paths, |config| {
+        config.forgotten_services.push(forgotten.clone());
+    })
+    .expect("the registry should be writable");
+
+    let mut io = Recorder::default();
+    report(&store.doctor(), &reader, &store.ctx(), &mut io).expect("the report should succeed");
+    let text = io.text();
+
+    assert!(!text.contains(&forgotten), "the hidden service is named nowhere:\n{text}");
+    assert!(text.contains("1 forgotten service(s) hidden"), "{text}");
+    assert!(text.contains("accounts list --all"), "and says where to see it:\n{text}");
+    assert!(
+        !reader.reads().contains(&forgotten),
+        "and it was never read from the keychain: {:?}",
+        reader.reads()
+    );
+}
+
+#[test]
+fn the_report_does_not_offer_relocate_for_a_row_that_cannot_be_relocated() {
+    // A record `import --from keychain` wrote for an item that named nobody is
+    // keyed by its service name and its organization is `_unknown-org` — so it
+    // matched the `_unknown-org` rule and drew a suggestion `relocate` refuses
+    // outright, spelled `accounts relocate Claude Code-credentials-…`.
+    let store = store();
+    let service = format!("{LIVE_SERVICE}-6cdd6b98");
+    let record = AccountRecord {
+        account_uuid: service.clone(),
+        organization_uuid: UNKNOWN_ORG.to_owned(),
+        email: None,
+        org_name: None,
+        label: None,
+        kind: AccountKind::ConfigDirReadOnly {
+            dir: PathBuf::from("/elsewhere/.claude"),
+            service: service.clone(),
+            shares_live_dir: false,
+        },
+        forgotten: false,
+        created_at: jiff::Timestamp::now().to_string(),
+    };
+    AgentctlConfig::update(&store.paths, |config| config.upsert(record))
+        .expect("the registry should be writable");
+
+    let mut io = Recorder::default();
+    report(&store.doctor(), &FakeReader::unlocked(), &store.ctx(), &mut io)
+        .expect("the report should succeed");
+    let text = io.text();
+
+    assert!(!text.contains("accounts relocate"), "advice that cannot be taken:\n{text}");
+
+    // And the owned case still gets it.
+    record_owned(&store, UNKNOWN_ORG, None);
+    let mut io = Recorder::default();
+    report(&store.doctor(), &FakeReader::unlocked(), &store.ctx(), &mut io)
+        .expect("the report should succeed");
+    assert!(io.text().contains(&format!("accounts relocate {ACCT}")), "{}", io.text());
+}

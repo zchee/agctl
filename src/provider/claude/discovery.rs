@@ -249,7 +249,7 @@ fn record_row(
         AccountKind::Foreign { source } => Some(AccountRow {
             id,
             record: record.clone(),
-            state: AccountState::NeedsLogin,
+            state: AccountState::Foreign { source: source.clone() },
             source: Source::None,
             credentials: None,
             visible_by_default: true,
@@ -482,7 +482,7 @@ fn foreign_row(entry: &ServiceEntry) -> AccountRow {
     AccountRow {
         id: entry.service.clone(),
         record,
-        state: AccountState::Unclaimed,
+        state: AccountState::Foreign { source: "claude-switcher".to_owned() },
         source: Source::None,
         credentials: None,
         visible_by_default: false,

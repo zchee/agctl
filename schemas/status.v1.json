@@ -68,8 +68,8 @@
         "email": { "type": ["string", "null"] },
         "org_name": { "type": ["string", "null"] },
         "kind": {
-          "description": "Where the credentials live, and so whether agentctl may write them. Only `owned` is ever refreshed.",
-          "enum": ["owned", "live", "config_dir", "metadata"]
+          "description": "Where the credentials live, and so whether agentctl may write them. Only `owned` is ever refreshed. `foreign` is synthesized by discovery for a credential that belongs to something else — a third-party tool's keychain item, or a token in the environment — and is never recorded in the registry.",
+          "enum": ["owned", "live", "config_dir", "foreign"]
         },
         "source": {
           "description": "Where this row's credentials were actually read from on this pass.",
@@ -84,6 +84,7 @@
             "identity_unknown",
             "stale_sibling_of_live",
             "unclaimed",
+            "foreign",
             "forgotten",
             "migrated_to_keychain",
             "claude_session_detected",

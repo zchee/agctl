@@ -163,7 +163,7 @@ pub fn acquire(
         LockError::Unavailable(format!("`{}` does not name a lock file", path.display()))
     })?;
     let mut guard = lock_at(dir.as_fd(), name, &path, deadline, cancel, &fault)?;
-    write_body(&mut guard)?;
+    write_body(&mut guard, cancel)?;
 
     // Used by plan AC7 and AC35 to make a second process actually wait, and
     // to prove a `watch` frame keeps redrawing while a worker is stuck.
@@ -317,10 +317,10 @@ pub fn read_body(path: &Path) -> Option<LockBody> {
 }
 
 /// Replaces the lock file's body with a description of this holder.
-fn write_body(guard: &mut NamespaceLockGuard) -> Result<(), LockError> {
+fn write_body(guard: &mut NamespaceLockGuard, cancel: &Cancel) -> Result<(), LockError> {
     let body = LockBody {
         pid: std::process::id(),
-        pid_start_time: crate::runtime::proc::self_start_time(),
+        pid_start_time: crate::runtime::proc::self_start_time(cancel),
         acquired_at: jiff::Timestamp::now().to_string(),
     };
     let json = serde_json::to_string(&body).map_err(|err| {

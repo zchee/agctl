@@ -876,6 +876,50 @@ pub fn open_namespace_dir(paths: &Paths, ns_dir: &Path) -> Result<OwnedFd, FileS
     Ok(leaf.fd)
 }
 
+/// Removes one name from a directory under the namespace root, resolving that
+/// directory without ever following a symbolic link.
+///
+/// `doctor --remove-stale` is the only caller, and it is the only thing in
+/// agentctl that deletes a lock artefact at all. Its own path check is
+/// lexical — it compares spellings — and a lexical check cannot see a
+/// symbolic link planted at `<acct>` or `<org>`:
+/// `<root>/<acct>/<org>/.oauth_refresh.lock` spells a location under the root
+/// while naming Claude Code's live lock in the user's home directory, which
+/// is exactly the file invariant I11 exists to protect. So the directory is
+/// walked down from the root one `O_NOFOLLOW` component at a time and the
+/// file is unlinked relative to the descriptor that walk produced — a
+/// directory nothing could have redirected between the check and the unlink.
+///
+/// `unlinkat` without `AT_REMOVEDIR` never removes a directory, and removes a
+/// symbolic link rather than what it points at, so the final component needs
+/// no separate guard.
+///
+/// # Errors
+///
+/// [`FileStoreError::RefusedSymlink`] for a link anywhere along the chain,
+/// [`FileStoreError::OutsideNamespaceRoot`] when the path does not spell a
+/// location below the root, and [`FileStoreError::Io`] when the directory is
+/// not there or the unlink itself fails.
+pub fn remove_file_under_root(paths: &Paths, path: &Path) -> Result<(), FileStoreError> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(FileStoreError::OutsideNamespaceRoot(path.to_path_buf()));
+    };
+    let root = paths.namespace_root();
+    let Some(chain) = open_chain(&root, parent, Walk::MustExist)? else {
+        return Err(FileStoreError::io(
+            format!("`{}` is not there", parent.display()),
+            io::Error::from(io::ErrorKind::NotFound),
+        ));
+    };
+    let leaf = chain
+        .into_iter()
+        .next_back()
+        .ok_or_else(|| FileStoreError::OutsideNamespaceRoot(path.to_path_buf()))?;
+    rustix::fs::unlinkat(&leaf.fd, name, AtFlags::empty()).map_err(|errno| {
+        FileStoreError::errno(format!("could not remove `{}`", path.display()), errno)
+    })
+}
+
 /// Opens `ns_dir` for an operation that was not handed the [`Paths`] it came
 /// from.
 ///

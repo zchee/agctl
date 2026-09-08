@@ -42,6 +42,18 @@ pub enum AccountState {
     StaleSiblingOfLive,
     /// A Claude Code credentials item that no agentctl record claims.
     Unclaimed,
+    /// A credential belonging to something that is not agentctl and not
+    /// Claude Code — another tool's keychain item (fact F10). Listed so the
+    /// user can see it is there, hidden by default, and never read.
+    ///
+    /// Distinct from [`AccountState::Unclaimed`], which is a Claude Code
+    /// credentials item agentctl *could* adopt. Nothing here is adoptable, so
+    /// a consumer branching on the `state` token must be able to tell the two
+    /// apart.
+    Foreign {
+        /// What owns it, as the row's `kind` also spells it.
+        source: String,
+    },
     /// Hidden at the user's request by `accounts forget`.
     Forgotten,
     /// A keychain item exists for this namespace: a Claude Code session has
@@ -111,6 +123,7 @@ impl AccountState {
             Self::IdentityUnknown => "identity unknown".to_owned(),
             Self::StaleSiblingOfLive => "stale sibling of live".to_owned(),
             Self::Unclaimed => "unclaimed".to_owned(),
+            Self::Foreign { source } => format!("foreign ({source})"),
             Self::Forgotten => "forgotten".to_owned(),
             Self::MigratedToKeychain { service } => format!("migrated to keychain ({service})"),
             Self::ClaudeSessionDetected { lock, age_ms } => format!(
@@ -157,6 +170,7 @@ impl AccountState {
             Self::IdentityUnknown => "identity_unknown",
             Self::StaleSiblingOfLive => "stale_sibling_of_live",
             Self::Unclaimed => "unclaimed",
+            Self::Foreign { .. } => "foreign",
             Self::Forgotten => "forgotten",
             Self::MigratedToKeychain { .. } => "migrated_to_keychain",
             Self::ClaudeSessionDetected { .. } => "claude_session_detected",
@@ -186,6 +200,7 @@ impl AccountState {
             Self::Ok
             | Self::StaleSiblingOfLive
             | Self::Unclaimed
+            | Self::Foreign { .. }
             | Self::Forgotten
             | Self::MigratedToKeychain { .. }
             | Self::PendingReplayed
@@ -226,6 +241,7 @@ impl AccountState {
             | Self::IdentityUnknown
             | Self::StaleSiblingOfLive
             | Self::Unclaimed
+            | Self::Foreign { .. }
             | Self::Forgotten
             | Self::KeychainLocked { .. }
             | Self::KeychainTimeout

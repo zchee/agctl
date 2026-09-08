@@ -13,11 +13,17 @@
 //! status of 2 still carries a usable table on stdout, so a wrapper can render
 //! it and flag the degraded rows, whereas 1 means there is nothing to render.
 
-// Only `Config` has a construction site so far — every unimplemented command
-// returns one. The rest are the contract W1 to W3 fill in. Scoped to the
-// non-test build because `error_tests.rs` constructs every variant, and
-// spelled `expect` so it starts warning once the last variant finds a caller.
-#![cfg_attr(not(test), expect(dead_code, reason = "variants land with W1 to W3"))]
+// `Config`, `Io`, `Keychain`, `Refused` and `Partial` all have construction
+// sites now. `Http` and `Auth` do not, and the reason is a design decision
+// rather than an unfinished one: every network failure a pass meets becomes a
+// row state (`rate-limited`, `needs login`, `error`) beside a rendered table,
+// not a failure of the whole run. W3's `watch` is the remaining candidate for
+// a caller. Scoped to the non-test build because `error_tests.rs` constructs
+// every variant, and spelled `expect` so it starts warning once they do.
+#![cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Http and Auth have no caller yet; W3 may add one")
+)]
 
 use std::time::Duration;
 

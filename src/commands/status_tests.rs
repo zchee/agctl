@@ -1538,3 +1538,107 @@ fn a_cancelled_pass_returns_without_fetching() {
     assert!(outcomes.is_empty(), "a cancelled pass starts no work");
     usage.assert_calls(0);
 }
+
+// ---------------------------------------------------------------------------
+// AC8 on a row whose identifier is not a path segment
+// ---------------------------------------------------------------------------
+
+/// The row `import --from keychain` produces for an item that named nobody.
+///
+/// Its `account_uuid` is the keychain service name, because there was no
+/// account UUID to key the record by and a `ConfigDirReadOnly` record never
+/// gets a namespace directory for anything to derive a path from. The
+/// credential handed in here does carry an identity — an item can gain a
+/// `tokenAccount` after it was imported — so the row is readable and fetches
+/// like any other.
+fn service_keyed_row(service: &str, blob: &str) -> AccountRow {
+    let credentials =
+        Credentials::parse_blob(blob.as_bytes()).expect("the fixture blob should parse");
+    let record = AccountRecord {
+        account_uuid: service.to_owned(),
+        organization_uuid: crate::config::paths::UNKNOWN_ORG.to_owned(),
+        email: Some("other@example.com".to_owned()),
+        org_name: None,
+        label: None,
+        kind: AccountKind::ConfigDirReadOnly {
+            dir: PathBuf::from("/elsewhere/.claude"),
+            service: service.to_owned(),
+            shares_live_dir: false,
+        },
+        forgotten: false,
+        created_at: String::new(),
+    };
+    AccountRow {
+        id: service.to_owned(),
+        record,
+        state: AccountState::Ok,
+        source: Source::Keychain,
+        credentials: Some(credentials),
+        visible_by_default: true,
+        note: None,
+    }
+}
+
+#[test]
+fn ac8_a_row_keyed_by_a_service_name_caches_like_any_other() {
+    // The cache file used to be named only for identifiers that were valid
+    // path segments, and a keychain service name holds a space — so this row
+    // missed the cache on every pass and spent a request against Anthropic
+    // each time, for an account agentctl cannot even refresh. Worse, the
+    // stale-while-error path AC8 rests on had nothing to fall back to: a 429
+    // rendered an empty row rather than the last known numbers.
+    let store = store();
+    let server = MockServer::start();
+    let service = format!("{LIVE_SERVICE}-6cdd6b98");
+    let blob = blob("sk-ant-oat01-other", "sk-ant-ort01-other", fresh_at());
+
+    let cache_path = cache::path(&store.paths, &service, crate::config::paths::UNKNOWN_ORG);
+    assert_eq!(
+        cache_path.parent(),
+        Some(store.paths.cache_dir().as_path()),
+        "a service name still names a file inside the cache directory"
+    );
+
+    // Pass one fetches and fills the cache.
+    let mut ok = usage_ok(&server);
+    let rows = pass(
+        &store,
+        &server,
+        crate::provider::claude::discovery::Discovery {
+            rows: vec![service_keyed_row(&service, &blob)],
+            preflight: KeychainStatus::Unlocked,
+            listing: Vec::new(),
+        },
+        Setup::new(&server),
+    );
+    assert_eq!(rows[0].state, AccountState::Ok);
+    ok.assert_calls(1);
+    ok.delete();
+    assert!(cache_path.is_file(), "the entry was written: {}", cache_path.display());
+
+    // Pass two meets a 429 and must render what pass one cached.
+    let limited = server.mock(|when, then| {
+        when.method(GET).path(USAGE_PATH);
+        then.status(429).header("retry-after", "30").body("{}");
+    });
+    let mut setup = Setup::new(&server);
+    setup.options.refresh = true;
+    let rows = pass(
+        &store,
+        &server,
+        crate::provider::claude::discovery::Discovery {
+            rows: vec![service_keyed_row(&service, &blob)],
+            preflight: KeychainStatus::Unlocked,
+            listing: Vec::new(),
+        },
+        setup,
+    );
+
+    limited.assert_calls(1);
+    assert_eq!(rows[0].state, AccountState::RateLimited { retry_after_s: Some(30) });
+    assert_eq!(
+        rows[0].usage.as_ref().map(|usage| usage.windows.len()),
+        Some(3),
+        "the cached numbers are rendered rather than an empty row"
+    );
+}

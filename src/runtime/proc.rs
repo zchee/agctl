@@ -84,11 +84,11 @@ pub fn exists(pid: u32) -> bool {
 ///
 /// The `kill(pid, 0)` probe comes first so the common case — a lock left
 /// behind by a process that is long gone — costs no subprocess at all.
-pub fn holder(pid: u32) -> Holder {
+pub fn holder(pid: u32, cancel: &Cancel) -> Holder {
     if !exists(pid) {
         return Holder::Dead;
     }
-    match field("stat", pid) {
+    match field("stat", pid, cancel) {
         // `ps` reports the state as a leading letter followed by flags:
         // `T` is stopped or traced, `Z` a zombie whose exit status nobody has
         // collected. Both mean the holder will not release anything.
@@ -107,8 +107,8 @@ pub fn holder(pid: u32) -> Holder {
 /// The string is compared, never parsed: its only job is to differ when a
 /// process id has been recycled, and `ps`'s own formatting is stable enough
 /// for that within one machine's uptime.
-pub fn start_time(pid: u32) -> Option<String> {
-    field("lstart", pid)
+pub fn start_time(pid: u32, cancel: &Cancel) -> Option<String> {
+    field("lstart", pid, cancel)
 }
 
 /// This process's start time, read once and remembered.
@@ -116,9 +116,9 @@ pub fn start_time(pid: u32) -> Option<String> {
 /// Called from [`crate::secret::namespace_lock::acquire`], which runs on every
 /// refresh: a fresh `ps` per lock acquisition would be a subprocess in the hot
 /// path for a value that cannot change while this process is alive.
-pub fn self_start_time() -> Option<String> {
+pub fn self_start_time(cancel: &Cancel) -> Option<String> {
     static SELF_START: OnceLock<Option<String>> = OnceLock::new();
-    SELF_START.get_or_init(|| start_time(std::process::id())).clone()
+    SELF_START.get_or_init(|| start_time(std::process::id(), cancel)).clone()
 }
 
 /// Runs `ps -o <name>= -p <pid>` and returns the single trimmed line it prints.
@@ -127,7 +127,12 @@ pub fn self_start_time() -> Option<String> {
 /// spawned, it exceeded [`PS_TIMEOUT`], it exited non-zero because the process
 /// had already gone, or it printed nothing. Every caller treats those the same
 /// way, so distinguishing them would only add branches nobody reads.
-fn field(name: &str, pid: u32) -> Option<String> {
+///
+/// `cancel` is the caller's own flag rather than a fresh one, so a Ctrl-C
+/// arriving while `ps` is running ends the wait at once. A private `Cancel`
+/// here would have left `doctor` — which asks this question once per lock
+/// file — unable to be interrupted for up to [`PS_TIMEOUT`] per lock.
+fn field(name: &str, pid: u32, cancel: &Cancel) -> Option<String> {
     let mut child = Command::new(PS_BIN)
         .arg("-o")
         .arg(format!("{name}="))
@@ -145,7 +150,7 @@ fn field(name: &str, pid: u32) -> Option<String> {
     let stdout = child.stdout.take();
 
     let now = Instant::now();
-    let ctx = PassCtx::standalone(Cancel::new(), now.checked_add(PS_TIMEOUT).unwrap_or(now));
+    let ctx = PassCtx::standalone(cancel.clone(), now.checked_add(PS_TIMEOUT).unwrap_or(now));
     let token = ctx.register_child(child);
     let status = ctx.wait_child_timeout(token, PS_TIMEOUT).ok()??;
     if !status.success() {

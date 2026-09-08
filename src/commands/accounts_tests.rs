@@ -109,6 +109,43 @@ impl Prompt for Recorder {
     }
 }
 
+/// A prompt that changes the store while its question is on screen.
+///
+/// The window this exists to reproduce is the one between `relocate`'s
+/// pre-lock read and its locks: an HTTP request and then an unbounded wait for
+/// a human, during which any other process may do anything at all to the
+/// namespace. `confirm` is the honest place to stand in that window, because
+/// it *is* that window.
+struct RacingPrompt<F: FnMut()> {
+    lines: Mutex<Vec<String>>,
+    act: F,
+    answer: bool,
+}
+
+impl<F: FnMut()> RacingPrompt<F> {
+    fn answering(answer: bool, act: F) -> Self {
+        Self { lines: Mutex::new(Vec::new()), act, answer }
+    }
+
+    fn text(&self) -> String {
+        self.lines.lock().map(|lines| lines.join("\n")).unwrap_or_default()
+    }
+}
+
+impl<F: FnMut()> Prompt for RacingPrompt<F> {
+    fn tell(&mut self, message: &str) {
+        if let Ok(mut lines) = self.lines.lock() {
+            lines.push(message.to_owned());
+        }
+    }
+
+    fn confirm(&mut self, question: &str) -> Result<bool, AppError> {
+        self.tell(question);
+        (self.act)();
+        Ok(self.answer)
+    }
+}
+
 fn now_millis() -> i64 {
     jiff::Timestamp::now().as_millisecond()
 }
@@ -175,6 +212,55 @@ fn record_config_dir(store: &Store, service: &str, shares_live_dir: bool) {
     record.email = Some("other@example.com".to_owned());
     AgentctlConfig::update(&store.paths, |config| config.upsert(record))
         .expect("the registry should be writable");
+}
+
+/// Records one read-only keychain row that names nobody, exactly as
+/// `import --from keychain` writes it.
+///
+/// The key is the *service name*: the item's blob carried no `tokenAccount`,
+/// so there was no account UUID to key it by, and a `ConfigDirReadOnly` record
+/// never gets a namespace directory for anything to derive a path from. Built
+/// by hand rather than through `new_record` because a service name holds a
+/// space and `validate_segment` — rightly — rejects it.
+fn record_service_keyed(store: &Store, service: &str) {
+    let record = AccountRecord {
+        account_uuid: service.to_owned(),
+        organization_uuid: UNKNOWN_ORG.to_owned(),
+        email: None,
+        org_name: None,
+        label: None,
+        kind: AccountKind::ConfigDirReadOnly {
+            dir: PathBuf::from("/elsewhere/.claude"),
+            service: service.to_owned(),
+            shares_live_dir: false,
+        },
+        forgotten: false,
+        created_at: jiff::Timestamp::now().to_string(),
+    };
+    AgentctlConfig::update(&store.paths, |config| config.upsert(record))
+        .expect("the registry should be writable");
+}
+
+/// Every path under the namespace root, sorted.
+///
+/// The evidence a refused command created nothing and removed nothing: a
+/// comparison of the registry bytes alone would miss a namespace directory
+/// deleted on the way to the refusal.
+fn namespace_root_listing(store: &Store) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![store.paths.namespace_root()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path.clone());
+            }
+            found.push(path);
+        }
+    }
+    found.sort();
+    found
 }
 
 /// The keychain service naming the same physical directory as the live store.
@@ -653,4 +739,287 @@ fn forgetting_twice_says_so_rather_than_recording_it_twice() {
 
     assert_eq!(store.config().forgotten_services.len(), 1, "recorded once");
     assert!(io.text().contains("already hidden"), "{}", io.text());
+}
+
+#[test]
+fn remove_delete_secret_refuses_a_service_keyed_read_only_record() {
+    // The shape `import --from keychain` writes for an item whose blob names
+    // nobody: `account_uuid` is the keychain service name and the
+    // organization is `_unknown-org`. `--delete-secret` on it must refuse
+    // before it goes looking for `claude/<service name>/_unknown-org/`, and
+    // must not drop the record either — the credential is in the login
+    // keychain, which agentctl never writes (invariant I9, decision D-001).
+    let store = store();
+    let service = unclaimed_service();
+    record_service_keyed(&store, &service);
+
+    let registry = store.paths.config_file();
+    let before = fs::read(&registry).expect("the registry should be readable");
+    let root_before = namespace_root_listing(&store);
+
+    let mut io = Recorder::default();
+    let removal = Removal { id: &service, delete_secret: true, yes: true };
+    let err = remove(&store.accounts(), &removal, &mut io)
+        .expect_err("a read-only row is refused whatever the flags say");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("read-only row (kind `config_dir`)"),
+        "the refusal names the kind:\n{message}"
+    );
+    assert!(
+        message.contains(&format!("keychain service `{service}`")),
+        "and names the item by its service, not as an `<account>/<organization>` pair:\n{message}"
+    );
+    assert!(message.contains("login keychain"), "and where the credential actually is:\n{message}");
+    assert!(message.contains("accounts forget"), "and what to do instead:\n{message}");
+    assert_eq!(
+        err.exit_code(),
+        crate::error::EXIT_FATAL,
+        "a command that refused and rendered nothing exits 1"
+    );
+    assert_eq!(
+        fs::read(&registry).expect("the registry should still be readable"),
+        before,
+        "the registry is byte for byte what it was"
+    );
+    assert_eq!(
+        namespace_root_listing(&store),
+        root_before,
+        "nothing was created or removed under the namespace root"
+    );
+    assert!(io.text().is_empty(), "nothing was said before the refusal:\n{}", io.text());
+}
+
+#[test]
+fn show_names_the_service_and_never_passes_it_off_as_an_account() {
+    // The same record, read rather than removed. Its key is a keychain
+    // service name, and printing that under a bare `account` label would
+    // present it as an Anthropic account UUID — a user would copy it into
+    // `--account` believing it identified an account.
+    let store = store();
+    let service = unclaimed_service();
+    record_service_keyed(&store, &service);
+
+    let mut io = Recorder::default();
+    show(&store.accounts(), &FakeReader::unlocked(), &store.ctx(), &service, &mut io)
+        .expect("a recorded read-only row can be shown");
+    let text = io.text();
+
+    assert!(
+        text.contains(&format!("service            {service}")),
+        "the keychain service has a line of its own:\n{text}"
+    );
+    assert!(
+        !text.contains(&format!("account            {service}")),
+        "and is never printed as an account uuid:\n{text}"
+    );
+    assert!(
+        text.contains("keyed by its service name"),
+        "the account line says why it is empty:\n{text}"
+    );
+    assert!(text.contains("kind               config_dir"), "{text}");
+}
+
+#[test]
+fn show_still_prints_the_account_uuid_of_an_identified_read_only_row() {
+    // The counterpart: an item whose blob *did* name an account is keyed by
+    // that account, and the `account` line must go on saying so.
+    let store = store();
+    let service = unclaimed_service();
+    record_config_dir(&store, &service, false);
+
+    let mut io = Recorder::default();
+    show(&store.accounts(), &FakeReader::unlocked(), &store.ctx(), "other@example.com", &mut io)
+        .expect("a recorded read-only row can be shown");
+    let text = io.text();
+
+    assert!(
+        text.contains("account            99999999-8888-7777-6666-555555555555"),
+        "the account uuid is printed as an account uuid:\n{text}"
+    );
+    assert!(text.contains(&format!("service            {service}")), "{text}");
+    assert!(!text.contains("keyed by its service name"), "{text}");
+}
+
+#[test]
+fn forget_refuses_a_service_that_is_not_agentctls_to_hide() {
+    // Plan AC47 hides agentctl's own rows. A `claude-switcher:*` item is not
+    // one: it is hidden already, never read (fact F10), and `forgotten_services`
+    // is consulted only where an unclaimed `Claude Code-credentials-<sha8>`
+    // item is being decided about — so recording one would change nothing
+    // while telling the user agentctl had touched another tool's credential.
+    let store = store();
+    let switcher = format!("{SWITCHER_SERVICE_PREFIX}someone@example.com");
+
+    let mut io = Recorder::default();
+    let err = forget(&store.accounts(), &switcher, true, &mut io)
+        .expect_err("a foreign service is refused");
+    let message = err.to_string();
+    assert!(message.contains("belongs to claude-switcher"), "{message}");
+    assert!(message.contains("never reads or writes it"), "{message}");
+    assert_eq!(
+        err.exit_code(),
+        crate::error::EXIT_FATAL,
+        "a command that refused and rendered nothing exits 1"
+    );
+    assert!(store.config().forgotten_services.is_empty(), "nothing was recorded");
+
+    // `unforget` is refused for the same reason: there is nothing it could
+    // have hidden in the first place.
+    let err = forget(&store.accounts(), &switcher, false, &mut io)
+        .expect_err("unforgetting a foreign service is refused too");
+    assert!(err.to_string().contains("belongs to claude-switcher"), "{err}");
+
+    // And so is a legacy `Claude Code-<sha8>` API-key item, which is not a
+    // credentials item either (fact F5).
+    let err = forget(&store.accounts(), "Claude Code-6cdd6b98", true, &mut io)
+        .expect_err("a legacy API-key item is refused");
+    let message = err.to_string();
+    assert!(message.contains("is not an item agentctl reports"), "{message}");
+    assert_eq!(err.exit_code(), crate::error::EXIT_FATAL);
+    assert!(store.config().forgotten_services.is_empty(), "still nothing was recorded");
+}
+
+#[test]
+fn relocate_aborts_when_the_source_changed_while_the_question_was_on_screen() {
+    // The move used to write whatever the pre-lock read saw. A `status
+    // --refresh` landing in the window between that read and the locks
+    // rotates the refresh token (fact F8) — so the blob the probe holds is
+    // superseded, and writing it into the new namespace and then deleting the
+    // old one would leave the account with a dead refresh chain and no copy
+    // of the live one. Only a fresh login would recover it.
+    let store = store();
+    let source = store.ns_dir(UNKNOWN_ORG);
+    write_credential_file(&store, UNKNOWN_ORG, &blob("sk-ant-oat01-first", Some(ORG)));
+    record_owned(&store, UNKNOWN_ORG);
+
+    let rotated = blob("sk-ant-oat01-rotated", Some(ORG));
+    let credential = source.join(file_store::CREDENTIALS_FILE);
+    let (rotated_for_prompt, path_for_prompt) = (rotated.clone(), credential.clone());
+    let mut io = RacingPrompt::answering(true, move || {
+        fs::write(&path_for_prompt, &rotated_for_prompt).expect("the refresh should be writable");
+    });
+
+    let err = relocate(&store.accounts(), None, ACCT, false, &mut io)
+        .expect_err("a namespace that moved under the command is not written over");
+
+    let message = err.to_string();
+    assert!(message.contains("changed during relocate"), "{message}");
+    assert!(message.contains("re-run"), "the message says what to do next:\n{message}");
+    assert_eq!(err.exit_code(), crate::error::EXIT_FATAL, "nothing was rendered, so exit 1");
+
+    assert_eq!(
+        fs::read(&credential).expect("the source is still readable"),
+        rotated.as_bytes(),
+        "the source holds the rotated credential, untouched by the abort"
+    );
+    assert!(!store.ns_dir(ORG).exists(), "and nothing was written to the target");
+    assert!(store.config().get(ACCT, UNKNOWN_ORG).is_some(), "and the record is untouched");
+    assert!(io.text().contains("Relocate"), "the question was asked before any of that");
+}
+
+#[test]
+fn relocate_refuses_a_target_that_appeared_while_the_question_was_on_screen() {
+    // Plan AC40, from the other side. The target check moved under the target
+    // lock precisely for this: a `login` into the same organization takes only
+    // that lock, so a check made before taking it runs against a namespace
+    // that does not exist yet — and the move would then overwrite a
+    // credential that was minutes old.
+    let store = store();
+    write_credential_file(&store, UNKNOWN_ORG, &blob("sk-ant-oat01-owned", Some(ORG)));
+    record_owned(&store, UNKNOWN_ORG);
+
+    let target = store.ns_dir(ORG);
+    let fresh = blob("sk-ant-oat01-just-logged-in", Some(ORG));
+    let (target_for_prompt, fresh_for_prompt) = (target.clone(), fresh.clone());
+    let mut io = RacingPrompt::answering(true, move || {
+        fs::create_dir_all(&target_for_prompt).expect("the login creates its namespace");
+        fs::write(target_for_prompt.join(file_store::CREDENTIALS_FILE), &fresh_for_prompt)
+            .expect("and writes its credential");
+    });
+
+    let err = relocate(&store.accounts(), None, ACCT, false, &mut io)
+        .expect_err("an occupied target is refused");
+
+    assert!(err.to_string().contains("already exists"), "{err}");
+    assert_eq!(
+        fs::read(target.join(file_store::CREDENTIALS_FILE)).expect("readable"),
+        fresh.as_bytes(),
+        "the credential that landed in the window is untouched"
+    );
+    assert!(
+        store.ns_dir(UNKNOWN_ORG).join(file_store::CREDENTIALS_FILE).is_file(),
+        "and so is the source"
+    );
+    assert!(store.config().get(ACCT, UNKNOWN_ORG).is_some(), "and the record");
+}
+
+#[test]
+fn relocate_finishes_a_move_that_crashed_after_the_write() {
+    // The first crash window. The order under the locks is write the target,
+    // update the registry, remove the source; a crash after the write leaves
+    // the credential in both places with the registry still naming the old
+    // one. Re-running must recognise its own earlier attempt — same digests —
+    // and finish, rather than refuse the namespace it created itself.
+    let store = store();
+    let blob = blob("sk-ant-oat01-owned", Some(ORG));
+    write_credential_file(&store, UNKNOWN_ORG, &blob);
+    write_credential_file(&store, ORG, &blob);
+    record_owned(&store, UNKNOWN_ORG);
+
+    let mut io = Recorder::default();
+    relocate(&store.accounts(), None, ACCT, true, &mut io)
+        .expect("re-running finishes the interrupted move");
+
+    assert!(!store.ns_dir(UNKNOWN_ORG).exists(), "the source is gone");
+    assert!(store.ns_dir(ORG).join(file_store::CREDENTIALS_FILE).is_file(), "the target remains");
+    let config = store.config();
+    assert!(config.get(ACCT, ORG).is_some(), "and the registry now names the organization");
+    assert!(config.get(ACCT, UNKNOWN_ORG).is_none(), "and no longer names the old one");
+    assert!(io.text().contains("already in place"), "the message says so:\n{}", io.text());
+}
+
+#[test]
+fn relocate_waits_for_a_held_lock_and_then_proceeds() {
+    // Plan AC26's rule, applied to the other command that mutates a
+    // namespace: a `status` mid-refresh holds the source lock, and a
+    // relocation that ignored it would copy a credential out from under a
+    // rename and then delete the directory being renamed into.
+    let store = store();
+    write_credential_file(&store, UNKNOWN_ORG, &blob("sk-ant-oat01-owned", Some(ORG)));
+    record_owned(&store, UNKNOWN_ORG);
+
+    let held = Duration::from_millis(400);
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        let paths = &store.paths;
+        let holder = scope.spawn(move || {
+            let cancel = Cancel::new();
+            let guard = namespace_lock::acquire(
+                paths,
+                ACCT,
+                UNKNOWN_ORG,
+                Instant::now() + Duration::from_secs(5),
+                &cancel,
+                Fault::none(),
+            )
+            .expect("the holder takes the source lock first");
+            std::thread::sleep(held);
+            drop(guard);
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        let mut io = Recorder::default();
+        relocate(&store.accounts(), None, ACCT, true, &mut io)
+            .expect("the relocation waits, then proceeds");
+        holder.join().expect("the holder thread finishes");
+    });
+
+    assert!(started.elapsed() >= held, "the relocation waited for the lock");
+    assert!(
+        store.ns_dir(ORG).join(file_store::CREDENTIALS_FILE).is_file(),
+        "and then did the work"
+    );
+    assert!(!store.ns_dir(UNKNOWN_ORG).exists());
 }

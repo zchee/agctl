@@ -25,12 +25,13 @@
 //! it: the pass is observed entirely through the channel, and the channel
 //! disconnects exactly when the last worker has been joined.
 
-// The pass API is complete but not yet wired into a command: `main` reaches
-// only `Cancel`, and W1's `status` is what will call `run_pass`. The
-// suppression is scoped to the non-test build because the tests below do
-// exercise these items, and it is `expect` rather than `allow` so that it
-// starts warning — and gets deleted — the moment W1 makes it stale.
-#![cfg_attr(not(test), expect(dead_code, reason = "remaining items are consumed by W3 (watch)"))]
+// `run_pass` is wired: `status` calls it on every invocation. What is left is
+// `PassCtx::remaining` and `wait_child`, which W3's `watch` needs — the first
+// to draw how much of the frame budget is gone, the second to wait on a child
+// without a timeout of its own. Scoped to the non-test build because the tests
+// below do exercise these items, and `expect` rather than `allow` so that it
+// starts warning — and gets deleted — the moment W3 makes it stale.
+#![cfg_attr(not(test), expect(dead_code, reason = "remaining and wait_child await W3's watch"))]
 
 use std::collections::BTreeMap;
 use std::io;

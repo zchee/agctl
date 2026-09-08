@@ -2,11 +2,13 @@
 //! carefully fenced way to clean up after Claude Code.
 //!
 //! The report is a read of the whole store: the keychain preflight, every
-//! discovered row with its token expiries, the namespace locks and who holds
-//! them, the artefacts a Claude Code session leaves behind, the files a failed
-//! write leaves behind, and the four situations that are not failures but are
-//! worth knowing about — a stale sibling, a forgotten service, two rows
-//! holding the same credential, and a namespace still called `_unknown-org`.
+//! discovered row with its token expiries, the credentials on this machine
+//! that belong to something else and are never read, the namespace locks and
+//! who holds them, the artefacts a Claude Code session leaves behind, the
+//! files a failed write leaves behind, and the four situations that are not
+//! failures but are worth knowing about — a stale sibling, a forgotten
+//! service, two rows holding the same credential, and a namespace still
+//! called `_unknown-org`.
 //!
 //! # `--remove-stale` is the only thing in agentctl that deletes a lock
 //!
@@ -85,7 +87,7 @@ pub const LEGACY_LOCK_SUFFIX: &str = ".lock";
 ///
 /// # Errors
 ///
-/// Returns [`AppError::Refused`] when `--remove-stale` names something this
+/// Returns [`AppError::Config`] when `--remove-stale` names something this
 /// command will not remove, and [`AppError`] for a store that cannot be read.
 pub fn run(config_dir: Option<&Path>, args: &DoctorArgs, cancel: &Cancel) -> Result<(), AppError> {
     let paths = Paths::resolve(config_dir)?;
@@ -166,7 +168,17 @@ pub fn report(
 
     out.push(String::new());
     out.push("accounts".to_owned());
+    let mut forgotten = 0usize;
     for row in &found.rows {
+        // Plan AC47: `accounts forget` means `status` and `doctor` stop
+        // reporting the service, and this is `doctor`'s half of that. Counted
+        // rather than silently dropped, so a user who forgot something and
+        // then wondered where it went is told it is hidden and how to see it
+        // — one line, naming nothing.
+        if matches!(row.state, AccountState::Forgotten) {
+            forgotten = forgotten.saturating_add(1);
+            continue;
+        }
         out.push(format!(
             "  {}  {}  kind={} source={} state={}",
             row.id,
@@ -179,9 +191,17 @@ pub fn report(
             out.push(format!("      {}", expiries(credentials)));
         }
     }
+    if forgotten > 0 {
+        out.push(format!(
+            "  {forgotten} forgotten service(s) hidden; `accounts list --all` shows them"
+        ));
+    }
 
     out.push(String::new());
-    out.extend(lock_section(doctor.paths));
+    out.extend(foreign_section(doctor.env, &found));
+
+    out.push(String::new());
+    out.extend(lock_section(doctor.paths, doctor.cancel));
 
     out.push(String::new());
     out.extend(namespace_section(doctor, &config, io));
@@ -191,6 +211,47 @@ pub fn report(
 
     io.tell(&out.join("\n"));
     Ok(())
+}
+
+/// The credentials on this machine that belong to something else.
+///
+/// Listed because they are there and a user comparing `security dump-keychain`
+/// against this report should not have to wonder whether agentctl is quietly
+/// using them; named "never read" because that is the invariant. A
+/// `claude-switcher:*` item is a third-party tool's (fact F10) and is not
+/// opened even to learn whose it is — the address in the service name is the
+/// only thing this section knows about it — and `CLAUDE_CODE_OAUTH_TOKEN`
+/// short-circuits every credential store in Claude Code itself (fact F19),
+/// which is worth saying out loud when a row elsewhere in this report looks
+/// unaccountably healthy.
+fn foreign_section(env: &EnvView, found: &discovery::Discovery) -> Vec<String> {
+    let mut out = vec!["foreign items (never read)".to_owned()];
+    let mut empty = true;
+
+    for entry in &found.listing {
+        if !entry.service.starts_with(crate::secret::SWITCHER_SERVICE_PREFIX) {
+            continue;
+        }
+        empty = false;
+        out.push(format!(
+            "  {}  belongs to claude-switcher; agentctl never reads or writes it",
+            entry.service
+        ));
+    }
+
+    if env.oauth_token_set {
+        empty = false;
+        out.push(format!(
+            "  {}  is set in the environment and short-circuits every credential store; \
+             agentctl reports it and never reads its value",
+            namespace::OAUTH_TOKEN_ENV
+        ));
+    }
+
+    if empty {
+        out.push("  none".to_owned());
+    }
+    out
 }
 
 /// What the keychain preflight found, as a sentence.
@@ -236,7 +297,7 @@ fn relative(at_ms: i64, now_ms: i64) -> String {
 }
 
 /// agentctl's own namespace locks, and who holds them.
-fn lock_section(paths: &Paths) -> Vec<String> {
+fn lock_section(paths: &Paths, cancel: &Cancel) -> Vec<String> {
     let mut out = vec!["namespace locks".to_owned()];
     let locks_dir = paths.locks_dir();
     let Ok(entries) = fs::read_dir(&locks_dir) else {
@@ -261,12 +322,14 @@ fn lock_section(paths: &Paths) -> Vec<String> {
                 // for: the pid may well be in use again by something entirely
                 // unrelated, and reporting that as the lock holder would send
                 // a user after the wrong process.
-                let recycled = body
-                    .pid_start_time
-                    .as_ref()
-                    .is_some_and(|recorded| proc::start_time(body.pid).as_ref() != Some(recorded));
-                let state =
-                    if recycled { "dead (pid recycled)" } else { proc::holder(body.pid).label() };
+                let recycled = body.pid_start_time.as_ref().is_some_and(|recorded| {
+                    proc::start_time(body.pid, cancel).as_ref() != Some(recorded)
+                });
+                let state = if recycled {
+                    "dead (pid recycled)"
+                } else {
+                    proc::holder(body.pid, cancel).label()
+                };
                 out.push(format!(
                     "  {name}  pid {} ({state}), taken {}",
                     body.pid, body.acquired_at
@@ -392,13 +455,44 @@ fn namespace_section(
 /// `.lock` appended (fact F17) — which is why the legacy one is looked for
 /// under the canonical spelling rather than the one agentctl uses.
 fn claude_artefacts(ns_dir: &Path) -> Vec<Artefact> {
-    let mut candidates = vec![ns_dir.join(REFRESH_LOCK), ns_dir.join(STORAGE_WRITE_LOCK)];
-    if let Ok(canonical) = namespace::canonical(ns_dir) {
-        let mut legacy = canonical.into_os_string();
-        legacy.push(LEGACY_LOCK_SUFFIX);
-        candidates.push(legacy.into());
-    }
-    candidates.iter().filter_map(|path| sample(path)).collect()
+    let mut out: Vec<Artefact> = [ns_dir.join(REFRESH_LOCK), ns_dir.join(STORAGE_WRITE_LOCK)]
+        .iter()
+        .filter_map(|path| sample(path))
+        .collect();
+    out.extend(legacy_lock(ns_dir));
+    out
+}
+
+/// The legacy `<namespace>.lock`, found by its canonical spelling and reported
+/// under its lexical one.
+///
+/// Those two differ whenever the store is reached through a symbolic link, and
+/// on macOS that is the common case rather than the exotic one: `$TMPDIR`
+/// lives under `/var`, which is a link to `/private/var`, and a `~/.config`
+/// moved onto another volume behaves the same way. Reporting the canonical
+/// spelling printed a `--remove-stale <path>` command that this very build
+/// then refused, because [`remove_stale`]'s root check compares spellings and
+/// the canonical one does not begin with the root as [`Paths`] spells it.
+///
+/// So: look under the canonical spelling, because that is where Claude Code
+/// writes it (fact F17), and report the lexical one, because that is the
+/// spelling a user can paste back. Both name the same file — only components
+/// above the leaf are resolved, and a symbolic link at `<acct>` or `<org>` is
+/// refused by everything that would act on the result.
+fn legacy_lock(ns_dir: &Path) -> Option<Artefact> {
+    let lexical = with_lock_suffix(ns_dir);
+    let found = sample(&lexical).or_else(|| {
+        let canonical = namespace::canonical(ns_dir).ok()?;
+        sample(&with_lock_suffix(&canonical))
+    })?;
+    Some(Artefact { path: lexical, ..found })
+}
+
+/// `<path>.lock` — the legacy lock sits beside the directory, not inside it.
+fn with_lock_suffix(dir: &Path) -> PathBuf {
+    let mut name = dir.to_path_buf().into_os_string();
+    name.push(LEGACY_LOCK_SUFFIX);
+    PathBuf::from(name)
 }
 
 /// Reads one artefact's modification time and age.
@@ -450,23 +544,17 @@ fn attention_section(
     let mut empty = true;
 
     for row in &found.rows {
-        match &row.state {
-            AccountState::StaleSiblingOfLive => {
-                empty = false;
-                out.push(format!(
-                    "  {}  names the same directory as the live credential but holds different \
-                     tokens; hidden by default, never merged",
-                    row.id
-                ));
-            }
-            AccountState::Forgotten => {
-                empty = false;
-                out.push(format!(
-                    "  {}  hidden by `accounts forget`; `accounts unforget` reports it again",
-                    row.id
-                ));
-            }
-            _ => {}
+        // Only the stale sibling is listed here. There is deliberately no
+        // `Forgotten` arm: naming a hidden service in the one report a user
+        // runs to find out what is on the machine would undo `accounts
+        // forget`, so the accounts block above counts them instead.
+        if matches!(row.state, AccountState::StaleSiblingOfLive) {
+            empty = false;
+            out.push(format!(
+                "  {}  names the same directory as the live credential but holds different \
+                 tokens; hidden by default, never merged",
+                row.id
+            ));
         }
     }
     for service in &config.forgotten_services {
@@ -499,7 +587,14 @@ fn attention_section(
     }
 
     for record in &config.accounts {
-        if record.organization_uuid == UNKNOWN_ORG {
+        // Only an owned namespace can be relocated, so only an owned one gets
+        // the suggestion. A read-only keychain row is keyed
+        // `<service>/_unknown-org` precisely because the item named nobody,
+        // and `relocate` refuses it — advice that cannot be taken is worse
+        // than none.
+        if record.organization_uuid == UNKNOWN_ORG
+            && matches!(record.kind, AccountKind::Owned { .. })
+        {
             empty = false;
             out.push(format!(
                 "  {}/{UNKNOWN_ORG}  the login could not name an organization; \
@@ -562,16 +657,20 @@ fn state_of(path: &Path) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`AppError::Refused`] for every path this command will not remove
-/// and for a run without `--yes`, and [`AppError::Io`] when the removal itself
-/// fails.
+/// Returns [`AppError::Config`] for every path this command will not remove
+/// and for a run without `--yes` — each of those exits 1, because the run
+/// rendered nothing — and [`AppError::Io`] when the removal itself fails.
 pub fn remove_stale(
     doctor: &Doctor<'_>,
     path: &Path,
     yes: bool,
     io: &mut dyn Prompt,
 ) -> Result<(), AppError> {
-    let refuse = |reason: String| -> AppError { AppError::Refused { reason } };
+    // `Config`, not `Refused`: a refusal here renders no table, and the exit
+    // contract reserves 2 for a run that produced output with a degraded row
+    // in it. A `--remove-stale` that removed nothing produced nothing, so it
+    // exits 1.
+    let refuse = AppError::Config;
 
     if !doctor.paths.is_under_namespace_root(path) {
         return Err(refuse(format!(
@@ -652,9 +751,27 @@ pub fn remove_stale(
         )));
     }
 
-    fs::remove_file(path).map_err(|err| AppError::Io {
-        context: format!("could not remove `{}`", path.display()),
-        source: err,
+    // Not `fs::remove_file`. Every check above is lexical or an `lstat` of the
+    // final component; none of them can see a symbolic link planted at
+    // `<acct>` or `<org>`, and `remove_file` would follow it — turning the one
+    // deletion agentctl is allowed to make into a deletion of whatever the
+    // link points at, the live `~/.claude/.oauth_refresh.lock` being the
+    // obvious target. This walks down from the namespace root with
+    // `O_NOFOLLOW` and unlinks relative to the directory that walk produced.
+    file_store::remove_file_under_root(doctor.paths, path).map_err(|err| match err {
+        file_store::FileStoreError::RefusedSymlink(shown) => refuse(format!(
+            "`{}` is reached through a symbolic link; agentctl will not delete through one",
+            shown.display()
+        )),
+        file_store::FileStoreError::OutsideNamespaceRoot(shown) => refuse(format!(
+            "`{}` does not resolve to a location inside `{}`",
+            shown.display(),
+            doctor.paths.namespace_root().display()
+        )),
+        other => AppError::Io {
+            context: format!("could not remove `{}`", path.display()),
+            source: std::io::Error::other(other.to_string()),
+        },
     })?;
     io.tell(&format!("Removed `{}`.", path.display()));
     Ok(())

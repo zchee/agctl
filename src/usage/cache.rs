@@ -1,4 +1,4 @@
-//! The per-account usage cache: `<cache_dir>/<acct>.<org>.json`.
+//! The per-account usage cache: `<cache_dir>/<acct>.<org>.<sha8>.json`.
 //!
 //! Two jobs, both from plan principle P4:
 //!
@@ -41,8 +41,6 @@ use serde_json::Value;
 
 use crate::config::paths::FILE_MODE;
 use crate::config::paths::Paths;
-use crate::config::paths::validate_segment;
-use crate::error::AppError;
 use crate::secret::file_store::hex8;
 
 /// How long a cached response is served without asking the API again.
@@ -114,17 +112,53 @@ impl CacheEntry {
     }
 }
 
-/// The cache file for one account.
+/// The cache file for one row.
 ///
-/// # Errors
+/// `<acct>.<org>.<sha8>.json`, where the two identifiers are reduced to
+/// characters that are safe in a file name and `sha8` is taken over the
+/// untouched pair.
 ///
-/// Returns [`AppError::Config`] when either identifier cannot be part of a
-/// file name — the same validation the namespace directories use, so a
-/// registry that cannot name a namespace cannot name a cache entry either.
-pub fn path(paths: &Paths, acct: &str, org: &str) -> Result<PathBuf, AppError> {
-    validate_segment(acct)?;
-    validate_segment(org)?;
-    Ok(paths.cache_dir().join(format!("{acct}.{org}.json")))
+/// # Why this is not `validate_segment`
+///
+/// It used to be, and rows whose identifiers are not path segments therefore
+/// had no cache at all: an `import --from keychain` record for an item that
+/// named nobody is keyed by its *keychain service name*, which holds a space,
+/// so every pass over such a row was a cache miss and a fresh request against
+/// Anthropic — for a row agentctl cannot even refresh. Refusing to name a file
+/// was the wrong answer to "this identifier has a space in it".
+///
+/// The digest is what makes the sanitized name safe rather than merely
+/// pretty: two identifiers that sanitize to the same string still differ in
+/// the digest, so no two rows can collide on one entry and read each other's
+/// usage figures. The readable prefix is kept only so a human looking in the
+/// cache directory can tell which file is whose.
+pub fn path(paths: &Paths, acct: &str, org: &str) -> PathBuf {
+    let digest = crate::provider::claude::namespace::sha8(&format!("{acct}/{org}"));
+    paths.cache_dir().join(format!("{}.{}.{digest}.json", file_safe(acct), file_safe(org)))
+}
+
+/// The longest run of one identifier that reaches a cache file name.
+///
+/// Only the readable half is truncated; uniqueness lives in the digest. The
+/// bound exists because two identifiers of unbounded length would otherwise
+/// build a name longer than `NAME_MAX`, which is an error the caller could do
+/// nothing about.
+const MAX_NAME_PART: usize = 48;
+
+/// One identifier, reduced to characters that are safe in a file name.
+///
+/// Anything outside `[A-Za-z0-9._-]` becomes `-`, which covers the separators
+/// (`/`), the shell-significant characters, and the space a keychain service
+/// name carries. An identifier that is empty, or that sanitizes to `.` or
+/// `..`, becomes `_`: those three would otherwise build a name that either
+/// hides the file or does not name a file at all.
+fn file_safe(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .take(MAX_NAME_PART)
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." { "_".to_owned() } else { cleaned }
 }
 
 /// Reads an entry, or `None` when there is nothing usable to read.

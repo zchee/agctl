@@ -482,10 +482,11 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
     };
 
     let now_ms = now_ms();
-    let cache_path = cache::path(&shared.paths, &record.account_uuid, &record.organization_uuid)
-        .inspect_err(|err| tracing::debug!(error = %err, "no cache path for this row"))
-        .ok();
-    let entry = cache_path.as_deref().and_then(cache::load);
+    // Every row gets a cache entry, including one keyed by a keychain service
+    // name: `cache::path` names a file for any identifier at all, so a row
+    // agentctl cannot refresh is still not made to re-fetch on every pass.
+    let cache_path = cache::path(&shared.paths, &record.account_uuid, &record.organization_uuid);
+    let entry = cache::load(&cache_path);
     let cached_usage = || {
         entry.as_ref().and_then(|entry| {
             let fetched_at = Timestamp::from_millisecond(entry.fetched_at_ms).ok()?;
@@ -617,8 +618,8 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
         match fetched {
             Ok(usage) => {
                 span.record("http.status", 200);
-                if let (Some(path), Some(body)) = (cache_path.as_deref(), usage.raw.as_ref()) {
-                    store_cache(path, body, usage.fetched_at.as_millisecond(), None);
+                if let Some(body) = usage.raw.as_ref() {
+                    store_cache(&cache_path, body, usage.fetched_at.as_millisecond(), None);
                 }
                 outcome.state = merge_states(carried.clone(), classify(&usage, &AccountState::Ok));
                 outcome.usage = Some(usage);
@@ -656,11 +657,11 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
                 }
                 // Persist the window so the *next* invocation also declines
                 // to call, not merely the rest of this pass (plan AC8).
-                if let (Some(path), Some(entry)) = (cache_path.as_deref(), entry.as_ref()) {
+                if let Some(entry) = entry.as_ref() {
                     let until = retry_after
                         .and_then(|after| i64::try_from(after.as_millis()).ok())
                         .and_then(|millis| now_ms.checked_add(millis));
-                    store_cache(path, &entry.body, entry.fetched_at_ms, until);
+                    store_cache(&cache_path, &entry.body, entry.fetched_at_ms, until);
                 }
                 outcome.state = AccountState::RateLimited { retry_after_s: seconds };
                 outcome.usage = cached_usage();

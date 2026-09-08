@@ -65,6 +65,7 @@ use crate::runtime::coordinator::Cancel;
 use crate::runtime::coordinator::PassCtx;
 use crate::runtime::fault::Fault;
 use crate::secret::KeychainReader;
+use crate::secret::SWITCHER_SERVICE_PREFIX;
 use crate::secret::file_store;
 use crate::secret::file_store::ReadOutcome;
 use crate::secret::file_store::WriteRequest;
@@ -81,9 +82,12 @@ const EMPTY_CELL: &str = crate::render::table::EMPTY_CELL;
 ///
 /// # Errors
 ///
-/// Returns [`AppError`] for every failure. `AppError::Refused` covers the
-/// invariant-I9 refusals and a cancelled confirmation — both mean the store is
-/// exactly as it was.
+/// Returns [`AppError`] for every failure. A command that refuses a row and
+/// renders nothing — the invariant-I9 refusals — is [`AppError::Config`], so
+/// it exits 1: exit 2 is reserved for a run that produced a table with a
+/// degraded row in it. `AppError::Refused` stays on the two outcomes that are
+/// not a judgement about the row — a declined confirmation and a lock held
+/// past the wait — and both mean the store is exactly as it was.
 pub fn run(
     config_dir: Option<&Path>,
     command: &AccountsCommand,
@@ -266,14 +270,22 @@ pub fn show(
     let row = resolve_row(&found.rows, id)?;
     let record = &row.record;
 
+    let service = match &record.kind {
+        AccountKind::ConfigDirReadOnly { service, .. } => Some(service.as_str()),
+        _ => None,
+    };
+
     let mut out = Vec::new();
     out.push(format!("id                 {}", row.id));
-    out.push(format!("account            {}", or_dash(record.account_uuid.as_str())));
+    out.push(account_line(record, service));
     out.push(format!("organization       {}", or_dash(record.organization_uuid.as_str())));
     out.push(format!("email              {}", opt(record.email.as_deref())));
     out.push(format!("org name           {}", opt(record.org_name.as_deref())));
     out.push(format!("label              {}", opt(record.label.as_deref())));
     out.push(format!("kind               {}", record.kind.name()));
+    if let Some(service) = service {
+        out.push(format!("service            {service}"));
+    }
     out.push(format!("source             {}", row.source.name()));
     out.push(format!("state              {}", row.state.label()));
     out.push(format!("note               {}", opt(row.note.as_deref())));
@@ -292,15 +304,34 @@ pub fn show(
     }
 
     if matches!(record.kind, AccountKind::Owned { .. }) {
-        out.extend(namespace_report(accounts.paths, record));
+        out.extend(namespace_report(accounts.paths, record, accounts.cancel));
     }
 
     io.tell(&out.join("\n"));
     Ok(())
 }
 
+/// The `account` line, which must never present a service name as a UUID.
+///
+/// A `ConfigDirReadOnly` item whose credential blob names nobody has no
+/// account UUID to be keyed by, so `import` keys its record by the keychain
+/// service name instead (there is no namespace directory to derive from it,
+/// so nothing else depends on the key being a UUID). Printed under a bare
+/// `account` label, that string reads as an Anthropic account identifier — a
+/// user would copy it into `--account` expecting an account and get a
+/// keychain item — so this says what it actually is.
+fn account_line(record: &AccountRecord, service: Option<&str>) -> String {
+    if service == Some(record.account_uuid.as_str()) {
+        return format!(
+            "account            {EMPTY_CELL} (the keychain item names no account, so this record \
+             is keyed by its service name)"
+        );
+    }
+    format!("account            {}", or_dash(record.account_uuid.as_str()))
+}
+
 /// The on-disk state of one owned namespace.
-fn namespace_report(paths: &Paths, record: &AccountRecord) -> Vec<String> {
+fn namespace_report(paths: &Paths, record: &AccountRecord, cancel: &Cancel) -> Vec<String> {
     let ns_dir = paths.namespace_dir(&record.account_uuid, &record.organization_uuid);
     let lock_path = paths.lock_path(&record.account_uuid, &record.organization_uuid);
 
@@ -314,7 +345,7 @@ fn namespace_report(paths: &Paths, record: &AccountRecord) -> Vec<String> {
 
     match namespace_lock::read_body(&lock_path) {
         Some(body) => {
-            let holder = crate::runtime::proc::holder(body.pid);
+            let holder = crate::runtime::proc::holder(body.pid, cancel);
             out.push(format!(
                 "lock holder        pid {} ({}), taken {}",
                 body.pid,
@@ -406,10 +437,10 @@ pub struct Removal<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`AppError::Refused`] when the row is not one agentctl owns, when
-/// the confirmation is declined, or when the namespace lock could not be taken
-/// inside [`COMMAND_LOCK_TIMEOUT`]; [`AppError::Config`] when `id` names no
-/// record; [`AppError::Io`] when the removal itself fails.
+/// Returns [`AppError::Config`] when the row is not one agentctl owns and when
+/// `id` names no record; [`AppError::Refused`] when the confirmation is
+/// declined or the namespace lock could not be taken inside
+/// [`COMMAND_LOCK_TIMEOUT`]; [`AppError::Io`] when the removal itself fails.
 pub fn remove(
     accounts: &Accounts<'_>,
     removal: &Removal<'_>,
@@ -425,23 +456,30 @@ pub fn remove(
         // `resolve_id` cannot return one; the arm keeps the match exhaustive
         // and says the truthful thing if that ever changes.
         AccountKind::Foreign { source } => {
-            return Err(AppError::Refused {
-                reason: format!(
-                    "`{id}` belongs to {source}; agentctl never reads or writes it, so there is \
+            return Err(AppError::Config(format!(
+                "`{id}` belongs to {source}; agentctl never reads or writes it, so there is \
                  nothing to remove"
-                ),
-            });
+            )));
         }
         // Invariant I9. Neither of these is agentctl's to delete: the
         // credentials are in the keychain, which phase 1 never writes.
         AccountKind::Live | AccountKind::ConfigDirReadOnly { .. } => {
-            return Err(AppError::Refused {
-                reason: format!(
-                    "`{id}` is a read-only row: its credentials live in the login keychain, which \
-                 agentctl never writes or deletes. Use `agentctl claude accounts forget` to stop \
-                 reporting it, or remove the item with Keychain Access."
-                ),
-            });
+            // Named by its keychain service where it has one. A record for an
+            // item that named nobody is keyed by that service name, so `id`
+            // here would be `<service>/_unknown-org` — which reads as an
+            // account and an organization and is neither.
+            let named = match &record.kind {
+                AccountKind::ConfigDirReadOnly { service, .. } => {
+                    format!("keychain service `{service}`")
+                }
+                _ => format!("`{id}`"),
+            };
+            return Err(AppError::Config(format!(
+                "{named} is a read-only row (kind `{}`): its credentials live in the login \
+                 keychain, which agentctl never writes or deletes. Use `agentctl claude accounts \
+                 forget` to stop reporting it, or remove the item with Keychain Access.",
+                record.kind.name()
+            )));
         }
     }
 
@@ -538,16 +576,37 @@ fn delete_namespace(
 /// re-implemented against paths it does not control. A namespace holds one
 /// file, so the copy is the whole move.
 ///
-/// If the process dies between the write and the removal, both namespaces
-/// exist and the registry still points at the old one — `doctor` lists the
-/// stray `_unknown-org` directory, and re-running `relocate` finishes the job.
+/// # What runs before the locks, and what does not
+///
+/// The credential is read once before the locks are taken, and that read
+/// decides exactly one thing: which organization this account belongs to. It
+/// may cost an HTTP request, and unless `--yes` was given it is followed by an
+/// unbounded wait for a human — neither of which may happen with a namespace
+/// lock held. So nothing that read saw is written. Under the locks the source
+/// is read again and its digests compared against the first read; a `status`
+/// that refreshed in between rotated the refresh token (fact F8), and writing
+/// the superseded blob would leave the account with a dead refresh chain and
+/// no copy of the live one. A mismatch aborts and changes nothing.
+///
+/// # The crash windows
+///
+/// The order under the locks is: write the target, update the registry, remove
+/// the source. A crash after the write leaves the credential in both places
+/// with the registry still naming the old one; re-running finishes the job,
+/// because a target holding a credential with the same digests is recognised
+/// as this move's own earlier attempt rather than as a collision. A crash
+/// after the registry update leaves the account working under its new name and
+/// a stray `_unknown-org` directory behind, which `accounts remove` clears —
+/// the reverse order would instead have left the registry naming a namespace
+/// that no longer exists, which is an account that cannot be read at all.
 ///
 /// # Errors
 ///
-/// Returns [`AppError::Refused`] when the row is not an owned `_unknown-org`
+/// Returns [`AppError::Config`] when the row is not an owned `_unknown-org`
 /// namespace, when the target namespace already exists (plan AC40), when the
-/// confirmation is declined, or when either lock could not be taken;
-/// [`AppError::Config`] when no organization can be established.
+/// namespace changed while the question was on screen, and when no
+/// organization can be established; [`AppError::Refused`] when the
+/// confirmation is declined or either lock could not be taken.
 pub fn relocate(
     accounts: &Accounts<'_>,
     client: Option<&OauthClient>,
@@ -560,35 +619,22 @@ pub fn relocate(
     let spelling = key_spelling(&record);
 
     if !matches!(record.kind, AccountKind::Owned { .. }) {
-        return Err(AppError::Refused {
-            reason: format!(
-                "`{spelling}` is not a namespace agentctl created, so there is nothing to move"
-            ),
-        });
+        return Err(AppError::Config(format!(
+            "`{spelling}` is not a namespace agentctl created, so there is nothing to move"
+        )));
     }
     if record.organization_uuid != UNKNOWN_ORG {
-        return Err(AppError::Refused {
-            reason: format!(
-                "`{spelling}` already names an organization; `relocate` only moves a namespace \
-                 created as `{UNKNOWN_ORG}`"
-            ),
-        });
+        return Err(AppError::Config(format!(
+            "`{spelling}` already names an organization; `relocate` only moves a namespace \
+             created as `{UNKNOWN_ORG}`"
+        )));
     }
 
     let source = accounts.paths.namespace_dir(&record.account_uuid, UNKNOWN_ORG);
-    let credentials = read_namespace(&source)?;
-    let (organization_uuid, org_name) = organization_of(&credentials, client, accounts.cancel)?;
+    let probe = read_namespace(&source)?;
+    let (organization_uuid, org_name) = organization_of(&probe, client, accounts.cancel)?;
     validate_segment(&organization_uuid)?;
-
     let target = accounts.paths.namespace_dir(&record.account_uuid, &organization_uuid);
-    if std::fs::symlink_metadata(&target).is_ok() {
-        return Err(AppError::Refused {
-            reason: format!(
-                "`{}` already exists; move or remove it before relocating `{spelling}` into it",
-                target.display()
-            ),
-        });
-    }
 
     if !yes {
         io.tell(&format!(
@@ -605,51 +651,174 @@ pub fn relocate(
     // always in this order — source, then target. Two relocations of one
     // account contend on the source lock first and therefore cannot deadlock
     // against each other, and a concurrent `login` into the target takes only
-    // the target lock.
+    // the target lock — which is why the target is not examined until this
+    // lock is in hand.
     let source_guard = lock(accounts, &record.account_uuid, UNKNOWN_ORG)?;
     let target_guard = lock(accounts, &record.account_uuid, &organization_uuid)?;
 
-    // Invariant I9: a pending write describes credentials this move is about
-    // to supersede, and a stray temporary file holds token material at rest.
-    login::clear_stale_files(accounts.paths, &source)?;
-
-    let blob = credentials.to_blob_json();
-    let request = WriteRequest {
-        paths: accounts.paths,
-        ns_dir: &target,
-        blob_json: &blob,
-        prior: None,
-        new_expires_at_ms: credentials.expires_at_ms,
-        fault: fault(),
+    let plan = Relocation {
+        record: &record,
+        probe: &probe,
+        source: &source,
+        target: &target,
+        organization_uuid: &organization_uuid,
+        org_name,
+        spelling: &spelling,
     };
-    file_store::write_credentials(&request, &accounts.ctx()).map_err(|err| {
-        AppError::Config(format!("could not write `{}`: {err}", target.display()))
-    })?;
-
-    file_store::remove_namespace(accounts.paths, &source).map_err(|err| AppError::Io {
-        context: format!("could not remove `{}`: {err}", source.display()),
-        source: std::io::Error::other(err.to_string()),
-    })?;
+    let outcome = move_namespace(accounts, &plan);
 
     drop(target_guard);
     drop(source_guard);
+    let resumed = outcome?;
 
-    let export_spelling = namespace::export_spelling(&target);
+    let account_uuid = &record.account_uuid;
+    if resumed {
+        io.tell(&format!(
+            "Relocated `{spelling}` to `{account_uuid}/{organization_uuid}`. The credential was \
+             already in place from an earlier run; this finished the move."
+        ));
+    } else {
+        io.tell(&format!("Relocated `{spelling}` to `{account_uuid}/{organization_uuid}`."));
+    }
+    Ok(())
+}
+
+/// One relocation, as decided before the locks were taken.
+struct Relocation<'a> {
+    /// The registry record being moved.
+    record: &'a AccountRecord,
+    /// The credential the pre-lock read saw. Never written — only its digests
+    /// are used, to prove the source has not changed since.
+    probe: &'a Credentials,
+    /// The `_unknown-org` namespace.
+    source: &'a Path,
+    /// Where it is going.
+    target: &'a Path,
+    /// The organization the target is named for.
+    organization_uuid: &'a str,
+    /// Its display name, when one was learned.
+    org_name: Option<String>,
+    /// `<account>/<organization>`, for messages.
+    spelling: &'a str,
+}
+
+/// The half of `relocate` that runs with both namespace locks held.
+///
+/// Returns whether the target already held this move's own earlier attempt, in
+/// which case the write was skipped.
+///
+/// # Errors
+///
+/// Returns [`AppError::Config`] when the source changed under the lock or the
+/// target is occupied by something else, and [`AppError::Io`] when a write or
+/// a removal fails.
+fn move_namespace(accounts: &Accounts<'_>, plan: &Relocation<'_>) -> Result<bool, AppError> {
+    let current = under_lock_read(plan.source)?;
+    let Some(current) = current else {
+        return Err(changed(plan.source));
+    };
+    if current.digests() != plan.probe.digests() {
+        return Err(changed(plan.source));
+    }
+
+    // Plan AC40, and only now that the target lock is held: a `login` into
+    // this organization that landed while the confirmation was on screen took
+    // exactly this lock, and a check made before taking it would have run
+    // against a namespace that did not exist yet.
+    let resumed = match under_lock_read(plan.target)? {
+        // This move's own earlier attempt: the write landed and the process
+        // died before the registry was updated. Finishing it is what makes
+        // re-running `relocate` the fix rather than a second problem.
+        Some(existing) if existing.digests() == current.digests() => true,
+        Some(_) => return Err(occupied(plan)),
+        None if std::fs::symlink_metadata(plan.target).is_ok() => return Err(occupied(plan)),
+        None => false,
+    };
+
+    // Invariant I9: a pending write describes credentials this move is about
+    // to supersede, and a stray temporary file holds token material at rest.
+    login::clear_stale_files(accounts.paths, plan.source)?;
+
+    if !resumed {
+        let blob = current.to_blob_json();
+        let request = WriteRequest {
+            paths: accounts.paths,
+            ns_dir: plan.target,
+            blob_json: &blob,
+            prior: None,
+            new_expires_at_ms: current.expires_at_ms,
+            fault: fault(),
+        };
+        file_store::write_credentials(&request, &accounts.ctx()).map_err(|err| {
+            AppError::Config(format!("could not write `{}`: {err}", plan.target.display()))
+        })?;
+    }
+
+    // Before the source is removed, not after. A crash here leaves a stray
+    // directory; the other order leaves a registry entry naming a namespace
+    // that is gone, which is an account nothing can read.
+    let account_uuid = plan.record.account_uuid.clone();
+    let export_spelling = namespace::export_spelling(plan.target);
     let export_sha8 = namespace::sha8(&export_spelling);
-    let account_uuid = record.account_uuid.clone();
     let moved = AccountRecord {
-        organization_uuid: organization_uuid.clone(),
-        org_name: org_name.or_else(|| record.org_name.clone()),
+        organization_uuid: plan.organization_uuid.to_owned(),
+        org_name: plan.org_name.clone().or_else(|| plan.record.org_name.clone()),
         kind: AccountKind::Owned { export_spelling, export_sha8 },
-        ..record
+        ..plan.record.clone()
     };
     AgentctlConfig::update(accounts.paths, |config| {
         config.accounts.retain(|rec| rec.key() != (account_uuid.as_str(), UNKNOWN_ORG));
         config.upsert(moved);
     })?;
 
-    io.tell(&format!("Relocated `{spelling}` to `{account_uuid}/{organization_uuid}`."));
-    Ok(())
+    file_store::remove_namespace(accounts.paths, plan.source).map_err(|err| AppError::Io {
+        context: format!("could not remove `{}`", plan.source.display()),
+        source: std::io::Error::other(err.to_string()),
+    })?;
+    Ok(resumed)
+}
+
+/// Reads one namespace's credential under a held lock.
+///
+/// `None` is an absent namespace rather than a failure, because both callers
+/// have a use for that answer: a missing source means the namespace changed,
+/// and a missing target means there is nothing in the way.
+///
+/// # Errors
+///
+/// Returns [`AppError::Config`] when the file is there but cannot be used.
+fn under_lock_read(ns_dir: &Path) -> Result<Option<Credentials>, AppError> {
+    match file_store::read_credentials(ns_dir) {
+        Ok(ReadOutcome::Present { bytes, .. }) => {
+            Credentials::parse_blob(&bytes).map(Some).map_err(|err| {
+                AppError::Config(format!("`{}` could not be read: {err}", ns_dir.display()))
+            })
+        }
+        Ok(ReadOutcome::Absent) => Ok(None),
+        Err(err) => {
+            Err(AppError::Config(format!("`{}` could not be read: {err}", ns_dir.display())))
+        }
+    }
+}
+
+/// The source moved under us between the pre-lock read and the lock.
+fn changed(source: &Path) -> AppError {
+    AppError::Config(format!(
+        "`{}` changed during relocate; nothing was moved. Something refreshed or removed the \
+         credential while this command was deciding — re-run `agentctl claude accounts relocate` \
+         and it will work from what is there now.",
+        source.display()
+    ))
+}
+
+/// The target namespace holds something that is not this move's own work.
+fn occupied(plan: &Relocation<'_>) -> AppError {
+    AppError::Config(format!(
+        "`{}` already exists and holds a different credential; move or remove it before \
+         relocating `{}` into it",
+        plan.target.display(),
+        plan.spelling
+    ))
 }
 
 /// Reads a namespace's credentials, or says why it cannot.
@@ -658,12 +827,10 @@ fn read_namespace(ns_dir: &Path) -> Result<Credentials, AppError> {
         Ok(ReadOutcome::Present { bytes, .. }) => Credentials::parse_blob(&bytes).map_err(|err| {
             AppError::Config(format!("`{}` could not be read: {err}", ns_dir.display()))
         }),
-        Ok(ReadOutcome::Absent) => Err(AppError::Refused {
-            reason: format!(
-                "`{}` holds no credentials; run `agentctl claude login` instead",
-                ns_dir.display()
-            ),
-        }),
+        Ok(ReadOutcome::Absent) => Err(AppError::Config(format!(
+            "`{}` holds no credentials; run `agentctl claude login` instead",
+            ns_dir.display()
+        ))),
         Err(err) => {
             Err(AppError::Config(format!("`{}` could not be read: {err}", ns_dir.display())))
         }
@@ -754,9 +921,10 @@ fn lock(
 ///
 /// # Errors
 ///
-/// Returns [`AppError::Refused`] for the live service — hiding the credential
+/// Returns [`AppError::Config`] for the live service — hiding the credential
 /// Claude Code is using would hide the row the user is most likely asking
-/// about — and whatever the registry write reports.
+/// about — and for a service that is not a Claude Code credential item at all,
+/// plus whatever the registry write reports.
 pub fn forget(
     accounts: &Accounts<'_>,
     service: &str,
@@ -765,12 +933,31 @@ pub fn forget(
 ) -> Result<(), AppError> {
     let live_service = namespace::service_name(accounts.env);
     if hide && service == live_service {
-        return Err(AppError::Refused {
-            reason: format!(
-                "`{service}` is the credential Claude Code is using right now; hiding it would \
-                 hide the live row"
-            ),
-        });
+        return Err(AppError::Config(format!(
+            "`{service}` is the credential Claude Code is using right now; hiding it would hide \
+             the live row"
+        )));
+    }
+
+    // Anything agentctl cannot classify is not a row this flag governs. A
+    // `claude-switcher:*` item is hidden by default already and is never read
+    // (fact F10), and `forgotten_services` is consulted only where an
+    // unclaimed `Claude Code-credentials-<sha8>` item is being decided about
+    // — so recording one here would change nothing while telling the user
+    // agentctl had done something to another tool's credential.
+    if namespace::classify(service).is_none() {
+        let whose = if service.starts_with(SWITCHER_SERVICE_PREFIX) {
+            format!("`{service}` belongs to claude-switcher")
+        } else {
+            format!(
+                "`{service}` is not an item agentctl reports — only `{live}` and \
+                 `{live}-<8 hex>` are",
+                live = namespace::LIVE_SERVICE
+            )
+        };
+        return Err(AppError::Config(format!(
+            "{whose}; agentctl never reads or writes it, so there is nothing to hide or report"
+        )));
     }
 
     let changed = AgentctlConfig::update(accounts.paths, |config| {

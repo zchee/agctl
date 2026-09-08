@@ -181,6 +181,11 @@ fn a_switcher_item_is_listed_hidden_and_never_read() {
 
     let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
     let foreign = row(&discovery, "claude-switcher:alice@example.com");
+    assert_eq!(
+        foreign.state.name(),
+        "foreign",
+        "a switcher item is not `unclaimed`: nothing here is agentctl's to adopt"
+    );
     assert!(!foreign.visible_by_default);
     assert_eq!(foreign.source, Source::None);
     assert_eq!(foreign.record.email.as_deref(), Some("alice@example.com"));
@@ -454,10 +459,11 @@ fn a_forgotten_record_is_hidden() {
 }
 
 #[test]
-fn a_foreign_record_asks_for_a_login() {
+fn a_foreign_record_says_whose_it_is() {
     // A credential that belongs to something else is never read (fact F10),
-    // so the only honest thing to say about it is that agentctl has nothing
-    // to show until the user logs in.
+    // so the state says exactly that rather than `needs login` — which would
+    // invite the user to fix a row that is not theirs to fix — or `unclaimed`,
+    // which is a Claude Code item agentctl could adopt and this is not.
     let (dir, paths) = store();
     let env = env_in(dir.path());
     let mut config = AgentctlConfig::default();
@@ -472,7 +478,8 @@ fn a_foreign_record_asks_for_a_login() {
 
     let discovery = discover(&config, &paths, &FakeReader::unlocked(), &env, &ctx());
     let foreign = row(&discovery, "acct-1");
-    assert_eq!(foreign.state, AccountState::NeedsLogin);
+    assert_eq!(foreign.state, AccountState::Foreign { source: "claude-switcher".to_owned() });
+    assert_eq!(foreign.state.name(), "foreign", "the JSON token says foreign, not unclaimed");
     assert_eq!(foreign.source, Source::None);
     assert!(foreign.note.as_deref().is_some_and(|note| note.contains("claude-switcher")));
 }

@@ -23,27 +23,55 @@ fn body() -> Value {
 #[test]
 fn path_is_the_account_and_organization_under_the_cache_dir() {
     let (_dir, paths) = store_dir();
-    let path = path(&paths, ACCT, ORG).expect("both identifiers are valid segments");
+    let path = path(&paths, ACCT, ORG);
     assert_eq!(path.parent(), Some(paths.cache_dir().as_path()));
-    assert_eq!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some(format!("{ACCT}.{ORG}.json").as_str())
-    );
+    let name = path.file_name().and_then(|n| n.to_str()).expect("the name is UTF-8");
+    assert!(name.starts_with(&format!("{ACCT}.{ORG}.")), "the readable half is intact: {name}");
+    assert!(name.ends_with(".json"), "{name}");
 }
 
 #[test]
-fn path_refuses_an_identifier_that_could_escape_the_cache_dir() {
+fn path_names_a_file_inside_the_cache_dir_for_any_identifier_at_all() {
+    // The identifiers that used to be refused outright, which meant a row
+    // keyed by a keychain service name had no cache and re-fetched on every
+    // pass. Every one of them must now name a file, and that file must be
+    // directly inside the cache directory — a `..` or a `/` that survived
+    // into the name would be an escape.
     let (_dir, paths) = store_dir();
-    for bad in ["..", "a/b", "", "."] {
-        assert!(path(&paths, bad, ORG).is_err(), "account `{bad}` should be refused");
-        assert!(path(&paths, ACCT, bad).is_err(), "organization `{bad}` should be refused");
+    let awkward = ["..", ".", "", "a/b", "../../etc/passwd", "Claude Code-credentials-6cdd6b98"];
+    for value in awkward {
+        for (acct, org) in [(value, ORG), (ACCT, value)] {
+            let path = path(&paths, acct, org);
+            assert_eq!(
+                path.parent(),
+                Some(paths.cache_dir().as_path()),
+                "`{value}` escaped the cache directory: {}",
+                path.display()
+            );
+            let name = path.file_name().and_then(|n| n.to_str()).expect("the name is UTF-8");
+            assert!(!name.contains('/'), "{name}");
+            assert!(name.ends_with(".json"), "{name}");
+            // And it is writable, which is the point of naming it at all.
+            std::fs::write(&path, "{}")
+                .unwrap_or_else(|err| panic!("`{}` should be writable: {err}", path.display()));
+        }
     }
+}
+
+#[test]
+fn two_identifiers_that_sanitize_alike_still_get_their_own_entry() {
+    // The readable half is lossy on purpose, so the digest is what keeps two
+    // rows from reading each other's usage figures.
+    let (_dir, paths) = store_dir();
+    let first = path(&paths, "a b", ORG);
+    let second = path(&paths, "a/b", ORG);
+    assert_ne!(first, second, "the digest separates them: {}", first.display());
 }
 
 #[test]
 fn a_stored_entry_round_trips() {
     let (_dir, paths) = store_dir();
-    let path = path(&paths, ACCT, ORG).expect("valid segments");
+    let path = path(&paths, ACCT, ORG);
     let entry = CacheEntry::new(1_757_000_000_000, body());
 
     store(&path, &entry).expect("the cache entry should be writable");
@@ -55,7 +83,7 @@ fn a_stored_entry_round_trips() {
 #[test]
 fn a_stored_entry_is_a_regular_file_at_0600_with_no_temporary_left_behind() {
     let (_dir, paths) = store_dir();
-    let path = path(&paths, ACCT, ORG).expect("valid segments");
+    let path = path(&paths, ACCT, ORG);
     store(&path, &CacheEntry::new(0, body())).expect("writable");
 
     let meta = std::fs::metadata(&path).expect("the entry should exist");
@@ -74,7 +102,7 @@ fn a_stored_entry_is_a_regular_file_at_0600_with_no_temporary_left_behind() {
 #[test]
 fn a_rewrite_replaces_the_file_atomically() {
     let (_dir, paths) = store_dir();
-    let path = path(&paths, ACCT, ORG).expect("valid segments");
+    let path = path(&paths, ACCT, ORG);
 
     store(&path, &CacheEntry::new(1, body())).expect("writable");
     let first = std::fs::metadata(&path).expect("present").ino();
@@ -125,7 +153,7 @@ fn rate_limit_remaining_counts_down_and_then_clears() {
 #[test]
 fn an_unreadable_entry_loads_as_none_rather_than_failing() {
     let (_dir, paths) = store_dir();
-    let path = path(&paths, ACCT, ORG).expect("valid segments");
+    let path = path(&paths, ACCT, ORG);
 
     assert_eq!(load(&path), None, "an absent file");
 
@@ -150,7 +178,7 @@ fn a_stale_entry_still_loads_so_it_can_be_rendered_stale() {
     // only `is_fresh` does, so a failed fetch can still show yesterday's
     // numbers next to a `stale` badge.
     let (_dir, paths) = store_dir();
-    let path = path(&paths, ACCT, ORG).expect("valid segments");
+    let path = path(&paths, ACCT, ORG);
     store(&path, &CacheEntry::new(0, body())).expect("writable");
 
     let loaded = load(&path).expect("a stale entry still loads");

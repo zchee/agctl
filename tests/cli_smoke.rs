@@ -164,7 +164,9 @@ fn accounts_remove_refuses_an_id_it_does_not_know() {
 fn doctor_remove_stale_refuses_a_path_outside_the_store() {
     // Invariant I11, from outside the process: the live store's own lock is
     // the path a user is most likely to try, and it is exactly the one this
-    // command must not touch.
+    // command must not touch. Exit 1, not 2: the run removed nothing and
+    // rendered nothing, and 2 means a table was printed with a degraded row
+    // in it.
     let (mut command, dir) = isolated();
     let outside = dir.path().join(".claude").join(".oauth_refresh.lock");
     std::fs::create_dir_all(dir.path().join(".claude")).expect("creatable");
@@ -172,7 +174,7 @@ fn doctor_remove_stale_refuses_a_path_outside_the_store() {
     command
         .args(["claude", "doctor", "--remove-stale", &outside.to_string_lossy(), "--yes"])
         .assert()
-        .code(2)
+        .code(1)
         .stderr(contains("not inside"));
     assert!(outside.exists(), "the live store's lock is untouched");
 }

@@ -14,13 +14,17 @@ const IMPOSSIBLE_PID: u32 = u32::MAX;
 fn this_process_exists_and_is_alive() {
     let pid = std::process::id();
     assert!(exists(pid), "the running test process exists");
-    assert_eq!(holder(pid), Holder::Alive);
+    assert_eq!(holder(pid, &Cancel::new()), Holder::Alive);
 }
 
 #[test]
 fn an_impossible_pid_is_dead() {
     assert!(!exists(IMPOSSIBLE_PID));
-    assert_eq!(holder(IMPOSSIBLE_PID), Holder::Dead, "no subprocess is needed to say so");
+    assert_eq!(
+        holder(IMPOSSIBLE_PID, &Cancel::new()),
+        Holder::Dead,
+        "no subprocess is needed to say so"
+    );
 }
 
 #[test]
@@ -34,19 +38,23 @@ fn pid_one_exists_even_though_it_is_not_ours() {
 #[test]
 fn a_start_time_is_readable_and_stable() {
     // Plan AC48(c): the value the lock body records.
-    let first = self_start_time().expect("`ps -o lstart=` answers for this process");
+    let first = self_start_time(&Cancel::new()).expect("`ps -o lstart=` answers for this process");
     assert!(!first.is_empty());
-    assert_eq!(first, self_start_time().expect("memoized"), "memoized, so it cannot drift");
+    assert_eq!(
+        first,
+        self_start_time(&Cancel::new()).expect("memoized"),
+        "memoized, so it cannot drift"
+    );
     assert_eq!(
         Some(first),
-        start_time(std::process::id()),
+        start_time(std::process::id(), &Cancel::new()),
         "the memo answers what a fresh read would"
     );
 }
 
 #[test]
 fn a_start_time_for_an_impossible_pid_is_unavailable() {
-    assert_eq!(start_time(IMPOSSIBLE_PID), None);
+    assert_eq!(start_time(IMPOSSIBLE_PID, &Cancel::new()), None);
 }
 
 #[test]
@@ -77,7 +85,7 @@ fn a_stopped_child_is_reported_as_stopped() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut seen = Holder::Alive;
     while Instant::now() < deadline {
-        seen = holder(pid);
+        seen = holder(pid, &Cancel::new());
         if seen == Holder::Stopped {
             break;
         }
