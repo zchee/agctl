@@ -25,8 +25,6 @@
 //! this project builds with `-C debug-assertions=off` everywhere (plan
 //! section 3.9, constraint C-006).
 
-#![cfg_attr(not(test), expect(dead_code, reason = "consumed by lane D and lane C"))]
-
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;

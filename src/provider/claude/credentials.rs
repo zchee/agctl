@@ -253,6 +253,17 @@ impl Credentials {
         Value::Object(root).to_string()
     }
 
+    /// The `Authorization` header value for a request made as this account.
+    ///
+    /// Built here, beside [`Credentials::to_blob_json`], for the same reason
+    /// [`Credentials::refresh_body`] is: routing it through
+    /// [`Credentials::with_exposed`] keeps the whole crate at the two
+    /// exposure sites invariant I6 allows. The OAuth profile call (fact F26)
+    /// and the usage call (fact F20) both go through here.
+    pub fn authorization_header(&self) -> String {
+        self.with_exposed(|access, _| format!("Bearer {access}"))
+    }
+
     /// The refresh POST body (fact F8).
     ///
     /// Built here rather than in the OAuth client so the refresh token does

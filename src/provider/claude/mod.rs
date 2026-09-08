@@ -16,3 +16,31 @@ pub mod credentials;
 pub mod discovery;
 pub mod namespace;
 pub mod oauth;
+
+/// The `User-Agent` agentctl sends to Anthropic.
+///
+/// Honest, not mimicked. Probe S3 established that this value is accepted on
+/// both the usage endpoint and the token endpoint — a refresh grant carrying
+/// it returned 200 — so there is no reason to impersonate Claude Code's
+/// `claude-cli/<version> (external, cli)`, and every reason not to: a client
+/// that lies about who it is cannot be rate-limited, deprecated or excluded
+/// separately from the product it is pretending to be. Decision U13.
+pub const USER_AGENT_DEFAULT: &str = concat!("agentctl/", env!("CARGO_PKG_VERSION"));
+
+/// The environment variable that replaces [`USER_AGENT_DEFAULT`].
+///
+/// Production-visible on purpose (plan section 3.2): if Anthropic ever starts
+/// refusing the honest agent, the user can put Claude Code's back without
+/// waiting for a release.
+pub const USER_AGENT_ENV: &str = "AGENTCTL_CLAUDE_USER_AGENT";
+
+/// The `User-Agent` this process should send, override included.
+///
+/// An unset or blank override yields [`USER_AGENT_DEFAULT`]; a blank string
+/// would otherwise produce a header that some proxies drop and others reject.
+pub fn user_agent() -> String {
+    match std::env::var(USER_AGENT_ENV) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => USER_AGENT_DEFAULT.to_owned(),
+    }
+}

@@ -9,6 +9,7 @@
 //! one shown row is degraded.
 
 mod cli;
+mod commands;
 mod config;
 mod error;
 mod provider;
@@ -69,12 +70,12 @@ fn init_tracing() {
 /// Every arm that is not yet built returns [`AppError::not_implemented`], so
 /// an unbuilt command fails loudly with exit status 1 instead of exiting 0
 /// having done nothing. W1 to W3 replace these arms.
-fn dispatch(cli: &Cli, _cancel: &Cancel) -> Result<(), AppError> {
+fn dispatch(cli: &Cli, cancel: &Cancel) -> Result<(), AppError> {
     let Command::Claude { command } = &cli.command;
     match command {
         ClaudeCommand::Status(_) => Err(AppError::not_implemented("agentctl claude status")),
         ClaudeCommand::Watch(_) => Err(AppError::not_implemented("agentctl claude watch")),
-        ClaudeCommand::Login(_) => Err(AppError::not_implemented("agentctl claude login")),
+        ClaudeCommand::Login(args) => commands::login::run(cli.config_dir.as_deref(), args, cancel),
         ClaudeCommand::Import(_) => Err(AppError::not_implemented("agentctl claude import")),
         ClaudeCommand::Doctor(_) => Err(AppError::not_implemented("agentctl claude doctor")),
         ClaudeCommand::Accounts { command } => match command {
