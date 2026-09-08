@@ -1,0 +1,77 @@
+keychain: "/Users/example/Library/Keychains/login.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    0x00000007 <blob>="Claude Code-credentials"
+    0x00000008 <blob>=<NULL>
+    "acct"<blob>="example"
+    "cdat"<timedate>=0x32303236303930383031323030355A00  "20260908012005Z\000"
+    "crtr"<uint32>=<NULL>
+    "cusi"<sint32>=<NULL>
+    "desc"<blob>=<NULL>
+    "gena"<blob>=<NULL>
+    "icmt"<blob>=<NULL>
+    "invi"<sint32>=<NULL>
+    "mdat"<timedate>=0x32303236303930383031323030355A00  "20260908012005Z\000"
+    "nega"<sint32>=<NULL>
+    "prot"<blob>=<NULL>
+    "scrp"<sint32>=<NULL>
+    "svce"<blob>="Claude Code-credentials"
+    "type"<uint32>=<NULL>
+class: "genp"
+attributes:
+    0x00000007 <blob>="Claude Code-credentials-5cdc535f"
+    0x00000008 <blob>=<NULL>
+    "acct"<blob>="example"
+    "cdat"<timedate>=0x32303236303832363039303030305A00  "20260826090000Z\000"
+    "crtr"<uint32>=<NULL>
+    "desc"<blob>=<NULL>
+    "mdat"<timedate>=0x32303236303832363039303030305A00  "20260826090000Z\000"
+    "svce"<blob>="Claude Code-credentials-5cdc535f"
+    "type"<uint32>=<NULL>
+class: "genp"
+attributes:
+    0x00000007 <blob>="Claude Code-credentials-6cdd6b98"
+    0x00000008 <blob>=<NULL>
+    "acct"<blob>="example"
+    "cdat"<timedate>=0x32303236303832363039303530305A00  "20260826090500Z\000"
+    "desc"<blob>=<NULL>
+    "mdat"<timedate>=0x32303236303832363039303530305A00  "20260826090500Z\000"
+    "svce"<blob>="Claude Code-credentials-6cdd6b98"
+    "type"<uint32>=<NULL>
+class: "genp"
+attributes:
+    0x00000007 <blob>="claude-switcher:alice@example.com"
+    0x00000008 <blob>=<NULL>
+    "acct"<blob>="example"
+    "cdat"<timedate>=0x32303236303532333038303030305A00  "20260523080000Z\000"
+    "mdat"<timedate>=0x32303236303532333038303030305A00  "20260523080000Z\000"
+    "svce"<blob>="claude-switcher:alice@example.com"
+    "type"<uint32>=<NULL>
+class: "genp"
+attributes:
+    0x00000007 <blob>="claude-switcher:bob@example.com"
+    0x00000008 <blob>=<NULL>
+    "acct"<blob>="example"
+    "cdat"<timedate>=0x32303236303532333038303130305A00  "20260523080100Z\000"
+    "mdat"<timedate>=0x32303236303532333038303130305A00  "20260523080100Z\000"
+    "svce"<blob>="claude-switcher:bob@example.com"
+    "type"<uint32>=<NULL>
+class: "genp"
+attributes:
+    0x00000007 <blob>="Claude Code-86c75be7"
+    0x00000008 <blob>=<NULL>
+    "acct"<blob>="example"
+    "cdat"<timedate>=0x32303235313230313132303030305A00  "20251201120000Z\000"
+    "mdat"<timedate>=0x32303235313230313132303030305A00  "20251201120000Z\000"
+    "svce"<blob>="Claude Code-86c75be7"
+    "type"<uint32>=<NULL>
+class: "genp"
+attributes:
+    0x00000007 <blob>="Chrome Safe Storage"
+    0x00000008 <blob>=<NULL>
+    "acct"<blob>="Chrome"
+    "cdat"<timedate>=0x32303234303130313030303030305A00  "20240101000000Z\000"
+    "mdat"<timedate>=0x32303234303130313030303030305A00  "20240101000000Z\000"
+    "svce"<blob>="Chrome Safe Storage"
+    "type"<uint32>=<NULL>

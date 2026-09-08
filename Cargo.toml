@@ -18,12 +18,12 @@ base64 = "0.23.1"
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.29"
 etcetera = "0.11"
-fd-lock = "4"
 hex = "0.4.3"
 jiff = "0.2"
 open = "5.4.3"
 rand = "0.10.2"
 ratatui = "0.30"
+rustix = { version = "1", features = ["fs"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

@@ -378,3 +378,96 @@ fn a_deadline_already_past_stops_the_pass_without_running_jobs() {
 
     assert_eq!(ran.load(Ordering::SeqCst), 0, "no job should start after the deadline has passed");
 }
+
+#[test]
+fn a_standalone_context_owns_its_own_child_table() {
+    // `login` and the unit tests need a context outside a pass. Nothing
+    // watches it, so the caller must reap what it registers -- which is what
+    // `wait_child_timeout` does on both of its paths.
+    let ctx = PassCtx::standalone(Cancel::new(), Instant::now() + Duration::from_secs(30));
+    assert!(!ctx.should_stop());
+    assert!(ctx.remaining() > Duration::from_secs(25));
+
+    let child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exit 7")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("a shell should be spawnable");
+    let token = ctx.register_child(child);
+
+    let status = ctx
+        .wait_child_timeout(token, Duration::from_secs(10))
+        .expect("waiting should succeed")
+        .expect("the child exits well inside its budget");
+    assert_eq!(status.code(), Some(7));
+}
+
+#[test]
+fn wait_child_timeout_kills_and_reaps_a_child_that_overruns() {
+    // The mechanism behind the 2 000 ms and 10 000 ms `security` budgets: a
+    // keychain prompt nobody answers must not hold a pass open.
+    let ctx = PassCtx::standalone(Cancel::new(), Instant::now() + Duration::from_secs(30));
+    let child = Command::new("/bin/sleep")
+        .arg(SLEEP_SECONDS)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("sleep should be spawnable");
+    let pid = child.id();
+    let token = ctx.register_child(child);
+
+    let start = Instant::now();
+    let outcome = ctx
+        .wait_child_timeout(token, Duration::from_millis(200))
+        .expect("a timeout is not an error");
+    let elapsed = start.elapsed();
+
+    assert!(outcome.is_none(), "the child should have been killed, not reaped normally");
+    assert!(elapsed >= Duration::from_millis(200), "returned early: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "overran its budget: {elapsed:?}");
+    assert!(!pid_is_alive(pid), "the child should be dead and reaped");
+
+    // The token is gone from the table, so a second wait reports the same
+    // thing a coordinator kill does rather than blocking forever.
+    let err = ctx
+        .wait_child_timeout(token, Duration::from_millis(50))
+        .expect_err("the child is no longer registered");
+    assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+}
+
+#[test]
+fn wait_child_timeout_reports_a_coordinator_kill_as_interrupted() {
+    let ctx = PassCtx::standalone(Cancel::new(), Instant::now() + Duration::from_secs(30));
+    let err = ctx
+        .wait_child_timeout(ChildToken(9999), Duration::from_millis(50))
+        .expect_err("an unregistered token means the coordinator took the child");
+    assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+}
+
+#[test]
+fn a_cloned_context_shares_the_child_table() {
+    // What lets the `security` reader hold a context of its own and still
+    // have its children killed by the pass watchdog.
+    let ctx = PassCtx::standalone(Cancel::new(), Instant::now() + Duration::from_secs(30));
+    let clone = ctx.clone();
+
+    let child = Command::new("/bin/sleep")
+        .arg(SLEEP_SECONDS)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("sleep should be spawnable");
+    let pid = child.id();
+    let token = clone.register_child(child);
+
+    // Registered through the clone, waited through the original.
+    assert!(
+        ctx.wait_child_timeout(token, Duration::from_millis(150)).expect("not an error").is_none()
+    );
+    assert!(!pid_is_alive(pid));
+
+    ctx.cancel().cancel();
+    assert!(clone.cancel().is_cancelled(), "cancellation is shared too");
+}

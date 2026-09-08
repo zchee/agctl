@@ -9,8 +9,11 @@
 //! one shown row is degraded.
 
 mod cli;
+mod config;
 mod error;
+mod provider;
 mod runtime;
+mod secret;
 
 use std::process;
 

@@ -181,7 +181,12 @@ impl ChildTable {
 
 /// What a job is given so it can cooperate with cancellation and hand its
 /// child processes to the coordinator.
-#[derive(Debug)]
+///
+/// Cloning is shallow and deliberate: every clone observes the same
+/// cancellation flag and shares the same child table, so a long-lived helper
+/// that a job builds for itself — the `security(1)` reader, say — can hold a
+/// context of its own and still have its children killed by the watchdog.
+#[derive(Debug, Clone)]
 pub struct PassCtx {
     cancel: Cancel,
     deadline: Instant,
@@ -189,6 +194,19 @@ pub struct PassCtx {
 }
 
 impl PassCtx {
+    /// Builds a context that belongs to no pass.
+    ///
+    /// `login` and the unit tests need a context to spawn `security(1)`
+    /// through, but they are not running inside [`run_pass`] and so have no
+    /// coordinator thread behind them. The child table is owned by the
+    /// returned value and **nothing watches it**: dropping this context kills
+    /// nothing, so a caller must reach every child it registers through
+    /// [`PassCtx::wait_child`] or [`PassCtx::wait_child_timeout`], both of
+    /// which reap what they wait on.
+    pub fn standalone(cancel: Cancel, deadline: Instant) -> Self {
+        Self { cancel, deadline, children: Arc::new(Mutex::new(ChildTable::default())) }
+    }
+
     /// The pass-wide cancellation flag.
     pub fn cancel(&self) -> &Cancel {
         &self.cancel
@@ -245,6 +263,60 @@ impl PassCtx {
                             "the pass coordinator killed this child process",
                         ));
                     }
+                }
+            }
+            thread::sleep(CHILD_POLL_INTERVAL);
+        }
+    }
+
+    /// Waits for a registered child to exit, giving up after `timeout`.
+    ///
+    /// Polls exactly as [`PassCtx::wait_child`] does, so the watchdog can
+    /// always take the child table. On timeout the child is killed and reaped
+    /// through that table and `Ok(None)` is returned, which is what bounds the
+    /// 2 000 ms and 10 000 ms `security(1)` budgets: a keychain prompt that
+    /// never gets an answer cannot hold the pass open.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::Interrupted`] when the coordinator killed the
+    /// child first. Any other error is the underlying `wait` failure.
+    pub fn wait_child_timeout(
+        &self,
+        token: ChildToken,
+        timeout: Duration,
+    ) -> io::Result<Option<ExitStatus>> {
+        // `Instant + Duration` panics on overflow and overflow checks are off
+        // in every profile here, so the addition is spelled out: an absurd
+        // timeout degrades to "already expired" rather than wrapping.
+        let now = Instant::now();
+        let deadline = now.checked_add(timeout).unwrap_or(now);
+        loop {
+            {
+                let mut table = lock_recovering(&self.children);
+                match table.live.get_mut(&token) {
+                    Some(child) => {
+                        if let Some(status) = child.try_wait()? {
+                            table.live.remove(&token);
+                            return Ok(Some(status));
+                        }
+                    }
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "the pass coordinator killed this child process",
+                        ));
+                    }
+                }
+
+                if Instant::now() >= deadline {
+                    // Still holding the table, so nothing can register a child
+                    // under this token between the check and the kill.
+                    if let Some(mut child) = table.live.remove(&token) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    return Ok(None);
                 }
             }
             thread::sleep(CHILD_POLL_INTERVAL);
