@@ -180,25 +180,54 @@ impl AgentctlConfig {
         Ok(config)
     }
 
-    /// Writes the registry atomically, under the configuration lock.
+    /// Reads the registry, applies `f` to it, and writes it back — all under
+    /// one hold of the configuration lock.
+    ///
+    /// This is the only way to change the registry, and the reason is the
+    /// lock. `flock` is per open file description, so a caller that took
+    /// `.config.lock` itself and then called a self-locking `save` would
+    /// deadlock against its own descriptor; and a caller that did not take the
+    /// lock would read, think, and write across a window in which another
+    /// process could have added an account, which the write would then erase.
+    /// Re-reading the file *inside* the lock closes both: `f` never sees a
+    /// registry older than the lock it is protected by.
+    ///
+    /// `f` must not itself call `update`, `load` or anything else that touches
+    /// the registry — it runs while the lock is held, so a nested acquisition
+    /// would block until [`CONFIG_LOCK_TIMEOUT`] and then fail.
     ///
     /// # Errors
     ///
     /// Returns [`AppError::Refused`] when the lock is held past
-    /// [`CONFIG_LOCK_TIMEOUT`], and [`AppError::Io`] for any filesystem
-    /// failure along the way.
-    pub fn save(&self, paths: &Paths) -> Result<(), AppError> {
+    /// [`CONFIG_LOCK_TIMEOUT`], [`AppError::Config`] when the file on disk is
+    /// not a registry this build understands, and [`AppError::Io`] for any
+    /// filesystem failure along the way. `f`'s value is returned only when the
+    /// write succeeded.
+    pub fn update<R>(paths: &Paths, f: impl FnOnce(&mut Self) -> R) -> Result<R, AppError> {
         paths.ensure_dirs()?;
 
         let lock_path = paths.config_lock();
         let cancel = Cancel::new();
         let now = Instant::now();
         let deadline = now.checked_add(CONFIG_LOCK_TIMEOUT).unwrap_or(now);
-        let _guard = namespace_lock::lock_file(&lock_path, deadline, &cancel, &Fault::none())
+        let guard = namespace_lock::lock_file(&lock_path, deadline, &cancel, &Fault::none())
             .map_err(|err| AppError::Refused {
                 reason: format!("could not lock `{}`: {err}", lock_path.display()),
             })?;
 
+        let mut config = Self::load(paths)?;
+        let value = f(&mut config);
+        config.write_locked(paths, &guard)?;
+        Ok(value)
+    }
+
+    /// Writes the registry atomically. The caller holds the configuration
+    /// lock, which is what the guard argument is there to prove.
+    fn write_locked(
+        &self,
+        paths: &Paths,
+        _guard: &namespace_lock::NamespaceLockGuard,
+    ) -> Result<(), AppError> {
         let document = serde_json::to_string_pretty(self)
             .map_err(|err| AppError::Config(format!("could not serialize the config: {err}")))?;
 
@@ -234,9 +263,11 @@ impl AgentctlConfig {
 
     /// Resolves a user-supplied identifier to exactly one record.
     ///
-    /// Accepted spellings, in order: `<account_uuid>` when it names one
-    /// record, `<account_uuid>/<organization_uuid>`, and an email address when
-    /// it names one record.
+    /// `<account_uuid>/<organization_uuid>` is tried first, because it is the
+    /// spelling the ambiguity message below tells the user to fall back to and
+    /// so must never itself be ambiguous. Anything else is matched against
+    /// three fields at once — the account UUID, the email address, and the
+    /// `login --label` label — and has to name exactly one record.
     ///
     /// # Errors
     ///

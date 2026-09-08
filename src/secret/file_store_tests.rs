@@ -6,6 +6,7 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use super::*;
+use crate::config::paths::FILE_MODE;
 use crate::provider::claude::credentials::Credentials;
 use crate::runtime::coordinator::Cancel;
 
@@ -618,4 +619,140 @@ fn an_unarmed_pause_point_does_not_delay_a_write() {
     let start = Instant::now();
     write(&store, &json, None, Fault::from_list("rename_fail_not_armed"));
     assert!(start.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// Plants `link` as a symbolic link to a directory that is not part of the
+/// store, and puts one file inside it whose survival the caller asserts.
+///
+/// This is the shape of the escape the `O_NOFOLLOW` walk exists to close: the
+/// path still *spells* something under the namespace root, so the lexical
+/// check passes, and it resolves to a directory another program owns.
+fn plant_directory_link(dir: &TempDir, link: &Path) -> PathBuf {
+    let elsewhere = dir.path().join("someone-elses-store");
+    std::fs::create_dir_all(&elsewhere).expect("directories should be creatable");
+    std::fs::write(elsewhere.join(CREDENTIALS_FILE), b"not agentctl's").expect("writable");
+    std::fs::create_dir_all(link.parent().expect("the link has a parent"))
+        .expect("directories should be creatable");
+    std::os::unix::fs::symlink(&elsewhere, link).expect("the symlink should be creatable");
+    elsewhere
+}
+
+fn assert_untouched(elsewhere: &Path) {
+    assert_eq!(
+        std::fs::read_to_string(elsewhere.join(CREDENTIALS_FILE)).expect("readable"),
+        "not agentctl's",
+        "the link's target was written through"
+    );
+    let strays: Vec<_> = std::fs::read_dir(elsewhere)
+        .expect("listable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != CREDENTIALS_FILE)
+        .collect();
+    assert!(strays.is_empty(), "the link's target gained files: {strays:?}");
+}
+
+#[test]
+fn a_write_through_a_symlinked_account_component_is_refused() {
+    // The lexical under-root check passes — `<root>/acct/org` spells a path
+    // below the root — and the walk is what refuses.
+    let store = store();
+    let elsewhere = plant_directory_link(&store._dir, &store.paths.namespace_root().join("acct"));
+
+    let json = blob("a", None);
+    let err = write_credentials(&request(&store, &json, None, Fault::none()), &ctx())
+        .expect_err("a symlinked account component must be refused");
+    assert!(matches!(err, FileStoreError::RefusedSymlink(_)), "got {err:?}");
+    assert_untouched(&elsewhere);
+}
+
+#[test]
+fn a_write_through_a_symlinked_organization_component_is_refused() {
+    let store = store();
+    let elsewhere = plant_directory_link(&store._dir, &store.ns_dir);
+
+    let json = blob("a", None);
+    let err = write_credentials(&request(&store, &json, None, Fault::none()), &ctx())
+        .expect_err("a symlinked organization component must be refused");
+    assert!(matches!(err, FileStoreError::RefusedSymlink(_)), "got {err:?}");
+    assert_untouched(&elsewhere);
+}
+
+#[test]
+fn a_component_that_is_a_file_is_refused_rather_than_walked_through() {
+    let store = store();
+    std::fs::create_dir_all(store.paths.namespace_root()).expect("directories should be creatable");
+    std::fs::write(store.paths.namespace_root().join("acct"), b"not a directory")
+        .expect("writable");
+
+    let json = blob("a", None);
+    let err = write_credentials(&request(&store, &json, None, Fault::none()), &ctx())
+        .expect_err("a component that is a file must be refused");
+    assert!(matches!(err, FileStoreError::NotRegular(_)), "got {err:?}");
+}
+
+#[test]
+fn remove_namespace_refuses_a_symlinked_component() {
+    // Deleting through a link is the same escape as writing through one, and
+    // a worse one to discover after the fact.
+    let store = store();
+    let elsewhere = plant_directory_link(&store._dir, &store.ns_dir);
+
+    let err = remove_namespace(&store.paths, &store.ns_dir)
+        .expect_err("a symlinked namespace must be refused");
+    assert!(matches!(err, FileStoreError::RefusedSymlink(_)), "got {err:?}");
+    assert_untouched(&elsewhere);
+    assert!(store.ns_dir.exists(), "the link itself is left for the user to deal with");
+}
+
+#[test]
+fn resolve_pending_refuses_a_symlinked_component() {
+    let store = store();
+    let elsewhere = plant_directory_link(&store._dir, &store.ns_dir);
+    std::fs::write(elsewhere.join(PENDING_FILE), blob("smuggled", None)).expect("writable");
+    std::fs::write(
+        elsewhere.join(PENDING_META),
+        serde_json::to_string(&meta_from(None)).expect("serializable"),
+    )
+    .expect("writable");
+
+    let err = resolve_pending(&store.ns_dir, &ForeignActivity::None)
+        .expect_err("a symlinked namespace must be refused");
+    assert!(matches!(err, FileStoreError::RefusedSymlink(_)), "got {err:?}");
+    assert_eq!(
+        std::fs::read_to_string(elsewhere.join(CREDENTIALS_FILE)).expect("readable"),
+        "not agentctl's",
+        "nothing was replayed through the link"
+    );
+    assert!(elsewhere.join(PENDING_FILE).exists(), "and nothing was deleted through it either");
+}
+
+#[test]
+fn a_cancelled_pass_unlinks_the_temporary_file_and_leaves_the_old_one() {
+    // The window between `fsync` and `rename` is the last one in which
+    // stopping costs nothing, so `Ctrl-C` there must cost nothing.
+    let store = store();
+    let first = blob("old-access", Some("old-refresh"));
+    write(&store, &first, None, Fault::none());
+
+    let cancel = Cancel::new();
+    cancel.cancel();
+    let ctx = PassCtx::standalone(cancel, Instant::now() + std::time::Duration::from_secs(30));
+
+    let prior = digests_of(&first);
+    let second = blob("new-access", Some("old-refresh"));
+    let err = write_credentials(&request(&store, &second, Some(&prior), Fault::none()), &ctx)
+        .expect_err("a cancelled pass must not replace the credentials");
+    assert!(matches!(err, FileStoreError::Cancelled(_)), "got {err:?}");
+
+    assert_eq!(
+        std::fs::read_to_string(store.ns_dir.join(CREDENTIALS_FILE)).expect("readable"),
+        first,
+        "the old credentials are still in place"
+    );
+    assert!(
+        list_stray_tmp(&store.ns_dir).expect("listable").is_empty(),
+        "the staged replacement was unlinked, not left holding a token at rest"
+    );
+    assert!(!store.ns_dir.join(PENDING_FILE).exists(), "and it was not parked as pending either");
 }

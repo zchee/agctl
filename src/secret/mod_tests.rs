@@ -138,11 +138,12 @@ fn the_disabled_backend_answers_nothing_to_everything() {
 #[test]
 fn the_reader_trait_is_read_only() {
     // Plan AC15 and AC25 ask for a compile-time guarantee that no code path
-    // can write a keychain item. This is that guarantee, restated where a
-    // reader will look for it: the trait's whole surface is three read
-    // methods, so a `dyn KeychainReader` has no vocabulary for a write. A
-    // future `write` would break this call, and its reviewer would have to
-    // delete this test on purpose.
+    // can write a keychain item. The guarantee is the trait's surface, not
+    // this call: `KeychainReader` declares three methods, all reads, so a
+    // `dyn KeychainReader` has no vocabulary for a write and no caller can
+    // reach one through it. What this test adds is a place where that surface
+    // is written down and exercised — adding a `write` method would leave it
+    // passing, so the check a reviewer must make is against the list below.
     fn only_reads<R: KeychainReader>(reader: &R) -> (KeychainStatus, usize, bool) {
         let status = reader.preflight();
         let listed = reader.list_services("").map(|entries| entries.len()).unwrap_or_default();

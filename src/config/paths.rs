@@ -179,19 +179,31 @@ impl Paths {
         create_dir_mode(&self.cache_dir())
     }
 
-    /// Whether `p` sits strictly below [`Paths::namespace_root`].
+    /// Whether `p` *spells* a path strictly below [`Paths::namespace_root`].
     ///
     /// The comparison is lexical: `.` and `..` are folded out of both paths
-    /// and no symlink is resolved. That is deliberate. Resolving symlinks
-    /// would ask the filesystem a question whose answer can change between
-    /// the check and the write, and the guarantee wanted here is about the
-    /// path the writer will actually pass to `rename`, not about where that
-    /// path currently points. The symlink question is asked separately, and
-    /// at the right moment, by the `O_NOFOLLOW`/`lstat` rules in
-    /// [`crate::secret::file_store`].
+    /// and no symlink is resolved. That is deliberate, and it is also the
+    /// limit of what this answers.
     ///
-    /// The root itself is not "under" the root, so a caller cannot be talked
-    /// into writing over `claude/` with a namespace path of `.`.
+    /// **What it guarantees:** the string the writer will hand to `rename`
+    /// begins with the namespace root and is not the root itself, so no
+    /// caller can be talked into writing over `claude/` with a namespace path
+    /// of `.`, or out of the store with one full of `..`. That property is
+    /// stable — it is about the path, and a path does not change under you.
+    ///
+    /// **What it does not guarantee:** where that path *leads*. A symlinked
+    /// `<acct>` or `<org>` component spells something under the root and
+    /// resolves to somewhere else entirely — a running Claude Code's store,
+    /// say. Resolving links here would not fix that either, because the
+    /// answer can change between the check and the write. The escape is
+    /// closed instead by
+    /// [`file_store::open_namespace_dir`](crate::secret::file_store::open_namespace_dir),
+    /// which walks the chain with `O_DIRECTORY | O_NOFOLLOW` and performs
+    /// every leaf operation relative to the descriptor it returns, so there
+    /// is no path left to re-resolve; and, for the lock files, by
+    /// [`crate::secret::namespace_lock`], which does the same for `.locks`.
+    /// This check and that walk are both required; neither replaces the
+    /// other.
     pub fn is_under_namespace_root(&self, p: &Path) -> bool {
         let root = lexical_normalize(&self.namespace_root());
         let target = lexical_normalize(p);

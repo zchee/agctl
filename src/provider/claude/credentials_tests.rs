@@ -240,3 +240,29 @@ fn debug_never_prints_a_token() {
     assert!(rendered.contains("<redacted>"));
     assert!(rendered.contains(&credentials.digests().access_sha256));
 }
+
+#[test]
+fn a_wrong_typed_known_key_keeps_its_place_among_the_unknown_ones() {
+    // A blob whose `subscriptionType` is a number rather than a string is not
+    // something to lose, and not something to reorder either: `extra` is an
+    // index-backed map, so a remove-then-reinsert would move the key to the
+    // end and change the bytes agentctl writes back for a file it did not
+    // author.
+    let blob = br#"{"claudeAiOauth":{"accessToken":"a","expiresAt":5,"alpha":1,"subscriptionType":7,"omega":2}}"#;
+    let credentials = Credentials::parse_blob(blob).expect("the blob should parse");
+    assert_eq!(credentials.subscription_type, None, "a number is not a subscription type");
+
+    let keys: Vec<&str> = credentials.extra.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["alpha", "subscriptionType", "omega"], "the key moved");
+    assert_eq!(credentials.extra.get("subscriptionType"), Some(&serde_json::json!(7)));
+}
+
+#[test]
+fn a_wrong_typed_expiry_keeps_its_place_too() {
+    let blob = br#"{"claudeAiOauth":{"accessToken":"a","expiresAt":5,"alpha":1,"refreshTokenExpiresAt":"soon","omega":2}}"#;
+    let credentials = Credentials::parse_blob(blob).expect("the blob should parse");
+    assert_eq!(credentials.refresh_token_expires_at_ms, None);
+
+    let keys: Vec<&str> = credentials.extra.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["alpha", "refreshTokenExpiresAt", "omega"], "the key moved");
+}

@@ -595,3 +595,126 @@ fn a_cancelled_pass_returns_what_it_has_so_far() {
     let discovery = discover(&config, &paths, &FakeReader::unlocked(), &env, &ctx);
     assert_eq!(discovery.rows.len(), 1, "only the live row was built before the stop");
 }
+
+#[test]
+fn an_oversized_claude_json_leaves_the_live_row_visible_without_an_identity() {
+    // `.claude.json` belongs to Claude Code and grows without a documented
+    // bound, so the read is capped. Past the cap the row must still render —
+    // an unreadable identity file is not a reason to hide an account that
+    // plainly exists.
+    let (dir, paths) = store();
+    let env = env_in(dir.path());
+    let path = dir.path().join(".claude.json");
+    let padding = " ".repeat(usize::try_from(MAX_CLAUDE_JSON_BYTES).expect("a 64-bit host") + 1);
+    std::fs::write(&path, format!("{{\"oauthAccount\":{{}}}}{padding}"))
+        .expect("the file should be writable");
+    assert!(
+        std::fs::metadata(&path).expect("the file exists").len() > MAX_CLAUDE_JSON_BYTES,
+        "the fixture has to break the cap for this test to mean anything"
+    );
+
+    let reader = FakeReader::unlocked().with_item(namespace::LIVE_SERVICE, OLD_BLOB);
+    let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
+
+    let live = &discovery.rows[0];
+    assert_eq!(live.id, "live", "no identity was found");
+    assert_eq!(live.state, AccountState::IdentityUnknown);
+    assert!(live.visible_by_default, "the row is still shown");
+}
+
+#[test]
+fn a_symlinked_claude_json_is_not_followed_for_an_identity() {
+    let (dir, paths) = store();
+    let env = env_in(dir.path());
+    let elsewhere = dir.path().join("planted.json");
+    std::fs::write(
+        &elsewhere,
+        br#"{"oauthAccount":{"accountUuid":"99999999-9999-4999-8999-999999999999"}}"#,
+    )
+    .expect("the file should be writable");
+    std::os::unix::fs::symlink(&elsewhere, dir.path().join(".claude.json"))
+        .expect("the symlink should be creatable");
+
+    let reader = FakeReader::unlocked().with_item(namespace::LIVE_SERVICE, OLD_BLOB);
+    let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
+
+    let live = &discovery.rows[0];
+    assert_eq!(live.id, "live", "the planted identity was not adopted");
+    assert_eq!(live.state, AccountState::IdentityUnknown);
+}
+
+#[test]
+fn an_unchanged_claude_json_is_not_parsed_twice() {
+    // `watch` re-runs discovery every few seconds against a file that is
+    // hundreds of kilobytes and changes its `oauthAccount` only at a login,
+    // so the `(dev, ino, size, mtime)` fingerprint decides whether the parse
+    // runs at all. Observed by poisoning the memo with an answer the file
+    // does not contain: getting it back proves the bytes were not re-read.
+    let dir = TempDir::new().expect("a temporary directory should be available");
+    let path = dir.path().join(".claude.json");
+    std::fs::write(
+        &path,
+        br#"{"oauthAccount":{"accountUuid":"55555555-5555-4555-8555-555555555555"}}"#,
+    )
+    .expect("the file should be writable");
+
+    let first = claude_json_identity(&path).expect("the identity should parse");
+    assert_eq!(first.account_uuid, "55555555-5555-4555-8555-555555555555");
+
+    let sentinel = Identity {
+        account_uuid: "memo-hit".to_owned(),
+        organization_uuid: None,
+        email: None,
+        org_name: None,
+    };
+    {
+        let mut memo = memo();
+        let (cached_path, snap, _) = memo.take().expect("the first read populated the memo");
+        assert_eq!(cached_path, path);
+        *memo = Some((cached_path, snap, Some(sentinel.clone())));
+    }
+    assert_eq!(claude_json_identity(&path), Some(sentinel), "the file was parsed again");
+
+    // And a change to the file invalidates it: same length, new mtime and a
+    // new inode, which is what a rewrite by Claude Code looks like.
+    std::fs::remove_file(&path).expect("the file should be removable");
+    std::fs::write(
+        &path,
+        br#"{"oauthAccount":{"accountUuid":"77777777-7777-4777-8777-777777777777"}}"#,
+    )
+    .expect("the file should be writable");
+    assert_eq!(
+        claude_json_identity(&path).map(|identity| identity.account_uuid),
+        Some("77777777-7777-4777-8777-777777777777".to_owned()),
+        "a changed file must be re-read"
+    );
+}
+
+#[test]
+fn claude_json_keys_outside_oauth_account_are_ignored_rather_than_parsed() {
+    // The typed shape is the point: everything else in `.claude.json` —
+    // project lists, session history, MCP configuration — is skipped by
+    // `serde` without being materialised, including values that no
+    // `serde_json::Value` tree would survive being asked about.
+    let dir = TempDir::new().expect("a temporary directory should be available");
+    let path = dir.path().join(".claude.json");
+    std::fs::write(
+        &path,
+        br#"{"projects":{"/a":{"history":[1,2,3]}},"oauthAccount":{"accountUuid":"55555555-5555-4555-8555-555555555555","emailAddress":"json@example.com","unexpected":{"nested":true}},"tipsHistory":{}}"#,
+    )
+    .expect("the file should be writable");
+
+    let identity = claude_json_identity(&path).expect("the identity should parse");
+    assert_eq!(identity.account_uuid, "55555555-5555-4555-8555-555555555555");
+    assert_eq!(identity.email.as_deref(), Some("json@example.com"));
+    assert_eq!(identity.organization_uuid, None, "an absent field is absent, not an error");
+}
+
+#[test]
+fn an_oauth_account_without_a_uuid_is_no_identity() {
+    let dir = TempDir::new().expect("a temporary directory should be available");
+    let path = dir.path().join(".claude.json");
+    std::fs::write(&path, br#"{"oauthAccount":{"emailAddress":"nameless@example.com"}}"#)
+        .expect("the file should be writable");
+    assert_eq!(claude_json_identity(&path), None);
+}

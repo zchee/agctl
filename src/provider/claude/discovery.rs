@@ -27,6 +27,12 @@
 
 #![cfg_attr(not(test), expect(dead_code, reason = "consumed by lane D and lane C"))]
 
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::PoisonError;
+
 use crate::config::AccountKind;
 use crate::config::AccountRecord;
 use crate::config::AgentctlConfig;
@@ -45,6 +51,9 @@ use crate::runtime::coordinator::PassCtx;
 use crate::secret::KeychainReader;
 use crate::secret::KeychainStatus;
 use crate::secret::ServiceEntry;
+use crate::secret::file_store;
+use crate::secret::file_store::FileSnapshot;
+use crate::secret::file_store::ReadOutcome;
 use crate::secret::foreign_activity;
 use crate::secret::foreign_activity::ForeignActivity;
 use crate::secret::foreign_activity::OwnedMeta;
@@ -62,6 +71,16 @@ const KEYCHAIN_PREFIXES: [&str; 2] = ["Claude Code", crate::secret::SWITCHER_SER
 /// Appended to an owned row's note when the keychain could not be read, so
 /// the migration probe could not run (plan section 3.3 step 1).
 const MIGRATION_PROBE_SKIPPED: &str = "keychain locked — migration probe skipped";
+
+/// The largest `.claude.json` that will be read for the live row's identity.
+///
+/// `.claude.json` belongs to Claude Code, not to agentctl: it accumulates
+/// session history and project state, it is measured in hundreds of kilobytes
+/// on a machine in daily use, and nothing bounds it. Sixteen mebibytes is far
+/// above anything observed and still small enough that reading it cannot
+/// exhaust a terminal's memory; past it, the live row simply reports an
+/// unknown identity rather than a failure.
+pub const MAX_CLAUDE_JSON_BYTES: u64 = 16 << 20;
 
 /// Everything one pass found.
 #[derive(Debug)]
@@ -515,23 +534,99 @@ fn record_from_identity(identity: Option<&Identity>, kind: AccountKind) -> Accou
     }
 }
 
+/// Just the `oauthAccount` object of a `.claude.json`, and nothing else.
+///
+/// Deserializing into this rather than into a `serde_json::Value` matters
+/// because of what the rest of the file is: session history, project lists,
+/// MCP configuration and tips state, all of which `serde` skips without
+/// allocating once it knows no field wants them. The live file on the
+/// development machine is 234 KiB and there is no documented ceiling.
+#[derive(Debug, Default, serde::Deserialize)]
+struct ClaudeJson {
+    #[serde(default, rename = "oauthAccount")]
+    oauth_account: Option<OauthAccount>,
+}
+
+/// The identity fields of `.claude.json`'s `oauthAccount` (facts F30, F33).
+#[derive(Debug, Default, serde::Deserialize)]
+struct OauthAccount {
+    #[serde(default, rename = "accountUuid")]
+    account_uuid: Option<String>,
+    #[serde(default, rename = "emailAddress")]
+    email_address: Option<String>,
+    #[serde(default, rename = "organizationUuid")]
+    organization_uuid: Option<String>,
+    #[serde(default, rename = "organizationName")]
+    organization_name: Option<String>,
+}
+
+/// The last `.claude.json` that was parsed, keyed by its identity.
+///
+/// `watch` re-runs [`discover`] every few seconds, and `.claude.json` is
+/// rewritten continuously by running Claude Code sessions but changes its
+/// `oauthAccount` only at a login. Re-reading and re-parsing a file of this
+/// size on every frame to learn that nothing changed is the kind of work a
+/// terminal UI cannot afford, so the `(dev, ino, size, mtime)` fingerprint
+/// decides whether the parse runs at all. The path is part of the key so that
+/// two stores — or two tests — cannot read each other's answers.
+static CLAUDE_JSON_MEMO: Mutex<Option<(PathBuf, FileSnapshot, Option<Identity>)>> =
+    Mutex::new(None);
+
 /// Reads `oauthAccount` out of a `.claude.json` (facts F30, F33).
 ///
-/// Every failure is `None`. The file is rewritten continuously by running
+/// Every failure is `None`: a missing file, a symlinked one, one past
+/// [`MAX_CLAUDE_JSON_BYTES`], and a partial write caught mid-parse all mean
+/// the same thing to the caller — identity unavailable for this pass, with
+/// the live row still rendered. The file is rewritten continuously by running
 /// Claude Code sessions (fact F41), so catching a partial write is expected
 /// rather than exceptional, and the consequence — `identity unknown` on one
-/// pass — is mild.
-fn claude_json_identity(path: &std::path::Path) -> Option<Identity> {
-    let bytes = std::fs::read(path).ok()?;
-    let document: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let account = document.get("oauthAccount")?;
-    let text = |key: &str| account.get(key).and_then(serde_json::Value::as_str).map(str::to_owned);
-    Some(Identity {
-        account_uuid: text("accountUuid")?,
-        organization_uuid: text("organizationUuid"),
-        email: text("emailAddress"),
-        org_name: text("organizationName"),
-    })
+/// pass — is mild. What must not happen is the row disappearing, or an
+/// unbounded read of a file agentctl does not control.
+fn claude_json_identity(path: &Path) -> Option<Identity> {
+    // The `lstat` is what makes the memo worth having: it is one syscall
+    // against a read of a quarter of a megabyte and a parse of the same.
+    if let Ok(Some(snap)) = file_store::snapshot(path) {
+        let memo = memo();
+        if let Some((cached, cached_snap, identity)) = memo.as_ref()
+            && cached.as_path() == path
+            && *cached_snap == snap
+        {
+            return identity.clone();
+        }
+    }
+
+    let (bytes, snap) = match file_store::read_file(path, MAX_CLAUDE_JSON_BYTES) {
+        Ok(ReadOutcome::Present { bytes, snap }) => (bytes, snap),
+        Ok(ReadOutcome::Absent) => return None,
+        Err(err) => {
+            tracing::debug!(path = %path.display(), error = %err, "could not read `.claude.json`");
+            return None;
+        }
+    };
+
+    let identity = serde_json::from_slice::<ClaudeJson>(&bytes)
+        .ok()
+        .and_then(|document| document.oauth_account)
+        .and_then(|account| {
+            Some(Identity {
+                account_uuid: account.account_uuid?,
+                organization_uuid: account.organization_uuid,
+                email: account.email_address,
+                org_name: account.organization_name,
+            })
+        });
+
+    // Stored against the snapshot the read itself observed, not the one the
+    // `lstat` above saw: those differ exactly when the file changed in
+    // between, and the bytes just parsed belong to the later of the two.
+    *memo() = Some((path.to_path_buf(), snap, identity.clone()));
+    identity
+}
+
+/// The memo, recovered rather than propagated if a parse ever panicked while
+/// holding it — the value is a cache, and a poisoned cache is still a cache.
+fn memo() -> MutexGuard<'static, Option<(PathBuf, FileSnapshot, Option<Identity>)>> {
+    CLAUDE_JSON_MEMO.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]

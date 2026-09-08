@@ -439,7 +439,8 @@ fn watchdog(
             return;
         }
         if cancel.is_cancelled() || Instant::now() >= deadline {
-            break Instant::now() + WORKER_JOIN_BUDGET;
+            let now = Instant::now();
+            break now.checked_add(WORKER_JOIN_BUDGET).unwrap_or(now);
         }
         cancel.wait_timeout(WATCHDOG_POLL_INTERVAL);
     };

@@ -28,6 +28,21 @@
 //! agentctl would rather leave the old file in place and hand the new one to
 //! the next run, which is what [`WriteOutcome::SavedToPending`] is.
 //!
+//! # The path check and the directory walk are two different checks
+//!
+//! [`Paths::is_under_namespace_root`](crate::config::paths::Paths::is_under_namespace_root)
+//! is lexical: it says what a path *spells*, not where it *points*. On its own
+//! it does not stop a symlinked `<acct>` or `<org>` component from redirecting
+//! a write — or a delete — into a running Claude Code's store, which is a
+//! directory another local process can create before agentctl first writes
+//! there. So every mutation in this module goes through
+//! [`open_namespace_dir`], which walks down from the namespace root one
+//! component at a time with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` and then
+//! performs the leaf operation relative to the descriptor it returns. A link
+//! anywhere along the chain is [`FileStoreError::RefusedSymlink`], and a
+//! component swapped for a link *after* the walk cannot redirect anything,
+//! because there is no path left to re-resolve.
+//!
 //! # Pending
 //!
 //! When the rename fails, the new credentials are still valid and the old
@@ -41,23 +56,31 @@
 
 #![cfg_attr(not(test), expect(dead_code, reason = "consumed by lane D and lane C"))]
 
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::Read;
 use std::io::Write;
+use std::os::fd::AsFd;
+use std::os::fd::BorrowedFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::fs::PermissionsExt;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
+use rustix::fs::AtFlags;
+use rustix::fs::CWD;
+use rustix::fs::FileType;
 use rustix::fs::Mode;
 use rustix::fs::OFlags;
+use rustix::io::Errno;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::config::paths::FILE_MODE;
+use crate::config::paths::DIR_MODE;
 use crate::config::paths::Paths;
 use crate::provider::claude::credentials::Credentials;
 use crate::provider::claude::credentials::Digests;
@@ -80,6 +103,9 @@ pub const PENDING_FILE: &str = ".credentials.json.pending";
 
 /// What the pending credentials were derived from.
 pub const PENDING_META: &str = ".pending.meta";
+
+/// The mode every file this module creates ends up with.
+const FILE_MODE_BITS: Mode = Mode::RUSR.union(Mode::WUSR);
 
 /// Enough of a file's identity to notice it changed underneath us.
 ///
@@ -116,11 +142,14 @@ pub enum ReadOutcome {
 /// Why a credential file could not be read or written.
 #[derive(Debug, thiserror::Error)]
 pub enum FileStoreError {
-    /// The path is a symbolic link. Never followed, never overwritten.
+    /// The path, or a directory on the way to it, is a symbolic link. Never
+    /// followed, never overwritten.
     #[error("`{0}` is a symbolic link; agentctl will not read or write through one")]
     RefusedSymlink(PathBuf),
-    /// The path exists but is not a regular file.
-    #[error("`{0}` is not a regular file")]
+    /// The path exists but is not what belongs there: a credentials or
+    /// metadata file must be a regular file, and a component of the namespace
+    /// directory must be a directory.
+    #[error("`{0}` is not the plain file or directory that belongs at that path")]
     NotRegular(PathBuf),
     /// The file is larger than the format allows.
     #[error("`{path}` is {size} bytes, larger than the {limit}-byte limit")]
@@ -135,6 +164,10 @@ pub enum FileStoreError {
     /// The path is not inside this store's namespace root (invariant I1).
     #[error("`{0}` is outside the agentctl namespace root; refusing to write")]
     OutsideNamespaceRoot(PathBuf),
+    /// The pass was cancelled, or ran out of deadline, while the replacement
+    /// was staged but not yet renamed into place.
+    #[error("cancelled before `{0}` could be replaced")]
+    Cancelled(PathBuf),
     /// An underlying filesystem call failed.
     #[error("{context}")]
     Io {
@@ -153,6 +186,36 @@ impl FileStoreError {
     /// Wraps an [`io::Error`] with what was being attempted.
     fn io(context: impl Into<String>, source: io::Error) -> Self {
         Self::Io { context: context.into(), source }
+    }
+
+    /// Wraps a `rustix` errno with what was being attempted.
+    fn errno(context: impl Into<String>, errno: Errno) -> Self {
+        Self::io(context, as_io_error(errno))
+    }
+}
+
+/// A `rustix` errno as the [`io::Error`] the rest of the crate speaks.
+fn as_io_error(errno: Errno) -> io::Error {
+    io::Error::from_raw_os_error(errno.raw_os_error())
+}
+
+/// `O_NOFOLLOW` reports a symlink as `ELOOP` on Linux and macOS, and as
+/// `EMLINK` on some BSDs.
+fn is_symlink_errno(errno: Errno) -> bool {
+    errno == Errno::LOOP || errno == Errno::MLINK
+}
+
+/// The identity of an already-opened file.
+fn snapshot_of(meta: &fs::Metadata) -> FileSnapshot {
+    FileSnapshot {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        size: meta.size(),
+        // Seconds and nanoseconds are combined explicitly rather than through
+        // `SystemTime`, which cannot represent a pre-epoch mtime on every
+        // platform. `i128` makes the multiplication exact for any `i64`
+        // second count, so there is nothing to check.
+        mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
     }
 }
 
@@ -178,16 +241,7 @@ pub fn snapshot(path: &Path) -> io::Result<Option<FileSnapshot>> {
             format!("`{}` is a symbolic link", path.display()),
         ));
     }
-    Ok(Some(FileSnapshot {
-        dev: meta.dev(),
-        ino: meta.ino(),
-        size: meta.size(),
-        // Seconds and nanoseconds are combined explicitly rather than through
-        // `SystemTime`, which cannot represent a pre-epoch mtime on every
-        // platform. `i128` makes the multiplication exact for any `i64`
-        // second count, so there is nothing to check.
-        mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
-    }))
+    Ok(Some(snapshot_of(&meta)))
 }
 
 /// Reads `<ns_dir>/.credentials.json` under the fact-F40 rules.
@@ -201,14 +255,43 @@ pub fn read_credentials(ns_dir: &Path) -> Result<ReadOutcome, FileStoreError> {
 }
 
 /// Opens a file with `O_NOFOLLOW` and reads it, applying the size limit.
-fn read_file(path: &Path, limit: u64) -> Result<ReadOutcome, FileStoreError> {
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+///
+/// The size limit is the caller's, because the callers differ by three orders
+/// of magnitude: a credentials blob is capped at
+/// [`MAX_CREDENTIALS_BYTES`], its metadata at [`MAX_META_BYTES`], and
+/// `.claude.json` — which a Claude Code session grows without bound — at
+/// [`crate::provider::claude::discovery::MAX_CLAUDE_JSON_BYTES`].
+///
+/// # Errors
+///
+/// Returns [`FileStoreError`] for a symlink, a non-regular file, an oversized
+/// file, or any errno outside the absent set of fact F40.
+pub fn read_file(path: &Path, limit: u64) -> Result<ReadOutcome, FileStoreError> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
     let fd = match rustix::fs::open(path, flags, Mode::empty()) {
         Ok(fd) => fd,
         Err(errno) => return classify_open(path, errno),
     };
+    read_opened(File::from(fd), path, limit)
+}
 
-    let mut file = File::from(fd);
+/// [`read_file`], relative to an already-opened namespace directory.
+fn read_file_at(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    limit: u64,
+    display: &Path,
+) -> Result<ReadOutcome, FileStoreError> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = match rustix::fs::openat(dir, name, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(errno) => return classify_open(display, errno),
+    };
+    read_opened(File::from(fd), display, limit)
+}
+
+/// Applies the regular-file and size rules to an open descriptor.
+fn read_opened(mut file: File, path: &Path, limit: u64) -> Result<ReadOutcome, FileStoreError> {
     let meta = file
         .metadata()
         .map_err(|err| FileStoreError::io(format!("could not stat `{}`", path.display()), err))?;
@@ -235,15 +318,7 @@ fn read_file(path: &Path, limit: u64) -> Result<ReadOutcome, FileStoreError> {
         return Err(FileStoreError::TooLarge { path: path.to_path_buf(), size: read, limit });
     }
 
-    Ok(ReadOutcome::Present {
-        bytes,
-        snap: FileSnapshot {
-            dev: meta.dev(),
-            ino: meta.ino(),
-            size: meta.size(),
-            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
-        },
-    })
+    Ok(ReadOutcome::Present { bytes, snap: snapshot_of(&meta) })
 }
 
 /// Maps an `open` failure onto absent, refused, or failed (fact F40).
@@ -251,21 +326,15 @@ fn read_file(path: &Path, limit: u64) -> Result<ReadOutcome, FileStoreError> {
 /// Spelled as comparisons rather than as match arms because `rustix`'s errno
 /// values are associated constants on a newtype, which cannot appear in
 /// patterns.
-fn classify_open(path: &Path, errno: rustix::io::Errno) -> Result<ReadOutcome, FileStoreError> {
-    use rustix::io::Errno;
-
+fn classify_open(path: &Path, errno: Errno) -> Result<ReadOutcome, FileStoreError> {
     let absent = [Errno::NOENT, Errno::ISDIR, Errno::NOTDIR, Errno::ACCESS, Errno::PERM];
     if absent.contains(&errno) {
         return Ok(ReadOutcome::Absent);
     }
-    // `O_NOFOLLOW` on a symlink is ELOOP on macOS and EMLINK on some BSDs.
-    if errno == Errno::LOOP || errno == Errno::MLINK {
+    if is_symlink_errno(errno) {
         return Err(FileStoreError::RefusedSymlink(path.to_path_buf()));
     }
-    Err(FileStoreError::io(
-        format!("could not open `{}`", path.display()),
-        io::Error::from_raw_os_error(errno.raw_os_error()),
-    ))
+    Err(FileStoreError::errno(format!("could not open `{}`", path.display()), errno))
 }
 
 /// What a write did.
@@ -307,40 +376,36 @@ pub struct WriteRequest<'a> {
 ///
 /// Returns [`FileStoreError::OutsideNamespaceRoot`] when the target is not
 /// under the namespace root, [`FileStoreError::RefusedSymlink`] or
-/// [`FileStoreError::NotRegular`] when the existing target is not a plain
-/// file, and [`FileStoreError::Io`] for a filesystem failure. A failed
-/// *rename* is not an error: it returns
-/// [`WriteOutcome::SavedToPending`].
+/// [`FileStoreError::NotRegular`] when the existing target — or any directory
+/// on the way to it — is not a plain file or a plain directory,
+/// [`FileStoreError::Cancelled`] when the pass stopped while the replacement
+/// was staged, and [`FileStoreError::Io`] for a filesystem failure. A failed
+/// *rename* is not an error: it returns [`WriteOutcome::SavedToPending`].
 pub fn write_credentials(
     req: &WriteRequest<'_>,
-    _ctx: &PassCtx,
+    ctx: &PassCtx,
 ) -> Result<WriteOutcome, FileStoreError> {
     let target = req.ns_dir.join(CREDENTIALS_FILE);
     if !req.paths.is_under_namespace_root(&target) {
         return Err(FileStoreError::OutsideNamespaceRoot(target));
     }
 
+    let dir = open_namespace_dir(req.paths, req.ns_dir)?;
+    let dir = dir.as_fd();
+
     // Refuse before creating anything: a symlink at the target means somebody
     // else is managing this path and the rename would land somewhere unknown.
-    match fs::symlink_metadata(&target) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(FileStoreError::RefusedSymlink(target));
-        }
-        Ok(meta) if !meta.is_file() => return Err(FileStoreError::NotRegular(target)),
-        Ok(_) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(FileStoreError::io(format!("could not stat `{}`", target.display()), err));
-        }
+    match entry_at(dir, CREDENTIALS_FILE, &target)? {
+        Entry::Absent | Entry::Regular => {}
+        Entry::Symlink => return Err(FileStoreError::RefusedSymlink(target)),
+        Entry::Other => return Err(FileStoreError::NotRegular(target)),
     }
 
-    ensure_namespace_dirs(req.paths, req.ns_dir)?;
-
-    let tmp = req.ns_dir.join(format!("{CREDENTIALS_FILE}.tmp.{}", hex8()));
+    let tmp_name = format!("{CREDENTIALS_FILE}.tmp.{}", hex8());
+    let tmp = req.ns_dir.join(&tmp_name);
     let token = cleanup::register_tmp_path(tmp.clone());
-    let write = write_new_file(&tmp, req.blob_json.as_bytes());
-    if let Err(err) = write {
-        let _ = fs::remove_file(&tmp);
+    if let Err(err) = create_new_file_at(dir, &tmp_name, req.blob_json.as_bytes()) {
+        let _ = unlink_at(dir, &tmp_name);
         cleanup::unregister(token);
         return Err(FileStoreError::io(format!("could not write `{}`", tmp.display()), err));
     }
@@ -351,34 +416,46 @@ pub fn write_credentials(
     // must re-check for before it renames.
     req.fault.pause_point("before_rename");
 
+    // The same window is the last moment at which a cancelled pass can leave
+    // the namespace exactly as it found it: after the rename there is nothing
+    // left to undo, and before the write there is nothing to gain.
+    if ctx.should_stop() {
+        let _ = unlink_at(dir, &tmp_name);
+        cleanup::unregister(token);
+        return Err(FileStoreError::Cancelled(target));
+    }
+
     let rename = if req.fault.is("rename_fail") {
         Err(io::Error::new(
             io::ErrorKind::CrossesDevices,
-            "rename failure injected by AGENTCTL_FAULT",
+            // The variable's name is deliberately not spelled here: this
+            // literal is in code the default-feature build compiles, so
+            // naming it would put a test-only environment variable into the
+            // release artifact (plan AC37). `crate::runtime::fault` documents
+            // which switch reaches this.
+            "rename failure injected by the test fault switch",
         ))
     } else {
-        fs::rename(&tmp, &target)
+        rustix::fs::renameat(dir, tmp_name.as_str(), dir, CREDENTIALS_FILE).map_err(as_io_error)
     };
 
     match rename {
         Ok(()) => {
-            let result = fs::set_permissions(&target, PermissionsExt::from_mode(FILE_MODE))
-                .and_then(|()| snapshot(&target));
+            // The mode was set on the temporary file's inode, which the rename
+            // carries over, so there is nothing left to chmod here.
+            let snap = snapshot_at(dir, CREDENTIALS_FILE, &target);
             cleanup::unregister(token);
-            match result {
+            match snap {
                 Ok(Some(snap)) => Ok(WriteOutcome::Written { snap }),
                 Ok(None) => Err(FileStoreError::io(
                     format!("`{}` vanished immediately after being written", target.display()),
                     io::Error::from(io::ErrorKind::NotFound),
                 )),
-                Err(err) => Err(FileStoreError::io(
-                    format!("could not finish writing `{}`", target.display()),
-                    err,
-                )),
+                Err(err) => Err(err),
             }
         }
         Err(err) => {
-            let outcome = save_to_pending(req, &tmp, &err);
+            let outcome = save_to_pending(req, dir, &tmp_name, &err);
             cleanup::unregister(token);
             outcome
         }
@@ -394,7 +471,8 @@ pub fn write_credentials(
 /// a valid pending.
 fn save_to_pending(
     req: &WriteRequest<'_>,
-    tmp: &Path,
+    dir: BorrowedFd<'_>,
+    tmp_name: &str,
     cause: &io::Error,
 ) -> Result<WriteOutcome, FileStoreError> {
     let meta = PendingMeta {
@@ -408,20 +486,20 @@ fn save_to_pending(
     })?;
 
     let meta_path = req.ns_dir.join(PENDING_META);
-    let _ = fs::remove_file(&meta_path);
-    if let Err(err) = write_new_file(&meta_path, meta_json.as_bytes()) {
-        let _ = fs::remove_file(tmp);
+    let _ = unlink_at(dir, PENDING_META);
+    if let Err(err) = create_new_file_at(dir, PENDING_META, meta_json.as_bytes()) {
+        let _ = unlink_at(dir, tmp_name);
         return Err(FileStoreError::io(format!("could not write `{}`", meta_path.display()), err));
     }
 
     let pending = req.ns_dir.join(PENDING_FILE);
-    let _ = fs::remove_file(&pending);
-    if let Err(err) = fs::rename(tmp, &pending) {
-        let _ = fs::remove_file(tmp);
-        let _ = fs::remove_file(&meta_path);
-        return Err(FileStoreError::io(
+    let _ = unlink_at(dir, PENDING_FILE);
+    if let Err(errno) = rustix::fs::renameat(dir, tmp_name, dir, PENDING_FILE) {
+        let _ = unlink_at(dir, tmp_name);
+        let _ = unlink_at(dir, PENDING_META);
+        return Err(FileStoreError::errno(
             format!("could not park credentials at `{}`", pending.display()),
-            err,
+            errno,
         ));
     }
 
@@ -490,30 +568,35 @@ impl PendingDiscardReason {
 /// # Errors
 ///
 /// Returns [`FileStoreError`] only for failures that leave the namespace in
-/// an unknown state; every *decidable* outcome — including a corrupt or
-/// hostile pending file — is a [`PendingDecision`].
+/// an unknown state — including a symlinked `<acct>` or `<org>` component,
+/// which would make the replay land outside the store; every *decidable*
+/// outcome — including a corrupt or hostile pending file — is a
+/// [`PendingDecision`].
 pub fn resolve_pending(
     ns_dir: &Path,
     foreign: &ForeignActivity,
 ) -> Result<PendingDecision, FileStoreError> {
+    let Some(dir) = open_ns_dir(ns_dir)? else { return Ok(PendingDecision::NoPending) };
+    let dir = dir.as_fd();
+
     let pending_path = ns_dir.join(PENDING_FILE);
     let meta_path = ns_dir.join(PENDING_META);
+    let current_path = ns_dir.join(CREDENTIALS_FILE);
 
     // A meta with no pending file is the crash window described in
     // `save_to_pending`: there is nothing to replay, so clear the marker.
-    if !path_exists(&pending_path) {
-        let _ = fs::remove_file(&meta_path);
+    if matches!(entry_at(dir, PENDING_FILE, &pending_path)?, Entry::Absent) {
+        let _ = unlink_at(dir, PENDING_META);
         return Ok(PendingDecision::NoPending);
     }
 
-    let pending = match read_file(&pending_path, MAX_CREDENTIALS_BYTES) {
+    // Absent here means the path is a directory or unreadable, which is as
+    // invalid as a corrupt file; so is a symlink, so every failure collapses.
+    let pending = match read_file_at(dir, PENDING_FILE, MAX_CREDENTIALS_BYTES, &pending_path) {
         Ok(ReadOutcome::Present { bytes, .. }) => Some(bytes),
-        // Absent here means the path is a directory or unreadable, which is
-        // as invalid as a corrupt file.
-        Ok(ReadOutcome::Absent) => None,
-        Err(_) => None,
+        _ => None,
     };
-    let meta = match read_file(&meta_path, MAX_META_BYTES) {
+    let meta = match read_file_at(dir, PENDING_META, MAX_META_BYTES, &meta_path) {
         Ok(ReadOutcome::Present { bytes, .. }) => {
             serde_json::from_slice::<PendingMeta>(&bytes).ok()
         }
@@ -521,17 +604,17 @@ pub fn resolve_pending(
     };
 
     let (Some(pending_bytes), Some(meta)) = (pending, meta) else {
-        return discard(ns_dir, PendingDiscardReason::Invalid);
+        return discard(dir, PendingDiscardReason::Invalid);
     };
     if Credentials::parse_blob(&pending_bytes).is_err() {
-        return discard(ns_dir, PendingDiscardReason::Invalid);
+        return discard(dir, PendingDiscardReason::Invalid);
     }
 
     if !matches!(foreign, ForeignActivity::None) {
-        return discard(ns_dir, PendingDiscardReason::NamespaceTakenOver);
+        return discard(dir, PendingDiscardReason::NamespaceTakenOver);
     }
 
-    let current = match read_credentials(ns_dir) {
+    let current = match read_file_at(dir, CREDENTIALS_FILE, MAX_CREDENTIALS_BYTES, &current_path) {
         Ok(ReadOutcome::Present { bytes, .. }) => Credentials::parse_blob(&bytes).ok(),
         Ok(ReadOutcome::Absent) => None,
         // An unreadable current file is not something to overwrite blindly.
@@ -545,38 +628,46 @@ pub fn resolve_pending(
                 == Some(digests.access_sha256.as_str())
                 && meta.derived_from_refresh_sha256 == digests.refresh_sha256;
             if matches {
-                replay(ns_dir, false)
+                replay(dir, ns_dir, false)
             } else {
-                discard(ns_dir, PendingDiscardReason::FileChanged)
+                discard(dir, PendingDiscardReason::FileChanged)
             }
         }
         None if meta.derived_from_access_sha256.is_none()
             && meta.derived_from_refresh_sha256.is_none() =>
         {
-            replay(ns_dir, true)
+            replay(dir, ns_dir, true)
         }
-        None => discard(ns_dir, PendingDiscardReason::FileRemoved),
+        None => discard(dir, PendingDiscardReason::FileRemoved),
     }
 }
 
 /// Moves the pending file into place and clears the metadata.
-fn replay(ns_dir: &Path, first_write: bool) -> Result<PendingDecision, FileStoreError> {
-    let pending = ns_dir.join(PENDING_FILE);
-    let target = ns_dir.join(CREDENTIALS_FILE);
-    fs::rename(&pending, &target).map_err(|err| {
-        FileStoreError::io(format!("could not replay `{}`", pending.display()), err)
+///
+/// The mode is set on the pending file *before* the rename, because a rename
+/// carries the inode and its mode across, and chmod-after-rename would be a
+/// second lookup of a name that is now the live credentials file.
+fn replay(
+    dir: BorrowedFd<'_>,
+    ns_dir: &Path,
+    first_write: bool,
+) -> Result<PendingDecision, FileStoreError> {
+    let pending_path = ns_dir.join(PENDING_FILE);
+    chmod_0600_at(dir, PENDING_FILE, &pending_path)?;
+    rustix::fs::renameat(dir, PENDING_FILE, dir, CREDENTIALS_FILE).map_err(|errno| {
+        FileStoreError::errno(format!("could not replay `{}`", pending_path.display()), errno)
     })?;
-    fs::set_permissions(&target, PermissionsExt::from_mode(FILE_MODE)).map_err(|err| {
-        FileStoreError::io(format!("could not set the mode of `{}`", target.display()), err)
-    })?;
-    let _ = fs::remove_file(ns_dir.join(PENDING_META));
+    let _ = unlink_at(dir, PENDING_META);
     Ok(PendingDecision::Replayed { first_write })
 }
 
 /// Deletes both pending files and reports why.
-fn discard(ns_dir: &Path, reason: PendingDiscardReason) -> Result<PendingDecision, FileStoreError> {
-    let _ = fs::remove_file(ns_dir.join(PENDING_FILE));
-    let _ = fs::remove_file(ns_dir.join(PENDING_META));
+fn discard(
+    dir: BorrowedFd<'_>,
+    reason: PendingDiscardReason,
+) -> Result<PendingDecision, FileStoreError> {
+    let _ = unlink_at(dir, PENDING_FILE);
+    let _ = unlink_at(dir, PENDING_META);
     Ok(PendingDecision::Discarded(reason))
 }
 
@@ -589,44 +680,48 @@ fn discard(ns_dir: &Path, reason: PendingDiscardReason) -> Result<PendingDecisio
 /// # Errors
 ///
 /// Returns [`FileStoreError::OutsideNamespaceRoot`] when `ns_dir` is not
-/// under the namespace root, and [`FileStoreError::Io`] for a removal that
-/// failed for a reason other than the file already being gone.
+/// under the namespace root, [`FileStoreError::RefusedSymlink`] when a
+/// component of it is a link — deleting *through* one is the same escape as
+/// writing through one — and [`FileStoreError::Io`] for a removal that failed
+/// for a reason other than the file already being gone.
 pub fn remove_namespace(paths: &Paths, ns_dir: &Path) -> Result<(), FileStoreError> {
     if !paths.is_under_namespace_root(ns_dir) {
         return Err(FileStoreError::OutsideNamespaceRoot(ns_dir.to_path_buf()));
     }
 
-    let mut targets =
-        vec![ns_dir.join(CREDENTIALS_FILE), ns_dir.join(PENDING_FILE), ns_dir.join(PENDING_META)];
-    targets.extend(list_stray_tmp(ns_dir).map_err(|err| {
-        FileStoreError::io(format!("could not list `{}`", ns_dir.display()), err)
-    })?);
+    let root = paths.namespace_root();
+    let Some(chain) = open_chain(&root, ns_dir, Walk::MustExist)? else { return Ok(()) };
+    let Some(leaf) = chain.last() else { return Ok(()) };
 
-    for target in targets {
-        match fs::remove_file(&target) {
+    let mut names: Vec<OsString> =
+        vec![CREDENTIALS_FILE.into(), PENDING_FILE.into(), PENDING_META.into()];
+    let stray = list_stray_tmp(ns_dir)
+        .map_err(|err| FileStoreError::io(format!("could not list `{}`", ns_dir.display()), err))?;
+    names.extend(stray.iter().filter_map(|path| path.file_name().map(OsStr::to_os_string)));
+
+    for name in names {
+        match rustix::fs::unlinkat(&leaf.fd, name.as_os_str(), AtFlags::empty()) {
             Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(FileStoreError::io(
-                    format!("could not remove `{}`", target.display()),
-                    err,
+            Err(errno) if errno == Errno::NOENT => {}
+            Err(errno) => {
+                return Err(FileStoreError::errno(
+                    format!("could not remove `{}`", ns_dir.join(&name).display()),
+                    errno,
                 ));
             }
         }
     }
 
     // Climb toward the namespace root, removing directories that are now
-    // empty. `remove_dir` refuses a non-empty directory, which is the check
-    // wanted here: a sibling organization's namespace must survive.
-    let root = paths.namespace_root();
-    let mut dir = ns_dir.to_path_buf();
-    while dir != root && paths.is_under_namespace_root(&dir) {
-        if fs::remove_dir(&dir).is_err() {
+    // empty. `AT_REMOVEDIR` refuses a non-empty directory, which is the check
+    // wanted here: a sibling organization's namespace must survive. Index 0 is
+    // the root itself, which is never removed.
+    for index in (1..chain.len()).rev() {
+        let Some(name) = chain[index].name.as_ref() else { break };
+        let removed =
+            rustix::fs::unlinkat(&chain[index - 1].fd, name.as_os_str(), AtFlags::REMOVEDIR);
+        if removed.is_err() {
             break;
-        }
-        match dir.parent() {
-            Some(parent) => dir = parent.to_path_buf(),
-            None => break,
         }
     }
     Ok(())
@@ -672,46 +767,302 @@ pub fn hex8() -> String {
     format!("{:08x}", rand::random::<u32>())
 }
 
-/// Whether anything at all exists at `path`, links included.
-fn path_exists(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok()
+/// Whether a walk may create the components it does not find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    /// Create a missing component with `mkdirat` at 0700.
+    Create,
+    /// A missing component ends the walk.
+    MustExist,
 }
 
-/// Creates the namespace directory chain, every level at mode 0700.
+/// One directory on the way from the namespace root down to a namespace.
+struct DirStep {
+    /// The open descriptor, never obtained by following a link.
+    fd: OwnedFd,
+    /// This directory's name within its parent; `None` for the root, which
+    /// has no parent in the chain and is therefore never removed.
+    name: Option<OsString>,
+}
+
+/// What `lstat`ing one name inside a namespace directory found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Entry {
+    /// Nothing is there.
+    Absent,
+    /// A regular file.
+    Regular,
+    /// A symbolic link, whatever it points at.
+    Symlink,
+    /// Something else: a directory, a socket, a device.
+    Other,
+}
+
+/// Opens a namespace directory without ever following a symbolic link.
 ///
-/// Every level individually rather than `create_dir_all`, which applies the
-/// umask and commonly leaves a directory group-readable — a directory holding
-/// refresh tokens (risk R22).
-fn ensure_namespace_dirs(paths: &Paths, ns_dir: &Path) -> Result<(), FileStoreError> {
+/// The walk starts at [`Paths::namespace_root`] — after that directory and
+/// the configuration directory above it have been created — and descends one
+/// component at a time with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, creating
+/// what is missing with `mkdirat` at 0700. The returned descriptor is what
+/// every subsequent operation on the namespace is performed relative to, so
+/// no later operation re-resolves a path that could have changed underneath
+/// it.
+///
+/// # Errors
+///
+/// Returns [`FileStoreError::RefusedSymlink`] for a link anywhere along the
+/// chain, [`FileStoreError::NotRegular`] for a component that exists but is
+/// not a directory, [`FileStoreError::OutsideNamespaceRoot`] when `ns_dir`
+/// does not spell a path below the root, and [`FileStoreError::Io`]
+/// otherwise.
+pub fn open_namespace_dir(paths: &Paths, ns_dir: &Path) -> Result<OwnedFd, FileStoreError> {
+    // The two levels above the namespace root are this store's own roots, and
+    // `Paths::ensure_dirs` may not have run yet (`login` creates the store on
+    // its first use). They are created by path; the walk below then refuses a
+    // link *at* the root, so a redirected root is caught either way.
+    create_dir_0700(paths.config_dir())?;
+    let root = paths.namespace_root();
+    create_dir_0700(&root)?;
+
+    let chain = open_chain(&root, ns_dir, Walk::Create)?.ok_or_else(|| {
+        FileStoreError::io(
+            format!("`{}` vanished while it was being created", ns_dir.display()),
+            io::Error::from(io::ErrorKind::NotFound),
+        )
+    })?;
+    let leaf = chain
+        .into_iter()
+        .next_back()
+        .ok_or_else(|| FileStoreError::OutsideNamespaceRoot(ns_dir.to_path_buf()))?;
+    Ok(leaf.fd)
+}
+
+/// Opens `ns_dir` for an operation that was not handed the [`Paths`] it came
+/// from.
+///
+/// [`resolve_pending`]'s signature carries only the namespace directory, so
+/// the walk is anchored at that path's grandparent — which is
+/// [`Paths::namespace_root`] for every path
+/// [`Paths::namespace_dir`](crate::config::paths::Paths::namespace_dir)
+/// builds — and therefore covers exactly the two components another process
+/// could have planted, `<acct>` and `<org>`.
+fn open_ns_dir(ns_dir: &Path) -> Result<Option<OwnedFd>, FileStoreError> {
+    let Some(anchor) = ns_dir.parent().and_then(Path::parent) else {
+        return Err(FileStoreError::OutsideNamespaceRoot(ns_dir.to_path_buf()));
+    };
+    let Some(chain) = open_chain(anchor, ns_dir, Walk::MustExist)? else { return Ok(None) };
+    Ok(chain.into_iter().next_back().map(|step| step.fd))
+}
+
+/// Walks from `root` down to `ns_dir`, one `O_NOFOLLOW` component at a time.
+///
+/// Returns `Ok(None)` when a component is missing and the walk may not create
+/// it. The returned chain always starts with `root` itself.
+fn open_chain(
+    root: &Path,
+    ns_dir: &Path,
+    walk: Walk,
+) -> Result<Option<Vec<DirStep>>, FileStoreError> {
+    let Some(root_fd) = open_dir_at(CWD, root.as_os_str(), root)? else { return Ok(None) };
+    let mut chain = vec![DirStep { fd: root_fd, name: None }];
+
     let relative = ns_dir
-        .strip_prefix(paths.config_dir())
+        .strip_prefix(root)
         .map_err(|_| FileStoreError::OutsideNamespaceRoot(ns_dir.to_path_buf()))?;
 
-    let mut dir = paths.config_dir().to_path_buf();
-    create_dir_0700(&dir)?;
+    let mut shown = root.to_path_buf();
     for component in relative.components() {
-        dir = dir.join(component);
-        create_dir_0700(&dir)?;
+        let name = match component {
+            Component::CurDir => continue,
+            Component::Normal(name) => name,
+            _ => return Err(FileStoreError::OutsideNamespaceRoot(ns_dir.to_path_buf())),
+        };
+        shown.push(name);
+
+        let child = {
+            let parent = match chain.last() {
+                Some(step) => step.fd.as_fd(),
+                None => return Err(FileStoreError::OutsideNamespaceRoot(ns_dir.to_path_buf())),
+            };
+            match open_dir_at(parent, name, &shown)? {
+                Some(fd) => fd,
+                None if walk == Walk::Create => create_dir_at(parent, name, &shown)?,
+                None => return Ok(None),
+            }
+        };
+        chain.push(DirStep { fd: child, name: Some(name.to_os_string()) });
     }
-    Ok(())
+    Ok(Some(chain))
 }
 
-/// Creates one directory at mode 0700, tolerating one that already exists.
+/// Opens one directory relative to `dir`, refusing anything that is not one.
+///
+/// `shown` is the path the caller would recognise, used only for the error.
+fn open_dir_at(
+    dir: BorrowedFd<'_>,
+    name: &OsStr,
+    shown: &Path,
+) -> Result<Option<OwnedFd>, FileStoreError> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    match rustix::fs::openat(dir, name, flags, Mode::empty()) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(errno) if is_symlink_errno(errno) => {
+            Err(FileStoreError::RefusedSymlink(shown.to_path_buf()))
+        }
+        // Darwin evaluates `O_DIRECTORY` against the link itself, so a
+        // symlinked directory arrives as `ENOTDIR` rather than `ELOOP`, and a
+        // dangling one can arrive as `ENOENT` — the two errnos that also have
+        // innocent meanings. An `lstat` tells them apart. It is a second look
+        // at the same name, but not a race worth worrying about: the open
+        // already refused to traverse anything, so all this decides is which
+        // error the caller is handed, and a name swapped in between still
+        // cannot be walked through.
+        Err(errno) if errno == Errno::NOTDIR || errno == Errno::NOENT => {
+            match entry_at(dir, name, shown)? {
+                Entry::Symlink => Err(FileStoreError::RefusedSymlink(shown.to_path_buf())),
+                Entry::Absent => Ok(None),
+                Entry::Regular | Entry::Other => {
+                    Err(FileStoreError::NotRegular(shown.to_path_buf()))
+                }
+            }
+        }
+        Err(errno) => {
+            Err(FileStoreError::errno(format!("could not open `{}`", shown.display()), errno))
+        }
+    }
+}
+
+/// Creates one directory relative to `dir` and opens it, both `O_NOFOLLOW`.
+///
+/// `mkdirat`'s mode argument is masked by the process umask, and this
+/// directory holds refresh tokens (risk R22), so the mode is set again on the
+/// descriptor rather than left to whatever the umask allowed.
+fn create_dir_at(
+    dir: BorrowedFd<'_>,
+    name: &OsStr,
+    shown: &Path,
+) -> Result<OwnedFd, FileStoreError> {
+    match rustix::fs::mkdirat(dir, name, Mode::RWXU) {
+        Ok(()) => {}
+        // Another process creating it first is a race agentctl wins by
+        // re-opening rather than by failing; the re-open still refuses a link.
+        Err(errno) if errno == Errno::EXIST => {}
+        Err(errno) => {
+            return Err(FileStoreError::errno(
+                format!("could not create `{}`", shown.display()),
+                errno,
+            ));
+        }
+    }
+
+    let fd = open_dir_at(dir, name, shown)?.ok_or_else(|| {
+        FileStoreError::io(
+            format!("`{}` vanished immediately after it was created", shown.display()),
+            io::Error::from(io::ErrorKind::NotFound),
+        )
+    })?;
+    rustix::fs::fchmod(&fd, Mode::RWXU).map_err(|errno| {
+        FileStoreError::errno(format!("could not set the mode of `{}`", shown.display()), errno)
+    })?;
+    Ok(fd)
+}
+
+/// `lstat`s one name inside an already-opened namespace directory.
+fn entry_at<P: rustix::path::Arg>(
+    dir: BorrowedFd<'_>,
+    name: P,
+    shown: &Path,
+) -> Result<Entry, FileStoreError> {
+    match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(match FileType::from_raw_mode(stat.st_mode) {
+            FileType::RegularFile => Entry::Regular,
+            FileType::Symlink => Entry::Symlink,
+            _ => Entry::Other,
+        }),
+        Err(errno) if errno == Errno::NOENT => Ok(Entry::Absent),
+        Err(errno) => {
+            Err(FileStoreError::errno(format!("could not stat `{}`", shown.display()), errno))
+        }
+    }
+}
+
+/// The identity of one name inside an already-opened namespace directory.
+fn snapshot_at(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    shown: &Path,
+) -> Result<Option<FileSnapshot>, FileStoreError> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = match rustix::fs::openat(dir, name, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(errno) if errno == Errno::NOENT => return Ok(None),
+        Err(errno) if is_symlink_errno(errno) => {
+            return Err(FileStoreError::RefusedSymlink(shown.to_path_buf()));
+        }
+        Err(errno) => {
+            return Err(FileStoreError::errno(
+                format!("could not open `{}`", shown.display()),
+                errno,
+            ));
+        }
+    };
+    let meta = File::from(fd)
+        .metadata()
+        .map_err(|err| FileStoreError::io(format!("could not stat `{}`", shown.display()), err))?;
+    Ok(Some(snapshot_of(&meta)))
+}
+
+/// Removes one name from an already-opened namespace directory.
+fn unlink_at(dir: BorrowedFd<'_>, name: &str) -> io::Result<()> {
+    rustix::fs::unlinkat(dir, name, AtFlags::empty()).map_err(as_io_error)
+}
+
+/// Sets one file's mode to 0600 without following a link at `name`.
+fn chmod_0600_at(dir: BorrowedFd<'_>, name: &str, shown: &Path) -> Result<(), FileStoreError> {
+    // `fchmodat`'s `AT_SYMLINK_NOFOLLOW` is unimplemented on Linux, so the
+    // link is refused by the open instead and the mode set on the descriptor.
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = rustix::fs::openat(dir, name, flags, Mode::empty()).map_err(|errno| {
+        if is_symlink_errno(errno) {
+            FileStoreError::RefusedSymlink(shown.to_path_buf())
+        } else {
+            FileStoreError::errno(format!("could not open `{}`", shown.display()), errno)
+        }
+    })?;
+    rustix::fs::fchmod(&fd, FILE_MODE_BITS).map_err(|errno| {
+        FileStoreError::errno(format!("could not set the mode of `{}`", shown.display()), errno)
+    })
+}
+
+/// Creates one directory at [`DIR_MODE`], tolerating one that already exists.
+///
+/// Used only for this store's own two roots, which the `O_NOFOLLOW` walk
+/// re-checks afterwards. Every level individually rather than
+/// `create_dir_all`, which applies the umask and commonly leaves a directory
+/// group-readable — a directory holding refresh tokens (risk R22).
 fn create_dir_0700(dir: &Path) -> Result<(), FileStoreError> {
     if dir.is_dir() {
         return Ok(());
     }
     let mut builder = fs::DirBuilder::new();
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, crate::config::paths::DIR_MODE);
+    builder.recursive(true);
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, DIR_MODE);
     builder
         .create(dir)
         .map_err(|err| FileStoreError::io(format!("could not create `{}`", dir.display()), err))
 }
 
-/// Creates a file at 0600 with `O_EXCL`, writes it, and `fsync`s it.
-fn write_new_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file =
-        fs::OpenOptions::new().write(true).create_new(true).mode(FILE_MODE).open(path)?;
+/// Creates a file at 0600 with `O_EXCL` inside an already-opened directory,
+/// writes it, and `fsync`s it.
+///
+/// `openat`'s mode argument is masked by the process umask, so the mode is set
+/// again on the descriptor: this file holds a refresh token, and it is the
+/// inode the rename will carry into place.
+fn create_new_file_at(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let fd = rustix::fs::openat(dir, name, flags, FILE_MODE_BITS).map_err(as_io_error)?;
+    rustix::fs::fchmod(&fd, FILE_MODE_BITS).map_err(as_io_error)?;
+    let mut file = File::from(fd);
     file.write_all(bytes)?;
     file.sync_all()
 }

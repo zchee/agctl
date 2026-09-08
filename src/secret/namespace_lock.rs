@@ -32,9 +32,13 @@
 
 #![cfg_attr(not(test), expect(dead_code, reason = "consumed by lane D and lane C"))]
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Seek;
 use std::io::Write;
+use std::os::fd::AsFd;
+use std::os::fd::BorrowedFd;
+use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -43,6 +47,7 @@ use std::time::Instant;
 use rustix::fs::FlockOperation;
 use rustix::fs::Mode;
 use rustix::fs::OFlags;
+use rustix::io::Errno;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -149,11 +154,16 @@ pub fn acquire(
     validate_segment(acct).map_err(|err| LockError::Unavailable(err.to_string()))?;
     validate_segment(org).map_err(|err| LockError::Unavailable(err.to_string()))?;
 
-    let locks_dir = paths.locks_dir();
-    create_locks_dir(&locks_dir)?;
+    // The locks directory is opened `O_NOFOLLOW` and the lock file is taken
+    // relative to that descriptor, so there is no second path resolution
+    // between checking `.locks` and using it.
+    let dir = create_locks_dir(&paths.locks_dir())?;
 
     let path = paths.lock_path(acct, org);
-    let mut guard = lock_file(&path, deadline, cancel, &fault)?;
+    let name = path.file_name().ok_or_else(|| {
+        LockError::Unavailable(format!("`{}` does not name a lock file", path.display()))
+    })?;
+    let mut guard = lock_at(dir.as_fd(), name, &path, deadline, cancel, &fault)?;
     write_body(&mut guard)?;
 
     // Used by plan AC7 and AC35 to make a second process actually wait, and
@@ -166,7 +176,7 @@ pub fn acquire(
 
 /// Takes an exclusive `flock` on `path`, creating the file if needed.
 ///
-/// Shared with [`crate::config::AgentctlConfig::save`], which wants the same
+/// Shared with [`crate::config::AgentctlConfig::update`], which wants the same
 /// semantics over `.config.lock`.
 ///
 /// # Errors
@@ -178,23 +188,40 @@ pub fn lock_file(
     cancel: &Cancel,
     fault: &Fault,
 ) -> Result<NamespaceLockGuard, LockError> {
+    let dir = open_parent_dir(path)?;
+    let name = path.file_name().ok_or_else(|| {
+        LockError::Unavailable(format!("`{}` does not name a lock file", path.display()))
+    })?;
+    lock_at(dir.as_fd(), name, path, deadline, cancel, fault)
+}
+
+/// Takes the exclusive `flock` on `name` inside an already-opened directory.
+///
+/// Splitting this out is what lets the two callers differ where they must:
+/// [`acquire`] hands in a `.locks` descriptor opened `O_NOFOLLOW`, because a
+/// link there is nobody's legitimate layout, while [`lock_file`] resolves the
+/// configuration directory normally, because that one may well be a symlink
+/// the user put there and every other path in the store follows it.
+fn lock_at(
+    dir: BorrowedFd<'_>,
+    name: &OsStr,
+    path: &Path,
+    deadline: Instant,
+    cancel: &Cancel,
+    fault: &Fault,
+) -> Result<NamespaceLockGuard, LockError> {
     if fault.is("flock_enotsup") {
         return Err(LockError::Unavailable(
-            "flock is not supported on this filesystem (injected by AGENTCTL_FAULT)".to_owned(),
+            // Not naming the environment variable is deliberate: this literal
+            // is in code the default-feature build compiles, so spelling it
+            // would put a test-only variable name into the release artifact
+            // (plan AC37). `crate::runtime::fault` says which switch this is.
+            "flock is not supported on this filesystem (injected by the test fault switch)"
+                .to_owned(),
         ));
     }
 
-    // `O_NOFOLLOW` rather than an `lstat` first: the check and the open are
-    // then one syscall, so a link cannot be swapped in between them.
-    let flags = OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW;
-    let fd = rustix::fs::open(path, flags, Mode::RUSR | Mode::WUSR).map_err(|errno| {
-        if errno == rustix::io::Errno::LOOP || errno == rustix::io::Errno::MLINK {
-            LockError::RefusedSymlink(path.to_path_buf())
-        } else {
-            LockError::Unavailable(format!("could not open `{}`: {errno}", path.display()))
-        }
-    })?;
-    let file = File::from(fd);
+    let file = open_lock_file(dir, name, path)?;
 
     loop {
         match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
@@ -219,6 +246,61 @@ pub fn lock_file(
                 )));
             }
         }
+    }
+}
+
+/// How many times [`open_lock_file`] re-looks before giving up.
+///
+/// Each round costs two `openat` calls and only happens while another process
+/// is creating the same lock file, so a handful is generous; the bound is
+/// there so churn cannot spin forever.
+const CREATE_ATTEMPTS: u32 = 8;
+
+/// Opens the lock file inside `dir`, creating it if it is not there yet.
+///
+/// Deliberately not one `openat(.., O_CREAT, ..)` call. Darwin does not retry
+/// `openat`'s lookup when another thread wins the create race: two processes
+/// reaching a fresh lock file at the same moment make it return `ENOENT` — not
+/// `EEXIST` — about 40% of the time, measured on this machine with a
+/// two-thread probe. Path-based `open(2)` does not have the fault, but a path
+/// is exactly what the descriptor exists to stop resolving a second time. So
+/// the create is split: open what is there, and only when there is nothing
+/// there create it with `O_EXCL`, reading `EEXIST` as "somebody just made it"
+/// and looking again.
+///
+/// A planted symlink is refused either way round: `O_NOFOLLOW` refuses it on
+/// the open of an existing file, and `O_CREAT | O_EXCL` refuses it — as
+/// `EEXIST`, which sends us back to the `O_NOFOLLOW` open that reports it
+/// properly.
+fn open_lock_file(dir: BorrowedFd<'_>, name: &OsStr, path: &Path) -> Result<File, LockError> {
+    let existing = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let fresh = OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
+
+    for _ in 0..CREATE_ATTEMPTS {
+        match rustix::fs::openat(dir, name, existing, Mode::empty()) {
+            Ok(fd) => return Ok(File::from(fd)),
+            Err(errno) if errno == Errno::NOENT => {}
+            Err(errno) => return Err(open_error(errno, path)),
+        }
+        match rustix::fs::openat(dir, name, fresh, Mode::RUSR | Mode::WUSR) {
+            Ok(fd) => return Ok(File::from(fd)),
+            Err(errno) if errno == Errno::EXIST => continue,
+            Err(errno) => return Err(open_error(errno, path)),
+        }
+    }
+
+    Err(LockError::Unavailable(format!(
+        "could not open `{}`: it kept being created and removed underneath us",
+        path.display()
+    )))
+}
+
+/// Maps an `openat` failure on the lock file onto a [`LockError`].
+fn open_error(errno: Errno, path: &Path) -> LockError {
+    if errno == Errno::LOOP || errno == Errno::MLINK {
+        LockError::RefusedSymlink(path.to_path_buf())
+    } else {
+        LockError::Unavailable(format!("could not open `{}`: {errno}", path.display()))
     }
 }
 
@@ -257,17 +339,75 @@ fn write_body(guard: &mut NamespaceLockGuard) -> Result<(), LockError> {
     })
 }
 
-/// Creates the locks directory at 0700.
-fn create_locks_dir(dir: &Path) -> Result<(), LockError> {
+/// Creates the locks directory at 0700, refusing a symbolic link.
+///
+/// `Path::is_dir` follows links, so it would happily accept a `.locks`
+/// pointing anywhere and then create every lock file there. The check is
+/// therefore an `lstat`: a link at this path is somebody else deciding where
+/// this store's locks live, which is a decision to refuse rather than to
+/// follow.
+fn create_locks_dir(dir: &Path) -> Result<OwnedFd, LockError> {
     use std::os::unix::fs::DirBuilderExt;
 
-    if dir.is_dir() {
-        return Ok(());
+    let exists = match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(LockError::RefusedSymlink(dir.to_path_buf()));
+        }
+        Ok(meta) if meta.is_dir() => true,
+        Ok(_) => {
+            return Err(LockError::Unavailable(format!("`{}` is not a directory", dir.display())));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            return Err(LockError::Unavailable(format!(
+                "could not stat `{}`: {err}",
+                dir.display()
+            )));
+        }
+    };
+
+    if !exists {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(crate::config::paths::DIR_MODE);
+        builder.create(dir).map_err(|err| {
+            LockError::Unavailable(format!("could not create `{}`: {err}", dir.display()))
+        })?;
     }
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true).mode(crate::config::paths::DIR_MODE);
-    builder.create(dir).map_err(|err| {
-        LockError::Unavailable(format!("could not create `{}`: {err}", dir.display()))
+
+    // `O_NOFOLLOW` closes the window the `lstat` above leaves open: a link
+    // swapped in between the two would be followed by a second resolution,
+    // and there is no second resolution once the descriptor is held. Darwin
+    // reports `O_DIRECTORY | O_NOFOLLOW` on a link as `ENOTDIR`, so that
+    // errno joins `ELOOP` here — the `lstat` already established that a
+    // directory was there a moment ago.
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    rustix::fs::open(dir, flags, Mode::empty()).map_err(|errno| {
+        if errno == Errno::LOOP || errno == Errno::MLINK || errno == Errno::NOTDIR {
+            LockError::RefusedSymlink(dir.to_path_buf())
+        } else {
+            LockError::Unavailable(format!("could not open `{}`: {errno}", dir.display()))
+        }
+    })
+}
+
+/// Opens the directory holding `path`, so the lock file is taken relative to
+/// a descriptor rather than by a path resolved a second time.
+///
+/// Deliberately *without* `O_NOFOLLOW`. The only caller is [`lock_file`], and
+/// the only path it is given is `.config.lock`, whose parent is the
+/// configuration directory — a directory the user names, and one that a
+/// dotfile manager may well have made a symlink. Everything else in the store
+/// resolves it normally (`Paths::ensure_dirs`, the config writer), so refusing
+/// it only here would half-support a layout rather than support or reject it.
+/// Nothing is gained security-wise either: an attacker who can plant a link at
+/// the configured path could equally plant a real directory there.
+fn open_parent_dir(path: &Path) -> Result<OwnedFd, LockError> {
+    let parent = path.parent().ok_or_else(|| {
+        LockError::Unavailable(format!("`{}` has no parent directory", path.display()))
+    })?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    rustix::fs::open(parent, flags, Mode::empty()).map_err(|errno| {
+        LockError::Unavailable(format!("could not open `{}`: {errno}", parent.display()))
     })
 }
 

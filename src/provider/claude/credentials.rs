@@ -400,31 +400,28 @@ fn sha256_hex(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
 }
 
-/// Removes a string-valued key.
+/// Removes a string-valued key, leaving a wrong-typed one exactly where it is.
+///
+/// The type is checked before the removal rather than after, because
+/// `serde_json`'s `preserve_order` map is index-backed: `shift_remove`
+/// followed by `insert` would put the value back at the *end*, which is a
+/// reordering the byte-stable round-trip this passthrough exists for cannot
+/// afford.
 fn take_string(map: &mut Map<String, Value>, key: &str) -> Option<String> {
+    if !matches!(map.get(key), Some(Value::String(_))) {
+        return None;
+    }
     match map.shift_remove(key) {
         Some(Value::String(text)) => Some(text),
-        Some(other) => {
-            // Not a string: put it back so the round-trip does not lose it.
-            map.insert(key.to_owned(), other);
-            None
-        }
-        None => None,
+        _ => None,
     }
 }
 
-/// Removes an integer-valued key.
+/// Removes an integer-valued key, leaving a wrong-typed one where it is.
 fn take_i64(map: &mut Map<String, Value>, key: &str) -> Option<i64> {
-    match map.shift_remove(key) {
-        Some(value) => match value.as_i64() {
-            Some(number) => Some(number),
-            None => {
-                map.insert(key.to_owned(), value);
-                None
-            }
-        },
-        None => None,
-    }
+    let number = map.get(key).and_then(Value::as_i64)?;
+    map.shift_remove(key);
+    Some(number)
 }
 
 /// Inserts a string field when it has a value.

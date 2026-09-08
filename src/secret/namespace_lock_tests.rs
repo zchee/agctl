@@ -1,5 +1,6 @@
 //! Tests for the namespace lock (plan AC48, L3).
 
+use std::os::fd::AsFd;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
@@ -212,4 +213,131 @@ fn hold_lock_keeps_the_lock_until_the_deadline() {
 fn the_documented_timings_are_the_plan_s() {
     assert_eq!(RETRY_INTERVAL, Duration::from_millis(250));
     assert_eq!(COMMAND_LOCK_TIMEOUT, Duration::from_secs(5));
+}
+
+#[test]
+fn a_symlinked_locks_directory_is_refused() {
+    // A link at `.locks` puts this store's locks — and with them its idea of
+    // who may write a namespace — under somebody else's control, so both the
+    // directory check and the descriptor the lock is opened relative to
+    // refuse it.
+    let (dir, paths) = store();
+    let elsewhere = dir.path().join("someone-elses-locks");
+    std::fs::create_dir_all(&elsewhere).expect("directories should be creatable");
+    std::fs::create_dir_all(paths.namespace_root()).expect("directories should be creatable");
+    std::os::unix::fs::symlink(&elsewhere, paths.locks_dir())
+        .expect("the symlink should be creatable");
+
+    let err = acquire(&paths, "acct", "org", soon(), &Cancel::new(), Fault::none())
+        .expect_err("a symlinked locks directory must be refused");
+    assert!(matches!(err, LockError::RefusedSymlink(_)), "got {err:?}");
+
+    let planted: Vec<_> = std::fs::read_dir(&elsewhere)
+        .expect("listable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(planted.is_empty(), "a lock file was created through the link: {planted:?}");
+}
+
+#[test]
+fn a_file_where_the_locks_directory_belongs_is_refused() {
+    let (_dir, paths) = store();
+    std::fs::create_dir_all(paths.namespace_root()).expect("directories should be creatable");
+    std::fs::write(paths.locks_dir(), b"not a directory").expect("the file should be writable");
+
+    let err = acquire(&paths, "acct", "org", soon(), &Cancel::new(), Fault::none())
+        .expect_err("a file where the locks directory belongs must be refused");
+    assert!(matches!(err, LockError::Unavailable(_)), "got {err:?}");
+}
+
+#[test]
+fn a_symlinked_configuration_directory_is_followed_rather_than_refused() {
+    // The counterpart to the `.locks` rule, and the reason the two paths are
+    // opened differently. `.locks` lives inside a directory agentctl created,
+    // so a link there is nobody's legitimate layout. The configuration
+    // directory is a path the *user* names, and a dotfile manager pointing it
+    // at a repository is ordinary; `Paths::ensure_dirs` and the config writer
+    // both follow it, so the lock has to as well or the layout is only
+    // half-supported.
+    let dir = TempDir::new().expect("a temporary directory should be available");
+    let real = dir.path().join("dotfiles-agentctl");
+    std::fs::create_dir_all(&real).expect("directories should be creatable");
+    let linked = dir.path().join("agentctl");
+    std::os::unix::fs::symlink(&real, &linked).expect("the symlink should be creatable");
+
+    let paths = Paths::with_config_dir(linked);
+    let guard = lock_file(&paths.config_lock(), soon(), &Cancel::new(), &Fault::none())
+        .expect("a symlinked configuration directory is a supported layout");
+    assert!(real.join(".config.lock").exists(), "the lock landed in the real directory");
+    drop(guard);
+}
+
+#[test]
+fn many_threads_racing_to_create_one_fresh_lock_file_all_open_it() {
+    // A regression test for a fault a single-shot test misses. Darwin does
+    // not retry `openat`'s lookup when another thread wins an `O_CREAT` race,
+    // so `openat(dirfd, name, O_RDWR | O_CREAT, ..)` on a lock file that does
+    // not exist yet returns `ENOENT` — not `EEXIST` — for a large fraction of
+    // the racers: a two-thread probe measured 328 failures in 800 attempts on
+    // this machine, and it cost roughly four `AgentctlConfig::update` runs in
+    // five before `open_lock_file` split the create out behind `O_EXCL`.
+    //
+    // `open_lock_file` is exercised rather than `acquire` on purpose: the
+    // fault is in the create, and going through `acquire` would serialise the
+    // threads on the `flock` and spend the whole test in its 250 ms backoff.
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 60;
+
+    for round in 0..ROUNDS {
+        let dir = TempDir::new().expect("a temporary directory should be available");
+        let path = dir.path().join(".config.lock");
+        let name = path.file_name().expect("the path names a file");
+        let parent = rustix::fs::open(
+            dir.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("the temporary directory should be openable");
+
+        let failures = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    if let Err(err) = open_lock_file(parent.as_fd(), name, &path) {
+                        failures
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(err.to_string());
+                    }
+                });
+            }
+        });
+
+        let failures = failures.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(failures.is_empty(), "round {round}: {failures:?}");
+        assert!(path.exists(), "round {round}: the lock file should have been created");
+    }
+}
+
+#[test]
+fn a_lock_file_that_is_a_symlink_is_still_refused_when_it_has_to_be_created_around() {
+    // The create path uses `O_CREAT | O_EXCL`, which reports a planted link as
+    // `EEXIST`; the retry then opens it `O_NOFOLLOW` and reports it properly.
+    let (dir, paths) = store();
+    std::fs::create_dir_all(paths.namespace_root()).expect("directories should be creatable");
+    std::fs::create_dir_all(paths.locks_dir()).expect("directories should be creatable");
+    let elsewhere = dir.path().join("planted.lock");
+    std::fs::write(&elsewhere, b"{}").expect("the file should be writable");
+    std::os::unix::fs::symlink(&elsewhere, paths.lock_path("acct", "org"))
+        .expect("the symlink should be creatable");
+
+    let err = acquire(&paths, "acct", "org", soon(), &Cancel::new(), Fault::none())
+        .expect_err("a symlinked lock file must be refused");
+    assert!(matches!(err, LockError::RefusedSymlink(_)), "got {err:?}");
+    assert_eq!(
+        std::fs::read_to_string(&elsewhere).expect("readable"),
+        "{}",
+        "the link's target was written through"
+    );
 }

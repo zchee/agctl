@@ -65,15 +65,17 @@ fn saving_and_loading_round_trips_every_kind() {
         .expect("valid"),
     );
 
-    config.save(&paths).expect("the registry should save");
+    let saved = config.clone();
+    AgentctlConfig::update(&paths, |registry| *registry = config)
+        .expect("the registry should save");
     let loaded = AgentctlConfig::load(&paths).expect("the registry should load");
-    assert_eq!(loaded, config);
+    assert_eq!(loaded, saved);
 }
 
 #[test]
 fn the_saved_file_is_0600_and_the_lock_file_stays() {
     let (_dir, paths) = store();
-    AgentctlConfig::default().save(&paths).expect("the registry should save");
+    AgentctlConfig::update(&paths, |_| ()).expect("the registry should save");
 
     let mode =
         std::fs::metadata(paths.config_file()).expect("the file exists").permissions().mode();
@@ -84,10 +86,9 @@ fn the_saved_file_is_0600_and_the_lock_file_stays() {
 #[test]
 fn saving_twice_leaves_no_temporary_file() {
     let (_dir, paths) = store();
-    let mut config = AgentctlConfig::default();
-    config.save(&paths).expect("the first save should succeed");
-    config.upsert(owned("acct-1", "org-1"));
-    config.save(&paths).expect("the second save should succeed");
+    AgentctlConfig::update(&paths, |_| ()).expect("the first save should succeed");
+    AgentctlConfig::update(&paths, |registry| registry.upsert(owned("acct-1", "org-1")))
+        .expect("the second save should succeed");
 
     let strays: Vec<_> = std::fs::read_dir(paths.config_dir())
         .expect("the store should be listable")
@@ -214,4 +215,46 @@ fn the_serialized_shape_tags_the_kind() {
     })
     .expect("the kind should serialize");
     assert_eq!(config_dir["kind"], "config_dir_read_only");
+}
+
+#[test]
+fn two_concurrent_updates_both_land() {
+    // The reason `save` is not public. `flock` is per open file description,
+    // so a load-outside/save-inside pair would let each thread write a
+    // registry it read before the other thread's record existed, and the
+    // later write would erase the earlier one. `update` re-reads inside the
+    // lock, so the second thread sees the first thread's record and adds to
+    // it.
+    let (_dir, paths) = store();
+    paths.ensure_dirs().expect("directories should be creatable");
+
+    std::thread::scope(|scope| {
+        for acct in ["acct-1", "acct-2"] {
+            let paths = &paths;
+            scope.spawn(move || {
+                AgentctlConfig::update(paths, |registry| registry.upsert(owned(acct, "org")))
+                    .unwrap_or_else(|err| panic!("`{acct}` should have been written: {err}"));
+            });
+        }
+    });
+
+    let loaded = AgentctlConfig::load(&paths).expect("the registry should load");
+    let mut accounts: Vec<&str> =
+        loaded.accounts.iter().map(|record| record.account_uuid.as_str()).collect();
+    accounts.sort_unstable();
+    assert_eq!(accounts, ["acct-1", "acct-2"], "one update overwrote the other");
+}
+
+#[test]
+fn update_returns_the_closure_s_value_and_persists_the_change() {
+    let (_dir, paths) = store();
+    let key = AgentctlConfig::update(&paths, |registry| {
+        registry.upsert(owned("acct-1", "org-1"));
+        registry.accounts.len()
+    })
+    .expect("the registry should save");
+    assert_eq!(key, 1, "the closure's value is handed back once the write succeeded");
+
+    let loaded = AgentctlConfig::load(&paths).expect("the registry should load");
+    assert_eq!(loaded.get("acct-1", "org-1").map(AccountRecord::key), Some(("acct-1", "org-1")));
 }
