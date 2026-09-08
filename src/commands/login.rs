@@ -99,6 +99,15 @@ pub trait LoginIo {
     fn confirm(&mut self, question: &str) -> Result<bool, AppError>;
 }
 
+/// Suppresses the browser launch, so the end-to-end suite can drive a real
+/// `login` without opening a window on the developer's desktop.
+///
+/// Test seam only, and compiled out without the `testing` feature (plan
+/// section 3.9): a release build must not be talkable out of showing the user
+/// the URL it is asking them to authorize.
+#[cfg(feature = "testing")]
+pub const NO_BROWSER_ENV: &str = "AGENTCTL_NO_BROWSER";
+
 /// The real terminal.
 pub struct Terminal;
 
@@ -108,6 +117,14 @@ impl LoginIo for Terminal {
     }
 
     fn open_browser(&mut self, url: &str) {
+        // The URL has already been printed, so suppressing the launch costs
+        // the user nothing but a click.
+        #[cfg(feature = "testing")]
+        if std::env::var_os(NO_BROWSER_ENV).is_some() {
+            tracing::debug!("not opening a browser: the test seam is set");
+            return;
+        }
+
         // Detached: `open(1)` returns immediately on macOS, but a Linux
         // desktop opener can live as long as the browser it started, and
         // waiting for that would hang the login.

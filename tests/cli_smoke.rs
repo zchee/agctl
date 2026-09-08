@@ -21,8 +21,16 @@ use predicates::str::contains;
 use tempfile::TempDir;
 
 /// The binary under test.
+///
+/// `CARGO_BIN_EXE_agentctl` — the path cargo built for *this* test target —
+/// rather than `assert_cmd`'s `cargo_bin`, which guesses
+/// `<manifest>/target/debug/agentctl`. This project builds into a tmpfs target
+/// directory (`~/.config/rust/config.dev.toml`), so that guess finds whatever
+/// a bare `cargo build` happened to leave in the worktree: on this machine a
+/// binary from an earlier build, of a different size, from different sources.
+/// A smoke test asserting against a stale artifact is worse than no smoke test.
 fn agentctl() -> Command {
-    Command::cargo_bin("agentctl").expect("the `agentctl` binary should be built")
+    Command::new(env!("CARGO_BIN_EXE_agentctl"))
 }
 
 /// The binary under test, cut off from every real credential store.
