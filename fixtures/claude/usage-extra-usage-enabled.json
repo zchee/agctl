@@ -1,0 +1,116 @@
+{
+  "five_hour": {
+    "utilization": 4.0,
+    "resets_at": "2026-09-08T16:50:00.309254+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null,
+    "locked_reason": null
+  },
+  "seven_day": {
+    "utilization": 59.0,
+    "resets_at": "2026-09-11T16:00:00.309275+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null,
+    "locked_reason": null
+  },
+  "seven_day_oauth_apps": null,
+  "seven_day_opus": null,
+  "seven_day_sonnet": null,
+  "seven_day_cowork": null,
+  "seven_day_omelette": null,
+  "tangelo": null,
+  "iguana_necktie": null,
+  "omelette_promotional": null,
+  "nimbus_quill": {
+    "utilization": 0.0,
+    "resets_at": null,
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null,
+    "locked_reason": null
+  },
+  "cinder_cove": null,
+  "copper_kite": null,
+  "amber_ladder": null,
+  "juniper_tide": null,
+  "extra_usage": {
+    "is_enabled": true,
+    "monthly_limit": 500000,
+    "used_credits": 21956.0,
+    "utilization": 4.3911999999999995,
+    "currency": "USD",
+    "decimal_places": 2,
+    "disabled_reason": null,
+    "user_disabled": false,
+    "spend_limit_reached": false,
+    "credits_ever_enabled": true,
+    "daily": null,
+    "weekly": null
+  },
+  "limits": [
+    {
+      "kind": "session",
+      "group": "session",
+      "percent": 4,
+      "severity": "normal",
+      "resets_at": "2026-09-08T16:50:00.309254+00:00",
+      "scope": null,
+      "is_active": false
+    },
+    {
+      "kind": "weekly_all",
+      "group": "weekly",
+      "percent": 59,
+      "severity": "normal",
+      "resets_at": "2026-09-11T16:00:00.309275+00:00",
+      "scope": null,
+      "is_active": false
+    },
+    {
+      "kind": "weekly_scoped",
+      "group": "weekly",
+      "percent": 94,
+      "severity": "critical",
+      "resets_at": "2026-09-11T16:00:00.309444+00:00",
+      "scope": {
+        "model": {
+          "id": null,
+          "display_name": "Fable"
+        },
+        "surface": null
+      },
+      "is_active": true
+    }
+  ],
+  "spend": {
+    "used": {
+      "amount_minor": 21956,
+      "currency": "USD",
+      "exponent": 2
+    },
+    "limit": {
+      "amount_minor": 500000,
+      "currency": "USD",
+      "exponent": 2
+    },
+    "percent": 4,
+    "severity": "normal",
+    "enabled": true,
+    "disabled_reason": null,
+    "cap": {
+      "money": null,
+      "credits": {
+        "amount_minor": 500000,
+        "exponent": 2
+      }
+    },
+    "balance": null,
+    "auto_reload": null,
+    "disclaimer": "Usage credits cover you when you hit your plan limits. [Learn more](https://support.claude.com/articles/12429409)",
+    "can_purchase_credits": false,
+    "can_toggle": false
+  },
+  "member_dashboard_available": false
+}

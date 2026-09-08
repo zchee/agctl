@@ -1,0 +1,17 @@
+{
+  "token_type": "Bearer",
+  "access_token": "<REDACTED-ACCESS-TOKEN>",
+  "expires_in": 28800,
+  "refresh_token": "<REDACTED-REFRESH-TOKEN>",
+  "scope": "user:file_upload user:inference user:mcp_servers user:profile user:sessions:claude_code",
+  "token_uuid": "33333333-3333-4333-8333-333333333333",
+  "refresh_token_expires_in": 2377445,
+  "organization": {
+    "uuid": "22222222-2222-4222-8222-222222222222",
+    "name": "Example Org"
+  },
+  "account": {
+    "uuid": "11111111-1111-4111-8111-111111111111",
+    "email_address": "user@example.com"
+  }
+}
