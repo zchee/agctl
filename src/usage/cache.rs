@@ -1,0 +1,195 @@
+//! The per-account usage cache: `<cache_dir>/<acct>.<org>.json`.
+//!
+//! Two jobs, both from plan principle P4:
+//!
+//! - **Do not hammer an undocumented endpoint.** Inside [`TTL`] a repeated
+//!   `status` answers from disk and makes no request at all.
+//! - **Stale beats blank.** When a fetch fails — a 429, a dead network, a
+//!   keychain that went away — the last good numbers are rendered with the
+//!   row marked `stale` or `rate-limited`. A user who can see yesterday's 35 %
+//!   next to a `rate-limited` badge is better served than one who sees an
+//!   empty cell.
+//!
+//! # Why the *body* is cached, not the snapshot
+//!
+//! The entry stores the untouched response body and re-parses it on load,
+//! rather than serializing [`UsageSnapshot`](crate::usage::model::UsageSnapshot).
+//! That costs one JSON parse per cached row and buys three things: `--raw`
+//! round-trips from the cache exactly as it does from the network; a build
+//! that learns to read a new field (the `extra_usage` credits parser in W2)
+//! immediately understands entries written by an older build; and the model
+//! types need no `serde` derives, so nothing about the on-disk format leaks
+//! into the vocabulary the renderer uses.
+//!
+//! The file is written the same way credentials are — a temporary file, then
+//! a rename, mode 0600 — because it sits in the same store and a half-written
+//! cache entry would be indistinguishable from a corrupt one. It holds no
+//! token material (invariant I4); the mode is for consistency and because
+//! usage figures are still the user's business alone.
+
+use std::fs;
+use std::io;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Value;
+
+use crate::config::paths::FILE_MODE;
+use crate::config::paths::Paths;
+use crate::config::paths::validate_segment;
+use crate::error::AppError;
+use crate::secret::file_store::hex8;
+
+/// How long a cached response is served without asking the API again.
+pub const TTL: Duration = Duration::from_secs(300);
+
+/// The format version of an entry. A file written by a future build with a
+/// higher version is ignored rather than misread.
+pub const ENTRY_VERSION: u32 = 1;
+
+/// The largest cache file this build will read.
+///
+/// A usage body is a couple of kilobytes; the ceiling is here so a corrupt or
+/// hostile file cannot make a `status` run allocate without bound.
+pub const MAX_ENTRY_BYTES: u64 = 1 << 20;
+
+/// One account's cached usage response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheEntry {
+    /// The format version, [`ENTRY_VERSION`].
+    pub version: u32,
+    /// When the response was received, milliseconds since the epoch.
+    pub fetched_at_ms: i64,
+    /// When a `retry-after` the server sent expires, if it sent one.
+    ///
+    /// Persisted rather than kept in memory so that a *second* `status`
+    /// invocation inside the window also declines to call (plan AC8: no retry
+    /// within the window, not merely no retry within the pass).
+    #[serde(default)]
+    pub rate_limited_until_ms: Option<i64>,
+    /// The untouched response body.
+    pub body: Value,
+}
+
+impl CacheEntry {
+    /// Builds an entry around a freshly received body.
+    pub fn new(fetched_at_ms: i64, body: Value) -> Self {
+        Self { version: ENTRY_VERSION, fetched_at_ms, rate_limited_until_ms: None, body }
+    }
+
+    /// Whether this entry may be served without asking the API.
+    ///
+    /// A clock that moved backwards makes the entry look like it was fetched
+    /// in the future; that is treated as *not* fresh, so the run refetches
+    /// rather than serving an entry it cannot date.
+    pub fn is_fresh(&self, now_ms: i64, ttl: Duration) -> bool {
+        let Ok(ttl_ms) = i64::try_from(ttl.as_millis()) else {
+            return false;
+        };
+        let Some(age_ms) = now_ms.checked_sub(self.fetched_at_ms) else {
+            return false;
+        };
+        (0..ttl_ms).contains(&age_ms)
+    }
+
+    /// How many seconds of a server-imposed rate limit are still to run.
+    ///
+    /// `None` means the account is free to call again.
+    pub fn rate_limited_for(&self, now_ms: i64) -> Option<u64> {
+        let until = self.rate_limited_until_ms?;
+        let remaining_ms = until.checked_sub(now_ms)?;
+        if remaining_ms <= 0 {
+            return None;
+        }
+        // Round up, so a 500 ms remainder is reported as "1s to go" rather
+        // than as "no wait left". `div_ceil` is stable for unsigned integers
+        // only, which is why the conversion comes first — and it is
+        // infallible here, the value having just been shown positive.
+        u64::try_from(remaining_ms).ok().map(|millis| millis.div_ceil(1000))
+    }
+}
+
+/// The cache file for one account.
+///
+/// # Errors
+///
+/// Returns [`AppError::Config`] when either identifier cannot be part of a
+/// file name — the same validation the namespace directories use, so a
+/// registry that cannot name a namespace cannot name a cache entry either.
+pub fn path(paths: &Paths, acct: &str, org: &str) -> Result<PathBuf, AppError> {
+    validate_segment(acct)?;
+    validate_segment(org)?;
+    Ok(paths.cache_dir().join(format!("{acct}.{org}.json")))
+}
+
+/// Reads an entry, or `None` when there is nothing usable to read.
+///
+/// Every failure — absent, oversized, corrupt, a version from the future — is
+/// `None`. A cache is an optimisation: refusing to run because one is
+/// unreadable would turn a harmless stale file into an outage.
+pub fn load(path: &Path) -> Option<CacheEntry> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_ENTRY_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let entry: CacheEntry = serde_json::from_slice(&bytes).ok()?;
+    (entry.version == ENTRY_VERSION).then_some(entry)
+}
+
+/// Writes an entry atomically at mode 0600.
+///
+/// # Errors
+///
+/// Returns the underlying [`io::Error`]. Callers treat a cache write failure
+/// as a warning: the numbers were still fetched and rendered.
+pub fn store(path: &Path, entry: &CacheEntry) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "the cache path has no parent directory")
+    })?;
+    fs::create_dir_all(parent)?;
+
+    let json = serde_json::to_vec(entry)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+
+    let tmp = parent.join(format!(
+        ".{}.tmp.{}",
+        path.file_name().map_or_else(|| "usage".into(), |name| name.to_string_lossy()),
+        hex8()
+    ));
+
+    // `create_new` so a stray temporary file from a crashed run is never
+    // silently reused, and an explicit mode so the process umask cannot widen
+    // it (the same rule the credential store follows).
+    let write = (|| -> io::Result<()> {
+        use std::io::Write;
+
+        let mut file =
+            fs::OpenOptions::new().write(true).create_new(true).mode(FILE_MODE).open(&tmp)?;
+        file.write_all(&json)?;
+        file.sync_all()
+    })();
+
+    if let Err(err) = write {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+
+    // A pre-existing file keeps its own mode through a rename onto it only on
+    // some filesystems, so the mode is asserted afterwards as well.
+    fs::set_permissions(path, PermissionsExt::from_mode(FILE_MODE))
+}
+
+#[cfg(test)]
+#[path = "cache_tests.rs"]
+mod tests;

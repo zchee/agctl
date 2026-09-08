@@ -13,8 +13,10 @@ mod commands;
 mod config;
 mod error;
 mod provider;
+mod render;
 mod runtime;
 mod secret;
+mod usage;
 
 use std::process;
 
@@ -25,6 +27,7 @@ use crate::cli::AccountsCommand;
 use crate::cli::ClaudeCommand;
 use crate::cli::Cli;
 use crate::cli::Command;
+use crate::commands::status;
 use crate::error::AppError;
 use crate::error::EXIT_OK;
 use crate::runtime::coordinator::Cancel;
@@ -73,7 +76,7 @@ fn init_tracing() {
 fn dispatch(cli: &Cli, cancel: &Cancel) -> Result<(), AppError> {
     let Command::Claude { command } = &cli.command;
     match command {
-        ClaudeCommand::Status(_) => Err(AppError::not_implemented("agentctl claude status")),
+        ClaudeCommand::Status(args) => status::run(cli, args, cancel),
         ClaudeCommand::Watch(_) => Err(AppError::not_implemented("agentctl claude watch")),
         ClaudeCommand::Login(args) => commands::login::run(cli.config_dir.as_deref(), args, cancel),
         ClaudeCommand::Import(_) => Err(AppError::not_implemented("agentctl claude import")),

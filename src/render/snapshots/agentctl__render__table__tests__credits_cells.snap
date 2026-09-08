@@ -1,0 +1,11 @@
+---
+source: src/render/table_tests.rs
+expression: rendered
+---
+ Account    | Org  | Plan | 5h  | Weekly | Fable (weekly) | Credits               | Next reset | State 
+------------+------+------+-----+--------+----------------+-----------------------+------------+-------
+ n/a        | Acme | max  | 21% | 35%    | 56%            | n/a                   | 2h13m      | ok    
+ off        | Acme | max  | 21% | 35%    | 56%            | off                   | 2h13m      | ok    
+ capped     | Acme | max  | 21% | 35%    | 56%            | $12.34 / $50.00 (25%) | 2h13m      | ok    
+ uncapped   | Acme | max  | 21% | 35%    | 56%            | $12.34 / Unlimited    | 2h13m      | ok    
+ unmeasured | Acme | max  | 21% | 35%    | 56%            | —                     | 2h13m      | ok

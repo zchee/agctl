@@ -19,8 +19,6 @@
 //! `doctor --remove-stale` is the single, interactive, heavily-qualified
 //! exception (invariant I11).
 
-#![cfg_attr(not(test), expect(dead_code, reason = "consumed by lane D and lane C"))]
-
 use std::path::Path;
 use std::time::SystemTime;
 

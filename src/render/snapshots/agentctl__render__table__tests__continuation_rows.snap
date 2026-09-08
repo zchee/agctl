@@ -1,0 +1,9 @@
+---
+source: src/render/table_tests.rs
+expression: rendered
+---
+ Account                        | Org  | Plan | 5h  | Weekly | Fable (weekly) | Credits | Next reset | State 
+--------------------------------+------+------+-----+--------+----------------+---------+------------+-------
+ alice@example.com              | Acme | max  | 21% | 35%    | 56%            | n/a     | 2h13m      | ok    
+   ↳ monthly_foo (unknown kind) |      |      |     | 7%     |                |         | 23d0h      |       
+   ↳ opus (weekly)              |      |      |     | 12%    |                |         | —          |

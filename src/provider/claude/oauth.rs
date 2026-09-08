@@ -644,7 +644,6 @@ fn exchange_body(
 ///
 /// See [`OauthError`]. `invalid_grant` means the refresh chain is dead and
 /// only a fresh login recovers it (risk R26, AC29) — it is never transient.
-#[cfg_attr(not(test), expect(dead_code, reason = "the refresh path lands with lane C"))]
 pub fn refresh(
     client: &OauthClient,
     creds: &Credentials,

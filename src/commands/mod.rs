@@ -7,3 +7,4 @@
 //! unit test that never spawns a process.
 
 pub mod login;
+pub mod status;

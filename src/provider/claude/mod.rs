@@ -10,12 +10,14 @@
 //! - [`oauth`] — the OAuth response types. Lane D fills in the client.
 //! - [`account`] — what a row is and what its state means.
 //! - [`discovery`] — turning a keychain and a registry into rows.
+//! - [`usage`] — the usage endpoint: request, response, normalization.
 
 pub mod account;
 pub mod credentials;
 pub mod discovery;
 pub mod namespace;
 pub mod oauth;
+pub mod usage;
 
 /// The `User-Agent` agentctl sends to Anthropic.
 ///

@@ -25,8 +25,6 @@
 //!   They belong to a third-party tool that rewrites the live item on every
 //!   switch; agentctl neither reads nor writes them.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "consumed by lane D and lane C"))]
-
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;

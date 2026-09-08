@@ -1,0 +1,26 @@
+{
+  "_comment": "SYNTHETIC. Hand-written for plan AC49: what an API or console account looks like — `limits` is an empty array AND every legacy window key is null, so there is no subscription window anywhere in the body. agentctl must report `no subscription limits` and exit 2 without panicking, rather than rendering an empty table as if it were healthy. Not captured from the API.",
+  "five_hour": null,
+  "seven_day": null,
+  "seven_day_oauth_apps": null,
+  "seven_day_opus": null,
+  "seven_day_sonnet": null,
+  "seven_day_cowork": null,
+  "seven_day_omelette": null,
+  "extra_usage": {
+    "is_enabled": false,
+    "monthly_limit": null,
+    "used_credits": null,
+    "utilization": null,
+    "currency": null,
+    "decimal_places": null,
+    "disabled_reason": null,
+    "user_disabled": false,
+    "spend_limit_reached": false,
+    "credits_ever_enabled": false,
+    "daily": null,
+    "weekly": null
+  },
+  "limits": [],
+  "member_dashboard_available": false
+}

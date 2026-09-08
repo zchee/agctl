@@ -1,0 +1,37 @@
+{
+  "_comment": "SYNTHETIC. Hand-written for plan AC4 and risk R3: a `limits[]` entry whose `kind` this build has never seen (`monthly_foo`, with a `group` and a `scope` shape to match). agentctl must render it as an `Unknown` row and exit 0 rather than dropping it or failing, which is what keeps a server-side addition visible instead of silent. Not captured from the API.",
+  "five_hour": null,
+  "seven_day": null,
+  "seven_day_opus": null,
+  "extra_usage": null,
+  "limits": [
+    {
+      "kind": "session",
+      "group": "session",
+      "percent": 12,
+      "severity": "normal",
+      "resets_at": "2026-09-08T03:29:59.817079+00:00",
+      "scope": null,
+      "is_active": false
+    },
+    {
+      "kind": "weekly_all",
+      "group": "weekly",
+      "percent": 40,
+      "severity": "normal",
+      "resets_at": "2026-09-10T19:59:59.817101+00:00",
+      "scope": null,
+      "is_active": false
+    },
+    {
+      "kind": "monthly_foo",
+      "group": "monthly",
+      "percent": 7,
+      "severity": "normal",
+      "resets_at": "2026-10-01T00:00:00+00:00",
+      "scope": null,
+      "is_active": true
+    }
+  ],
+  "member_dashboard_available": false
+}

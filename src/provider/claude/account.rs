@@ -16,8 +16,6 @@
 //!   read usage with — what it must not do is *refresh*, and that is enforced
 //!   separately by the refusal in the refresh path.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "consumed by lane D and lane C"))]
-
 use crate::config::AccountRecord;
 use crate::provider::claude::credentials::Credentials;
 
