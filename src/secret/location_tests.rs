@@ -149,10 +149,11 @@ fn a_corrupt_blob_is_transient_rather_than_absent() {
 }
 
 #[test]
-fn a_metadata_only_record_has_nothing_to_read() {
-    // Decision D-007: an import records who an account is, never a secret.
+fn a_foreign_record_has_nothing_to_read() {
+    // Invariant I1: another tool's keychain item is never read, so resolving
+    // one asks no store anything at all.
     let (_dir, paths) = paths();
-    let kind = AccountKind::Metadata { source: "claude-switcher".to_owned() };
+    let kind = AccountKind::Foreign { source: "claude-switcher".to_owned() };
     let mut rec = record(kind.clone());
     rec.organization_uuid = UNKNOWN_ORG.to_owned();
     let reader = FakeReader::unlocked();

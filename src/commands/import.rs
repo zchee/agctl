@@ -3,9 +3,8 @@
 //! The whole command is: build a plan, print it, and — unless `--dry-run` —
 //! apply it to the registry. Everything that decides *what* the plan says
 //! lives in [`crate::config::import`], which is pure; this module supplies the
-//! three ambient inputs those planners refuse to fetch for themselves (the
-//! file's bytes, the keychain listing, the environment) and performs the one
-//! write.
+//! two ambient inputs those planners refuse to fetch for themselves (the
+//! keychain listing and the environment) and performs the one write.
 //!
 //! # One write, and it is the registry
 //!
@@ -19,8 +18,9 @@
 //!
 //! An account already in the registry is reported and left alone, whatever
 //! kind it is (decision D-007). That is what makes a second import a no-op
-//! rather than a way to turn a logged-in account back into metadata, and it
-//! is why running this command twice produces a byte-identical registry.
+//! rather than a way to turn a logged-in account back into a read-only row,
+//! and it is why running this command twice produces a byte-identical
+//! registry.
 
 use std::path::Path;
 use std::time::Duration;
@@ -38,8 +38,6 @@ use crate::runtime::coordinator::Cancel;
 use crate::runtime::coordinator::PassCtx;
 use crate::secret::KeychainReader;
 use crate::secret::KeychainStatus;
-use crate::secret::file_store;
-use crate::secret::file_store::ReadOutcome;
 
 /// How long the keychain reads an import makes may take in total.
 ///
@@ -64,11 +62,11 @@ pub struct Import<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`AppError::Config`] when the source cannot be read or understood —
-/// a missing switcher file, a schema this build does not know, an unreadable
-/// keychain — and whatever [`AgentctlConfig::update`] reports when the
-/// registry cannot be written. All of them are fatal: an import either
-/// records what it found or it does not.
+/// Returns [`AppError::Config`] when the source cannot be read — a locked,
+/// timed-out or unavailable keychain — and whatever
+/// [`AgentctlConfig::update`] reports when the registry cannot be written.
+/// All of them are fatal: an import either records what it found or it does
+/// not.
 pub fn run(config_dir: Option<&Path>, args: &ImportArgs, cancel: &Cancel) -> Result<(), AppError> {
     let paths = Paths::resolve(config_dir)?;
     let env = EnvView::from_process();
@@ -97,11 +95,11 @@ pub fn run(config_dir: Option<&Path>, args: &ImportArgs, cancel: &Cancel) -> Res
 /// See [`run`].
 pub fn run_with(import: &Import<'_>) -> Result<Vec<String>, AppError> {
     let existing = AgentctlConfig::load(import.paths)?;
-    let mut plan = match import.args.from {
-        ImportSource::ClaudeSwitcher => switcher_plan(import, &existing)?,
+    // Matched rather than called directly so that a second source cannot be
+    // added to the command line without being wired up here.
+    let plan = match import.args.from {
         ImportSource::Keychain => keychain_plan(import, &existing)?,
     };
-    plan.decisions.splice(0..0, ignored_flag_warnings(import.args));
 
     let records = plan.records();
     let mut lines = plan.lines();
@@ -117,42 +115,6 @@ pub fn run_with(import: &Import<'_>) -> Result<Vec<String>, AppError> {
         })?;
     }
     Ok(lines)
-}
-
-/// Plans an import from the `claude-account-switcher` account file (fact F10).
-fn switcher_plan(import: &Import<'_>, existing: &AgentctlConfig) -> Result<ImportPlan, AppError> {
-    let path = match import.args.path.as_deref() {
-        Some(path) => path.to_path_buf(),
-        None => {
-            if import.env.home.as_os_str().is_empty() {
-                return Err(AppError::Config(
-                    "no home directory to look for `claude-switcher/accounts.json` in; pass \
-                     --path"
-                        .to_owned(),
-                ));
-            }
-            import::default_switcher_path(&import.env.home)
-        }
-    };
-
-    // Symlinks are followed: this is another tool's file, agentctl only ever
-    // reads it, and refusing a link would break a perfectly ordinary
-    // dotfile-manager setup. The size cap is what keeps that safe.
-    let bytes = match file_store::read_file_following(&path, import::MAX_SWITCHER_BYTES) {
-        Ok(ReadOutcome::Present { bytes, .. }) => bytes,
-        Ok(ReadOutcome::Absent) => {
-            return Err(AppError::Config(format!(
-                "no claude-switcher account file at `{}`",
-                path.display()
-            )));
-        }
-        Err(err) => {
-            return Err(AppError::Config(format!("could not read `{}`: {err}", path.display())));
-        }
-    };
-
-    let accounts = import::parse_switcher(&bytes, &path)?;
-    Ok(import::plan_switcher(&accounts, existing))
 }
 
 /// Plans an import of per-configuration-directory keychain items.
@@ -190,29 +152,6 @@ fn keychain_plan(import: &Import<'_>, existing: &AgentctlConfig) -> Result<Impor
         import.env,
         existing,
     ))
-}
-
-/// Warnings for flags that mean nothing for the chosen source.
-///
-/// Reported rather than rejected: a wrong flag here changes nothing, and a
-/// user who passed one has a wrong idea about what the command did, which is
-/// worth saying out loud.
-fn ignored_flag_warnings(args: &ImportArgs) -> Vec<import::Decision> {
-    let mut warnings = Vec::new();
-    match args.from {
-        ImportSource::ClaudeSwitcher if !args.claude_config_dir.is_empty() => {
-            warnings.push(import::Decision::Warning(
-                "--claude-config-dir means nothing for --from claude-switcher; ignored".to_owned(),
-            ));
-        }
-        ImportSource::Keychain if args.path.is_some() => {
-            warnings.push(import::Decision::Warning(
-                "--path means nothing for --from keychain; ignored".to_owned(),
-            ));
-        }
-        _ => {}
-    }
-    warnings
 }
 
 #[cfg(test)]

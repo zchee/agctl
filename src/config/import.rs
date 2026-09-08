@@ -1,25 +1,18 @@
 //! Learning about accounts from something that is not agentctl.
 //!
-//! Two sources, one rule: **an import records what is already true and
-//! changes nothing else** (decision D-007). Nothing here writes a credential,
-//! moves one, or deletes one, and neither source is asked for token material
-//! in the first place.
+//! One source, one rule: **an import records what is already true and changes
+//! nothing else** (decision D-007). Nothing here writes a credential, moves
+//! one, or deletes one.
 //!
-//! - `--from claude-switcher` reads a third-party tool's account list (fact
-//!   F10). That file holds identities and no secrets; the switcher's secrets
-//!   live in its own `claude-switcher:<email>` keychain items, which agentctl
-//!   never reads and never writes (invariant I1). So an imported account is
-//!   [`AccountKind::Metadata`] and renders `needs login` until the user logs
-//!   it in — which is the honest state, not a limitation.
-//! - `--from keychain` records Claude Code credential items belonging to
-//!   other configuration directories as [`AccountKind::ConfigDirReadOnly`].
-//!   Those are read, once, to learn who they belong to; they are never
-//!   written and never refreshed (decision D-009).
+//! `--from keychain` records Claude Code credential items belonging to other
+//! configuration directories as [`AccountKind::ConfigDirReadOnly`]. Those are
+//! read, once, to learn who they belong to; they are never written and never
+//! refreshed (decision D-009).
 //!
 //! # Why the planners are pure
 //!
-//! Every function here takes what it needs as an argument — the file's bytes,
-//! the keychain listing, the registry as it stands — and returns an
+//! Every function here takes what it needs as an argument — the keychain
+//! listing, the environment, the registry as it stands — and returns an
 //! [`ImportPlan`] describing what *would* happen. Nothing here touches the
 //! registry. That is what makes `--dry-run` the same code path as a real run
 //! with one call omitted, rather than a second implementation that can drift
@@ -39,14 +32,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 
-use serde::Deserialize;
-
 use crate::config::AccountKind;
 use crate::config::AccountRecord;
 use crate::config::AgentctlConfig;
 use crate::config::new_record;
 use crate::config::paths::UNKNOWN_ORG;
-use crate::error::AppError;
 use crate::provider::claude::credentials::Identity;
 use crate::provider::claude::namespace;
 use crate::provider::claude::namespace::EnvView;
@@ -57,28 +47,12 @@ use crate::secret::ServiceEntry;
 use crate::secret::location;
 use crate::secret::location::Resolved;
 
-/// The `source` recorded on an account imported from the switcher.
-pub const SWITCHER_SOURCE: &str = "claude-switcher";
-
-/// The switcher account-file schema version this build understands.
-pub const SWITCHER_VERSION: u32 = 2;
-
-/// The largest switcher account file that will be read.
-///
-/// The real file is a few kilobytes of identities. A megabyte is far above
-/// anything the tool produces and still small enough that a corrupt or
-/// hostile file cannot exhaust memory.
-pub const MAX_SWITCHER_BYTES: u64 = 1 << 20;
-
-/// The `provider` value whose entries agentctl can use.
-const CLAUDE_PROVIDER: &str = "claude";
-
 /// The prefix of the keychain services an import considers.
 ///
 /// Narrower than discovery's prefix on purpose: it excludes the legacy
-/// `Claude Code-<sha8>` API-key items (fact F5) and the `claude-switcher:*`
-/// items (fact F10) at the listing call, so this command never even asks the
-/// keychain about an item it must not touch.
+/// `Claude Code-<sha8>` API-key items (fact F5) and the third-party items
+/// discovery classifies as foreign (fact F10) at the listing call, so this
+/// command never even asks the keychain about an item it must not touch.
 pub const IMPORT_SERVICE_PREFIX: &str = crate::secret::CLAUDE_SERVICE_PREFIX;
 
 /// What an import would do about one entry.
@@ -92,7 +66,8 @@ pub enum Decision {
         detail: String,
     },
     /// The registry already knows this account. It is left exactly as it is,
-    /// so an import can never downgrade a logged-in account to metadata.
+    /// so an import can never downgrade a logged-in account to a read-only
+    /// one.
     AlreadyKnown {
         /// How the existing record is addressed.
         id: String,
@@ -136,11 +111,12 @@ impl ImportPlan {
         lines
     }
 
-    /// The closing line: `imported N, skipped M (codex), already known K`.
+    /// The closing line: `imported N, skipped M (no keychain item), already
+    /// known K`.
     ///
     /// The skipped count is broken down by reason, because "3 skipped" and
-    /// "3 skipped because they are Codex accounts" mean very different things
-    /// to somebody wondering whether the import worked.
+    /// "3 skipped because no keychain item names them" mean very different
+    /// things to somebody wondering whether the import worked.
     pub fn summary(&self) -> String {
         let mut imported = 0_usize;
         let mut known = 0_usize;
@@ -191,174 +167,8 @@ fn kind_label(kind: &AccountKind) -> &'static str {
         AccountKind::Owned { .. } => "owned",
         AccountKind::Live => "live",
         AccountKind::ConfigDirReadOnly { .. } => "config-dir-read-only",
-        AccountKind::Metadata { .. } => "metadata",
+        AccountKind::Foreign { .. } => "foreign",
     }
-}
-
-// ---------------------------------------------------------------------------
-// claude-switcher
-// ---------------------------------------------------------------------------
-
-/// The switcher's account file, as much of it as agentctl reads.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct SwitcherFile {
-    /// The schema version. Required: a file that does not say which schema it
-    /// is written in is not one to guess at.
-    version: u32,
-    /// The accounts, in the order the switcher listed them.
-    #[serde(default)]
-    accounts: Vec<SwitcherAccount>,
-}
-
-/// One entry of the switcher's `accounts[]` (fact F10).
-///
-/// Every field is optional because this file belongs to another tool: a
-/// version of it that stops writing `org_name`, or starts writing a third
-/// provider, must degrade to "skipped, here is why" rather than to a parse
-/// failure that hides the entries agentctl *can* use.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct SwitcherAccount {
-    /// The address the switcher displays and keys its keychain item by.
-    #[serde(default)]
-    pub email: Option<String>,
-    /// The organization name the switcher cached.
-    #[serde(default)]
-    pub org_name: Option<String>,
-    /// `claude` or `codex`; anything else is skipped.
-    #[serde(default)]
-    pub provider: Option<String>,
-    /// The `oauthAccount` object the switcher copied out of `.claude.json`.
-    /// `null` for every Codex entry.
-    #[serde(default)]
-    pub oauth_account: Option<SwitcherOauthAccount>,
-}
-
-/// The identity fields of a switcher entry's `oauth_account`.
-///
-/// The real object carries a dozen more keys — trial dates, onboarding flags,
-/// seat tier. None of them is identity, so none of them is read.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct SwitcherOauthAccount {
-    /// The Anthropic account UUID.
-    #[serde(default, rename = "accountUuid")]
-    pub account_uuid: Option<String>,
-    /// The account's email address.
-    #[serde(default, rename = "emailAddress")]
-    pub email_address: Option<String>,
-    /// The organization UUID, absent on a personal account.
-    #[serde(default, rename = "organizationUuid")]
-    pub organization_uuid: Option<String>,
-    /// The organization's display name.
-    #[serde(default, rename = "organizationName")]
-    pub organization_name: Option<String>,
-}
-
-/// The switcher's account file, at the location the tool hard-codes.
-///
-/// Not derived from `XDG_CONFIG_HOME`: this is another program's path, and
-/// that program spells it `~/.config/claude-switcher/accounts.json`
-/// regardless of what XDG says. Reproducing agentctl's own conventions here
-/// would look at a file the switcher never writes.
-pub fn default_switcher_path(home: &Path) -> PathBuf {
-    home.join(".config").join("claude-switcher").join("accounts.json")
-}
-
-/// Parses a switcher account file.
-///
-/// # Errors
-///
-/// Returns [`AppError::Config`] naming `path` and the first thing wrong with
-/// it: unparseable JSON, a missing `version`, or a schema version this build
-/// does not understand.
-pub fn parse_switcher(bytes: &[u8], path: &Path) -> Result<Vec<SwitcherAccount>, AppError> {
-    let file: SwitcherFile = serde_json::from_slice(bytes).map_err(|err| {
-        AppError::Config(format!(
-            "`{}` is not a claude-switcher account file: {err}",
-            path.display()
-        ))
-    })?;
-    if file.version != SWITCHER_VERSION {
-        return Err(AppError::Config(format!(
-            "`{}` is claude-switcher schema version {}, but agentctl understands version \
-             {SWITCHER_VERSION}",
-            path.display(),
-            file.version
-        )));
-    }
-    Ok(file.accounts)
-}
-
-/// Decides what to do with each parsed switcher entry.
-///
-/// Codex entries are counted and skipped; a Claude entry whose
-/// `oauth_account` names no account UUID is skipped too, because an email
-/// address is not an account identifier and inventing a key for it would
-/// produce a row nothing can ever be logged into (invariant I13).
-pub fn plan_switcher(accounts: &[SwitcherAccount], existing: &AgentctlConfig) -> ImportPlan {
-    let mut plan = ImportPlan::default();
-    let mut planned: Vec<(String, String)> = Vec::new();
-
-    for account in accounts {
-        let label = account
-            .email
-            .clone()
-            .or_else(|| account.oauth_account.as_ref().and_then(|o| o.email_address.clone()))
-            .unwrap_or_else(|| "<no email>".to_owned());
-
-        match account.provider.as_deref() {
-            Some(CLAUDE_PROVIDER) => {}
-            Some(other) => {
-                plan.decisions.push(Decision::Skipped { what: label, reason: other.to_owned() });
-                continue;
-            }
-            None => {
-                plan.decisions
-                    .push(Decision::Skipped { what: label, reason: "no provider".to_owned() });
-                continue;
-            }
-        }
-
-        let Some(uuid) =
-            account.oauth_account.as_ref().and_then(|oauth| oauth.account_uuid.clone())
-        else {
-            plan.decisions
-                .push(Decision::Skipped { what: label, reason: "no account uuid".to_owned() });
-            continue;
-        };
-        let oauth = account.oauth_account.as_ref();
-        let org = oauth
-            .and_then(|oauth| oauth.organization_uuid.clone())
-            .unwrap_or_else(|| UNKNOWN_ORG.to_owned());
-
-        if let Some(decision) = already_planned(existing, &planned, &uuid, &org) {
-            plan.decisions.push(decision);
-            continue;
-        }
-
-        let kind = AccountKind::Metadata { source: SWITCHER_SOURCE.to_owned() };
-        let mut record = match new_record(uuid.clone(), org.clone(), kind) {
-            Ok(record) => record,
-            Err(err) => {
-                plan.decisions.push(Decision::Skipped {
-                    what: format!("{label}: {err}"),
-                    reason: "unusable ids".to_owned(),
-                });
-                continue;
-            }
-        };
-        record.email = oauth
-            .and_then(|oauth| oauth.email_address.clone())
-            .or_else(|| account.email.clone())
-            .filter(|value| !value.is_empty());
-        record.org_name = oauth
-            .and_then(|oauth| oauth.organization_name.clone())
-            .or_else(|| account.org_name.clone())
-            .filter(|value| !value.is_empty());
-
-        planned.push((uuid, org));
-        plan.decisions.push(Decision::Record { record: Box::new(record), detail: label });
-    }
-    plan
 }
 
 // ---------------------------------------------------------------------------

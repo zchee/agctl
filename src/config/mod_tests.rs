@@ -60,7 +60,7 @@ fn saving_and_loading_round_trips_every_kind() {
         new_record(
             "acct-4".to_owned(),
             "org-4".to_owned(),
-            AccountKind::Metadata { source: "claude-switcher".to_owned() },
+            AccountKind::Foreign { source: "claude-switcher".to_owned() },
         )
         .expect("valid"),
     );

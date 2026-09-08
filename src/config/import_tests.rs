@@ -1,7 +1,7 @@
 //! The import parsers and planners, driven without a store or a keychain.
 //!
 //! Everything here is a pure function of its arguments, which is the point:
-//! the decisions an import makes — which entries are accounts, which are
+//! the decisions an import makes — which items are accounts, which are
 //! already known, which directory hashes to which keychain item — are settled
 //! before anything is written, so they can be asserted on without writing
 //! anything. The end-to-end half lives in `commands/import_tests.rs`.
@@ -19,24 +19,12 @@ use crate::provider::claude::namespace::sha8;
 use crate::secret::KeychainStatus;
 use crate::secret::fake_reader::FakeReader;
 
-/// The synthetic switcher file from plan AC10.
-const FIXTURE: &str = include_str!("../../fixtures/claude/claude-switcher-accounts.json");
-
-/// The first fixture account's UUID pair.
+/// An account and organization UUID pair, in the shape Anthropic issues.
 const FIRST_ACCT: &str = "aaaaaaaa-1111-2222-3333-444444444444";
 const FIRST_ORG: &str = "bbbbbbbb-5555-6666-7777-888888888888";
 
-/// The second fixture account, which names no organization.
+/// A second account, used where the keychain item names no organization.
 const SECOND_ACCT: &str = "cccccccc-9999-0000-1111-222222222222";
-
-fn fixture_path() -> PathBuf {
-    PathBuf::from("fixtures/claude/claude-switcher-accounts.json")
-}
-
-fn parse_fixture() -> Vec<SwitcherAccount> {
-    parse_switcher(FIXTURE.as_bytes(), &fixture_path())
-        .expect("the shipped fixture should parse as a v2 switcher file")
-}
 
 /// A credential blob in Claude Code's shape (fact F40), naming an account.
 fn blob(acct: &str, org: Option<&str>, email: &str) -> String {
@@ -92,205 +80,6 @@ fn warnings_of(plan: &ImportPlan) -> Vec<String> {
             _ => None,
         })
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// The switcher file
-// ---------------------------------------------------------------------------
-
-#[test]
-fn the_fixture_holds_two_claude_accounts_and_three_codex_ones() {
-    let accounts = parse_fixture();
-    assert_eq!(accounts.len(), 5, "the fixture should carry five entries");
-    let claude =
-        accounts.iter().filter(|account| account.provider.as_deref() == Some("claude")).count();
-    let codex =
-        accounts.iter().filter(|account| account.provider.as_deref() == Some("codex")).count();
-    assert_eq!((claude, codex), (2, 3));
-}
-
-#[test]
-fn a_v1_file_is_refused_by_version_rather_than_guessed_at() {
-    let document = json!({ "version": 1, "accounts": [] }).to_string();
-    let err = parse_switcher(document.as_bytes(), &fixture_path())
-        .expect_err("a v1 file should not be read as if it were v2");
-    let message = err.to_string();
-    assert!(message.contains("version 1"), "{message}");
-    assert!(message.contains("version 2"), "{message}");
-}
-
-#[test]
-fn a_file_with_no_version_is_refused() {
-    let document = json!({ "accounts": [] }).to_string();
-    let err = parse_switcher(document.as_bytes(), &fixture_path())
-        .expect_err("a file that does not say which schema it is should be refused");
-    assert!(err.to_string().contains("version"), "{err}");
-}
-
-#[test]
-fn a_malformed_file_names_the_first_error() {
-    let err = parse_switcher(b"{not json", &fixture_path())
-        .expect_err("unparseable bytes should not produce an empty import");
-    let message = err.to_string();
-    assert!(message.contains("claude-switcher account file"), "{message}");
-    assert!(message.contains("accounts.json"), "{message}");
-}
-
-#[test]
-fn an_entry_missing_every_optional_field_still_parses() {
-    let document = json!({ "version": 2, "accounts": [{}] }).to_string();
-    let accounts = parse_switcher(document.as_bytes(), &fixture_path())
-        .expect("a sparse entry belongs to the planner, not to the parser");
-    assert_eq!(accounts.len(), 1);
-    assert_eq!(
-        accounts[0],
-        SwitcherAccount { email: None, org_name: None, provider: None, oauth_account: None }
-    );
-}
-
-#[test]
-fn ac10_the_fixture_plans_two_metadata_accounts_and_skips_three_codex_ones() {
-    let plan = plan_switcher(&parse_fixture(), &AgentctlConfig::default());
-    let records = records_of(&plan);
-
-    assert_eq!(records.len(), 2, "both claude entries should be recorded");
-    assert!(
-        records.iter().all(|record| matches!(
-            &record.kind,
-            AccountKind::Metadata { source } if source == SWITCHER_SOURCE
-        )),
-        "an imported switcher account holds no credential, so it is metadata: {records:?}"
-    );
-    assert_eq!(records[0].key(), (FIRST_ACCT, FIRST_ORG));
-    assert_eq!(records[0].email.as_deref(), Some("first@example.com"));
-    assert_eq!(records[0].org_name.as_deref(), Some("First Org"));
-
-    // The second entry names no organization, so it lands under the
-    // placeholder rather than being dropped or given a made-up one.
-    assert_eq!(records[1].key(), (SECOND_ACCT, UNKNOWN_ORG));
-    assert_eq!(records[1].org_name, None, "an empty `org_name` is not a name");
-
-    let skips = skips_of(&plan);
-    assert_eq!(skips.len(), 3);
-    assert!(skips.iter().all(|(_, reason)| reason == "codex"), "{skips:?}");
-    assert_eq!(plan.summary(), "imported 2, skipped 3 (codex), already known 0");
-}
-
-#[test]
-fn an_account_already_in_the_registry_is_never_downgraded_to_metadata() {
-    let mut config = AgentctlConfig::default();
-    config.upsert(
-        new_record(
-            FIRST_ACCT.to_owned(),
-            FIRST_ORG.to_owned(),
-            AccountKind::Owned {
-                export_spelling: "/tmp/ns".to_owned(),
-                export_sha8: sha8("/tmp/ns"),
-            },
-        )
-        .expect("a uuid pair should be a usable key"),
-    );
-
-    let plan = plan_switcher(&parse_fixture(), &config);
-    assert_eq!(records_of(&plan).len(), 1, "only the unknown account should be recorded");
-    let known: Vec<&str> = plan
-        .decisions
-        .iter()
-        .filter_map(|decision| match decision {
-            Decision::AlreadyKnown { kind, .. } => Some(*kind),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(known, vec!["owned"]);
-    assert_eq!(plan.summary(), "imported 1, skipped 3 (codex), already known 1");
-}
-
-#[test]
-fn a_claude_entry_with_no_account_uuid_is_skipped_rather_than_keyed_by_its_email() {
-    let document = json!({
-        "version": 2,
-        "accounts": [{ "email": "nobody@example.com", "provider": "claude", "oauth_account": null }],
-    })
-    .to_string();
-    let accounts =
-        parse_switcher(document.as_bytes(), &fixture_path()).expect("the file itself is valid");
-
-    let plan = plan_switcher(&accounts, &AgentctlConfig::default());
-    assert!(records_of(&plan).is_empty(), "an email address is not an account identifier (I13)");
-    assert_eq!(
-        skips_of(&plan),
-        vec![("nobody@example.com".to_owned(), "no account uuid".to_owned())]
-    );
-}
-
-#[test]
-fn an_unknown_provider_is_skipped_under_its_own_name() {
-    let document = json!({
-        "version": 2,
-        "accounts": [
-            { "email": "a@example.com", "provider": "gemini" },
-            { "email": "b@example.com" },
-        ],
-    })
-    .to_string();
-    let accounts = parse_switcher(document.as_bytes(), &fixture_path()).expect("valid file");
-
-    let plan = plan_switcher(&accounts, &AgentctlConfig::default());
-    assert_eq!(
-        skips_of(&plan),
-        vec![
-            ("a@example.com".to_owned(), "gemini".to_owned()),
-            ("b@example.com".to_owned(), "no provider".to_owned()),
-        ]
-    );
-    assert_eq!(plan.summary(), "imported 0, skipped 2 (1 gemini, 1 no provider), already known 0");
-}
-
-#[test]
-fn two_entries_naming_one_account_are_recorded_once() {
-    let entry = json!({
-        "email": "first@example.com",
-        "provider": "claude",
-        "oauth_account": { "accountUuid": FIRST_ACCT, "organizationUuid": FIRST_ORG },
-    });
-    let document = json!({ "version": 2, "accounts": [entry, entry] }).to_string();
-    let accounts = parse_switcher(document.as_bytes(), &fixture_path()).expect("valid file");
-
-    let plan = plan_switcher(&accounts, &AgentctlConfig::default());
-    assert_eq!(records_of(&plan).len(), 1);
-    assert_eq!(
-        skips_of(&plan),
-        vec![(format!("{FIRST_ACCT}/{FIRST_ORG}"), "duplicate".to_owned())]
-    );
-}
-
-#[test]
-fn an_account_uuid_that_is_not_a_usable_key_is_skipped_with_the_reason() {
-    let document = json!({
-        "version": 2,
-        "accounts": [{
-            "email": "evil@example.com",
-            "provider": "claude",
-            "oauth_account": { "accountUuid": "../../etc" },
-        }],
-    })
-    .to_string();
-    let accounts = parse_switcher(document.as_bytes(), &fixture_path()).expect("valid file");
-
-    let plan = plan_switcher(&accounts, &AgentctlConfig::default());
-    assert!(records_of(&plan).is_empty());
-    let skips = skips_of(&plan);
-    assert_eq!(skips.len(), 1);
-    assert_eq!(skips[0].1, "unusable ids");
-    assert!(skips[0].0.contains("evil@example.com"), "{skips:?}");
-}
-
-#[test]
-fn the_default_path_is_the_switchers_own_hard_coded_one() {
-    assert_eq!(
-        default_switcher_path(Path::new("/home/example")),
-        PathBuf::from("/home/example/.config/claude-switcher/accounts.json")
-    );
 }
 
 // ---------------------------------------------------------------------------

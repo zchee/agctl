@@ -295,21 +295,11 @@ fn accounts_subcommands_all_parse() {
 }
 
 #[test]
-fn import_parses_both_sources_and_repeats_config_dir() {
-    let switcher = parse(&[
-        "agentctl",
-        "claude",
-        "import",
-        "--from",
-        "claude-switcher",
-        "--path",
-        "/tmp/accounts.json",
-        "--dry-run",
-    ]);
-    match claude_of(&switcher) {
+fn import_parses_its_source_and_repeats_config_dir() {
+    let dry_run = parse(&["agentctl", "claude", "import", "--from", "keychain", "--dry-run"]);
+    match claude_of(&dry_run) {
         ClaudeCommand::Import(args) => {
-            assert_eq!(args.from, ImportSource::ClaudeSwitcher);
-            assert_eq!(args.path, Some(PathBuf::from("/tmp/accounts.json")));
+            assert_eq!(args.from, ImportSource::Keychain);
             assert!(args.dry_run);
             assert!(args.claude_config_dir.is_empty());
         }

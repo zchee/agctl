@@ -245,14 +245,14 @@ fn record_row(
         // registry, because which item is "live" depends on the environment
         // the command was run in.
         AccountKind::Live => None,
-        AccountKind::Metadata { source } => Some(AccountRow {
+        AccountKind::Foreign { source } => Some(AccountRow {
             id,
             record: record.clone(),
             state: AccountState::NeedsLogin,
             source: Source::None,
             credentials: None,
             visible_by_default: true,
-            note: Some(format!("imported from {source}")),
+            note: Some(format!("belongs to {source}")),
         }),
         AccountKind::ConfigDirReadOnly { service, shares_live_dir, .. } => {
             let resolved = match preflight {
@@ -443,7 +443,7 @@ fn foreign_row(entry: &ServiceEntry) -> AccountRow {
         .map(str::to_owned)
         .filter(|value| !value.is_empty());
     let mut record =
-        record_from_identity(None, AccountKind::Metadata { source: "claude-switcher".to_owned() });
+        record_from_identity(None, AccountKind::Foreign { source: "claude-switcher".to_owned() });
     record.email = email;
     AccountRow {
         id: entry.service.clone(),
@@ -462,7 +462,7 @@ fn env_token_row() -> AccountRow {
         id: "env".to_owned(),
         record: record_from_identity(
             None,
-            AccountKind::Metadata { source: namespace::OAUTH_TOKEN_ENV.to_owned() },
+            AccountKind::Foreign { source: namespace::OAUTH_TOKEN_ENV.to_owned() },
         ),
         state: AccountState::EnvToken,
         source: Source::Env,

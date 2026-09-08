@@ -14,9 +14,10 @@
 //! - [`AccountKind::ConfigDirReadOnly`] — a keychain item belonging to some
 //!   other `CLAUDE_CONFIG_DIR`. Read-only for the same reason, and displayed
 //!   only so the user can see it exists.
-//! - [`AccountKind::Metadata`] — imported from something that carried no
-//!   usable secret, such as `claude-account-switcher`'s account list
-//!   (decision D-007). Always `needs login`.
+//! - [`AccountKind::Foreign`] — a credential that exists on the machine but
+//!   belongs to something else: another tool's keychain item, or a token in
+//!   the environment. agentctl reports that it is there and never reads it,
+//!   so such a row is always `needs login`.
 //!
 //! The registry is small and rewritten whole. It is still written under a lock
 //! and through a temporary file, because two `agentctl` processes racing to
@@ -147,9 +148,13 @@ pub enum AccountKind {
         /// account.
         shares_live_dir: bool,
     },
-    /// Imported metadata with no usable secret.
-    Metadata {
-        /// What it was imported from, such as `claude-switcher`.
+    /// A credential belonging to something that is not agentctl and not
+    /// Claude Code, so there is nothing here agentctl may read.
+    ///
+    /// Synthesized by discovery from the keychain listing and from the
+    /// environment; no command records one.
+    Foreign {
+        /// What owns it: a third-party tool, or an environment variable.
         source: String,
     },
 }

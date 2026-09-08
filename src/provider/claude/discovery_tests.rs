@@ -439,7 +439,7 @@ fn a_forgotten_record_is_hidden() {
     let mut record = new_record(
         "acct-1".to_owned(),
         "org-1".to_owned(),
-        AccountKind::Metadata { source: "claude-switcher".to_owned() },
+        AccountKind::Foreign { source: "claude-switcher".to_owned() },
     )
     .expect("valid");
     record.forgotten = true;
@@ -454,8 +454,10 @@ fn a_forgotten_record_is_hidden() {
 }
 
 #[test]
-fn a_metadata_record_asks_for_a_login() {
-    // Decision D-007: an import is non-destructive and carries no secret.
+fn a_foreign_record_asks_for_a_login() {
+    // A credential that belongs to something else is never read (fact F10),
+    // so the only honest thing to say about it is that agentctl has nothing
+    // to show until the user logs in.
     let (dir, paths) = store();
     let env = env_in(dir.path());
     let mut config = AgentctlConfig::default();
@@ -463,16 +465,16 @@ fn a_metadata_record_asks_for_a_login() {
         new_record(
             "acct-1".to_owned(),
             "org-1".to_owned(),
-            AccountKind::Metadata { source: "claude-switcher".to_owned() },
+            AccountKind::Foreign { source: "claude-switcher".to_owned() },
         )
         .expect("valid"),
     );
 
     let discovery = discover(&config, &paths, &FakeReader::unlocked(), &env, &ctx());
-    let imported = row(&discovery, "acct-1");
-    assert_eq!(imported.state, AccountState::NeedsLogin);
-    assert_eq!(imported.source, Source::None);
-    assert!(imported.note.as_deref().is_some_and(|note| note.contains("claude-switcher")));
+    let foreign = row(&discovery, "acct-1");
+    assert_eq!(foreign.state, AccountState::NeedsLogin);
+    assert_eq!(foreign.source, Source::None);
+    assert!(foreign.note.as_deref().is_some_and(|note| note.contains("claude-switcher")));
 }
 
 #[test]
@@ -584,7 +586,7 @@ fn a_cancelled_pass_returns_what_it_has_so_far() {
         new_record(
             "acct-1".to_owned(),
             "org-1".to_owned(),
-            AccountKind::Metadata { source: "x".to_owned() },
+            AccountKind::Foreign { source: "x".to_owned() },
         )
         .expect("valid"),
     );

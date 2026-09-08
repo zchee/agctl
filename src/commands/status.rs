@@ -30,9 +30,9 @@
 //! # The exit status is about *shown* rows
 //!
 //! Exit 2 means "you asked for numbers and at least one row you can see did
-//! not have them". A row hidden by default — a stale sibling, a
-//! `claude-switcher` item — cannot change the exit status, because the user
-//! did not ask about it (plan section 3.2).
+//! not have them". A row hidden by default — a stale sibling, a foreign
+//! keychain item — cannot change the exit status, because the user did not
+//! ask about it (plan section 3.2).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -1070,7 +1070,7 @@ fn kind_name(kind: &AccountKind) -> &'static str {
         AccountKind::Owned { .. } => "owned",
         AccountKind::Live => "live",
         AccountKind::ConfigDirReadOnly { .. } => "config_dir",
-        AccountKind::Metadata { .. } => "metadata",
+        AccountKind::Foreign { .. } => "foreign",
     }
 }
 

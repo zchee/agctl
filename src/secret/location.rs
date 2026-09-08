@@ -25,7 +25,7 @@
 //! | [`Live`](crate::config::AccountKind::Live) | keychain | transient; never the file |
 //! | [`ConfigDirReadOnly`](crate::config::AccountKind::ConfigDirReadOnly) | keychain | transient; never the file |
 //! | [`Owned`](crate::config::AccountKind::Owned) | file | transient |
-//! | [`Metadata`](crate::config::AccountKind::Metadata) | nothing | absent |
+//! | [`Foreign`](crate::config::AccountKind::Foreign) | nothing | absent |
 
 #![cfg_attr(
     not(test),
@@ -77,8 +77,9 @@ pub fn resolve(
             let ns_dir = paths.namespace_dir(&record.account_uuid, &record.organization_uuid);
             from_file(&ns_dir)
         }
-        // Imported metadata never carried a secret (decision D-007).
-        AccountKind::Metadata { .. } => Resolved::Absent,
+        // Somebody else's credential: agentctl never reads it, so as far as
+        // this store is concerned there is nothing there.
+        AccountKind::Foreign { .. } => Resolved::Absent,
     }
 }
 

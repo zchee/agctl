@@ -170,7 +170,7 @@ pub enum ClaudeCommand {
         #[command(subcommand)]
         command: AccountsCommand,
     },
-    /// Import accounts from another tool or from the keychain.
+    /// Record accounts that other Claude Code config directories hold.
     Import(ImportArgs),
     /// Report on store health, locks, and stray files.
     Doctor(DoctorArgs),
@@ -275,10 +275,13 @@ pub enum AccountsCommand {
 }
 
 /// Where `agentctl claude import` should read accounts from.
+///
+/// One source, still spelled as a value rather than as a bare flag: the
+/// keychain is not the only place accounts could come from, and a command
+/// line that already says *which* source it read does not change shape when a
+/// second one arrives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ImportSource {
-    /// The `claude-switcher` tool's account file.
-    ClaudeSwitcher,
     /// Claude Code credential services discovered in the login keychain.
     Keychain,
 }
@@ -289,10 +292,6 @@ pub struct ImportArgs {
     /// Which source to import from.
     #[arg(long = "from", value_name = "SOURCE")]
     pub from: ImportSource,
-
-    /// Read the source from this file instead of its default location.
-    #[arg(long, value_name = "FILE")]
-    pub path: Option<PathBuf>,
 
     /// A Claude Code config directory to scan; repeat to name several.
     #[arg(long = "claude-config-dir", value_name = "DIR")]
