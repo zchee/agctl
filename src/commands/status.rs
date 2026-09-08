@@ -196,7 +196,7 @@ pub fn run(cli: &Cli, args: &StatusArgs, cancel: &Cancel) -> Result<(), AppError
 /// # Errors
 ///
 /// Returns [`AppError::Config`] when an `--account` selector matches nothing.
-fn collect(
+pub fn collect(
     rows: Vec<AccountRow>,
     selectors: &[String],
     shared: Shared,
@@ -293,7 +293,7 @@ fn pass_deadline(timeout: Duration) -> Instant {
 /// Always empty without the `testing` feature: fault injection is a test
 /// seam, and a production build has no way to switch it on (plan section
 /// 3.9).
-fn current_fault() -> Fault {
+pub fn current_fault() -> Fault {
     #[cfg(feature = "testing")]
     {
         Fault::from_env()
@@ -346,9 +346,11 @@ fn matches_selector(row: &AccountRow, selector: &str) -> bool {
 
 /// The `--refresh` / `--no-cache` pair, which both bypass the cache.
 #[derive(Debug, Clone, Copy)]
-struct Options {
-    refresh: bool,
-    no_cache: bool,
+pub struct Options {
+    /// Refresh expired credentials even when a cached value would do.
+    pub refresh: bool,
+    /// Ignore the on-disk usage cache for this pass.
+    pub no_cache: bool,
 }
 
 impl Options {
@@ -365,47 +367,65 @@ impl Options {
 /// [`PassCtx`] for the coordinator to be able to kill it when the pass is
 /// cancelled (plan AC43). It is also the seam a test replaces with a scripted
 /// double, which is what keeps the pass tests off the real keychain.
-type ReaderFactory = Arc<dyn Fn(&PassCtx) -> Box<dyn KeychainReader + Send + Sync> + Send + Sync>;
+pub type ReaderFactory =
+    Arc<dyn Fn(&PassCtx) -> Box<dyn KeychainReader + Send + Sync> + Send + Sync>;
 
 /// The reader factory a real run uses.
-fn production_readers() -> ReaderFactory {
+pub fn production_readers() -> ReaderFactory {
     Arc::new(crate::secret::default_reader)
 }
 
 /// Everything the workers share, built once per pass.
-struct Shared {
-    paths: Arc<Paths>,
-    client: UsageClient,
-    refresher: Arc<dyn TokenRefresher>,
-    reader_factory: ReaderFactory,
-    listing: Vec<ServiceEntry>,
-    fault: Fault,
-    options: Options,
+pub struct Shared {
+    /// The store the pass reads and writes.
+    pub paths: Arc<Paths>,
+    /// The usage endpoint client.
+    pub client: UsageClient,
+    /// What mints a new access token from a stored refresh token.
+    pub refresher: Arc<dyn TokenRefresher>,
+    /// How a worker builds its own keychain reader.
+    pub reader_factory: ReaderFactory,
+    /// The `dump-keychain` listing this pass took, attributes only.
+    pub listing: Vec<ServiceEntry>,
+    /// The faults injected into this pass.
+    pub fault: Fault,
+    /// The cache options this pass runs under.
+    pub options: Options,
 }
 
 /// One finished row.
 #[derive(Debug)]
-struct RowOutcome {
-    index: usize,
+pub struct RowOutcome {
+    /// The row's position in discovery order, which is the order the table
+    /// and the watch display put it back into.
+    pub index: usize,
     /// The identifier `--account` accepts, and the key `--raw` files this
     /// row's body under in the JSON report.
-    id: String,
+    pub id: String,
     /// What the registry knows: the identifiers, the labels, and the kind.
     /// Kept whole rather than copied field by field, because the JSON report
     /// publishes most of it and a copy would be one more place to forget.
-    record: AccountRecord,
-    source: Source,
-    account: String,
-    org: String,
-    plan: String,
-    state: AccountState,
+    pub record: AccountRecord,
+    /// Where the credentials behind this row came from.
+    pub source: Source,
+    /// The first column: the email when known, else the row id.
+    pub account: String,
+    /// The organization's display name, or its UUID when unnamed.
+    pub org: String,
+    /// The subscription tier, as the credential recorded it.
+    pub plan: String,
+    /// What the pass concluded about this row.
+    pub state: AccountState,
     /// What the namespace lock did on this pass, from [`LockedResult`]. Only
     /// the JSON report shows it — the table has no column for it — and plan
     /// AC7 pins the `busy` case.
-    lock_state: &'static str,
-    note: Option<String>,
-    usage: Option<UsageSnapshot>,
-    visible_by_default: bool,
+    pub lock_state: &'static str,
+    /// A short explanation appended to the state, when there is one.
+    pub note: Option<String>,
+    /// The numbers, when this row has any.
+    pub usage: Option<UsageSnapshot>,
+    /// Whether the row appears without `--all`.
+    pub visible_by_default: bool,
 }
 
 impl RowOutcome {

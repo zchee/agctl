@@ -11,6 +11,7 @@ pub mod doctor;
 pub mod import;
 pub mod login;
 pub mod status;
+pub mod watch;
 
 use std::io::IsTerminal;
 use std::io::Write;

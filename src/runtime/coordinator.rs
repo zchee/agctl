@@ -25,13 +25,18 @@
 //! it: the pass is observed entirely through the channel, and the channel
 //! disconnects exactly when the last worker has been joined.
 
-// `run_pass` is wired: `status` calls it on every invocation. What is left is
-// `PassCtx::remaining` and `wait_child`, which W3's `watch` needs — the first
-// to draw how much of the frame budget is gone, the second to wait on a child
-// without a timeout of its own. Scoped to the non-test build because the tests
-// below do exercise these items, and `expect` rather than `allow` so that it
-// starts warning — and gets deleted — the moment W3 makes it stale.
-#![cfg_attr(not(test), expect(dead_code, reason = "remaining and wait_child await W3's watch"))]
+// `run_pass` is wired: `status` and `watch` both call it on every pass. What
+// is left is `PassCtx::remaining` and `wait_child`. W3 turned out not to need
+// either in production code — a watch pass reads its budget from the `Instant`
+// the loop already holds, and the only caller that waits on a child without a
+// timeout of its own is the AC43 test — so they are kept as part of the
+// context's contract and exercised by the tests below rather than deleted.
+// Scoped to the non-test build for that reason, and `expect` rather than
+// `allow` so it starts warning the moment a production caller appears.
+#![cfg_attr(
+    not(test),
+    expect(dead_code, reason = "remaining and wait_child are exercised only by tests")
+)]
 
 use std::collections::BTreeMap;
 use std::io;

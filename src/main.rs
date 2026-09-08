@@ -16,6 +16,7 @@ mod provider;
 mod render;
 mod runtime;
 mod secret;
+mod tui;
 mod usage;
 
 use std::process;
@@ -69,14 +70,16 @@ fn init_tracing() {
 
 /// Routes a parsed command line to its implementation.
 ///
-/// Every arm that is not yet built returns [`AppError::not_implemented`], so
-/// an unbuilt command fails loudly with exit status 1 instead of exiting 0
-/// having done nothing. W1 to W3 replace these arms.
+/// Every arm is one line, and every one of them is built: W3 replaced the last
+/// [`AppError::not_implemented`] placeholder with `watch`. The constructor
+/// stays for the next command that is parsed before it is implemented, so such
+/// an arm fails loudly with exit status 1 rather than exiting 0 having done
+/// nothing.
 fn dispatch(cli: &Cli, cancel: &Cancel) -> Result<(), AppError> {
     let Command::Claude { command } = &cli.command;
     match command {
         ClaudeCommand::Status(args) => status::run(cli, args, cancel),
-        ClaudeCommand::Watch(_) => Err(AppError::not_implemented("agentctl claude watch")),
+        ClaudeCommand::Watch(args) => commands::watch::run(cli, args, cancel),
         ClaudeCommand::Login(args) => commands::login::run(cli.config_dir.as_deref(), args, cancel),
         ClaudeCommand::Import(args) => {
             commands::import::run(cli.config_dir.as_deref(), args, cancel)

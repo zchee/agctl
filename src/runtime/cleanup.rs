@@ -21,15 +21,6 @@
 //! is no caller left to handle an error; a path that is already gone is the
 //! outcome we wanted anyway.
 
-// `emergency`, `register_tmp_path` and `unregister` are all live now — the
-// credential writer and the registry writer both bracket their temporary
-// files with them. What is left is `register_restore` and the `RestoreFn` it
-// takes, which exist for W3's TUI: the terminal has to be put back whatever
-// ends the process. Scoped to the non-test build because the tests below
-// exercise all of it, and spelled `expect` so it starts warning the moment
-// W3 makes it stale.
-#![cfg_attr(not(test), expect(dead_code, reason = "register_restore awaits W3's TUI"))]
-
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::LazyLock;

@@ -14,15 +14,16 @@
 //! it and flag the degraded rows, whereas 1 means there is nothing to render.
 
 // `Config`, `Io`, `Keychain`, `Refused` and `Partial` all have construction
-// sites now. `Http` and `Auth` do not, and the reason is a design decision
-// rather than an unfinished one: every network failure a pass meets becomes a
-// row state (`rate-limited`, `needs login`, `error`) beside a rendered table,
-// not a failure of the whole run. W3's `watch` is the remaining candidate for
-// a caller. Scoped to the non-test build because `error_tests.rs` constructs
-// every variant, and spelled `expect` so it starts warning once they do.
+// sites. `Http` and `Auth` do not, and the reason is a design decision rather
+// than an unfinished one: every network failure a pass meets becomes a row
+// state (`rate-limited`, `needs login`, `error`) beside a rendered table or a
+// watch frame, not a failure of the whole run. `not_implemented` is in the
+// same position now that W3 has built the last command: it is what the next
+// command that parses before it runs will use. Scoped to the non-test build
+// because `error_tests.rs` constructs every variant.
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "Http and Auth have no caller yet; W3 may add one")
+    expect(dead_code, reason = "Http, Auth and not_implemented are deliberately unconstructed")
 )]
 
 use std::time::Duration;

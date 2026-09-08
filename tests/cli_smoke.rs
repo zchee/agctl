@@ -84,11 +84,18 @@ fn claude_help_lists_every_subcommand() {
 }
 
 #[test]
-fn an_unimplemented_command_exits_one_and_says_so() {
-    // A command that has not been built yet must fail loudly rather than exit
-    // 0 having done nothing at all. `watch` is the one still outstanding; it
-    // lands in W3.
-    agentctl().args(["claude", "watch"]).assert().code(1).stderr(contains("not implemented"));
+fn watch_refuses_an_interval_below_the_polling_floor() {
+    // This was `an_unimplemented_command_exits_one_and_says_so`, which used
+    // `watch` as the last command that had not been built. W3 built it, so the
+    // assertion it replaces is no longer true of any command. What `watch` can
+    // still be asked to do from outside a terminal is refuse: the polling floor
+    // is enforced by the parser, before the process goes anywhere near raw mode
+    // (plan AC13).
+    agentctl()
+        .args(["claude", "watch", "--interval", "30s"])
+        .assert()
+        .failure()
+        .stderr(contains("60s floor"));
 }
 
 #[test]
