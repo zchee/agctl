@@ -4,7 +4,46 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 
+# `testing` compiles the test-only seams (fake keychain backend, endpoint URL
+# overrides, fault injection). It is never enabled in a release artifact: a
+# production-visible token-URL override would be an exfiltration vector, and
+# `cfg(debug_assertions)` cannot serve as the gate because this project builds
+# with `-C debug-assertions=off` everywhere. See plan section 3.9, AC37, AC38.
+[features]
+testing = []
+
 [dependencies]
+anyhow = "1"
+base64 = "0.23.1"
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.29"
+etcetera = "0.11"
+fd-lock = "4"
+hex = "0.4.3"
+jiff = "0.2"
+open = "5.4.3"
+rand = "0.10.2"
+ratatui = "0.30"
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.11.0"
+signal-hook = "0.4"
+tabled = "0.22"
+thiserror = "2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+unicode-normalization = "0.1"
+ureq = { version = "3", features = ["json"] }
+url = "2"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+httpmock = "0.8"
+insta = "1"
+jsonschema = "0.55"
+predicates = "3.1.4"
+tempfile = "3.27.0"
 
 [profile.release]
 opt-level = 3
