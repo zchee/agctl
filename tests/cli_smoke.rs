@@ -9,12 +9,16 @@
 //!
 //! # Nothing here touches a real credential
 //!
-//! Most commands exercised fail at parse time or reach an unimplemented
-//! dispatch arm. `status` does neither any more, so it is run through
-//! [`isolated`], which points the binary at a throwaway store and a disabled
-//! keychain backend. Running it bare would read the developer's own keychain
-//! item and spend a request against their live account — which is exactly
-//! what plan invariant I1 and the W1 verification checks exist to prevent.
+//! Every command is built now, so nothing here is safe by virtue of failing
+//! before it does any work. Anything that would reach a credential store runs
+//! through [`isolated`], which points the binary at a throwaway store and a
+//! disabled keychain backend; the rest fail at parse time, in `clap`, before
+//! dispatch. Running `status` bare would read the developer's own keychain
+//! item and spend a request against their live account — which is exactly what
+//! plan invariant I1 and the W1 verification checks exist to prevent.
+//!
+//! The wider end-to-end suite lives in `tests/e2e_*.rs` on the harness in
+//! `tests/common/mod.rs`; this file stays the thin surface check.
 
 use assert_cmd::Command;
 use predicates::str::contains;
@@ -65,16 +69,6 @@ fn help_exits_zero() {
 #[test]
 fn version_exits_zero() {
     agentctl().arg("--version").assert().success();
-}
-
-#[test]
-fn watch_below_the_interval_floor_fails_and_names_sixty() {
-    // AC13, seen from outside the process.
-    agentctl()
-        .args(["claude", "watch", "--interval", "30s"])
-        .assert()
-        .failure()
-        .stderr(contains("60"));
 }
 
 #[test]
