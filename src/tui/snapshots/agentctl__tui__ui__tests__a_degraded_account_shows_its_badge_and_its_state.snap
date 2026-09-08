@@ -2,7 +2,7 @@
 source: src/tui/ui_tests.rs
 expression: terminal.backend()
 ---
-"agentctl claude watch · 2 accounts · last fetch — · next fetch — · fetching · stale "
+"agentctl claude watch · 2 accounts · last fetch — · fetching · stale                "
 "┌▸ owner@example.com · Acme · max ─────────────────────────────────────────────────┐"
 "│5h        ███████████████                   21%                                   │"
 "│weekly    █████████████████████████         35%                                   │"

@@ -100,6 +100,11 @@ fn a_pass_in_flight_is_announced_and_marks_the_numbers_stale() {
 
     assert!(header.contains("fetching"), "{header}");
     assert!(header.contains("stale"), "the numbers on screen are the previous pass's: {header}");
+    assert!(
+        !header.contains("next fetch"),
+        "a countdown towards a schedule the pass in flight is about to replace would count \
+         down past zero and stay there: {header}"
+    );
 }
 
 #[test]

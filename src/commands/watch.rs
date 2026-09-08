@@ -15,11 +15,18 @@
 //! is answered at the next poll boundary rather than when the worker finishes
 //! (plan section 2 S1', AC35).
 //!
-//! `q` sets the pass-wide [`Cancel`] and returns. It does **not** join the
-//! worker: joining is exactly the thing that would make the exit take as long
-//! as the stuck worker does. Cancelling is what the worker needs — the
-//! coordinator's watchdog wakes on it and kills every registered child
-//! process, which is what bounds AC43 — and the terminal is restored by
+//! `q` never *joins* the worker: joining is exactly the thing that would make
+//! the exit take as long as the stuck worker does. What it does instead, in
+//! this order, is [`quit`]: cancel, wait [`QUIT_DRAIN_BUDGET`] for the pass in
+//! flight to come back, and run emergency cleanup. The bounded wait is not a
+//! join — it is the window in which cancellation does its work. Every child
+//! process the pass registered dies inside it, because
+//! [`wait_child_timeout`](PassCtx::wait_child_timeout) and
+//! [`wait_child`](PassCtx::wait_child) both treat cancellation as their
+//! deadline and reap what they were waiting on (AC43), and a pass caught
+//! between staging a credential file and renaming it into place gets the same
+//! window to put its own temporary away. What does not fit in it,
+//! [`cleanup::emergency`] unlinks. The terminal is restored by
 //! [`Tui`](crate::tui::Tui)'s destructor on the way out regardless.
 //!
 //! # The pass deadline is the interval less five seconds
@@ -73,6 +80,7 @@ use crate::provider::claude::discovery;
 use crate::provider::claude::namespace::EnvView;
 use crate::provider::claude::usage::TokenRefresher;
 use crate::provider::claude::usage::UsageClient;
+use crate::runtime::cleanup;
 use crate::runtime::coordinator::Cancel;
 use crate::runtime::coordinator::PassCtx;
 use crate::runtime::fault::Fault;
@@ -99,6 +107,20 @@ pub const DEADLINE_MARGIN: Duration = Duration::from_secs(5);
 /// precedes it — what keeps the redraw period inside the 500 ms plan AC35
 /// asks for.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long `q` waits for the pass in flight to come back before it stops
+/// waiting and cleans up on the pass's behalf.
+///
+/// Sized against the two windows worth waiting out, both of which are one
+/// poll interval wide rather than anything like this long: a child process
+/// being killed and reaped by the cancellation clause in
+/// [`wait_child_timeout`](PassCtx::wait_child_timeout), and a pass between
+/// `create_new_file_at` and `renameat` in
+/// [`write_credentials`](crate::secret::file_store::write_credentials), which
+/// re-checks [`should_stop`](PassCtx::should_stop) immediately after the
+/// staging write. Half the 500 ms plan AC35 gives the whole exit, so the
+/// budget can be spent in full and still leave room.
+pub const QUIT_DRAIN_BUDGET: Duration = Duration::from_millis(250);
 
 /// Runs `agentctl claude watch`.
 ///
@@ -141,11 +163,17 @@ pub fn run(cli: &Cli, args: &WatchArgs, cancel: &Cancel) -> Result<(), AppError>
 /// answers instantly — none of which the production pass can be made to do on
 /// demand without a machine to break.
 pub trait Pass: Send + Sync {
-    /// Produces one pass's rows, in discovery order.
+    /// Produces one pass's rows, in discovery order, or `None` when this pass
+    /// has nothing to say about the accounts.
+    ///
+    /// `None` is not "no accounts" — that is `Some(vec![])`. It is "this pass
+    /// failed before it could look", which the loop answers by keeping the
+    /// numbers already on screen rather than blanking them over a transient
+    /// failure to read the registry.
     ///
     /// Must respect `cancel` and `deadline`: the loop does not join the
     /// thread this runs on.
-    fn run(&self, forced: bool, cancel: &Cancel, deadline: Instant) -> Vec<RowOutcome>;
+    fn run(&self, forced: bool, cancel: &Cancel, deadline: Instant) -> Option<Vec<RowOutcome>>;
 }
 
 /// Builds a [`UsageClient`] for one pass.
@@ -195,14 +223,18 @@ impl Session {
 }
 
 impl Pass for Session {
-    fn run(&self, forced: bool, cancel: &Cancel, deadline: Instant) -> Vec<RowOutcome> {
+    fn run(&self, forced: bool, cancel: &Cancel, deadline: Instant) -> Option<Vec<RowOutcome>> {
         // The registry is re-read every pass: `login`, `accounts remove` or
         // `import` may have run in another terminal since the last one.
         let config = match AgentctlConfig::load(&self.paths) {
             Ok(config) => config,
             Err(err) => {
                 tracing::warn!(error = %err, "the account registry could not be read this pass");
-                return Vec::new();
+                // `None`, not an empty list: a registry that could not be read
+                // says nothing about the accounts, and a half-written file
+                // another terminal is in the middle of saving would otherwise
+                // blank the display for a whole interval.
+                return None;
             }
         };
 
@@ -226,13 +258,14 @@ impl Pass for Session {
         };
 
         match collect(found.rows, &[], shared, cancel, deadline) {
-            Ok(rows) => rows,
+            Ok(rows) => Some(rows),
             Err(err) => {
                 // Unreachable with no `--account` selectors, which is the only
                 // failure `collect` has; reported rather than swallowed so a
-                // later widening of that contract is visible.
+                // later widening of that contract is visible, and `None` so a
+                // widened contract cannot silently blank the display either.
                 tracing::warn!(error = %err, "the watch pass produced no rows");
-                Vec::new()
+                None
             }
         }
     }
@@ -317,7 +350,7 @@ where
     // The channel the running pass will answer on, or `None` when none is
     // running. Holding the receiver *is* how the loop knows a pass is in
     // flight, so the two cannot get out of step.
-    let mut in_flight: Option<Receiver<Vec<RowOutcome>>> = None;
+    let mut in_flight: Option<Receiver<Option<Vec<RowOutcome>>>> = None;
 
     // `Some(instant)` is when the next pass is due; `None` means no pass is
     // scheduled, which happens only for an interval too large to add to the
@@ -352,14 +385,15 @@ where
         draw(terminal, &app)?;
 
         // Never `recv`: the whole point of the worker thread is that the
-        // frames keep coming while it is stuck (plan AC35). A disconnect is a
-        // pass whose thread ended without answering — it panicked — and is
-        // treated as a pass that finished with nothing to show, so that a
-        // single bad pass cannot wedge the display into `fetching` for the
-        // rest of the run.
+        // frames keep coming while it is stuck (plan AC35). The outer option
+        // is "a pass ended"; the inner one is what it had to show. A
+        // disconnect is a pass whose thread ended without answering — it
+        // panicked — and reads as the same "nothing to show" a pass that could
+        // not read the registry reports, so that neither can wedge the display
+        // into `fetching` for the rest of the run.
         let finished: Option<Option<Vec<RowOutcome>>> =
             match in_flight.as_ref().map(Receiver::try_recv) {
-                Some(Ok(rows)) => Some(Some(rows)),
+                Some(Ok(rows)) => Some(rows),
                 Some(Err(mpsc::TryRecvError::Disconnected)) => Some(None),
                 Some(Err(mpsc::TryRecvError::Empty)) | None => None,
             };
@@ -383,10 +417,7 @@ where
 
         match app.reduce(Event::Key(key)) {
             Effect::Quit => {
-                // Cancelling is what reaches the worker: the coordinator's
-                // watchdog wakes on it and kills every child it holds (plan
-                // AC43). Nothing is joined, so this returns now.
-                cancel.cancel();
+                quit(cancel, in_flight.take());
                 return Ok(());
             }
             Effect::Refresh => {
@@ -398,6 +429,44 @@ where
             Effect::None => {}
         }
     }
+}
+
+/// Leaves the watch loop on `q`, in the order the guarantees need.
+///
+/// 1. **Cancel.** Every cooperative waiter is watching this flag — a namespace
+///    lock, the pause between two steps of a credential write, and, since it
+///    is a deadline there too, every wait on a `security(1)` child. Setting it
+///    first is what makes the rest short.
+/// 2. **Drain, bounded.** This is not a join; it is the window in which the
+///    cancellation just set does its work, and it is bounded so that a pass
+///    which ignores it cannot hold the exit open. A registered child is killed
+///    and reaped within one poll of the child table by
+///    [`wait_child_timeout`](PassCtx::wait_child_timeout) or
+///    [`wait_child`](PassCtx::wait_child) — whether or not a watchdog is
+///    behind it (plan AC43) — and a pass that has staged
+///    `.credentials.json.tmp.<hex>` and not yet renamed it re-checks
+///    [`should_stop`](PassCtx::should_stop) immediately afterwards, so it
+///    either completes the rename or takes the staged file away itself.
+///    Waiting is worth it: the pass removing its own temporary is tidier than
+///    the registry removing it.
+/// 3. **Emergency cleanup**, for the pass that did not make it: any temporary
+///    still registered is unlinked — token material must not be left at rest —
+///    and the terminal restore runs. It is idempotent, so the destructor
+///    running it again on the way out costs nothing.
+///
+/// The whole route is bounded by [`QUIT_DRAIN_BUDGET`], which is what keeps
+/// `q` inside the 500 ms plan AC35 asks for.
+fn quit(cancel: &Cancel, in_flight: Option<Receiver<Option<Vec<RowOutcome>>>>) {
+    cancel.cancel();
+
+    if let Some(receiver) = in_flight {
+        // Whatever it answers is discarded: the display is going away, and a
+        // disconnect — the pass thread ending — ends the wait just as an
+        // answer does.
+        let _ = receiver.recv_timeout(QUIT_DRAIN_BUDGET);
+    }
+
+    cleanup::emergency();
 }
 
 /// Starts one pass on its own thread, returning the channel it will answer
@@ -414,8 +483,9 @@ fn start_pass(
     forced: bool,
     cancel: &Cancel,
     deadline: Instant,
-) -> Option<Receiver<Vec<RowOutcome>>> {
-    let (tx, rx): (Sender<Vec<RowOutcome>>, Receiver<Vec<RowOutcome>>) = mpsc::channel();
+) -> Option<Receiver<Option<Vec<RowOutcome>>>> {
+    type Rows = Option<Vec<RowOutcome>>;
+    let (tx, rx): (Sender<Rows>, Receiver<Rows>) = mpsc::channel();
     let pass = Arc::clone(pass);
     let cancel = cancel.clone();
 

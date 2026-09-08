@@ -23,6 +23,8 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use super::*;
 
@@ -44,6 +46,21 @@ fn entries(log: &Log) -> Vec<&'static str> {
         Ok(entries) => entries.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     }
+}
+
+#[test]
+fn every_restore_route_gives_back_the_terminal_and_then_flushes_the_held_log() {
+    // The three routes share one callback, so what this pins is that the
+    // callback does both halves and in that order: the flush is only worth
+    // anything once the alternate screen is gone.
+    log_writer::hold_terminal();
+
+    restore_terminal_and_flush();
+
+    assert!(
+        !log_writer::is_held(),
+        "leaving the terminal must let `tracing` reach standard error again"
+    );
 }
 
 #[test]
@@ -72,6 +89,33 @@ fn the_restore_runs_before_the_previously_installed_panic_hook() {
     // into a log this test owns.
     let _ = std::panic::take_hook();
     assert!(cleanup::unregister(token), "the registry entry should still have been there");
+}
+
+#[test]
+fn the_terminal_is_restored_before_the_registry_entry_is_withdrawn() {
+    // A signal landing while the destructor is mid-restore has to find an
+    // entry still in the registry: that is the only thing that would restore
+    // the terminal on a route where no destructor finishes. Withdrawing first
+    // would leave that instant covered by nothing.
+    let token = cleanup::register_restore(Box::new(|| {}));
+    let live_during_restore = Arc::new(AtomicBool::new(false));
+
+    let probe = Arc::clone(&live_during_restore);
+    let withdrawn_afterwards = leave(token, move || {
+        // Taking the entry is how `cleanup` lets a caller ask whether one is
+        // there; consuming it only makes `leave`'s own withdrawal a no-op,
+        // which is what the second assertion reads.
+        probe.store(cleanup::unregister(token), Ordering::SeqCst);
+    });
+
+    assert!(
+        live_during_restore.load(Ordering::SeqCst),
+        "the registry entry must still be in place while the terminal is being restored"
+    );
+    assert!(
+        !withdrawn_afterwards,
+        "and the withdrawal must come after it, so it found nothing left to take"
+    );
 }
 
 #[test]

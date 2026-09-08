@@ -20,7 +20,12 @@
 //!
 //! On cancellation or deadline the watchdog kills and reaps every live child,
 //! which unblocks the workers within one poll interval; the workers then
-//! finish, the scope joins them, and [`cleanup::emergency`] runs. Because the
+//! finish, the scope joins them, and [`cleanup::emergency`] runs. Not every
+//! child has a watchdog behind it, though — [`PassCtx::standalone`] has none,
+//! and that is what a `watch` pass discovers under and what `login`, `import`,
+//! `doctor` and `accounts` read the keychain through — so both waits treat
+//! cancellation as their own deadline and reap what they were waiting on
+//! themselves. Because the
 //! coordinator thread is detached, a caller that has given up never blocks on
 //! it: the pass is observed entirely through the channel, and the channel
 //! disconnects exactly when the last worker has been joined.
@@ -208,7 +213,9 @@ impl PassCtx {
     /// returned value and **nothing watches it**: dropping this context kills
     /// nothing, so a caller must reach every child it registers through
     /// [`PassCtx::wait_child`] or [`PassCtx::wait_child_timeout`], both of
-    /// which reap what they wait on.
+    /// which reap what they wait on — and both of which treat cancellation as
+    /// a deadline, so a context with no watchdog behind it still lets go of
+    /// its children when the pass is cancelled.
     pub fn standalone(cancel: Cancel, deadline: Instant) -> Self {
         Self { cancel, deadline, children: Arc::new(Mutex::new(ChildTable::default())) }
     }
@@ -247,11 +254,18 @@ impl PassCtx {
     /// Waits for a registered child to exit, polling so the coordinator can
     /// still take the child table and kill it.
     ///
+    /// Cancellation ends the wait: this has no budget of its own, so without
+    /// that clause a job waiting here would hold a child open for as long as
+    /// the child felt like living, watchdog or no watchdog. The child is
+    /// killed and reaped before returning, exactly as the coordinator would
+    /// have done, so the caller sees the same outcome either way.
+    ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::Interrupted`] when the coordinator killed the
-    /// child out from under the job, which is how a job learns the pass was
-    /// cancelled mid-call. Any other error is the underlying `wait` failure.
+    /// Returns [`io::ErrorKind::Interrupted`] when the child was killed out
+    /// from under the job — by the coordinator, or by this call because the
+    /// pass was cancelled — which is how a job learns the pass is over. Any
+    /// other error is the underlying `wait` failure.
     pub fn wait_child(&self, token: ChildToken) -> io::Result<ExitStatus> {
         loop {
             {
@@ -270,18 +284,49 @@ impl PassCtx {
                         ));
                     }
                 }
+
+                // After the harvest above, so a child that exited on its own
+                // in the same instant is still reported as having exited
+                // rather than as having been killed.
+                if self.cancel.is_cancelled() {
+                    // Still holding the table, so nothing can register a child
+                    // under this token between the check and the kill.
+                    if let Some(mut child) = table.live.remove(&token) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "the pass was cancelled while this child process was running",
+                    ));
+                }
             }
             thread::sleep(CHILD_POLL_INTERVAL);
         }
     }
 
-    /// Waits for a registered child to exit, giving up after `timeout`.
+    /// Waits for a registered child to exit, giving up after `timeout` — or
+    /// as soon as the pass is cancelled, whichever comes first.
     ///
     /// Polls exactly as [`PassCtx::wait_child`] does, so the watchdog can
-    /// always take the child table. On timeout the child is killed and reaped
-    /// through that table and `Ok(None)` is returned, which is what bounds the
-    /// 2 000 ms and 10 000 ms `security(1)` budgets: a keychain prompt that
-    /// never gets an answer cannot hold the pass open.
+    /// always take the child table. On either kind of giving up the child is
+    /// killed and reaped through that table and `Ok(None)` is returned, which
+    /// is what bounds the 2 000 ms and 10 000 ms `security(1)` budgets: a
+    /// keychain prompt that never gets an answer cannot hold the pass open.
+    ///
+    /// **Cancellation counts as the deadline arriving**, which is what makes
+    /// the guarantee hold where there is no watchdog at all: a `watch` pass
+    /// runs its discovery under [`PassCtx::standalone`], and `login`, `import`,
+    /// `doctor` and `accounts` do all of their `security(1)` reads there. Before
+    /// this clause a Ctrl-C or a `q` during a `dump-keychain` left the child
+    /// running for the rest of its budget with nothing left to reap it.
+    ///
+    /// `Ok(None)` does not distinguish the two reasons, deliberately: every
+    /// caller already treats "no answer" the same way, and
+    /// [`security_cli`](crate::secret::security_cli) collapses it with the
+    /// error case into one timeout. The only visible consequence is that a
+    /// cancelled read is reported as having used its whole budget rather than
+    /// the time it actually took — a number nothing renders on the way out.
     ///
     /// # Errors
     ///
@@ -315,7 +360,10 @@ impl PassCtx {
                     }
                 }
 
-                if Instant::now() >= deadline {
+                // After the harvest above, so a child that exited on its own
+                // in the same instant is still reported as having exited
+                // rather than as having been killed.
+                if self.cancel.is_cancelled() || Instant::now() >= deadline {
                     // Still holding the table, so nothing can register a child
                     // under this token between the check and the kill.
                     if let Some(mut child) = table.live.remove(&token) {

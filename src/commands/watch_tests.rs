@@ -21,6 +21,10 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+// Only the staged-credential test walks a namespace by path, and it is behind
+// the feature that makes `Fault::pause_point` pause.
+#[cfg(feature = "testing")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
@@ -51,6 +55,10 @@ use crate::secret::KeychainReader;
 use crate::secret::KeychainStatus;
 use crate::secret::fake_reader::FakeReader;
 use crate::secret::file_store::CREDENTIALS_FILE;
+#[cfg(feature = "testing")]
+use crate::secret::file_store::WriteRequest;
+#[cfg(feature = "testing")]
+use crate::secret::file_store::write_credentials;
 use crate::secret::namespace_lock;
 use crate::tui::fixtures;
 
@@ -205,7 +213,7 @@ struct HeldPass {
 }
 
 impl Pass for HeldPass {
-    fn run(&self, _forced: bool, cancel: &Cancel, _deadline: Instant) -> Vec<RowOutcome> {
+    fn run(&self, _forced: bool, cancel: &Cancel, _deadline: Instant) -> Option<Vec<RowOutcome>> {
         let paths = Arc::clone(&self.paths);
         let entered = Arc::clone(&self.entered);
         let left = Arc::clone(&self.left);
@@ -231,16 +239,19 @@ impl Pass for HeldPass {
 
         let rx = run_pass(vec![job], cancel.clone(), hold_until, DEFAULT_MAX_WORKERS);
         let _drained: Vec<()> = rx.into_iter().collect();
-        Vec::new()
+        Some(Vec::new())
     }
 }
 
-/// What [`ChildPass`]'s registered child did.
+/// What a registered child did.
 #[derive(Debug, Default)]
 struct ChildReport {
     spawned_at: Option<Instant>,
     reaped_at: Option<Instant>,
     interrupted: bool,
+    /// Whether the wait gave up and killed the child rather than reporting an
+    /// exit status — [`PassCtx::wait_child_timeout`]'s `Ok(None)`.
+    gave_up: bool,
 }
 
 /// A pass that registers a real `sleep 30` with the coordinator and waits on
@@ -250,7 +261,7 @@ struct ChildPass {
 }
 
 impl Pass for ChildPass {
-    fn run(&self, _forced: bool, cancel: &Cancel, deadline: Instant) -> Vec<RowOutcome> {
+    fn run(&self, _forced: bool, cancel: &Cancel, deadline: Instant) -> Option<Vec<RowOutcome>> {
         let report = Arc::clone(&self.report);
         let job: Job<()> = Box::new(move |ctx| {
             let Ok(child) = Command::new("/bin/sleep").arg("30").spawn() else {
@@ -267,7 +278,40 @@ impl Pass for ChildPass {
 
         let rx = run_pass(vec![job], cancel.clone(), deadline, DEFAULT_MAX_WORKERS);
         let _drained: Vec<()> = rx.into_iter().collect();
-        Vec::new()
+        Some(Vec::new())
+    }
+}
+
+/// A pass that waits on a real child through a context with **no coordinator
+/// behind it**, which is the shape of a watch pass's discovery phase and of
+/// every `security(1)` read `login`, `import`, `doctor` and `accounts` make.
+///
+/// Nothing watches this child table. If cancellation were not a deadline
+/// inside [`PassCtx::wait_child_timeout`] there would be nothing left to reap
+/// the child after `q`, and a `dump-keychain` would outlive the display by the
+/// whole of its budget.
+struct StandaloneChildPass {
+    report: Arc<Mutex<ChildReport>>,
+    /// Far longer than the test runs, so a passing run cannot be the budget
+    /// expiring on its own.
+    budget: Duration,
+}
+
+impl Pass for StandaloneChildPass {
+    fn run(&self, _forced: bool, cancel: &Cancel, deadline: Instant) -> Option<Vec<RowOutcome>> {
+        let ctx = PassCtx::standalone(cancel.clone(), deadline);
+        let Ok(child) = Command::new("/bin/sleep").arg("30").spawn() else {
+            return Some(Vec::new());
+        };
+        let token = ctx.register_child(child);
+        lock(&self.report).spawned_at = Some(Instant::now());
+
+        let outcome = ctx.wait_child_timeout(token, self.budget);
+
+        let mut report = lock(&self.report);
+        report.reaped_at = Some(Instant::now());
+        report.gave_up = matches!(outcome, Ok(None));
+        Some(Vec::new())
     }
 }
 
@@ -277,7 +321,7 @@ struct PanickingPass {
 }
 
 impl Pass for PanickingPass {
-    fn run(&self, _forced: bool, _cancel: &Cancel, _deadline: Instant) -> Vec<RowOutcome> {
+    fn run(&self, _forced: bool, _cancel: &Cancel, _deadline: Instant) -> Option<Vec<RowOutcome>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         panic!("the pass fell over")
     }
@@ -290,10 +334,77 @@ struct RecordingPass {
 }
 
 impl Pass for RecordingPass {
-    fn run(&self, forced: bool, _cancel: &Cancel, _deadline: Instant) -> Vec<RowOutcome> {
+    fn run(&self, forced: bool, _cancel: &Cancel, _deadline: Instant) -> Option<Vec<RowOutcome>> {
         lock(&self.calls).push(forced);
-        vec![fixtures::row_with_usage(0, "owner@example.com")]
+        Some(vec![fixtures::row_with_usage(0, "owner@example.com")])
     }
+}
+
+/// A pass that answers with rows once and then reports nothing, the way a
+/// [`Session`] does when the registry cannot be read.
+struct FailsAfterFirstPass {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Pass for FailsAfterFirstPass {
+    fn run(&self, _forced: bool, _cancel: &Cancel, _deadline: Instant) -> Option<Vec<RowOutcome>> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Some(vec![fixtures::row_with_usage(0, "owner@example.com")])
+        } else {
+            None
+        }
+    }
+}
+
+/// A pass caught in the window the credential writer opens between staging
+/// `.credentials.json.tmp.<hex>` and renaming it into place.
+///
+/// The write is the real one, through
+/// [`write_credentials`](crate::secret::file_store::write_credentials), so
+/// what the loop has to clean up is a genuinely registered temporary file
+/// holding genuine token material — not a fixture standing in for one.
+#[cfg(feature = "testing")]
+struct StagingPass {
+    paths: Arc<Paths>,
+    blob: String,
+}
+
+#[cfg(feature = "testing")]
+impl Pass for StagingPass {
+    fn run(&self, _forced: bool, cancel: &Cancel, deadline: Instant) -> Option<Vec<RowOutcome>> {
+        let ns_dir = self.paths.namespace_dir(ACCT, ORG);
+        let request = WriteRequest {
+            paths: &self.paths,
+            ns_dir: &ns_dir,
+            blob_json: &self.blob,
+            prior: None,
+            new_expires_at_ms: Timestamp::now().as_millisecond() + 3_600_000,
+            fault: Fault::from_list("pause_before_rename"),
+        };
+
+        let ctx = PassCtx::standalone(cancel.clone(), deadline);
+        // The outcome is not this pass's business: the test is about what is
+        // left on disk when the loop returns, and every outcome here — the
+        // rename, the refusal, the cancellation — is one the writer handles.
+        let _ = write_credentials(&request, &ctx);
+        Some(Vec::new())
+    }
+}
+
+/// Every staged-but-unrenamed credential file in a namespace.
+#[cfg(feature = "testing")]
+fn staged_tmps(ns_dir: &Path) -> Vec<String> {
+    let prefix = format!("{CREDENTIALS_FILE}.tmp.");
+    let Ok(dir) = fs::read_dir(ns_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = dir
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&prefix))
+        .collect();
+    names.sort();
+    names
 }
 
 /// Locks a test mutex, recovering from poisoning so one failed assertion does
@@ -454,7 +565,14 @@ fn frames_keep_coming_and_quit_is_answered_while_a_worker_is_held() {
         "the loop left while the worker was still inside its 10s hold, after {ran_for:?}"
     );
     assert!(entered.load(Ordering::SeqCst), "the worker really did reach the lock");
-    assert!(!left.load(Ordering::SeqCst), "and had not come back out when `q` was pressed");
+    // `q` cancels and then drains for at most `QUIT_DRAIN_BUDGET`, so a
+    // cooperative worker is out by the time the loop returns. What proves the
+    // loop did not *wait out the hold* is the clock: 10 s of hold against a
+    // run that lasted less than five.
+    assert!(
+        left.load(Ordering::SeqCst),
+        "the held worker came out because it was cancelled, not because its 10s hold expired"
+    );
 
     assert!(events.asked_at.len() >= 6, "a frame was drawn before each of these asks");
     assert!(
@@ -463,13 +581,6 @@ fn frames_keep_coming_and_quit_is_answered_while_a_worker_is_held() {
         events.longest_redraw_gap()
     );
     assert!(cancel.is_cancelled(), "`q` sets the pass-wide cancellation flag");
-
-    // The worker is cooperative: cancelling is what winds it down, and it
-    // does so promptly rather than serving out the full hold.
-    assert!(
-        wait_until(Duration::from_secs(2), || left.load(Ordering::SeqCst)),
-        "the held worker should come out on cancellation"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -477,7 +588,7 @@ fn frames_keep_coming_and_quit_is_answered_while_a_worker_is_held() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_registered_child_is_killed_within_the_budget_after_quit() {
+fn a_registered_child_is_dead_by_the_time_quit_returns() {
     let report = Arc::new(Mutex::new(ChildReport::default()));
     let pass: Arc<dyn Pass> = Arc::new(ChildPass { report: Arc::clone(&report) });
 
@@ -487,26 +598,135 @@ fn a_registered_child_is_killed_within_the_budget_after_quit() {
 
     run_loop(&mut terminal, &mut events, &pass, &cancel, FLOOR)
         .expect("a test backend never fails to draw");
+    let returned_at = Instant::now();
     let quit_at = events.answered_quit_at.expect("the script answered `q`");
 
-    assert!(
-        wait_until(Duration::from_secs(2), || lock(&report).reaped_at.is_some()),
-        "the coordinator should have killed the child when the pass was cancelled"
-    );
-
+    // No polling for the child to die: `q` kills every registered child itself
+    // rather than leaving it to the coordinator's watchdog, so the `sleep 30`
+    // is already gone at this line. A `wait_until` here would pass even if the
+    // loop had left the job to a thread, which is the thing being ruled out.
     let report = lock(&report);
     let spawned_at = report.spawned_at.expect("the child was spawned");
-    let reaped_at = report.reaped_at.expect("the child was reaped");
+    let reaped_at = report
+        .reaped_at
+        .expect("the `sleep 30` must be dead before `run_loop` returns, not shortly after");
     assert!(spawned_at < quit_at, "the child was already running when `q` was pressed");
-    assert!(
-        reaped_at.duration_since(quit_at) <= Duration::from_millis(500),
-        "a `sleep 30` must be dead within 500ms of `q`, took {:?}",
-        reaped_at.duration_since(quit_at)
-    );
+    assert!(reaped_at <= returned_at, "and was reaped before the loop returned");
     assert!(
         report.interrupted,
         "the worker learns the pass was cancelled from its wait, not from a timeout"
     );
+
+    // AC35's budget, measured with the bounded drain in place.
+    let latency = returned_at.duration_since(quit_at);
+    assert!(latency < Duration::from_millis(500), "`q` must return within 500ms, took {latency:?}");
+}
+
+#[test]
+fn a_child_registered_with_no_watchdog_is_dead_by_the_time_quit_returns() {
+    // The same guarantee as the test above, on the path that has no watchdog
+    // at all. The 30 s budget is what makes it non-vacuous: without the
+    // cancellation clause in `wait_child_timeout` the wait would still be
+    // running when `run_loop` returned and `reaped_at` would be unset.
+    let report = Arc::new(Mutex::new(ChildReport::default()));
+    let pass: Arc<dyn Pass> = Arc::new(StandaloneChildPass {
+        report: Arc::clone(&report),
+        budget: Duration::from_secs(30),
+    });
+
+    let mut events = ScriptedEvents::quiet_then_quit(3);
+    let cancel = Cancel::new();
+    let mut terminal = terminal();
+
+    run_loop(&mut terminal, &mut events, &pass, &cancel, FLOOR)
+        .expect("a test backend never fails to draw");
+    let returned_at = Instant::now();
+    let quit_at = events.answered_quit_at.expect("the script answered `q`");
+
+    let report = lock(&report);
+    let spawned_at = report.spawned_at.expect("the child was spawned");
+    let reaped_at = report
+        .reaped_at
+        .expect("the `sleep 30` must be dead before `run_loop` returns, not 30 seconds later");
+    assert!(spawned_at < quit_at, "the child was already running when `q` was pressed");
+    assert!(reaped_at <= returned_at, "and was reaped before the loop returned");
+    assert!(
+        report.gave_up,
+        "the wait gave up and killed the child — `Ok(None)` is only returned after the \
+         kill and the reap"
+    );
+
+    let latency = returned_at.duration_since(quit_at);
+    assert!(latency < Duration::from_millis(500), "`q` must return within 500ms, took {latency:?}");
+}
+
+// ---------------------------------------------------------------------------
+// `q` leaves no token material staged
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "testing")]
+#[test]
+fn quitting_while_a_pass_holds_a_staged_credential_file_leaves_none_behind() {
+    // Gated on `testing` because that is the feature under which
+    // `Fault::pause_point` actually pauses; without it the writer would run
+    // straight through and there would be no staged file to observe, which
+    // would make the first assertion below vacuous rather than failing.
+    let store = store();
+    let ns_dir = store.paths.namespace_dir(ACCT, ORG);
+    fs::create_dir_all(&ns_dir).expect("the namespace directory should be creatable");
+
+    let pass: Arc<dyn Pass> = Arc::new(StagingPass {
+        paths: Arc::clone(&store.paths),
+        blob: blob(ACCT, "staged-access", "owner@example.com"),
+    });
+
+    // The staged file exists only between the write and the rename, so it is
+    // watched for rather than looked for once.
+    let seen_staged = Arc::new(AtomicBool::new(false));
+    let stop_watching = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let ns_dir = ns_dir.clone();
+        let seen = Arc::clone(&seen_staged);
+        let stop = Arc::clone(&stop_watching);
+        thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                if !staged_tmps(&ns_dir).is_empty() {
+                    seen.store(true, Ordering::SeqCst);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+
+    let mut events = ScriptedEvents::quiet_then_quit(3);
+    let cancel = Cancel::new();
+    let mut terminal = terminal();
+
+    run_loop(&mut terminal, &mut events, &pass, &cancel, FLOOR)
+        .expect("a test backend never fails to draw");
+    let returned_at = Instant::now();
+    let quit_at = events.answered_quit_at.expect("the script answered `q`");
+
+    stop_watching.store(true, Ordering::SeqCst);
+    let _ = watcher.join();
+
+    assert!(
+        seen_staged.load(Ordering::SeqCst),
+        "the pass really did stage a temporary credential file, so this test is about \
+         removing one rather than about there never having been one"
+    );
+    assert!(
+        staged_tmps(&ns_dir).is_empty(),
+        "`q` must not leave token material staged in the namespace: {:?}",
+        staged_tmps(&ns_dir)
+    );
+    assert!(
+        !ns_dir.join(CREDENTIALS_FILE).exists(),
+        "and a write the pass never finished must not have landed either"
+    );
+
+    let latency = returned_at.duration_since(quit_at);
+    assert!(latency < Duration::from_millis(500), "`q` must return within 500ms, took {latency:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -587,6 +807,66 @@ fn a_cancelled_run_leaves_without_drawing_again() {
 }
 
 // ---------------------------------------------------------------------------
+// A pass that could not look keeps the numbers that are on screen
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_pass_whose_registry_cannot_be_read_reports_nothing_rather_than_no_accounts() {
+    let store = store();
+    write_owned_registry(&store);
+    // What another terminal's `login` looks like if this pass reads the
+    // registry halfway through it being saved.
+    fs::write(store.paths.config_file(), "{\"version\": 1, \"accounts\": [")
+        .expect("the registry should be writable");
+
+    let session = Session {
+        paths: Arc::clone(&store.paths),
+        env: EnvView::with_home(store.home.clone()),
+        reader_factory: Arc::new(|_ctx| {
+            let reader: Box<dyn KeychainReader + Send + Sync> = Box::new(FakeReader::unlocked());
+            reader
+        }),
+        // Unroutable: this pass must fail long before anything is fetched.
+        client_factory: Arc::new(|| {
+            UsageClient::new("http://127.0.0.1:1", "agentctl/test", Duration::from_secs(1))
+        }),
+        refresher: Arc::new(NeverRefresher),
+        fault: Fault::none(),
+    };
+
+    let rows = session.run(false, &Cancel::new(), pass_deadline(FLOOR));
+
+    assert!(
+        rows.is_none(),
+        "an unreadable registry says nothing about the accounts; an empty list would say \
+         there are none and blank the display: {rows:?}"
+    );
+}
+
+#[test]
+fn a_pass_that_reports_nothing_leaves_the_previous_rows_on_screen() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let pass: Arc<dyn Pass> = Arc::new(FailsAfterFirstPass { calls: Arc::clone(&calls) });
+
+    // `r` is what makes the second pass happen inside this test rather than a
+    // minute later.
+    let mut events =
+        ScriptedEvents::scripted(vec![None, Some(Key::Refresh), None, None, Some(Key::Quit)]);
+    let mut terminal = terminal();
+
+    run_loop(&mut terminal, &mut events, &pass, &Cancel::new(), FLOOR)
+        .expect("a test backend never fails to draw");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "`r` should have started a second pass");
+    let frame = terminal.backend().to_string();
+    assert!(
+        frame.contains("owner@example.com"),
+        "the second pass reported nothing, so the first pass's row must still be on \
+         screen:\n{frame}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // AC44 — the keychain preflight is re-run every pass
 // ---------------------------------------------------------------------------
 
@@ -652,7 +932,8 @@ fn a_keychain_that_locks_between_passes_is_reported_on_the_next_one() {
     };
 
     let cancel = Cancel::new();
-    let first = session.run(false, &cancel, pass_deadline(FLOOR));
+    let first =
+        session.run(false, &cancel, pass_deadline(FLOOR)).expect("the registry is readable");
     assert_eq!(
         live_row(&first).state,
         AccountState::Ok,
@@ -665,7 +946,8 @@ fn a_keychain_that_locks_between_passes_is_reported_on_the_next_one() {
     // The user's keychain locks between the two passes.
     locked.store(true, Ordering::SeqCst);
 
-    let second = session.run(false, &cancel, pass_deadline(FLOOR));
+    let second =
+        session.run(false, &cancel, pass_deadline(FLOOR)).expect("the registry is readable");
 
     let live = live_row(&second);
     assert_eq!(

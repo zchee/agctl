@@ -489,7 +489,7 @@ impl Default for Fixture {
 /// scripting variables. Removed *before* the fixture's own settings are
 /// applied, so an inherited value loses to the fixture rather than to the
 /// list.
-const REMOVED_ENV: [&str; 14] = [
+const REMOVED_ENV: [&str; 17] = [
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -504,6 +504,13 @@ const REMOVED_ENV: [&str; 14] = [
     "AGENTCTL_FAKE_SECURITY_PREFLIGHT_EXIT",
     "AGENTCTL_FAKE_SECURITY_FIND_EXIT",
     "AGENTCTL_FAKE_SECURITY_DUMP_EXIT",
+    "AGENTCTL_FAKE_SECURITY_STDERR",
+    "AGENTCTL_FAKE_SECURITY_PREFLIGHT_STDERR",
+    // A developer's own `RUST_LOG` would change what every command prints,
+    // which is what `e2e_tracing` measures; it sets its own through the
+    // fixture, and the removals above run first, so this takes nothing away
+    // from a test that means to have one.
+    "RUST_LOG",
 ];
 
 // ---------------------------------------------------------------------------
@@ -759,21 +766,23 @@ impl Output {
 
 /// Waits for a child and drains both its pipes.
 ///
+/// `wait_with_output` rather than reading the two pipes in turn: a pipe holds
+/// about 64 KiB before it blocks the writer, so draining standard output to
+/// end-of-file first deadlocks against any child that fills standard error
+/// before it finishes writing standard output — which `RUST_LOG=agentctl=trace`
+/// makes easy. The standard library reads both at once.
+///
 /// # Panics
 ///
 /// Panics when the child cannot be waited for.
 #[must_use]
-pub fn finish(mut child: Child) -> Output {
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_string(&mut stdout);
+pub fn finish(child: Child) -> Output {
+    let output = child.wait_with_output().expect("the child should be waitable");
+    Output {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
-    let status = child.wait().expect("the child should be waitable");
-    Output { code: status.code(), stdout, stderr }
 }
 
 // ---------------------------------------------------------------------------
@@ -784,10 +793,34 @@ pub fn finish(mut child: Child) -> Output {
 ///
 /// `CARGO_TARGET_TMPDIR` is one directory shared by every process `nextest`
 /// starts for this test binary, which is what lets a per-test assertion also
-/// contribute to a suite-wide one. Removing the file resets the aggregate.
+/// contribute to a suite-wide one.
+///
+/// The file name carries the run's identity, so each run accumulates into a
+/// file of its own. Without that key the aggregate would outlive the run that
+/// wrote it, and a later run would read — and could fail on — a line no process
+/// in it ever produced.
+///
+/// `NEXTEST_RUN_ID` is set by `cargo-nextest` at run time, so it is read with
+/// [`std::env::var`] rather than `env!`, which would bake in whatever was set
+/// when the test binary was *compiled*. Under plain `cargo test` there is no
+/// run id, so the key falls back to this process's id: the aggregate is then
+/// per test binary rather than per run, which is a weaker suite-wide check but
+/// still never reads a line from a previous run.
 #[must_use]
 pub fn aggregate_log_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fake-security-argv.log")
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let key = match std::env::var("NEXTEST_RUN_ID") {
+        Ok(id) if is_plain_identifier(&id) => id,
+        // Also the path a forged run id takes: a value carrying a path
+        // separator would put the aggregate somewhere nobody asked for.
+        _ => format!("cargo-test-{}", std::process::id()),
+    };
+    dir.join(format!("fake-security-argv.{key}.log"))
+}
+
+/// Whether a value is safe to paste into a file name.
+fn is_plain_identifier(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
 }
 
 /// Appends one test's keychain calls to the suite-wide log.
@@ -858,12 +891,25 @@ impl LoginSession {
     #[must_use]
     pub fn finish(mut self) -> Output {
         drop(self.child.stdin.take());
+
+        // Standard error is drained on its own thread, for the reason
+        // [`finish`] uses `wait_with_output`: reading standard output to
+        // end-of-file first would deadlock against a login that fills the
+        // 64 KiB standard-error pipe before it is done talking. `wait_with_output`
+        // is not available here because standard output was already taken, to
+        // read the authorize URL back off it.
+        let pipe = self.child.stderr.take();
+        let draining = std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        });
+
         let mut rest = String::new();
         let _ = self.reader.read_to_string(&mut rest);
-        let mut stderr = String::new();
-        if let Some(mut pipe) = self.child.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr);
-        }
+        let stderr = draining.join().unwrap_or_default();
         let status = self.child.wait().expect("the child should be waitable");
         let mut stdout = self.url.clone();
         stdout.push('\n');

@@ -438,6 +438,109 @@ fn wait_child_timeout_kills_and_reaps_a_child_that_overruns() {
 }
 
 #[test]
+fn a_cancelled_timed_wait_kills_the_child_rather_than_serving_out_its_budget() {
+    // The clause that makes AC43 hold where no watchdog exists: `watch`
+    // discovers under a standalone context, and `login`, `import`, `doctor`
+    // and `accounts` do every `security(1)` read through one. Before it, a
+    // Ctrl-C during a `dump-keychain` left the child running for the rest of
+    // its budget with nothing left alive to reap it.
+    let cancel = Cancel::new();
+    let ctx = PassCtx::standalone(cancel.clone(), Instant::now() + Duration::from_secs(60));
+    let child = Command::new("/bin/sleep")
+        .arg(SLEEP_SECONDS)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("sleep should be spawnable");
+    let pid = child.id();
+    let token = ctx.register_child(child);
+
+    cancel.cancel();
+    let start = Instant::now();
+    let outcome = ctx
+        .wait_child_timeout(token, Duration::from_secs(30))
+        .expect("cancellation is not an error");
+    let elapsed = start.elapsed();
+
+    assert!(outcome.is_none(), "a cancelled wait gives up rather than reporting an exit status");
+    assert!(elapsed < BUDGET, "it must not serve out the 30s budget, took {elapsed:?}");
+    assert!(!pid_is_alive(pid), "and the child must be dead and reaped, not orphaned");
+
+    // Removed from the table by the kill, so a second wait reports what a
+    // coordinator kill reports rather than blocking on a child that is gone.
+    let err = ctx
+        .wait_child_timeout(token, Duration::from_millis(50))
+        .expect_err("the child is no longer registered");
+    assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+}
+
+#[test]
+fn a_cancelled_untimed_wait_kills_the_child_and_reports_it_as_interrupted() {
+    // `wait_child` has no budget of its own, so cancellation is the only thing
+    // that can end it. The pair has to behave alike or a job would keep a
+    // child alive by choosing the untimed call.
+    let cancel = Cancel::new();
+    let ctx = PassCtx::standalone(cancel.clone(), Instant::now() + Duration::from_secs(60));
+    let child = Command::new("/bin/sleep")
+        .arg(SLEEP_SECONDS)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("sleep should be spawnable");
+    let pid = child.id();
+    let token = ctx.register_child(child);
+
+    cancel.cancel();
+    let start = Instant::now();
+    let err = ctx.wait_child(token).expect_err("a cancelled wait never returns an exit status");
+    let elapsed = start.elapsed();
+
+    assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+    assert!(elapsed < BUDGET, "cancellation is what ends this wait, took {elapsed:?}");
+    assert!(!pid_is_alive(pid), "and the child must be dead and reaped, not orphaned");
+}
+
+#[test]
+fn a_child_that_exited_before_the_cancellation_is_still_reported_as_having_exited() {
+    // Why the cancellation clause sits *after* the `try_wait` harvest rather
+    // than at the top of the loop: a read that had already finished must be
+    // reported as finished, and its entry must leave the table. Checking
+    // cancellation first would call a completed `find-generic-password` a
+    // timeout and leave a zombie behind it.
+    let cancel = Cancel::new();
+    let ctx = PassCtx::standalone(cancel.clone(), Instant::now() + Duration::from_secs(60));
+
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exit 7")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("a shell should be spawnable");
+    // Waited here rather than slept on, so "the child had already exited" is a
+    // fact this test establishes rather than one it hopes for. `try_wait`
+    // inside the table then returns the status the standard library cached.
+    let status = child.wait().expect("the child should be waitable");
+    assert_eq!(status.code(), Some(7), "the fixture child really did exit on its own");
+    let token = ctx.register_child(child);
+
+    cancel.cancel();
+    let outcome = ctx
+        .wait_child_timeout(token, Duration::from_secs(30))
+        .expect("cancellation is not an error");
+
+    assert_eq!(
+        outcome.map(|status| status.code()),
+        Some(Some(7)),
+        "a child that had already exited must be harvested, not reported as killed"
+    );
+    let err = ctx
+        .wait_child_timeout(token, Duration::from_millis(50))
+        .expect_err("and its entry must have left the table rather than lingering as a zombie");
+    assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+}
+
+#[test]
 fn wait_child_timeout_reports_a_coordinator_kill_as_interrupted() {
     let ctx = PassCtx::standalone(Cancel::new(), Instant::now() + Duration::from_secs(30));
     let err = ctx

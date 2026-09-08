@@ -19,6 +19,13 @@
 mod common;
 
 use std::fs;
+use std::process::Command as StdCommand;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 use common::ACCT;
 use common::EMAIL;
@@ -49,6 +56,56 @@ fn assert_no_token_material(what: &str, stdout: &str, stderr: &str) {
             "{what}: `{needle}` reached standard error\n--- stderr ---\n{stderr}"
         );
     }
+}
+
+#[test]
+fn the_harness_drains_a_child_that_fills_its_standard_error_pipe() {
+    // Turning the trace level up is what makes this file's other tests
+    // interesting, and it is also what makes agentctl write far more to
+    // standard error than a pipe holds — about 64 KiB. A harness that read the
+    // two streams in turn would sit on standard output forever while the child
+    // sat on a full standard error, so this pins the property `common::finish`
+    // has to have, with a child that reproduces the shape exactly: fill
+    // standard error first, write standard output only afterwards.
+    let child = StdCommand::new("/bin/sh")
+        .arg("-c")
+        .arg("head -c 200000 /dev/zero | tr '\\0' 'e' >&2; echo done")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("`/bin/sh` should be runnable");
+
+    // A regression here would deadlock rather than fail, and a hung test says
+    // much less than a failed one. Killing the child unblocks both pipes, so
+    // `finish` returns and the assertions below report what went wrong.
+    let pid = child.id();
+    let finished_in_time = Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let finished_in_time = Arc::clone(&finished_in_time);
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while !finished_in_time.load(Ordering::SeqCst) {
+                if start.elapsed() >= Duration::from_secs(10) {
+                    let _ = StdCommand::new("/bin/kill").args(["-KILL", &pid.to_string()]).status();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+
+    let finished = common::finish(child);
+    finished_in_time.store(true, Ordering::SeqCst);
+    let _ = watchdog.join();
+
+    assert_eq!(finished.code(), 0, "the child should have exited on its own, not been killed");
+    assert_eq!(
+        finished.stderr.len(),
+        200_000,
+        "the whole of standard error should be read back, not the first pipe-full"
+    );
+    assert_eq!(finished.stdout.trim(), "done", "and standard output should be complete too");
 }
 
 #[test]

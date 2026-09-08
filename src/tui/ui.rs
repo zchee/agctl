@@ -86,12 +86,18 @@ pub fn header_line(app: &App) -> String {
         Some(at) => format!("last fetch {} ago", render_countdown(at, app.now)),
         None => format!("last fetch {EMPTY_CELL}"),
     });
-    parts.push(match app.next_fetch {
-        Some(at) => format!("next fetch in {}", render_countdown(app.now, at)),
-        None => format!("next fetch {EMPTY_CELL}"),
-    });
+    // The countdown and `fetching` are alternatives, not companions. While a
+    // pass is in flight the next one has not been scheduled yet, so
+    // `next_fetch` still holds the moment the *previous* pass aimed at — a
+    // number that counts down past zero and then sits there while the display
+    // says it is fetching. Showing one or the other keeps the header honest.
     if app.fetching {
         parts.push("fetching".to_owned());
+    } else {
+        parts.push(match app.next_fetch {
+            Some(at) => format!("next fetch in {}", render_countdown(app.now, at)),
+            None => format!("next fetch {EMPTY_CELL}"),
+        });
     }
     if app.stale {
         parts.push("stale".to_owned());

@@ -31,6 +31,7 @@ use crate::commands::status;
 use crate::error::AppError;
 use crate::error::EXIT_OK;
 use crate::runtime::coordinator::Cancel;
+use crate::runtime::log_writer::TerminalAwareWriter;
 use crate::runtime::signals;
 
 fn main() {
@@ -59,13 +60,20 @@ fn main() {
 /// stderr, not stdout: `status --json` writes a machine-readable document to
 /// stdout and log lines interleaved into it would corrupt it.
 ///
+/// The writer is [`TerminalAwareWriter`] rather than [`std::io::stderr`]
+/// directly, so that a line raised while `watch` owns the terminal is held
+/// back and delivered once the terminal has been given up, instead of being
+/// painted into the alternate screen and lost with it.
+///
 /// An unset or unparseable `RUST_LOG` falls back to `warn`, and a subscriber
 /// that is already installed is left alone, so this is safe to call more than
 /// once.
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-    let _ =
-        tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(TerminalAwareWriter)
+        .try_init();
 }
 
 /// Routes a parsed command line to its implementation.
