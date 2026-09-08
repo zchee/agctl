@@ -24,12 +24,62 @@ keychain backend, the endpoint URL overrides, the fault-injection switch — and
 `tests/feature_guard.rs` fails the build with a `compile_error!` without it, so a run that
 omits the flag does not quietly skip the e2e suite.
 
-Two acceptance criteria are separate gates, deliberately not folded into the three commands
-above: **AC38** requires that `direnv exec . cargo --config ~/.config/rust/config.dev.toml
-check --tests` (no features) *fails* with that `compile_error!`, and **AC37** requires that a
-default-feature `cargo build --release` produces an artifact containing no test-only
-environment-variable name, while the `--all-features` build does contain them. Check both when
-touching the feature gating or the test seams.
+Tests that spawn the binary — `tests/cli_smoke.rs` and every `tests/e2e_*.rs` — must reach
+it through `env!("CARGO_BIN_EXE_agentctl")`. Never `assert_cmd::Command::cargo_bin`: that
+resolves to `./target/debug`, and with `--config ~/.config/rust/config.dev.toml` redirecting
+the build to `/Volumes/tmpfs/target`, it has already found a **stale artifact** on this
+machine and tested a binary nobody had just built. A suite that passes against the wrong
+binary is worse than one that fails.
+
+## The two separate gates
+
+**AC38** and **AC37** are deliberately not folded into the three commands above. Check both
+whenever you touch the feature gating or the test seams.
+
+**AC38** — the no-feature build must fail loudly rather than silently skipping the e2e
+suite:
+
+```sh
+direnv exec . cargo --config ~/.config/rust/config.dev.toml check --tests --keep-going
+```
+
+Expected: it *fails*, and the only error listed is `tests/feature_guard.rs`'s
+`compile_error!`. Any other error means a test file lost its `#![cfg(feature = "testing")]`.
+
+**AC37** — a default-feature release artifact must contain no test-only environment-variable
+name, and must still contain the production ones. Run the script:
+
+```sh
+scripts/release-gate.sh
+```
+
+It builds `cargo build --release` (default features, no `--config`, into a scratch
+`--target-dir` that is never `./target` and never the shared `/Volumes/tmpfs/target`) and
+greps the artifact for two lists. **Nine seam names, every one of which must be absent:**
+
+| name | owner |
+|------|-------|
+| `AGENTCTL_FAULT` | `src/runtime/fault.rs` |
+| `AGENTCTL_FAULT_RESUME` | `src/runtime/fault.rs` |
+| `AGENTCTL_KEYCHAIN_BACKEND` | `src/secret/mod.rs` |
+| `AGENTCTL_SECURITY_BIN` | `src/secret/mod.rs` |
+| `AGENTCTL_CLAUDE_USAGE_URL` | `src/provider/claude/usage.rs` |
+| `AGENTCTL_CLAUDE_TOKEN_URL` | `src/provider/claude/oauth.rs` |
+| `AGENTCTL_CLAUDE_AUTHORIZE_URL` | `src/provider/claude/oauth.rs` |
+| `AGENTCTL_FAKE_SECURITY_LOG` | `src/secret/fake_security.rs` |
+| `AGENTCTL_NO_BROWSER` | `src/commands/login.rs` |
+
+**Three production names, every one of which must be present:** `AGENTCTL_CONFIG_DIR`,
+`AGENTCTL_CLAUDE_USER_AGENT`, `AGENTCTL_CLAUDE_OAUTH_SCOPES`. (The presence half is there so
+a build that somehow embedded no strings at all cannot pass by accident.)
+
+A seam in a release artifact is not a style problem. `AGENTCTL_CLAUDE_TOKEN_URL` in a
+production binary means a refresh token goes wherever an environment variable points it.
+If the gate fails, the build enabled `testing` — never `cargo build --release
+--all-features`, never `cargo install --all-features`.
+
+Adding a new test seam means adding its name to the `seams` array in
+`scripts/release-gate.sh` **and** to the table above, in the same change that introduces it.
 
 Benchmarks are not part of this gate. When you do run them, run them **bare** — `cargo bench`
 with no direnv — because `layout rust_stable` pins `-C target-cpu` to the host CPU.
@@ -52,4 +102,6 @@ with no direnv — because `layout rust_stable` pins `-C target-cpu` to the host
 ## Reporting
 
 State plainly which of the three passed and which failed, and paste the actual failing output
-rather than summarizing it. If all three pass, say so in one line — do not pad it.
+rather than summarizing it. If all three pass, say so in one line — do not pad it. Say
+separately whether you ran the AC37 and AC38 gates, and paste `scripts/release-gate.sh`'s
+output verbatim when you did.
