@@ -30,14 +30,6 @@
 //! exclusion. That is invariant I12, and it is the conservative side of a
 //! trade whose other side is two processes rotating one refresh chain.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "remaining items are consumed by W2 (accounts, import, doctor) and W3 (watch)"
-    )
-)]
-
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Seek;
@@ -128,10 +120,11 @@ pub struct LockBody {
     /// When that process started, for telling a live holder from a recycled
     /// pid.
     ///
-    /// Always `null` in this build. Reading it portably means a `sysctl` FFI
-    /// call on macOS, and nothing in phase 1 consumes it — `doctor`, which
-    /// does, lands in W2 and can fill it in then. The field exists now so a
-    /// lock body written today stays readable when it does.
+    /// Filled from [`crate::runtime::proc::self_start_time`] at acquire time,
+    /// which reads `ps -o lstart=` once per process. `null` when `ps` could not
+    /// be run: `doctor` then falls back to the process id alone, which is
+    /// weaker but still useful, rather than the acquire failing over a
+    /// diagnostic field.
     pub pid_start_time: Option<String>,
     /// When the lock was taken, RFC 3339.
     pub acquired_at: String,
@@ -327,7 +320,7 @@ pub fn read_body(path: &Path) -> Option<LockBody> {
 fn write_body(guard: &mut NamespaceLockGuard) -> Result<(), LockError> {
     let body = LockBody {
         pid: std::process::id(),
-        pid_start_time: None,
+        pid_start_time: crate::runtime::proc::self_start_time(),
         acquired_at: jiff::Timestamp::now().to_string(),
     };
     let json = serde_json::to_string(&body).map_err(|err| {

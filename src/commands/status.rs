@@ -40,6 +40,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use jiff::Timestamp;
+use serde_json::Map;
 use serde_json::Value;
 use tracing::field::Empty;
 
@@ -69,6 +70,9 @@ use crate::provider::claude::usage::UsageClient;
 use crate::provider::claude::usage::parse_usage;
 use crate::render::Report;
 use crate::render::StatusRow;
+use crate::render::json;
+use crate::render::json::JsonRow;
+use crate::render::json::StatusReport;
 use crate::render::table;
 use crate::runtime::coordinator::Cancel;
 use crate::runtime::coordinator::DEFAULT_MAX_WORKERS;
@@ -112,12 +116,6 @@ pub const PASS_TIMEOUT_MULTIPLIER: u32 = 3;
 /// stdout, and this only sets the exit status. Anything else is fatal and
 /// means nothing was rendered.
 pub fn run(cli: &Cli, args: &StatusArgs, cancel: &Cancel) -> Result<(), AppError> {
-    if args.json {
-        return Err(AppError::Config(
-            "`--json` lands in S6; the table is on stdout in the meantime".to_owned(),
-        ));
-    }
-
     // Step 1: load. `ensure_dirs` is what makes a first run work at all — the
     // cache write later would otherwise fail on a store that does not exist.
     let paths = Arc::new(Paths::resolve(cli.config_dir.as_deref())?);
@@ -165,10 +163,22 @@ pub fn run(cli: &Cli, args: &StatusArgs, cancel: &Cancel) -> Result<(), AppError
         now: Timestamp::now(),
         show_all: args.all,
     };
-    println!("{}", table::render(&report));
 
-    if args.raw {
-        print_raw(&outcomes, args.all);
+    // `--json` replaces the table rather than accompanying it: the document is
+    // the whole of stdout, so a caller can pipe it straight into a parser.
+    // Log lines are on stderr already (see `main::init_tracing`), which is what
+    // makes that safe.
+    if args.json {
+        let document = json_report(&outcomes, &report, args.raw);
+        let text = serde_json::to_string_pretty(&document).map_err(|err| {
+            AppError::Config(format!("the JSON report could not be serialized: {err}"))
+        })?;
+        println!("{text}");
+    } else {
+        println!("{}", table::render(&report));
+        if args.raw {
+            print_raw(&outcomes, args.all);
+        }
     }
 
     if failed > 0 { Err(AppError::Partial { failed }) } else { Ok(()) }
@@ -212,6 +222,33 @@ fn collect(
     // that two runs of `status` on an unchanged machine look the same.
     outcomes.sort_by_key(|outcome| outcome.index);
     Ok(outcomes)
+}
+
+/// Builds the `StatusReport v1` document from a finished pass.
+///
+/// The rows are the ones the table would have shown, in the same order, so the
+/// two renderings of one pass never disagree about what exists. `hidden` is
+/// the same count the table's footer prints.
+///
+/// `raw` carries the untouched usage bodies, keyed by row id, and only when
+/// `--raw` was given. Those bodies are usage figures — the `spend` object this
+/// build deliberately never parses among them (plan AC23) — and carry no token
+/// material (invariant I4).
+fn json_report(outcomes: &[RowOutcome], report: &Report, raw: bool) -> StatusReport {
+    let mut document = StatusReport::new(report.now, report.hidden_count());
+    let shown = outcomes.iter().filter(|outcome| report.show_all || outcome.visible_by_default);
+
+    let mut bodies = Map::new();
+    for outcome in shown {
+        document.rows.push(outcome.to_json_row());
+        if raw && let Some(body) = outcome.usage.as_ref().and_then(|usage| usage.raw.as_ref()) {
+            bodies.insert(outcome.id.clone(), body.clone());
+        }
+    }
+    if raw {
+        document.raw = Some(bodies);
+    }
+    document
 }
 
 /// Prints each shown row's untouched response body after the table.
@@ -350,10 +387,22 @@ struct Shared {
 #[derive(Debug)]
 struct RowOutcome {
     index: usize,
+    /// The identifier `--account` accepts, and the key `--raw` files this
+    /// row's body under in the JSON report.
+    id: String,
+    /// What the registry knows: the identifiers, the labels, and the kind.
+    /// Kept whole rather than copied field by field, because the JSON report
+    /// publishes most of it and a copy would be one more place to forget.
+    record: AccountRecord,
+    source: Source,
     account: String,
     org: String,
     plan: String,
     state: AccountState,
+    /// What the namespace lock did on this pass, from [`LockedResult`]. Only
+    /// the JSON report shows it — the table has no column for it — and plan
+    /// AC7 pins the `busy` case.
+    lock_state: &'static str,
     note: Option<String>,
     usage: Option<UsageSnapshot>,
     visible_by_default: bool,
@@ -371,6 +420,26 @@ impl RowOutcome {
             visible_by_default: self.visible_by_default,
         }
     }
+
+    fn to_json_row(&self) -> JsonRow {
+        let usage = self.usage.as_ref();
+        JsonRow {
+            id: self.id.clone(),
+            account_uuid: self.record.account_uuid.clone(),
+            organization_uuid: self.record.organization_uuid.clone(),
+            email: self.record.email.clone(),
+            org_name: self.record.org_name.clone(),
+            kind: self.record.kind.name(),
+            source: self.source.name(),
+            state: self.state.name(),
+            state_label: self.state.label(),
+            lock_state: self.lock_state,
+            windows: json::windows_of(usage),
+            credits: json::credits_of(usage),
+            next_reset: json::next_reset_of(usage),
+            note: self.note.clone(),
+        }
+    }
 }
 
 /// Produces one row: cache, refresh, fetch, normalize.
@@ -384,7 +453,7 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
     let span = tracing::info_span!(
         "account",
         account.id = %row.id,
-        kind = kind_name(&row.record.kind),
+        kind = row.record.kind.name(),
         source = ?row.source,
         cache.hit = Empty,
         http.status = Empty,
@@ -396,13 +465,17 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
     );
     let _entered = span.enter();
 
-    let AccountRow { id, record, state, credentials, visible_by_default, note, source: _ } = row;
+    let AccountRow { id, record, state, credentials, visible_by_default, note, source } = row;
     let mut outcome = RowOutcome {
         index,
+        id: id.clone(),
+        record: record.clone(),
+        source,
         account: record.email.clone().unwrap_or_else(|| id.clone()),
         org: record.org_name.clone().unwrap_or_else(|| record.organization_uuid.clone()),
         plan: credentials.as_ref().and_then(|c| c.subscription_type.clone()).unwrap_or_default(),
         state,
+        lock_state: "none",
         note,
         usage: None,
         visible_by_default,
@@ -620,6 +693,7 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
 /// Folds one [`LockedResult`] into the row and its span.
 fn apply(span: &tracing::Span, outcome: &mut RowOutcome, result: &LockedResult) {
     span.record("lock_state", result.lock_state);
+    outcome.lock_state = result.lock_state;
     if let Some(age_ms) = result.lock_age_ms {
         span.record("lock.age_ms", age_ms);
     }
@@ -635,7 +709,7 @@ fn apply(span: &tracing::Span, outcome: &mut RowOutcome, result: &LockedResult) 
 }
 
 /// What one trip through the namespace lock produced.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct LockedResult {
     /// The credentials to carry on with, or `None` when the row is finished.
     credentials: Option<Credentials>,
@@ -645,6 +719,22 @@ struct LockedResult {
     pending_decision: Option<String>,
     lock_age_ms: Option<i64>,
     lock_state: &'static str,
+}
+
+impl Default for LockedResult {
+    /// Spelled out rather than derived so `lock_state` starts at `none` and
+    /// not at the empty string: it reaches the JSON report, whose schema lists
+    /// the six words this vocabulary has, and `""` is not one of them.
+    fn default() -> Self {
+        Self {
+            credentials: None,
+            state: None,
+            note: None,
+            pending_decision: None,
+            lock_age_ms: None,
+            lock_state: "none",
+        }
+    }
 }
 
 /// The write path of plan section 3.3 step 3, from the target check to the
@@ -1061,16 +1151,6 @@ fn store_cache(path: &Path, body: &Value, fetched_at_ms: i64, until_ms: Option<i
     entry.rate_limited_until_ms = until_ms;
     if let Err(err) = cache::store(path, &entry) {
         tracing::debug!(path = %path.display(), error = %err, "could not write the usage cache");
-    }
-}
-
-/// The record kind, as a span field.
-fn kind_name(kind: &AccountKind) -> &'static str {
-    match kind {
-        AccountKind::Owned { .. } => "owned",
-        AccountKind::Live => "live",
-        AccountKind::ConfigDirReadOnly { .. } => "config_dir",
-        AccountKind::Foreign { .. } => "foreign",
     }
 }
 

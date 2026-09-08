@@ -28,7 +28,12 @@ fn acquiring_writes_a_body_naming_this_process() {
     let body = read_body(guard.path()).expect("the body should be readable");
     assert_eq!(body.pid, std::process::id());
     assert!(!body.acquired_at.is_empty(), "the body records when it was taken");
-    assert_eq!(body.pid_start_time, None, "not populated in this build; see the field's docs");
+    assert_eq!(
+        body.pid_start_time,
+        crate::runtime::proc::self_start_time(),
+        "the body names when this process started, so a recycled pid is detectable"
+    );
+    assert!(body.pid_start_time.is_some(), "`ps -o lstart=` answers on this platform");
 
     assert_eq!(guard.path(), paths.lock_path("acct", "org"));
     let mode = std::fs::metadata(guard.path()).expect("the lock file exists").permissions().mode();

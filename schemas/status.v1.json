@@ -1,0 +1,217 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/zchee/agentctl/schemas/status.v1.json",
+  "title": "agentctl claude status report, version 1",
+  "description": "The document `agentctl claude status --json` writes to stdout. It carries no token material: the only upstream bytes it reproduces are usage response bodies, under `raw`, and those contain usage figures alone.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "generated_at", "rows", "hidden"],
+  "properties": {
+    "version": {
+      "description": "The report version. A consumer must refuse a version it does not know.",
+      "const": 1
+    },
+    "generated_at": {
+      "description": "When the report was built, RFC 3339 in UTC. Every countdown in the document is relative to this instant.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "rows": {
+      "description": "The accounts the run displayed, in the order the table shows them. Rows hidden by default are present only when --all was given.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/row" }
+    },
+    "hidden": {
+      "description": "How many rows --all would have added. Zero when --all was given.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "raw": {
+      "description": "The untouched usage response bodies, keyed by row id. Present only with --raw.",
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "account_uuid",
+        "organization_uuid",
+        "email",
+        "org_name",
+        "kind",
+        "source",
+        "state",
+        "state_label",
+        "lock_state",
+        "windows",
+        "credits",
+        "next_reset",
+        "note"
+      ],
+      "properties": {
+        "id": {
+          "description": "The identifier --account accepts for this row: the account UUID when it is unambiguous, `<account>/<organization>` when it is not, and the keychain service name for an item with no identity.",
+          "type": "string"
+        },
+        "account_uuid": {
+          "description": "The Anthropic account UUID. Empty when the credential named no account.",
+          "type": "string"
+        },
+        "organization_uuid": {
+          "description": "The organization UUID, or `_unknown-org` when the login could not name one.",
+          "type": "string"
+        },
+        "email": { "type": ["string", "null"] },
+        "org_name": { "type": ["string", "null"] },
+        "kind": {
+          "description": "Where the credentials live, and so whether agentctl may write them. Only `owned` is ever refreshed.",
+          "enum": ["owned", "live", "config_dir", "metadata"]
+        },
+        "source": {
+          "description": "Where this row's credentials were actually read from on this pass.",
+          "enum": ["keychain", "file", "env", "none"]
+        },
+        "state": {
+          "description": "The row state as a stable token. `state_label` is the same fact as a sentence and may be reworded; this may not.",
+          "enum": [
+            "ok",
+            "expired",
+            "needs_login",
+            "identity_unknown",
+            "stale_sibling_of_live",
+            "unclaimed",
+            "forgotten",
+            "migrated_to_keychain",
+            "claude_session_detected",
+            "keychain_locked",
+            "keychain_timeout",
+            "busy",
+            "lock_unavailable",
+            "stale",
+            "no_subscription_limits",
+            "pending_replayed",
+            "pending_discarded",
+            "rate_limited",
+            "refresh_discarded",
+            "env_token",
+            "error"
+          ]
+        },
+        "state_label": {
+          "description": "The state as the table's State column spells it, payload included.",
+          "type": "string"
+        },
+        "lock_state": {
+          "description": "What the namespace lock did on this pass. `busy` means another process held it past this run's deadline; `adopted` means this run took the winner's freshly written credentials instead of refreshing again.",
+          "enum": [
+            "none",
+            "busy",
+            "adopted",
+            "claude_detected",
+            "migrated",
+            "unavailable"
+          ]
+        },
+        "windows": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/window" }
+        },
+        "credits": { "$ref": "#/$defs/credits" },
+        "next_reset": {
+          "description": "The soonest window reset across this row, RFC 3339.",
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "note": { "type": ["string", "null"] }
+      }
+    },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "label", "percent", "percent_floor", "resets_at", "is_active"],
+      "properties": {
+        "kind": {
+          "description": "`unknown` is a window this build does not recognise; its `label` carries the server's own kind string verbatim.",
+          "enum": ["session", "weekly_all", "weekly_scoped", "unknown"]
+        },
+        "label": {
+          "description": "The window's display label, which is where a scoped window's scope appears.",
+          "type": "string"
+        },
+        "percent": {
+          "description": "The percentage the server sent, clamped to 0..=100. Null when it sent something that is not a number.",
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "percent_floor": {
+          "description": "`percent` floored, which is the figure the table and the web UI agree on.",
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "resets_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "is_active": {
+          "description": "Whether this is the window currently constraining the account.",
+          "type": "boolean"
+        }
+      }
+    },
+    "credits": {
+      "description": "Extra-usage credits, from the response's `extra_usage` object alone. Present on every row, including rows that fetched nothing.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "used_minor",
+        "currency",
+        "exponent",
+        "limit_minor",
+        "percent",
+        "disabled_reason",
+        "scope"
+      ],
+      "properties": {
+        "state": {
+          "description": "`off` means the account has credits and they are switched off; `unavailable` means the response said nothing about credits at all. The two are not interchangeable.",
+          "enum": ["on", "off", "unavailable"]
+        },
+        "used_minor": {
+          "description": "Spend in minor units of `currency`. May be negative for a credited account.",
+          "type": ["integer", "null"]
+        },
+        "currency": {
+          "description": "ISO 4217 code. Null unless the server sent a figure to denominate.",
+          "type": ["string", "null"]
+        },
+        "exponent": {
+          "description": "How many decimal places one minor unit represents.",
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 6
+        },
+        "limit_minor": {
+          "description": "The monthly ceiling in minor units. Null for an uncapped account.",
+          "type": ["integer", "null"]
+        },
+        "percent": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "disabled_reason": { "type": ["string", "null"] },
+        "scope": {
+          "description": "Credits belong to the organization, not the account: two rows in one organization report the same figure, and summing them double-counts.",
+          "const": "organization"
+        }
+      }
+    }
+  }
+}

@@ -10,4 +10,5 @@
 pub mod cleanup;
 pub mod coordinator;
 pub mod fault;
+pub mod proc;
 pub mod signals;

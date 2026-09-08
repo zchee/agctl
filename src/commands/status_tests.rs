@@ -30,7 +30,6 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use clap::Parser;
 use httpmock::Method::GET;
 use httpmock::Method::POST;
 use httpmock::Mock;
@@ -1250,18 +1249,175 @@ fn clone_rows(rows: &[AccountRow]) -> Vec<AccountRow> {
         .collect()
 }
 
-#[test]
-fn json_is_refused_rather_than_silently_ignored() {
-    let cli = crate::cli::Cli::try_parse_from(["agentctl", "claude", "status", "--json"])
-        .expect("`--json` parses");
-    let crate::cli::Command::Claude { command } = &cli.command;
-    let crate::cli::ClaudeCommand::Status(args) = command else {
-        panic!("the parsed command should be `status`");
-    };
+// ---------------------------------------------------------------------------
+// `--json` — plan AC9, AC23, and AC7's JSON clause
+// ---------------------------------------------------------------------------
 
-    let err = run(&cli, args, &Cancel::new()).expect_err("`--json` is not implemented yet");
-    assert_eq!(err.exit_code(), crate::error::EXIT_FATAL);
-    assert!(err.to_string().contains("S6"), "the message says when it lands: {err}");
+/// The document a `--json` run would print, built from a finished pass.
+fn document(outcomes: &[RowOutcome], show_all: bool, raw: bool) -> serde_json::Value {
+    let report = Report {
+        rows: outcomes.iter().map(RowOutcome::to_status_row).collect(),
+        now: Timestamp::now(),
+        show_all,
+    };
+    let document = json_report(outcomes, &report, raw);
+    crate::render::json::assert_valid(&document);
+    serde_json::to_value(&document).expect("a report serializes")
+}
+
+#[test]
+fn ac9_the_json_report_validates_and_carries_no_token_material() {
+    let store = store();
+    let server = MockServer::start();
+    usage_ok(&server);
+
+    write_credential_file(&store, &blob("sk-ant-oat01-a", "sk-ant-ort01-a", fresh_at()));
+    let config = owned_config(&store);
+    let found = discover_with(&store, &config, &FakeReader::unlocked());
+    let outcomes = pass(&store, &server, found, Setup::new(&server));
+
+    // `assert_valid` inside `document` is half of AC9; this is the other half,
+    // and it greps the *serialized* document rather than the typed one,
+    // because a token could only ever escape as text.
+    let value = document(&outcomes, false, true);
+    let text = serde_json::to_string(&value).expect("the document serializes");
+    assert!(!text.contains("sk-ant-"), "no token material reaches the document:\n{text}");
+    assert!(!text.contains("oat01"), "not even a fragment of one:\n{text}");
+
+    let row = value["rows"]
+        .as_array()
+        .expect("rows is an array")
+        .iter()
+        .find(|row| row["email"] == json!("owner@example.com"))
+        .expect("the owned account is in the document");
+    assert_eq!(row["kind"], json!("owned"));
+    assert_eq!(row["source"], json!("file"));
+    assert_eq!(row["state"], json!("ok"));
+    assert_eq!(row["lock_state"], json!("none"), "a fresh token takes no lock");
+    assert_eq!(row["account_uuid"], json!(ACCT));
+    assert_eq!(row["organization_uuid"], json!(ORG));
+
+    let kinds: Vec<&str> = row["windows"]
+        .as_array()
+        .expect("windows is an array")
+        .iter()
+        .filter_map(|window| window["kind"].as_str())
+        .collect();
+    assert_eq!(kinds, ["session", "weekly_all", "weekly_scoped"], "the captured body's windows");
+    assert_eq!(row["windows"][0]["percent_floor"], json!(21));
+    assert_eq!(row["windows"][2]["is_active"], json!(true));
+}
+
+#[test]
+fn ac23_every_row_carries_credits_and_raw_carries_spend_untouched() {
+    let store = store();
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path(USAGE_PATH);
+        then.status(200).body(CREDITS_BODY);
+    });
+
+    write_credential_file(&store, &blob("sk-ant-oat01-a", "sk-ant-ort01-a", fresh_at()));
+    let config = owned_config(&store);
+    let found = discover_with(&store, &config, &FakeReader::unlocked());
+    let outcomes = pass(&store, &server, found, Setup::new(&server));
+
+    let value = document(&outcomes, true, true);
+    let rows = value["rows"].as_array().expect("rows is an array");
+    assert!(rows.len() > 1, "the live row is in the document too");
+    for row in rows {
+        assert!(row["credits"].is_object(), "every row carries a credits object: {row}");
+        assert_eq!(row["credits"]["scope"], json!("organization"));
+    }
+
+    let fetched = rows
+        .iter()
+        .find(|row| row["email"] == json!("owner@example.com"))
+        .expect("the owned account is in the document");
+    assert_eq!(fetched["credits"]["state"], json!("on"));
+    assert_eq!(fetched["credits"]["used_minor"], json!(21_956));
+    assert_eq!(fetched["credits"]["limit_minor"], json!(500_000));
+    assert_eq!(fetched["credits"]["currency"], json!("USD"));
+    assert_eq!(fetched["credits"]["exponent"], json!(2));
+    assert_eq!(fetched["credits"]["percent"], json!(4), "rounded, not floored");
+
+    // The row that fetched nothing still answers the question.
+    let live = rows
+        .iter()
+        .find(|row| row["kind"] == json!("live"))
+        .expect("the live row is in the document");
+    assert_eq!(live["credits"]["state"], json!("unavailable"));
+    assert!(live["windows"].as_array().is_some_and(Vec::is_empty));
+
+    // `spend` is never parsed into a typed value, so `--raw` is the only place
+    // it survives — and it survives byte for byte (plan section 3.8).
+    let id = fetched["id"].as_str().expect("the row has an id");
+    let raw = &value["raw"][id];
+    assert_eq!(raw["spend"]["used"]["amount_minor"], json!(21_956));
+    assert_eq!(raw["spend"]["percent"], json!(4));
+    assert_eq!(raw["extra_usage"]["utilization"], json!(4.3911999999999995));
+}
+
+#[test]
+fn the_json_report_omits_raw_entirely_without_the_flag() {
+    let store = store();
+    let server = MockServer::start();
+    usage_ok(&server);
+
+    write_credential_file(&store, &blob("sk-ant-oat01-a", "sk-ant-ort01-a", fresh_at()));
+    let config = owned_config(&store);
+    let found = discover_with(&store, &config, &FakeReader::unlocked());
+    let outcomes = pass(&store, &server, found, Setup::new(&server));
+
+    let value = document(&outcomes, false, false);
+    assert!(value.get("raw").is_none(), "absent, not null: {value}");
+    assert_eq!(value["version"], json!(1));
+    assert_eq!(value["hidden"], json!(0));
+}
+
+#[test]
+fn ac7_the_json_report_reports_a_lock_held_past_the_deadline_as_busy() {
+    // AC7's JSON clause. The table has no column for the lock, so `busy` in
+    // the `State` column and `lock_state: "busy"` in the document are two
+    // different assertions, and this is the second one.
+    let store = store();
+    let server = MockServer::start();
+    let usage = usage_ok(&server);
+    let token = token_ok(&server);
+
+    write_credential_file(&store, &blob("sk-ant-oat01-a", "sk-ant-ort01-a", expired_at()));
+    let config = owned_config(&store);
+
+    let holder_cancel = Cancel::new();
+    let held = namespace_lock::acquire(
+        &store.paths,
+        ACCT,
+        ORG,
+        Instant::now() + Duration::from_secs(30),
+        &holder_cancel,
+        Fault::none(),
+    )
+    .expect("an uncontended lock should be acquirable");
+
+    let found = discover_with(&store, &config, &FakeReader::unlocked());
+    let mut setup = Setup::new(&server);
+    setup.timeout = Duration::from_millis(200);
+    let outcomes = pass(&store, &server, found, setup);
+    drop(held);
+
+    let value = document(&outcomes, false, false);
+    let row = value["rows"]
+        .as_array()
+        .expect("rows is an array")
+        .iter()
+        .find(|row| row["email"] == json!("owner@example.com"))
+        .expect("the owned account is in the document");
+
+    assert_eq!(row["lock_state"], json!("busy"));
+    assert_eq!(row["state"], json!("busy"));
+    assert_eq!(row["state_label"], json!("busy"));
+    token.assert_calls(0);
+    usage.assert_calls(0);
 }
 
 #[test]

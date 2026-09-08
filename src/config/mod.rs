@@ -23,14 +23,6 @@
 //! and through a temporary file, because two `agentctl` processes racing to
 //! add an account must not leave a truncated document behind.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "remaining items are consumed by W2 (accounts, import, doctor) and W3 (watch)"
-    )
-)]
-
 pub mod import;
 pub mod paths;
 
@@ -69,11 +61,22 @@ pub struct AgentctlConfig {
     /// Every account this store knows about, in insertion order.
     #[serde(default)]
     pub accounts: Vec<AccountRecord>,
+    /// Keychain service names the user has asked `status` and `doctor` to stop
+    /// reporting (`accounts forget`).
+    ///
+    /// Separate from [`AccountRecord::forgotten`] because the rows this hides
+    /// have no record to carry a flag: an `unclaimed` or `identity unknown`
+    /// item is discovered from the keychain listing alone, and the registry is
+    /// keyed by `(account, organization)` — identifiers such an item, by
+    /// definition, may not have. The name is remembered, nothing else; the
+    /// keychain item itself is never touched (plan AC47, invariant I1).
+    #[serde(default)]
+    pub forgotten_services: Vec<String>,
 }
 
 impl Default for AgentctlConfig {
     fn default() -> Self {
-        Self { version: CONFIG_VERSION, accounts: Vec::new() }
+        Self { version: CONFIG_VERSION, accounts: Vec::new(), forgotten_services: Vec::new() }
     }
 }
 
@@ -157,6 +160,20 @@ pub enum AccountKind {
         /// What owns it: a third-party tool, or an environment variable.
         source: String,
     },
+}
+
+impl AccountKind {
+    /// The kind as one stable, machine-readable token, for the `kind` member
+    /// of `status --json`, the `Kind` column of `accounts list`, and the
+    /// `kind` field of the tracing span.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Owned { .. } => "owned",
+            Self::Live => "live",
+            Self::ConfigDirReadOnly { .. } => "config_dir",
+            Self::Foreign { .. } => "foreign",
+        }
+    }
 }
 
 impl AgentctlConfig {

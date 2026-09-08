@@ -85,9 +85,10 @@ fn claude_help_lists_every_subcommand() {
 
 #[test]
 fn an_unimplemented_command_exits_one_and_says_so() {
-    // A command W2 has not built yet must fail loudly rather than exit 0
-    // having done nothing at all.
-    agentctl().args(["claude", "doctor"]).assert().code(1).stderr(contains("not implemented"));
+    // A command that has not been built yet must fail loudly rather than exit
+    // 0 having done nothing at all. `watch` is the one still outstanding; it
+    // lands in W3.
+    agentctl().args(["claude", "watch"]).assert().code(1).stderr(contains("not implemented"));
 }
 
 #[test]
@@ -106,9 +107,74 @@ fn status_on_an_empty_store_renders_a_table_and_reports_the_degraded_row() {
 }
 
 #[test]
-fn status_json_says_when_it_lands_rather_than_pretending() {
+fn status_json_writes_only_the_document_to_stdout() {
+    // Plan section 3.2: `--json` keeps the same exit codes as the table — this
+    // store has one degraded row, so 2 — and stdout carries the document and
+    // nothing else, which is what lets a caller pipe it straight into a
+    // parser. The log line about the unreadable keychain is on stderr.
     let (mut command, _dir) = isolated();
-    command.args(["claude", "status", "--json"]).assert().code(1).stderr(contains("S6"));
+    let assert = command.args(["claude", "status", "--json"]).assert().code(2);
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("the document is valid UTF-8");
+
+    let document: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("stdout is one JSON document: {err}\n{stdout}"));
+    assert_eq!(document["version"], serde_json::json!(1));
+    assert!(document["rows"].is_array(), "{document}");
+    assert!(document.get("raw").is_none(), "`raw` is absent without --raw");
+    assert!(!stdout.contains("sk-ant-"), "no token material reaches stdout");
+}
+
+#[test]
+fn doctor_reports_on_an_isolated_store() {
+    // Plan AC45, from outside the process: the report runs against a store
+    // with nothing in it and still says what it looked at.
+    let (mut command, _dir) = isolated();
+    command
+        .args(["claude", "doctor"])
+        .assert()
+        .success()
+        .stdout(contains("namespace root"))
+        .stdout(contains("namespace locks"));
+}
+
+#[test]
+fn accounts_list_renders_its_own_columns() {
+    let (mut command, _dir) = isolated();
+    command
+        .args(["claude", "accounts", "list"])
+        .assert()
+        .success()
+        .stdout(contains("Kind"))
+        .stdout(contains("Source"))
+        .stdout(contains("Location"));
+}
+
+#[test]
+fn accounts_remove_refuses_an_id_it_does_not_know() {
+    let (mut command, _dir) = isolated();
+    command
+        .args(["claude", "accounts", "remove", "nobody@example.com"])
+        .assert()
+        .code(1)
+        .stderr(contains("nobody@example.com"));
+}
+
+#[test]
+fn doctor_remove_stale_refuses_a_path_outside_the_store() {
+    // Invariant I11, from outside the process: the live store's own lock is
+    // the path a user is most likely to try, and it is exactly the one this
+    // command must not touch.
+    let (mut command, dir) = isolated();
+    let outside = dir.path().join(".claude").join(".oauth_refresh.lock");
+    std::fs::create_dir_all(dir.path().join(".claude")).expect("creatable");
+    std::fs::write(&outside, "{}").expect("writable");
+    command
+        .args(["claude", "doctor", "--remove-stale", &outside.to_string_lossy(), "--yes"])
+        .assert()
+        .code(2)
+        .stderr(contains("not inside"));
+    assert!(outside.exists(), "the live store's lock is untouched");
 }
 
 #[test]

@@ -140,6 +140,41 @@ impl AccountState {
         }
     }
 
+    /// The state as one stable, machine-readable token.
+    ///
+    /// Separate from [`AccountState::label`] on purpose: the label is a
+    /// sentence for a person and is free to be reworded, while this is what
+    /// `status --json` puts in the `state` member and what a script branches
+    /// on, so it is part of the report's schema
+    /// (`schemas/status.v1.json`) and changes only with the report version.
+    /// Neither carries the variant's payload — the label spells that out for a
+    /// reader, and `note` carries it in the document.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Expired { .. } => "expired",
+            Self::NeedsLogin => "needs_login",
+            Self::IdentityUnknown => "identity_unknown",
+            Self::StaleSiblingOfLive => "stale_sibling_of_live",
+            Self::Unclaimed => "unclaimed",
+            Self::Forgotten => "forgotten",
+            Self::MigratedToKeychain { .. } => "migrated_to_keychain",
+            Self::ClaudeSessionDetected { .. } => "claude_session_detected",
+            Self::KeychainLocked { .. } => "keychain_locked",
+            Self::KeychainTimeout => "keychain_timeout",
+            Self::Busy => "busy",
+            Self::LockUnavailable => "lock_unavailable",
+            Self::Stale => "stale",
+            Self::NoSubscriptionLimits => "no_subscription_limits",
+            Self::PendingReplayed => "pending_replayed",
+            Self::PendingDiscarded { .. } => "pending_discarded",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::RefreshDiscarded => "refresh_discarded",
+            Self::EnvToken => "env_token",
+            Self::Error(_) => "error",
+        }
+    }
+
     /// Whether a shown row in this state makes the process exit 2.
     ///
     /// The informational states are not failures: an `unclaimed` item is a
@@ -216,6 +251,19 @@ pub enum Source {
     Env,
     /// Nowhere: there is no credential.
     None,
+}
+
+impl Source {
+    /// The source as one stable, machine-readable token, for the `source`
+    /// member of `status --json` and the `Source` column of `accounts list`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Keychain => "keychain",
+            Self::File => "file",
+            Self::Env => "env",
+            Self::None => "none",
+        }
+    }
 }
 
 /// One row of the status table.

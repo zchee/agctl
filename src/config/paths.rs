@@ -25,14 +25,6 @@
 //! that another tool may delete and recreate is a lock two processes can hold
 //! at once. Out of the namespace, never unlinked, the inode is stable.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "remaining items are consumed by W2 (accounts, import, doctor) and W3 (watch)"
-    )
-)]
-
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -119,7 +111,15 @@ impl Paths {
 
     /// Builds a value around an already-chosen directory.
     ///
-    /// Used by `login` and by tests that hand out a `tempfile::TempDir`.
+    /// Every command reaches its store through [`Paths::resolve`], so the only
+    /// callers left are the tests, which hand out a `tempfile::TempDir` rather
+    /// than going near the real `$HOME`. Kept because that is exactly what a
+    /// store-relative test needs, and because a constructor taking the
+    /// directory is the honest counterpart to one that resolves it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the test harnesses build stores in temporary directories")
+    )]
     pub fn with_config_dir(config_dir: PathBuf) -> Self {
         Self { config_dir }
     }

@@ -405,13 +405,18 @@ fn apply_profile(credentials: &mut Credentials, document: &serde_json::Value) {
 
 /// Removes a superseded pending file and any leftover temporary file.
 ///
+/// Shared with [`accounts::relocate`](crate::commands::accounts::relocate),
+/// which supersedes a namespace's contents in exactly the same way and is
+/// bound by the same clause of invariant I9 ("`login`/`relocate`/`remove`
+/// delete any pending first").
+///
 /// # Errors
 ///
 /// Returns [`AppError::Config`] when `ns_dir` is not inside this store — the
 /// same refusal [`file_store::write_credentials`] makes, applied before
 /// anything is unlinked rather than after — and [`AppError::Io`] when a file
 /// that exists cannot be removed.
-fn clear_stale_files(paths: &Paths, ns_dir: &Path) -> Result<(), AppError> {
+pub fn clear_stale_files(paths: &Paths, ns_dir: &Path) -> Result<(), AppError> {
     if !paths.is_under_namespace_root(ns_dir) {
         return Err(AppError::Config(format!(
             "`{}` is outside the agentctl namespace root; refusing to touch it",

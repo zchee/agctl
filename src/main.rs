@@ -23,7 +23,6 @@ use std::process;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::AccountsCommand;
 use crate::cli::ClaudeCommand;
 use crate::cli::Cli;
 use crate::cli::Command;
@@ -82,26 +81,11 @@ fn dispatch(cli: &Cli, cancel: &Cancel) -> Result<(), AppError> {
         ClaudeCommand::Import(args) => {
             commands::import::run(cli.config_dir.as_deref(), args, cancel)
         }
-        ClaudeCommand::Doctor(_) => Err(AppError::not_implemented("agentctl claude doctor")),
-        ClaudeCommand::Accounts { command } => match command {
-            AccountsCommand::List { .. } => {
-                Err(AppError::not_implemented("agentctl claude accounts list"))
-            }
-            AccountsCommand::Show { .. } => {
-                Err(AppError::not_implemented("agentctl claude accounts show"))
-            }
-            AccountsCommand::Remove { .. } => {
-                Err(AppError::not_implemented("agentctl claude accounts remove"))
-            }
-            AccountsCommand::Relocate { .. } => {
-                Err(AppError::not_implemented("agentctl claude accounts relocate"))
-            }
-            AccountsCommand::Forget { .. } => {
-                Err(AppError::not_implemented("agentctl claude accounts forget"))
-            }
-            AccountsCommand::Unforget { .. } => {
-                Err(AppError::not_implemented("agentctl claude accounts unforget"))
-            }
-        },
+        ClaudeCommand::Doctor(args) => {
+            commands::doctor::run(cli.config_dir.as_deref(), args, cancel)
+        }
+        ClaudeCommand::Accounts { command } => {
+            commands::accounts::run(cli.config_dir.as_deref(), command, cancel)
+        }
     }
 }

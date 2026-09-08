@@ -140,6 +140,7 @@ pub fn discover(
     rows.extend(unclaimed_rows(
         &listing,
         &claimed_services,
+        &cfg.forgotten_services,
         &live_service,
         reader,
         env,
@@ -365,6 +366,7 @@ fn record_row(
 fn unclaimed_rows(
     listing: &[ServiceEntry],
     claimed: &[String],
+    forgotten: &[String],
     live_service: &str,
     reader: &dyn KeychainReader,
     env: &EnvView,
@@ -390,6 +392,14 @@ fn unclaimed_rows(
             continue;
         };
         if entry.service == live_service {
+            continue;
+        }
+
+        // Hidden at the user's request. Checked before the read, so a
+        // forgotten item costs no `find-generic-password` and the keychain is
+        // not touched on its account at all (plan AC47).
+        if forgotten.iter().any(|service| service == &entry.service) {
+            rows.push(forgotten_row(entry));
             continue;
         }
 
@@ -433,6 +443,30 @@ fn unclaimed_rows(
         });
     }
     rows
+}
+
+/// A keychain item `accounts forget` has hidden: named, never read.
+///
+/// Still a row rather than nothing at all, so `--all` and `accounts list
+/// --all` can show what was hidden and `accounts unforget` names something
+/// the user can see (plan AC47).
+fn forgotten_row(entry: &ServiceEntry) -> AccountRow {
+    AccountRow {
+        id: entry.service.clone(),
+        record: record_from_identity(
+            None,
+            AccountKind::ConfigDirReadOnly {
+                dir: std::path::PathBuf::new(),
+                service: entry.service.clone(),
+                shares_live_dir: false,
+            },
+        ),
+        state: AccountState::Forgotten,
+        source: Source::None,
+        credentials: None,
+        visible_by_default: false,
+        note: Some(format!("keychain service `{}`; hidden by `accounts forget`", entry.service)),
+    }
 }
 
 /// A `claude-switcher:*` item: listed, hidden, and never read.

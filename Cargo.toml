@@ -23,7 +23,7 @@ jiff = "0.2"
 open = "5.4.3"
 rand = "0.10.2"
 ratatui = "0.30"
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
