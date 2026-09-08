@@ -1,0 +1,89 @@
+{
+  "_comment": "SYNTHETIC. Hand-written for plan AC10: a `claude-account-switcher` v2 account file (fact F10) with two `claude` entries and three `codex` entries. The first claude entry names an `organizationUuid`; the second does not, so importing it must fall back to `_unknown-org`. The codex entries carry `oauth_account: null`, exactly as the real tool writes them, and must be counted and skipped. No token material appears here and none appears in the real file either — the switcher keeps its secrets in `claude-switcher:<email>` keychain items, which agentctl never reads. Not captured from a real machine; the identifiers are made up.",
+  "version": 2,
+  "settings": {
+    "auto_switch": {
+      "claude": false,
+      "codex": false
+    },
+    "auto_switch_threshold": 0.9
+  },
+  "accounts": [
+    {
+      "email": "codex-one@example.com",
+      "subscription_type": "plus",
+      "org_name": "",
+      "active": false,
+      "keychain_account": "codex-one@example.com",
+      "oauth_account": null,
+      "provider": "codex"
+    },
+    {
+      "email": "codex-two@example.com",
+      "subscription_type": "pro",
+      "org_name": "",
+      "active": false,
+      "keychain_account": "codex-two@example.com",
+      "oauth_account": null,
+      "provider": "codex"
+    },
+    {
+      "email": "codex-three@example.com",
+      "subscription_type": "pro",
+      "org_name": "",
+      "active": true,
+      "keychain_account": "codex-three@example.com",
+      "oauth_account": null,
+      "provider": "codex"
+    },
+    {
+      "email": "first@example.com",
+      "subscription_type": "max",
+      "org_name": "First Org",
+      "active": true,
+      "keychain_account": "first@example.com",
+      "oauth_account": {
+        "accountUuid": "aaaaaaaa-1111-2222-3333-444444444444",
+        "emailAddress": "first@example.com",
+        "organizationUuid": "bbbbbbbb-5555-6666-7777-888888888888",
+        "organizationName": "First Org",
+        "displayName": "First",
+        "billingType": "subscription",
+        "seatTier": "max",
+        "organizationRole": "admin",
+        "workspaceRole": null,
+        "hasExtraUsageEnabled": false,
+        "accountCreatedAt": "2025-01-02T03:04:05.000000+00:00",
+        "subscriptionCreatedAt": "2025-01-02T03:04:05.000000+00:00",
+        "claudeCodeTrialDurationDays": null,
+        "claudeCodeTrialEndsAt": null,
+        "ccOnboardingFlags": []
+      },
+      "provider": "claude"
+    },
+    {
+      "email": "second@example.com",
+      "subscription_type": "pro",
+      "org_name": "",
+      "active": false,
+      "keychain_account": "second@example.com",
+      "oauth_account": {
+        "accountUuid": "cccccccc-9999-0000-1111-222222222222",
+        "emailAddress": "second@example.com",
+        "organizationName": null,
+        "displayName": "Second",
+        "billingType": "subscription",
+        "seatTier": "pro",
+        "organizationRole": null,
+        "workspaceRole": null,
+        "hasExtraUsageEnabled": false,
+        "accountCreatedAt": "2025-03-04T05:06:07.000000+00:00",
+        "subscriptionCreatedAt": "2025-03-04T05:06:07.000000+00:00",
+        "claudeCodeTrialDurationDays": null,
+        "claudeCodeTrialEndsAt": null,
+        "ccOnboardingFlags": []
+      },
+      "provider": "claude"
+    }
+  ]
+}

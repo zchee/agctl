@@ -6,5 +6,6 @@
 //! of one-line arms, and what lets each command's real work be exercised by a
 //! unit test that never spawns a process.
 
+pub mod import;
 pub mod login;
 pub mod status;

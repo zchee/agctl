@@ -79,7 +79,9 @@ fn dispatch(cli: &Cli, cancel: &Cancel) -> Result<(), AppError> {
         ClaudeCommand::Status(args) => status::run(cli, args, cancel),
         ClaudeCommand::Watch(_) => Err(AppError::not_implemented("agentctl claude watch")),
         ClaudeCommand::Login(args) => commands::login::run(cli.config_dir.as_deref(), args, cancel),
-        ClaudeCommand::Import(_) => Err(AppError::not_implemented("agentctl claude import")),
+        ClaudeCommand::Import(args) => {
+            commands::import::run(cli.config_dir.as_deref(), args, cancel)
+        }
         ClaudeCommand::Doctor(_) => Err(AppError::not_implemented("agentctl claude doctor")),
         ClaudeCommand::Accounts { command } => match command {
             AccountsCommand::List { .. } => {
