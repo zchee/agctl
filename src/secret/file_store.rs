@@ -250,6 +250,39 @@ pub fn snapshot(path: &Path) -> io::Result<Option<FileSnapshot>> {
     Ok(Some(snapshot_of(&meta)))
 }
 
+/// [`snapshot`] for a file agentctl only ever reads and never writes, such as
+/// Claude Code's own `.claude.json`: symbolic links are followed, because on
+/// this machine `~/.claude.json` *is* one (fact F41) and refusing it would
+/// blind the live row rather than protect anything.
+///
+/// # Errors
+///
+/// Returns the underlying `stat` error for anything other than a missing file.
+pub fn snapshot_following(path: &Path) -> io::Result<Option<FileSnapshot>> {
+    match fs::metadata(path) {
+        Ok(meta) => Ok(Some(snapshot_of(&meta))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// [`read_file`] for a file agentctl only ever reads and never writes: the
+/// same regular-file and size rules, but a symbolic link is followed rather
+/// than refused (see [`snapshot_following`]).
+///
+/// # Errors
+///
+/// Returns [`FileStoreError`] for a non-regular target, an oversized file, or
+/// any errno outside the absent set.
+pub fn read_file_following(path: &Path, limit: u64) -> Result<ReadOutcome, FileStoreError> {
+    let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(errno) => return classify_open(path, errno),
+    };
+    read_opened(File::from(fd), path, limit)
+}
+
 /// Reads `<ns_dir>/.credentials.json` under the fact-F40 rules.
 ///
 /// # Errors

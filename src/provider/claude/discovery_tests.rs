@@ -623,13 +623,19 @@ fn an_oversized_claude_json_leaves_the_live_row_visible_without_an_identity() {
 }
 
 #[test]
-fn a_symlinked_claude_json_is_not_followed_for_an_identity() {
+fn a_symlinked_claude_json_is_followed_for_the_live_row() {
+    // Fact F41: on the reference machine `~/.claude.json` is a symbolic link
+    // into the real configuration directory. The live row's identity comes
+    // from that file when the keychain blob carries no `tokenAccount`, so the
+    // link has to be followed — refusing it blinds the live row.
     let (dir, paths) = store();
     let env = env_in(dir.path());
-    let elsewhere = dir.path().join("planted.json");
+    let elsewhere = dir.path().join("real-config").join(".claude.json");
+    std::fs::create_dir_all(elsewhere.parent().expect("the file has a parent"))
+        .expect("the real config dir should be creatable");
     std::fs::write(
         &elsewhere,
-        br#"{"oauthAccount":{"accountUuid":"99999999-9999-4999-8999-999999999999"}}"#,
+        br#"{"oauthAccount":{"accountUuid":"99999999-9999-4999-8999-999999999999","emailAddress":"live@example.com"}}"#,
     )
     .expect("the file should be writable");
     std::os::unix::fs::symlink(&elsewhere, dir.path().join(".claude.json"))
@@ -639,8 +645,9 @@ fn a_symlinked_claude_json_is_not_followed_for_an_identity() {
     let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
 
     let live = &discovery.rows[0];
-    assert_eq!(live.id, "live", "the planted identity was not adopted");
-    assert_eq!(live.state, AccountState::IdentityUnknown);
+    assert_eq!(live.id, "99999999-9999-4999-8999-999999999999", "the identity behind the link");
+    assert_eq!(live.state, AccountState::Ok);
+    assert_eq!(live.record.email.as_deref(), Some("live@example.com"));
 }
 
 #[test]

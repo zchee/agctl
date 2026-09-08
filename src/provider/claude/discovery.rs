@@ -583,7 +583,10 @@ static CLAUDE_JSON_MEMO: Mutex<Option<(PathBuf, FileSnapshot, Option<Identity>)>
 fn claude_json_identity(path: &Path) -> Option<Identity> {
     // The `lstat` is what makes the memo worth having: it is one syscall
     // against a read of a quarter of a megabyte and a parse of the same.
-    if let Ok(Some(snap)) = file_store::snapshot(path) {
+    // Symbolic links are followed here: this is Claude Code's file, agentctl
+    // only reads it, and on the reference machine `~/.claude.json` is a link
+    // into the real configuration directory (fact F41).
+    if let Ok(Some(snap)) = file_store::snapshot_following(path) {
         let memo = memo();
         if let Some((cached, cached_snap, identity)) = memo.as_ref()
             && cached.as_path() == path
@@ -593,7 +596,7 @@ fn claude_json_identity(path: &Path) -> Option<Identity> {
         }
     }
 
-    let (bytes, snap) = match file_store::read_file(path, MAX_CLAUDE_JSON_BYTES) {
+    let (bytes, snap) = match file_store::read_file_following(path, MAX_CLAUDE_JSON_BYTES) {
         Ok(ReadOutcome::Present { bytes, snap }) => (bytes, snap),
         Ok(ReadOutcome::Absent) => return None,
         Err(err) => {
