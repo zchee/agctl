@@ -397,3 +397,99 @@ fn b90_a_login_into_another_account_says_nothing_about_the_live_one() {
         finished.stderr
     );
 }
+
+// ---------------------------------------------------------------------------
+// `--no-duplicate` (`agentctl-3m0`)
+// ---------------------------------------------------------------------------
+
+/// Everything under the fixture's configuration directory, by relative path.
+///
+/// "Nothing was written" is a claim about the whole tree: a namespace
+/// directory created and left empty would satisfy a check for
+/// `.credentials.json` alone and would still be a change to the machine.
+fn config_tree(fixture: &Fixture) -> Vec<String> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, found: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if let Ok(relative) = path.strip_prefix(root) {
+                found.push(relative.to_string_lossy().into_owned());
+            }
+            if path.is_dir() {
+                walk(&path, root, found);
+            }
+        }
+    }
+    let root = fixture.config_dir();
+    let mut found = Vec::new();
+    walk(&root, &root, &mut found);
+    found.sort();
+    found
+}
+
+#[test]
+fn m3m0_no_duplicate_refuses_the_live_account_and_leaves_the_store_untouched() {
+    // `agentctl-3m0`, through the binary: non-zero exit, a message that names
+    // where the claim came from, and a store that is byte-for-byte what it was.
+    let server = MockServer::start();
+    let token = exchange(&server, Some(EXCHANGE_ORG));
+
+    let mut fixture = Fixture::new();
+    fixture.endpoints(&server.base_url());
+    claude_json(&fixture, EXCHANGE_ACCT, EXCHANGE_ORG);
+    let before = config_tree(&fixture);
+
+    let mut session = common::start_login(&fixture, &["--no-duplicate"], &[]);
+    let state = session.state.clone();
+    session.paste(&format!("minted-code#{state}"));
+    let finished = session.finish();
+
+    assert_eq!(finished.code(), 1, "a refusal that renders nothing exits 1:\n{}", finished.stderr);
+    assert_eq!(
+        token.calls(),
+        1,
+        "the exchange still happened: the identity is not knowable before it"
+    );
+
+    let stderr = &finished.stderr;
+    assert!(stderr.contains(EXCHANGE_ACCT), "the refusal names the account:\n{stderr}");
+    assert!(stderr.contains(".claude.json"), "and where it looked:\n{stderr}");
+    assert!(stderr.contains("use --live"), "and the swap:\n{stderr}");
+    assert!(stderr.contains("without `--no-duplicate`"), "and the escape:\n{stderr}");
+    assert!(!stderr.contains("sk-ant-"), "no token material reaches it:\n{stderr}");
+    assert!(
+        !stderr.contains("both stay valid"),
+        "the refusal replaces the notice rather than joining it:\n{stderr}"
+    );
+
+    assert_eq!(config_tree(&fixture), before, "nothing was written");
+    assert!(!fixture.config_file().exists(), "no registry record");
+    assert!(
+        !fixture.ns_dir(EXCHANGE_ACCT, EXCHANGE_ORG).exists(),
+        "not even an empty namespace directory"
+    );
+}
+
+#[test]
+fn m3m0_no_duplicate_lets_a_login_into_any_other_account_through() {
+    let server = MockServer::start();
+    exchange(&server, Some(EXCHANGE_ORG));
+
+    let mut fixture = Fixture::new();
+    fixture.endpoints(&server.base_url());
+    claude_json(&fixture, "99999999-9999-4999-8999-999999999999", EXCHANGE_ORG);
+
+    let mut session = common::start_login(&fixture, &["--no-duplicate"], &[]);
+    let state = session.state.clone();
+    session.paste(&format!("minted-code#{state}"));
+    let finished = session.finish();
+
+    assert_eq!(finished.code(), 0, "stderr:\n{}", finished.stderr);
+    assert!(
+        fixture.ns_dir(EXCHANGE_ACCT, EXCHANGE_ORG).join(".credentials.json").is_file(),
+        "the credential was written"
+    );
+    // Keyed on the account UUID, not the email: `Fixture::owned_record` gives
+    // every owned account the same address (`agentctl-p95`).
+    assert_eq!(registry(&fixture)["accounts"][0]["account_uuid"], json!(EXCHANGE_ACCT));
+}

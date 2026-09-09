@@ -143,6 +143,7 @@ Three things about `watch` that are not visible from the flags:
 ```sh
 agentctl claude login --label work
 agentctl claude login --manual          # paste `code#state` instead of using the loopback
+agentctl claude login --no-duplicate    # refuse if this account is already the live one
 ```
 
 The browser goes to Anthropic's authorize page; the code comes back either to a loopback
@@ -155,6 +156,13 @@ behind at all.
 Logging the same `(account, organization)` in twice overwrites, and only after an
 interactive confirmation. There is no `--yes` on `login`, so a non-interactive re-login
 refuses rather than replacing a credential another process may be refreshing.
+
+Logging in as the account Claude Code is *already* signed in as is allowed, and prints a
+one-line notice on standard error saying both sessions stay valid: two independent token
+pairs for one account is a supported setup. `--no-duplicate` refuses that case instead,
+exits 1 and writes nothing; its message names the `.claude.json` the claim came from, so a
+stale one can be checked. To change which account Claude Code itself uses, that is
+`agentctl claude use --live <id>`, not a second login.
 
 ### `accounts` — inspect and edit what agentctl knows
 

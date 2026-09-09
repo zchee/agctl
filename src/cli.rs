@@ -249,6 +249,11 @@ pub struct LoginArgs {
     /// Give the resulting account a human-readable label.
     #[arg(long, value_name = "NAME")]
     pub label: Option<String>,
+
+    /// Refuse, instead of minting a second session, when the account
+    /// authorized is the one Claude Code is already signed in as.
+    #[arg(long)]
+    pub no_duplicate: bool,
 }
 
 /// Subcommands under `agentctl claude accounts`.

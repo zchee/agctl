@@ -18,6 +18,11 @@
 //!   this command in phase 1, so a non-interactive run refuses rather than
 //!   silently replacing a credential another process may be refreshing
 //!   (AC41).
+//! - `--no-duplicate` refuses before any of that — before `ensure_dirs`,
+//!   before the namespace lock, before the store and the registry — so a
+//!   refused login leaves the machine exactly as it found it. The exchange
+//!   has already happened by then, because the identity is not knowable
+//!   before it; the token pair it minted is simply never written down.
 //!
 //! # Terminal interaction is a seam
 //!
@@ -31,6 +36,7 @@
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::cli::LoginArgs;
@@ -79,6 +85,16 @@ pub struct Login<'a> {
     /// change the process environment. `None` means "nothing on this machine
     /// says who is live", which is never treated as a match.
     pub live_identity: Option<Identity>,
+    /// The file [`Login::live_identity`] was looked for in.
+    ///
+    /// Carried whether or not anything was found, because it is what the
+    /// `--no-duplicate` refusal names: a refusal that cites a file the reader
+    /// can open is one they can check, and a `.claude.json` whose
+    /// `oauthAccount` is stale is otherwise invisible.
+    pub live_identity_source: PathBuf,
+    /// Refuse the login outright when the identity is the live one's, instead
+    /// of noticing and continuing.
+    pub no_duplicate: bool,
     /// The process-wide cancellation flag.
     pub cancel: &'a Cancel,
 }
@@ -191,11 +207,16 @@ impl LoginIo for Terminal {
 pub fn run(config_dir: Option<&Path>, args: &LoginArgs, cancel: &Cancel) -> Result<(), AppError> {
     let paths = Paths::resolve(config_dir)?;
     let client = OauthClient::from_env(&claude::user_agent())?;
+    // One reading of the environment for both, so the identity and the file
+    // the refusal cites cannot come from two different views of it.
+    let env = EnvView::from_process();
     let login = Login {
         paths: &paths,
         manual: args.manual,
         label: args.label.as_deref(),
-        live_identity: discovery::live_identity(&EnvView::from_process()),
+        live_identity: discovery::live_identity(&env),
+        live_identity_source: namespace::claude_json_path(&env),
+        no_duplicate: args.no_duplicate,
         cancel,
     };
     run_with(&login, &client, &mut Terminal)
@@ -274,6 +295,13 @@ pub fn run_with(
     validate_segment(&organization_uuid)?;
 
     if is_live_identity(login.live_identity.as_ref(), &account_uuid, &organization_uuid) {
+        if login.no_duplicate {
+            return Err(AppError::Config(no_duplicate_refusal(
+                &account_uuid,
+                &organization_uuid,
+                &login.live_identity_source,
+            )));
+        }
         io.warn(&same_identity_notice(&account_uuid, &organization_uuid));
     }
 
@@ -403,6 +431,36 @@ fn same_identity_notice(account_uuid: &str, organization_uuid: &str) -> String {
         "Note: `{account_uuid}/{organization_uuid}` is the account Claude Code is signed in as \
          right now. This login mints a second, independent session; both stay valid. To hand \
          Claude Code a different account instead, use `agentctl claude use --live <id>`."
+    )
+}
+
+/// The sentence `--no-duplicate` refuses with.
+///
+/// Three things it has to carry, and one it deliberately does not:
+///
+/// - **Where the claim comes from.** The live identity is read from
+///   `.claude.json` and nowhere else — `login` never touches the keychain —
+///   and that file's `oauthAccount` is written by Claude Code at *its* login,
+///   so it can be stale. Naming the path is what turns "agentctl thinks this
+///   is already live" into something the reader can go and check.
+/// - **The other intent.** Someone who ran this meaning to *change* which
+///   account Claude Code uses wants `use --live`, which under decision D-017
+///   adopts the credential it displaces rather than stranding it.
+/// - **The way past it.** Dropping the flag is the escape, because a second
+///   independent session of one account is a supported setup (decision
+///   D-011) and this flag is the opt-in that says "not this time".
+///
+/// What it does not carry is any suggestion that something is broken. Nothing
+/// was written: the refusal happens before `ensure_dirs`, before the
+/// namespace lock and before any store or registry write.
+fn no_duplicate_refusal(account_uuid: &str, organization_uuid: &str, source: &Path) -> String {
+    format!(
+        "`{account_uuid}/{organization_uuid}` is already the account Claude Code is signed in \
+         as (per `{}`), and `--no-duplicate` was given, so nothing was written. To hand Claude \
+         Code a different account, run `agentctl claude use --live <id>`, which adopts the \
+         credential it displaces. To mint a second independent session for this account after \
+         all, run the same login without `--no-duplicate`.",
+        source.display()
     )
 }
 

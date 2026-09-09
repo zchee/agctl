@@ -228,15 +228,18 @@ fn login_parses_both_flags() {
         ClaudeCommand::Login(args) => {
             assert!(!args.manual);
             assert_eq!(args.label, None);
+            assert!(!args.no_duplicate, "no_duplicate defaults off");
         }
         other => panic!("expected `login`, got {other:?}"),
     }
 
-    let full = parse(&["agentctl", "claude", "login", "--manual", "--label", "work"]);
+    let full =
+        parse(&["agentctl", "claude", "login", "--manual", "--label", "work", "--no-duplicate"]);
     match claude_of(&full) {
         ClaudeCommand::Login(args) => {
             assert!(args.manual);
             assert_eq!(args.label.as_deref(), Some("work"));
+            assert!(args.no_duplicate, "`--no-duplicate` is spelled with a hyphen");
         }
         other => panic!("expected `login`, got {other:?}"),
     }
