@@ -59,9 +59,9 @@ cargo bench
 non-comparable across machines and across runs on a changed host. Let `[profile.bench]`
 govern instead.
 
-### Dev and test artifacts go to tmpfs
+### Dev and test artifacts go to a shared cache directory
 
-For dev and test profiles, add the tmpfs config so artifacts land in `/Volumes/tmpfs/target`
+For dev and test profiles, add the dev config so artifacts land in `~/.cache/rust/target`
 instead of `./target`:
 
 ```sh

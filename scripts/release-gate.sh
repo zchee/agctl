@@ -23,8 +23,9 @@
 # that a build which somehow contains no strings at all cannot pass by accident.
 #
 # The build goes to a scratch directory, never ./target and never the shared
-# /Volumes/tmpfs/target, so running this cannot disturb a working tree's
-# artifacts or another lane's build. Override with AGENTCTL_RELEASE_GATE_TARGET.
+# dev target dir (~/.cache/rust/target, formerly /Volumes/tmpfs/target), so
+# running this cannot disturb a working tree's artifacts or another lane's
+# build. Override with AGENTCTL_RELEASE_GATE_TARGET.
 #
 # No dev-profile cargo config is passed: this is a release build with its own
 # --target-dir.
@@ -98,8 +99,8 @@ production=(
 
 if [ -n "${AGENTCTL_RELEASE_GATE_TARGET:-}" ]; then
 	target_dir=$AGENTCTL_RELEASE_GATE_TARGET
-elif [ -d /Volumes/tmpfs ]; then
-	target_dir=/Volumes/tmpfs/agentctl-release-gate
+elif [ -d "${XDG_CACHE_HOME:-$HOME/.cache}/rust" ]; then
+	target_dir=${XDG_CACHE_HOME:-$HOME/.cache}/rust/agentctl-release-gate
 else
 	target_dir=${TMPDIR:-/tmp}/agentctl-release-gate
 fi
@@ -107,7 +108,7 @@ fi
 target_dir=$(canonicalize "$target_dir")
 
 case "$target_dir" in
-"$repo_root"/target | "$repo_root"/target/* | /Volumes/tmpfs/target | /Volumes/tmpfs/target/*)
+"$repo_root"/target | "$repo_root"/target/* | "${XDG_CACHE_HOME:-$HOME/.cache}"/rust/target | "${XDG_CACHE_HOME:-$HOME/.cache}"/rust/target/* | /Volumes/tmpfs/target | /Volumes/tmpfs/target/*)
 	echo "release-gate: refusing to build into the shared target dir $target_dir" >&2
 	exit 1
 	;;

@@ -1,6 +1,6 @@
 ---
 name: check
-description: Run the full local gate for agentctl — rustfmt, clippy with warnings denied, and the nextest suite — through direnv with the tmpfs target-dir this repo requires. Use before declaring any change complete, before committing, or when asked to verify that the tree is clean.
+description: Run the full local gate for agentctl — rustfmt, clippy with warnings denied, and the nextest suite — through direnv with the shared dev target-dir this repo requires. Use before declaring any change complete, before committing, or when asked to verify that the tree is clean.
 ---
 
 # Local gate
@@ -10,7 +10,7 @@ them together, most blocking first.
 
 `direnv exec .` is mandatory: `.envrc` is `layout rust_stable`, which exports the tuned
 stable `RUSTFLAGS` this project builds against. `--config ~/.config/rust/config.dev.toml`
-redirects dev/test artifacts to `/Volumes/tmpfs/target`; it is correct for clippy and tests,
+redirects dev/test artifacts to `~/.cache/rust/target`; it is correct for clippy and tests,
 and wrong for release builds meant to populate `./target`.
 
 ```sh
@@ -27,7 +27,8 @@ omits the flag does not quietly skip the e2e suite.
 Tests that spawn the binary — `tests/cli_smoke.rs` and every `tests/e2e_*.rs` — must reach
 it through `env!("CARGO_BIN_EXE_agentctl")`. Never `assert_cmd::Command::cargo_bin`: that
 resolves to `./target/debug`, and with `--config ~/.config/rust/config.dev.toml` redirecting
-the build to `/Volumes/tmpfs/target`, it has already found a **stale artifact** on this
+the build to the shared dev target dir (then `/Volumes/tmpfs/target`, now `~/.cache/rust/target`),
+it has already found a **stale artifact** on this
 machine and tested a binary nobody had just built. A suite that passes against the wrong
 binary is worse than one that fails.
 
@@ -54,7 +55,7 @@ scripts/release-gate.sh
 ```
 
 It builds `cargo build --release` (default features, no `--config`, into a scratch
-`--target-dir` that is never `./target` and never the shared `/Volumes/tmpfs/target`) and
+`--target-dir` that is never `./target` and never the shared `~/.cache/rust/target`) and
 greps the artifact for two lists. The ten seam names are one representative name per
 seam-owning module, not the whole test-only surface — `fixtures/fake-security.sh` alone
 defines ten `AGENTCTL_FAKE_SECURITY_*` names on its own. The fake's **write** knob is the
