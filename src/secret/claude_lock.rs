@@ -869,6 +869,16 @@ pub struct Acquisition {
 }
 
 /// One held directory and the modification time it had when it was created.
+///
+/// The modification time is `Option` only because the reading can fail, and
+/// [`take_all`] treats that failure as a refusal: a `None` never reaches a
+/// [`HeldLocks`], because the only `HeldOne` carrying one is the entry
+/// [`take_all`] pushes on its way out through [`TakeFailure::Io`], purely so
+/// that the directory it names is released with the rest. [`drift_check`]
+/// refuses on a `None` regardless, which is the second of the two guards —
+/// the field's type cannot state the invariant, so the check does.
+///
+/// [`drift_check`]: HeldLocks::drift_check
 #[derive(Debug, Clone)]
 struct HeldOne {
     artefact: Artefact,
@@ -933,6 +943,12 @@ impl HeldLocks {
     /// written. The budget is checked in the same place, because this is the
     /// last moment at which abandoning still costs nothing.
     ///
+    /// An **unreadable** modification time on either side is refusal A too,
+    /// not equality. Comparing the two `Option`s directly made a `None` at
+    /// `mkdir` time agree with a `None` now, so the one artefact whose
+    /// compromise could least be ruled out was the one this check waved
+    /// through. An unreadable reading is not evidence that nothing moved.
+    ///
     /// This replaces the 5-second heartbeat thread version 2 ran here. Under
     /// a 3 000 ms hold that thread could never fire, so refusal A was
     /// unreachable in production and only a fake clock ever exercised it
@@ -946,7 +962,14 @@ impl HeldLocks {
     /// [`LockError::BudgetExceeded`].
     pub fn drift_check(&self) -> Result<(), LockError> {
         for one in &self.held {
-            if self.fs.mtime(self.anchor.slot(&one.artefact)) != one.mtime {
+            let moved = match (one.mtime, self.fs.mtime(self.anchor.slot(&one.artefact))) {
+                (Some(recorded), Some(now)) => now != recorded,
+                // Either reading missing: refuse. `None == None` is what made
+                // this check inert for an artefact whose modification time
+                // could not be read at all.
+                _ => true,
+            };
+            if moved {
                 return Err(LockError::Compromised(one.artefact.path.clone()));
             }
         }
@@ -1237,7 +1260,11 @@ pub fn acquire_with(
                 release_all(&anchor, &held, seams);
                 let _ = std::fs::remove_file(&record_path);
                 return Err(LockError::Io {
-                    context: format!("could not create `{}`", artefact.path.display()),
+                    // "take", not "create": this arm is also reached by a
+                    // directory that was created and could not then be
+                    // stated, and "could not create" would contradict its own
+                    // message.
+                    context: format!("could not take `{}`", artefact.path.display()),
                     message,
                 });
             }
@@ -1258,7 +1285,8 @@ fn busy(
 enum TakeFailure {
     /// Somebody holds `artefact`; `held` is what was taken before that.
     Exists { artefact: Artefact, held: Vec<HeldOne> },
-    /// `artefact` could not be created at all.
+    /// `artefact` could not be created, or was created and could not then be
+    /// stated, which is the same refusal: neither is a hold.
     Io { artefact: Artefact, held: Vec<HeldOne>, message: String },
 }
 
@@ -1267,6 +1295,14 @@ enum TakeFailure {
 /// Every attempt is a single non-blocking `mkdir` — including
 /// `.storage-write`, whose profile carries `retries: 0` precisely so that
 /// none of fact F47's ten-step ladder enters the hold.
+///
+/// A directory whose modification time cannot be read immediately after its
+/// own `mkdir` is a [`TakeFailure::Io`], not a hold. Refusal A is the only
+/// thing that tells agentctl a third party touched a lock it holds, and it
+/// compares against the reading taken here; without one there is nothing to
+/// compare against, so the lock would be held with that check switched off.
+/// The directory exists by then, so it joins `held` on the way out and is
+/// released in reverse order with everything before it.
 fn take_all(
     anchor: &LockAnchor,
     plans: &[LockPlan; 3],
@@ -1280,7 +1316,17 @@ fn take_all(
         let result = if contended { Err(FsError::Exists) } else { seams.fs.mkdir(at) };
         match result {
             Ok(()) => {
-                held.push(HeldOne { artefact: lock.artefact.clone(), mtime: seams.fs.mtime(at) })
+                let Some(mtime) = seams.fs.mtime(at) else {
+                    held.push(HeldOne { artefact: lock.artefact.clone(), mtime: None });
+                    return Err(TakeFailure::Io {
+                        artefact: lock.artefact.clone(),
+                        held,
+                        message: "it was created, but its modification time could not be read, \
+                                  so a third party touching it could not be detected"
+                            .to_owned(),
+                    });
+                };
+                held.push(HeldOne { artefact: lock.artefact.clone(), mtime: Some(mtime) });
             }
             Err(FsError::Exists) => {
                 return Err(TakeFailure::Exists { artefact: lock.artefact.clone(), held });

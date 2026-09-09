@@ -24,6 +24,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 
 use crate::config::paths::FILE_MODE;
+use crate::secret::audit;
 use crate::secret::audit::AuditEntry;
 use crate::secret::audit::AuditEvent;
 
@@ -129,6 +130,17 @@ struct SpyFs {
     /// the only way to reach an `EEXIST` on a lock that was free when the
     /// lock-free probe looked at it.
     plant_before: Mutex<Vec<PathBuf>>,
+    /// Paths whose modification time cannot be read.
+    ///
+    /// The real `mtime` is a `statat` that returns `Option`, and every caller
+    /// in the protocol already has to handle the `None`. Reaching it on a
+    /// directory that certainly exists needs a real `statat` to fail — a
+    /// racing `rmdir` between the `mkdir` and the `statat`, `EACCES` on the
+    /// parent, `EIO` — none of which a test can stage against the real
+    /// filesystem without also changing what the directory *is*. So the seam
+    /// answers `None` for a chosen path, which is exactly the observable
+    /// those causes share and nothing more.
+    unreadable_mtime: Mutex<Vec<PathBuf>>,
 }
 
 impl SpyFs {
@@ -138,6 +150,7 @@ impl SpyFs {
             real: RealFs,
             retake: Mutex::new(Vec::new()),
             plant_before: Mutex::new(Vec::new()),
+            unreadable_mtime: Mutex::new(Vec::new()),
         }
     }
 
@@ -149,6 +162,11 @@ impl SpyFs {
     /// Makes a peer win the race for `path` on every attempt.
     fn plant_before_mkdir(&self, path: &Path) {
         lock(&self.plant_before).push(path.to_path_buf());
+    }
+
+    /// Makes `path`'s modification time unreadable from now on.
+    fn hide_mtime(&self, path: &Path) {
+        lock(&self.unreadable_mtime).push(path.to_path_buf());
     }
 }
 
@@ -174,6 +192,9 @@ impl LockFs for SpyFs {
     }
 
     fn mtime(&self, at: LockSlot<'_>) -> Option<SystemTime> {
+        if lock(&self.unreadable_mtime).iter().any(|hidden| hidden.as_path() == at.shown) {
+            return None;
+        }
         // Passed through and deliberately **not** recorded: the timeline is
         // what agentctl did to the filesystem, and a `stat` does nothing to it.
         self.real.mtime(at)
@@ -1361,6 +1382,127 @@ fn a_third_party_touching_any_held_lock_is_refusal_a() {
             assert!(!path.exists(), "everything is released: `{}`", path.display());
         }
         assert!(fixture.records().is_empty(), "and the record cleared");
+    }
+}
+
+#[test]
+fn a_lock_whose_modification_time_cannot_be_read_is_refused_at_the_take() {
+    // `agentctl-p2-lock-take-without-mtime-no-drift-check-axs`. Refusal A is
+    // the only thing that tells agentctl a third party touched a lock it
+    // holds, and it compares against the reading taken at that lock's own
+    // `mkdir`. A lock with no such reading is a lock held with refusal A
+    // switched off, so the take refuses instead of recording `None`.
+    for position in 0..3_usize {
+        let fixture = Fixture::new();
+        let clock = fixture.fake_clock();
+        let holders = FakeHolders::none_stopped();
+        let seams = fixture.seams(&clock, &holders);
+        let cancel = Cancel::new();
+
+        let unreadable = fixture.all()[position].clone();
+        fixture.fs.hide_mtime(&unreadable);
+
+        let err = fixture
+            .acquire(&seams, &cancel, &Fault::none())
+            .expect_err("a lock that cannot be re-stated is not a lock agentctl holds");
+        let LockError::Io { context, message } = err else {
+            panic!("position {position}: expected `Io`, got {err:?}");
+        };
+        assert!(
+            context.contains(&unreadable.display().to_string()),
+            "position {position}: the refusal names the lock, got `{context}`"
+        );
+        assert!(
+            message.contains("modification time could not be read"),
+            "position {position}: and says why, got `{message}`"
+        );
+
+        // Everything taken is given back in reverse order — including the
+        // directory whose own `mkdir` succeeded, which is the one a `held`
+        // that stopped short of it would have leaked.
+        let taken: Vec<PathBuf> = fixture.all()[..=position].to_vec();
+        let mut expected: Vec<Op> =
+            taken.iter().map(|path| Op::Mkdir(path.clone(), true)).collect();
+        expected.extend(taken.iter().rev().map(|path| Op::Rmdir(path.clone())));
+        assert_eq!(
+            fixture.timeline.ops(),
+            expected,
+            "position {position}: taken in order, released in reverse, nothing else attempted"
+        );
+
+        for path in fixture.all() {
+            assert!(!path.exists(), "position {position}: `{}` is absent", path.display());
+        }
+        assert!(
+            fixture.records().is_empty(),
+            "position {position}: the held-lock record is cleared, as on every other take failure"
+        );
+        assert!(
+            !audit::log_path(&fixture.paths).exists(),
+            "position {position}: nothing was stale, so the refusal invents no audit entry"
+        );
+    }
+}
+
+#[test]
+fn every_lock_a_hold_took_recorded_a_readable_modification_time() {
+    // The other half of the same fix: `HeldOne::mtime` is an `Option` because
+    // the reading can fail, and this pins that a hold never carries one that
+    // did. The only `None` the take produces is on its way out through
+    // `TakeFailure::Io`, and that entry never becomes a `HeldLocks`.
+    let fixture = Fixture::new();
+    let clock = fixture.fake_clock();
+    let holders = FakeHolders::none_stopped();
+    let seams = fixture.seams(&clock, &holders);
+    let cancel = Cancel::new();
+
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("an uncontended store");
+    let AcquireOutcome::Held(hold) = acquired.outcome else { panic!("expected a hold") };
+
+    assert_eq!(hold.held.len(), 3, "three locks, three readings");
+    for (one, path) in hold.held.iter().zip(fixture.all()) {
+        assert_eq!(one.artefact.path, path, "in acquisition order");
+        assert!(one.mtime.is_some(), "`{}` recorded a reading", path.display());
+        assert_eq!(
+            one.mtime,
+            mtime_of(&path),
+            "and it is the directory's own, read the way a peer would read it"
+        );
+    }
+}
+
+#[test]
+fn an_unreadable_modification_time_is_drift_on_either_side() {
+    // The comparison used to be `Option == Option`, so a lock whose reading
+    // was missing at `mkdir` time and missing again now compared *equal* and
+    // refusal A never fired for it. All three shapes are drift.
+    for case in ["missing on the recorded side", "missing on the re-read side", "missing on both"] {
+        let fixture = Fixture::new();
+        let clock = fixture.fake_clock();
+        let holders = FakeHolders::none_stopped();
+        let seams = fixture.seams(&clock, &holders);
+        let cancel = Cancel::new();
+
+        let acquired =
+            fixture.acquire(&seams, &cancel, &Fault::none()).expect("an uncontended store");
+        let AcquireOutcome::Held(mut hold) = acquired.outcome else { panic!("expected a hold") };
+        assert_eq!(hold.drift_check(), Ok(()), "{case}: the hold starts sound");
+
+        if case != "missing on the re-read side" {
+            // Not reachable through the take any more, which is the point of
+            // the other half of this fix; reached here directly so that the
+            // second guard is checked rather than merely argued.
+            hold.held[0].mtime = None;
+        }
+        if case != "missing on the recorded side" {
+            fixture.fs.hide_mtime(&fixture.primary);
+        }
+
+        assert_eq!(
+            hold.drift_check(),
+            Err(LockError::Compromised(fixture.primary.clone())),
+            "{case}: an unreadable reading is not evidence that nothing moved"
+        );
     }
 }
 
