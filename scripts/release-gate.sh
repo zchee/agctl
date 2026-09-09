@@ -41,7 +41,7 @@
 set -euo pipefail
 
 unset CDPATH
-repo_root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+repo_root=$(cd -- "$(dirname -- "$0")/.." && pwd -P)
 cd "$repo_root"
 
 # Resolves $1 to an absolute, symlink-free path, without requiring that it
