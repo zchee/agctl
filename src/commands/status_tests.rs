@@ -168,7 +168,10 @@ fn canonical_migration_service(store: &Store) -> String {
 fn reader_with(items: &[(String, String)]) -> FakeReader {
     let mut reader = FakeReader::unlocked();
     for (service, blob) in items {
-        reader = reader.with_entry(service).with_item(service, blob.as_bytes());
+        // `with_item` adds the listing entry too; adding one separately would
+        // put two entries under one service, which is a keychain the write
+        // path deliberately refuses (`migrated_item`).
+        reader = reader.with_item(service, blob.as_bytes());
     }
     reader
 }
@@ -1299,6 +1302,141 @@ fn ac66_an_item_under_the_canonical_spelling_stays_terminal() {
     token.assert_calls(0);
     usage.assert_calls(0);
     assert!(namespace_entries(&store).is_empty(), "and nothing was written into the namespace");
+}
+
+/// A [`Shared`] carrying `listing` and nothing that can reach a network or a
+/// child process.
+///
+/// [`migrated_item`] is asked about the listing alone, so the rest is inert on
+/// purpose: an unroutable usage endpoint and an empty reader. Driving these
+/// refusals through a whole pass would need a *refreshable* row, and a unit
+/// test has no `AGENTCTL_SECURITY_BIN` — the write would spawn the real
+/// `/usr/bin/security`.
+fn shared_listing(store: &Store, listing: Vec<ServiceEntry>) -> Shared {
+    Shared {
+        paths: Arc::clone(&store.paths),
+        env: EnvView::with_home(store.home.clone()),
+        client: UsageClient::new("http://127.0.0.1:1", "agentctl/test", Duration::from_secs(1)),
+        refresher: Arc::new(HttpRefresher::new("http://127.0.0.1:1/token".to_owned())),
+        reader_factory: readers(Vec::new()),
+        listing,
+        fault: Fault::none(),
+        options: Options { refresh: false, no_cache: false },
+    }
+}
+
+/// One `dump-keychain` listing entry.
+fn entry(service: &str, account: Option<&str>) -> ServiceEntry {
+    ServiceEntry {
+        service: service.to_owned(),
+        account: account.map(str::to_owned),
+        cdat: None,
+        mdat: None,
+    }
+}
+
+#[test]
+fn ac65_the_write_account_is_the_one_the_read_matched_on() {
+    // Invariant I1′ over the *whole* matching key. A generic password is named
+    // by its account and its service together, and the credential a refresh in
+    // place is computed from can only have come from
+    // `find-generic-password -a <current account> -s <service>`. So that is the
+    // account the write must name: any other one names a different item, and
+    // `add-generic-password -U` would create it rather than update the one
+    // Claude Code reads — leaving the fresh pair where nobody looks and the
+    // live session holding a refresh token the server has just rotated away.
+    let store = store();
+    fs::create_dir_all(store.paths.namespace_dir(ACCT, ORG))
+        .expect("the namespace directory should be creatable");
+    let config = owned_config(&store);
+    let record = config.accounts.first().expect("the fixture registers one account");
+    let service = migration_service(&store);
+    let account = crate::secret::current_account();
+
+    let agreeing = shared_listing(&store, vec![entry(&service, Some(&account))]);
+    let item = migrated_item(&agreeing, record, &service).expect("the listing corroborates");
+    assert_eq!(item.account, account, "the write names the account the read matched on");
+    assert_eq!(item.target.service(), service, "and the service the registry predicts");
+
+    // An entry the listing could not describe is not a reason to refuse: the
+    // account is not taken from the listing in the first place.
+    let silent = shared_listing(&store, vec![entry(&service, None)]);
+    assert_eq!(
+        migrated_item(&silent, record, &service)
+            .expect("a silent listing is not a refusal")
+            .account,
+        account
+    );
+}
+
+#[test]
+fn ac65_a_listing_naming_another_account_refuses_the_write() {
+    // The item the listing describes is not the item this process can read, so
+    // the two cannot be proved to be the same one: a stale duplicate, a
+    // renamed user, or an entry another process planted. Refusing is the only
+    // answer that cannot move a credential to an item nobody reads.
+    let store = store();
+    fs::create_dir_all(store.paths.namespace_dir(ACCT, ORG))
+        .expect("the namespace directory should be creatable");
+    let config = owned_config(&store);
+    let record = config.accounts.first().expect("the fixture registers one account");
+    let service = migration_service(&store);
+
+    let foreign = shared_listing(&store, vec![entry(&service, Some("somebody-else"))]);
+    assert_eq!(
+        migrated_item(&foreign, record, &service).err(),
+        Some("the keychain item is registered to another account; refusing to refresh")
+    );
+}
+
+#[test]
+fn ac65_two_listed_items_under_one_service_refuse_the_write() {
+    // Defence in depth, and deliberately kept: `discovery` deduplicates its
+    // listing by service (`discovery.rs`, `dedup_by`), so a pass cannot hand
+    // this function two entries today — which also means the *surviving* entry
+    // of a planted pair is an arbitrary one of the two. That is exactly why
+    // the account above is derived rather than read, and why this refusal is
+    // here for the day the deduplication moves.
+    let store = store();
+    fs::create_dir_all(store.paths.namespace_dir(ACCT, ORG))
+        .expect("the namespace directory should be creatable");
+    let config = owned_config(&store);
+    let record = config.accounts.first().expect("the fixture registers one account");
+    let service = migration_service(&store);
+    let account = crate::secret::current_account();
+
+    let both = shared_listing(
+        &store,
+        vec![entry(&service, Some(&account)), entry(&service, Some("somebody-else"))],
+    );
+    assert_eq!(
+        migrated_item(&both, record, &service).err(),
+        Some("more than one keychain item carries this service name; refusing to refresh")
+    );
+}
+
+#[test]
+fn oq6_only_a_timed_out_write_leaves_the_item_unknown() {
+    // W4a open question 6. `failed` is a claim that the item was not touched,
+    // and only a failure decided before a child exists — or reported by one
+    // that ran to completion — can make it. A timeout killed the child after
+    // `spawn` returned, so it may already have written; that case is settled
+    // by the verifying read after the release, not asserted here.
+    assert!(left_unknown(&KeychainWriteError::Timeout(1200)));
+
+    for settled in [
+        KeychainWriteError::LineTooLong { len: 5000, limit: 4032 },
+        KeychainWriteError::TargetMismatch { expected: "a".to_owned(), found: "b".to_owned() },
+        KeychainWriteError::Unquotable { field: "account" },
+        KeychainWriteError::Locked,
+        KeychainWriteError::Spawn("no such file".to_owned()),
+        KeychainWriteError::Failed {
+            class: crate::secret::StderrClass::Other,
+            stderr: "security: nope".to_owned(),
+        },
+    ] {
+        assert!(!left_unknown(&settled), "`{settled:?}` settles the question");
+    }
 }
 
 // ---------------------------------------------------------------------------

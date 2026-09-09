@@ -59,7 +59,7 @@ fn a_missing_item_exits_44_with_the_real_tool_s_message() {
 fn an_item_is_served_from_the_items_directory() {
     let (dir, path) = script();
     let items = dir.path().join("items");
-    write_item(&items, "Claude Code-credentials", b"blob-bytes").expect("writable");
+    write_item(&items, "u", "Claude Code-credentials", b"blob-bytes").expect("writable");
 
     let output = run(
         &path,
@@ -145,7 +145,7 @@ fn the_write_path_stores_the_decoded_blob_and_redacts_the_log() {
         run_with_stdin(&path, &env, &["-i"], &write_line("u", "Claude Code-credentials", blob));
     assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
 
-    let stored = std::fs::read(items.join(item_file_name("Claude Code-credentials")))
+    let stored = std::fs::read(item_path(&items, "u", "Claude Code-credentials"))
         .expect("the item should have been stored");
     assert_eq!(stored, blob, "the hex round-trips to the bytes that were sent");
 
@@ -198,7 +198,7 @@ fn the_write_path_refuses_anything_but_one_recognised_line() {
         assert!(stderr.starts_with("security:"), "`{name}`: {stderr}");
     }
     assert!(
-        !items.join(item_file_name("Claude Code-credentials")).exists(),
+        !item_path(&items, "u", "Claude Code-credentials").exists(),
         "a refused line stores nothing"
     );
 }
@@ -236,7 +236,7 @@ fn the_write_path_honours_the_forced_exit_knob() {
     assert_eq!(output.status.code(), Some(44));
     assert!(String::from_utf8_lossy(&output.stderr).contains("forced"));
     assert!(
-        !items.join(item_file_name("Claude Code-credentials")).exists(),
+        !item_path(&items, "u", "Claude Code-credentials").exists(),
         "a forced failure stores nothing"
     );
 }
@@ -268,7 +268,7 @@ fn the_item_file_name_fold_matches_the_shell_s() {
         "claude-switcher:user@example.com",
         "Claude Code-credentials-5cdc535f",
     ] {
-        write_item(&items, service, service.as_bytes()).expect("writable");
+        write_item(&items, "u", service, service.as_bytes()).expect("writable");
         let output = run(
             &path,
             &[("AGENTCTL_FAKE_SECURITY_ITEMS", &items.to_string_lossy())],

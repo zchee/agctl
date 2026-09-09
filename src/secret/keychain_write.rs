@@ -64,6 +64,7 @@ use crate::provider::claude::namespace::SECURESTORAGE_ENV;
 use crate::provider::claude::namespace::live_store_dir;
 use crate::provider::claude::namespace::service_name;
 use crate::runtime::coordinator::PassCtx;
+#[cfg(not(feature = "testing"))]
 use crate::secret::SECURITY_BIN;
 use crate::secret::StderrClass;
 use crate::secret::classify_stderr;
@@ -324,7 +325,7 @@ pub fn write_item(
     line: KeychainStdinLine,
     ctx: &PassCtx,
 ) -> Result<(), KeychainWriteError> {
-    write_item_through_inner(&security_bin(), target, account, line, ctx)
+    write_item_through_inner(&security_bin()?, target, account, line, ctx)
 }
 
 /// [`write_item`] with the transport binary named — **a test seam, and
@@ -454,9 +455,12 @@ pub(crate) fn line_text(
 /// `security -i` reads a *command line*, so a value carrying a quote, a
 /// backslash or a newline could end the field early and append arguments of
 /// its own — a second `-s`, or a second command. Neither name can carry one in
-/// practice (the account is `$USER` and the service comes from a
-/// [`WriteTarget`], whose suffix is eight validated hex digits), which is
-/// exactly why refusing costs nothing and closes the case anyway.
+/// practice — the account is the `$USER` the matching read was issued with
+/// (`crate::secret::current_account`, never an attribute read back out of a
+/// `dump-keychain` listing, which any same-user process can choose), and the
+/// service comes from a [`WriteTarget`], whose suffix is eight validated hex
+/// digits — which is exactly why refusing costs nothing and closes the case
+/// anyway.
 fn quotable(field: &'static str, value: &str) -> Result<(), KeychainWriteError> {
     if value.chars().any(|c| c == '"' || c == '\\' || c.is_control()) {
         return Err(KeychainWriteError::Unquotable { field });
@@ -480,16 +484,36 @@ pub fn argv_shapes() -> Vec<Vec<&'static str>> {
 
 /// The `security(1)` binary this process should write through.
 ///
-/// [`SECURITY_BIN`] in production — an absolute path, never resolved through
-/// `PATH` — and, under the `testing` feature only, whatever
-/// `AGENTCTL_SECURITY_BIN` names, exactly as
-/// [`default_reader`](crate::secret::default_reader) resolves the read side.
-fn security_bin() -> PathBuf {
-    #[cfg(feature = "testing")]
-    if let Some(value) = std::env::var_os(crate::secret::SECURITY_BIN_ENV) {
-        return PathBuf::from(value);
-    }
-    PathBuf::from(SECURITY_BIN)
+/// [`SECURITY_BIN`](crate::secret::SECURITY_BIN), an absolute path never
+/// resolved through `PATH`. This is
+/// the whole of the release build's answer; the `testing` build's is below and
+/// is deliberately narrower, not wider.
+#[cfg(not(feature = "testing"))]
+fn security_bin() -> Result<PathBuf, KeychainWriteError> {
+    Ok(PathBuf::from(SECURITY_BIN))
+}
+
+/// The `security(1)` a `testing` build may write through, or a refusal.
+///
+/// **Fails closed.** With `AGENTCTL_SECURITY_BIN` unset there is no stand-in
+/// wired, and falling back to the real binary would let any test that reached
+/// this path create an item in the developer's own login keychain — which is
+/// exactly what happened once, from a unit test that made a migrated namespace
+/// expired and had no idea it was one line away from a write. A `testing`
+/// build has no business writing a real keychain under any circumstances, so
+/// the absence of the seam is a refusal rather than a default.
+///
+/// The release build above has no such branch, and `scripts/release-gate.sh`
+/// keeps the feature out of a shipped artifact.
+#[cfg(feature = "testing")]
+fn security_bin() -> Result<PathBuf, KeychainWriteError> {
+    std::env::var_os(crate::secret::SECURITY_BIN_ENV).map(PathBuf::from).ok_or_else(|| {
+        KeychainWriteError::Spawn(format!(
+            "`{}` is unset in a `testing` build, so there is no write transport; \
+             the real `security(1)` is deliberately not a fallback",
+            crate::secret::SECURITY_BIN_ENV
+        ))
+    })
 }
 
 /// One completed `security -i` invocation.

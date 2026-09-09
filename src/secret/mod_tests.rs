@@ -189,6 +189,17 @@ fn default_reader_builds_without_touching_the_keychain() {
         std::time::Instant::now() + std::time::Duration::from_secs(5),
     );
     let reader = default_reader(&ctx);
-    // Dropped unused: calling `preflight` here would spawn the real binary.
-    drop(reader);
+    // And, under the `testing` feature with no stand-in wired, it is not even
+    // a reader that *could* spawn one: an unset `AGENTCTL_SECURITY_BIN` fails
+    // closed to `DisabledReader` rather than defaulting to the real
+    // `security(1)`. Calling `preflight` is therefore safe here, and is the
+    // assertion — a test that only dropped the reader would still pass if the
+    // fallback came back.
+    assert_eq!(
+        reader.preflight(),
+        KeychainStatus::Unavailable("disabled".to_owned()),
+        "a `testing` build with no stand-in wired has no keychain at all"
+    );
+    assert_eq!(reader.list_services("Claude Code").expect("no error"), Vec::new());
+    assert_eq!(reader.read("Claude Code-credentials").expect("no error"), None);
 }

@@ -346,7 +346,15 @@ fn every_state_token_is_in_the_schema_and_differs_from_its_label() {
 fn every_lock_state_the_pass_can_report_is_in_the_schema() {
     // The vocabulary `commands::status` writes into `lock_state`. Plan AC7's
     // JSON clause pins `busy`; the rest travel with it.
-    for lock_state in ["none", "busy", "adopted", "claude_detected", "migrated", "unavailable"] {
+    for lock_state in [
+        "none",
+        "busy",
+        "adopted",
+        "claude_detected",
+        "migrated",
+        "migrated_refreshed",
+        "unavailable",
+    ] {
         let mut row = row(&AccountState::Busy, None);
         row.lock_state = lock_state;
         assert_valid(&report(vec![row]));

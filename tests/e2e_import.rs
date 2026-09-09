@@ -166,17 +166,7 @@ fn ac19_an_import_records_in_place_and_writes_nothing_else() {
     // where they were — in the login keychain, which phase 1 never writes —
     // and the only thing that changes on disk is agentctl's own registry.
     let fixture = keychain_store();
-    let items = fixture.scratch("keychain-items");
-    let before: Vec<(String, Vec<u8>)> = fs::read_dir(&items)
-        .expect("the items directory should be readable")
-        .filter_map(Result::ok)
-        .map(|entry| {
-            (
-                entry.file_name().to_string_lossy().into_owned(),
-                fs::read(entry.path()).expect("readable"),
-            )
-        })
-        .collect();
+    let before = fixture.keychain_items();
 
     fixture.cmd().args(["claude", "import", "--from", "keychain"]).assert().success();
 
@@ -193,16 +183,7 @@ fn ac19_an_import_records_in_place_and_writes_nothing_else() {
         );
     }
 
-    let after: Vec<(String, Vec<u8>)> = fs::read_dir(&items)
-        .expect("readable")
-        .filter_map(Result::ok)
-        .map(|entry| {
-            (
-                entry.file_name().to_string_lossy().into_owned(),
-                fs::read(entry.path()).expect("readable"),
-            )
-        })
-        .collect();
+    let after = fixture.keychain_items();
     assert_eq!(after, before, "no keychain item was added, changed or removed");
     assert!(
         !fixture.config_dir().join("claude").join(FIRST_ACCT).exists(),

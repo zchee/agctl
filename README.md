@@ -263,7 +263,9 @@ counted; `--all` shows them.
   `delete-generic-password` code path at all, and no secret ever appears in a command
   line: the credential goes to `security -i` over a pipe. Every write is appended to
   `~/.config/agentctl/claude/keychain-writes.jsonl`, which records digest prefixes and
-  never token material.
+  never token material; the entry is written after the write, and a failure to append
+  is reported rather than rolling the write back, so a process killed between the two
+  leaves a write the log does not name.
 - **agentctl never writes under a live Claude Code configuration directory, and never
   touches `.claude.json`.** Every file it creates is under its own configuration
   directory.

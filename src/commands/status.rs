@@ -573,13 +573,13 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
     let mut in_place: Option<MigratedItem> = None;
     if let Some(service) = migrated_service {
         match migrated_item(shared, &record, &service) {
-            Some(item) => {
+            Ok(item) => {
                 outcome.state = AccountState::Ok;
                 outcome.note = Some(format!("keychain service `{service}`"));
                 in_place = Some(item);
             }
-            None => {
-                outcome.note = Some(MIGRATED_NAME_MISMATCH.to_owned());
+            Err(refusal) => {
+                outcome.note = Some(refusal.to_owned());
                 outcome.lock_state = "migrated";
             }
         }
@@ -1155,6 +1155,23 @@ fn refused(state: AccountState, lock_state: &'static str) -> LockedResult {
 const MIGRATED_NAME_MISMATCH: &str =
     "item name does not match the recorded export spelling; refusing to refresh";
 
+/// The note a migrated row carries when more than one keychain item claims
+/// the service name the registry predicts.
+///
+/// A generic password is identified by its **account and service together**
+/// (fact F42), so a second item under one service means the item that was
+/// read and the item a write would reach are not provably the same one — and
+/// `add-generic-password -U` would then create a third rather than update
+/// either. Refusing is the only answer that cannot move a credential to an
+/// item nobody reads (invariant I1′).
+const MIGRATED_AMBIGUOUS: &str =
+    "more than one keychain item carries this service name; refusing to refresh";
+
+/// The note a migrated row carries when the listed item belongs to another
+/// account than the one the read matched on.
+const MIGRATED_ACCOUNT_MISMATCH: &str =
+    "the keychain item is registered to another account; refusing to refresh";
+
 /// The namespaced keychain item one row may refresh in place (decision D-015).
 ///
 /// Constructed only through [`migrated_item`], which is what ties the three
@@ -1166,7 +1183,8 @@ struct MigratedItem {
     target: WriteTarget,
     /// The eight hex digits of the item's suffix, for the audit entry.
     sha8: String,
-    /// The item's `acct` attribute.
+    /// The `acct` attribute the read matched on, which is the only account a
+    /// write may name (see [`migrated_item`]).
     account: String,
 }
 
@@ -1178,25 +1196,40 @@ struct MigratedItem {
 /// this path: an item under any other name — including the one the namespace's
 /// *canonical* spelling hashes to, which discovery also looks for — is never a
 /// write target, however plainly it belongs to this namespace.
-fn migrated_item(shared: &Shared, record: &AccountRecord, service: &str) -> Option<MigratedItem> {
-    let sha8 = OwnedSha8::from_record(&shared.paths, record)?;
+fn migrated_item(
+    shared: &Shared,
+    record: &AccountRecord,
+    service: &str,
+) -> Result<MigratedItem, &'static str> {
+    let sha8 = OwnedSha8::from_record(&shared.paths, record).ok_or(MIGRATED_NAME_MISMATCH)?;
     let target = WriteTarget::migrated(sha8.clone());
     if target.service() != service {
-        return None;
+        return Err(MIGRATED_NAME_MISMATCH);
     }
-    // The item's own account attribute rather than this process's user name.
-    // Fact F42's `-U` matches on the account *and* the service, so a write
-    // that named a different account would add a second item beside the one
-    // Claude Code reads instead of updating it. The pass's `dump-keychain`
-    // listing carries attributes only, and `current_account` is the fallback
-    // for an item the listing could not describe.
-    let account = shared
-        .listing
-        .iter()
-        .find(|entry| entry.service == service)
-        .and_then(|entry| entry.account.clone())
-        .unwrap_or_else(crate::secret::current_account);
-    Some(MigratedItem { target, sha8: sha8.sha8().to_owned(), account })
+    // The account the **read** matched on, and nothing else. Every credential
+    // that reaches this path came out of
+    // `find-generic-password -a <current_account()> -w -s <service>` — nothing
+    // else can satisfy that read — and fact F42's `-U` matches on the account
+    // *and* the service. So an account taken from anywhere else names a
+    // different item, and the write would add a sibling beside the one Claude
+    // Code reads rather than updating it: the credential would land where
+    // nobody looks and the live session would keep the pre-refresh token the
+    // server has just rotated away. One derivation for the read and the write
+    // is the whole of invariant I1′ for the matching key (risk R42).
+    let account = crate::secret::current_account();
+    // The `dump-keychain` listing is a corroboration, never a source. It has
+    // to name this service exactly once, and either agree about the account
+    // or say nothing about it; anything else means the item read and the item
+    // about to be written cannot be proved to be the same item.
+    let mut listed = shared.listing.iter().filter(|entry| entry.service == service);
+    let found = listed.next();
+    if listed.next().is_some() {
+        return Err(MIGRATED_AMBIGUOUS);
+    }
+    if found.and_then(|entry| entry.account.as_deref()).is_some_and(|listed| listed != account) {
+        return Err(MIGRATED_ACCOUNT_MISMATCH);
+    }
+    Ok(MigratedItem { target, sha8: sha8.sha8().to_owned(), account })
 }
 
 /// Refreshes a migrated namespace's own keychain item in place (D-015).
@@ -1241,8 +1274,47 @@ fn refresh_in_place(
 
     // --- Phase B: the POST, holding nothing ------------------------------
     let before = current.digests();
+    let reader = (shared.reader_factory)(ctx);
+
+    // The window a test occupies to write the item between discovery's read
+    // and the check below, which is otherwise microseconds wide.
+    shared.fault.pause_point("before_migrated_reread");
+
+    // One read before the POST, holding nothing: legal here and forbidden six
+    // lines later (invariant I17). The file path asks the same question under
+    // its namespace lock and returns `adopted` without a POST when the answer
+    // has moved (`under_namespace_lock`); this path cannot ask it there, so it
+    // asks it here. If the item changed since discovery read it, a Claude Code
+    // session has already minted what this pass was about to mint — adopting
+    // theirs costs one read, where refreshing anyway spends a grant the server
+    // is about to reject and then discards the answer under the locks.
+    match location::from_keychain(reader.as_ref(), service) {
+        Resolved::Credentials(peer) if peer.digests() != before => return adopted(*peer),
+        Resolved::Credentials(_) => {}
+        // Absent, locked or unreadable: the value this refresh would be
+        // computed from can no longer be corroborated, and a POST made from it
+        // could not be written back anyway.
+        _ => {
+            return LockedResult {
+                state: Some(AccountState::Stale),
+                note: Some("the item could not be re-read before the refresh".to_owned()),
+                lock_state: "none",
+                ..LockedResult::default()
+            };
+        }
+    }
+
     let token = match shared.refresher.refresh(&current, ctx.cancel()) {
         Ok(token) => token,
+        // The server rotated our refresh token away. That is a logout only if
+        // the token is still the item's: when a peer refreshed while our POST
+        // was in flight it is *their* refresh that consumed the grant, and the
+        // row should take their credential rather than send the user to
+        // `agentctl claude login` — which decision D-014 forbids from writing
+        // a namespaced item at all, so the advice would be a dead end.
+        Err(RefreshError::InvalidGrant) => {
+            return after_invalid_grant(&shared.fault, reader.as_ref(), service, &before);
+        }
         Err(err) => {
             return LockedResult {
                 state: Some(refresh_failure_state(&err)),
@@ -1260,9 +1332,26 @@ fn refresh_in_place(
     }
     let after = current.digests();
 
-    // Refusal D, and the audit entry's precondition, both before anything is
-    // held: a line that cannot be written costs nothing to refuse here, and a
-    // write that could not be recorded must not happen at all (invariant I16).
+    // The audit entry's own precondition, before anything else can refuse: a
+    // write that could not be recorded must not happen at all (invariant I16),
+    // and from here on every way out of this function owes an entry, because
+    // from here on there is a minted credential to lose.
+    let Some(to_digest8) = audit::digest8(&after.access_sha256) else {
+        return refused(
+            AccountState::Error("the refreshed credential has no usable digest".to_owned()),
+            "none",
+        );
+    };
+    let mut audited = WriteAudit {
+        shared,
+        item,
+        from_digest8: audit::digest8(&before.access_sha256),
+        to_digest8,
+        outcome: audit::WriteOutcome::Discarded,
+    };
+
+    // Refusal D, before anything is held: a line that cannot be written costs
+    // nothing to refuse here.
     let line = match current.to_keychain_stdin_line(&item.account, service) {
         Ok(line) => line,
         Err(KeychainWriteError::LineTooLong { .. }) => {
@@ -1273,13 +1362,6 @@ fn refresh_in_place(
         }
         Err(err) => return refused(AccountState::Error(format!("refresh refused: {err}")), "none"),
     };
-    let Some(to_digest8) = audit::digest8(&after.access_sha256) else {
-        return refused(
-            AccountState::Error("the refreshed credential has no usable digest".to_owned()),
-            "none",
-        );
-    };
-    let from_digest8 = audit::digest8(&before.access_sha256);
 
     // The window a test occupies to change the item under us, which is
     // otherwise microseconds wide. Deliberately outside the hold: a pause
@@ -1350,7 +1432,6 @@ fn refresh_in_place(
     // Step 8: the item as it is *now*, compared with what the refresh was
     // computed from. A difference is a peer that wrote while the POST was in
     // flight, and their credential is newer than ours (invariant I2′).
-    let reader = (shared.reader_factory)(ctx);
     let observed = match location::from_keychain(reader.as_ref(), service) {
         Resolved::Credentials(credentials) => credentials.digests(),
         Resolved::Absent => return discarded("the item is gone"),
@@ -1412,8 +1493,15 @@ fn refresh_in_place(
         );
     }
 
-    if let Err(err) = write {
-        audit_write(shared, item, from_digest8, &to_digest8, audit::WriteOutcome::Failed);
+    // A failure decided before a child existed, or reported by one that ran to
+    // completion, settles the question: the item was not touched. A timeout
+    // does not — the child was killed after `spawn`, so it may already have
+    // written — so that one case falls through to the verifying read below
+    // instead of claiming `failed` (W4a open question 6's ruling).
+    if let Err(err) = write
+        && !left_unknown(&err)
+    {
+        audited.outcome = audit::WriteOutcome::Failed;
         return LockedResult {
             state: Some(write_refusal_state(&err)),
             note: Some(err.to_string()),
@@ -1430,8 +1518,8 @@ fn refresh_in_place(
         Resolved::Credentials(credentials) => credentials.digests() == after,
         _ => false,
     };
-    let outcome = if applied { audit::WriteOutcome::Applied } else { audit::WriteOutcome::Unknown };
-    audit_write(shared, item, from_digest8, &to_digest8, outcome);
+    audited.outcome =
+        if applied { audit::WriteOutcome::Applied } else { audit::WriteOutcome::Unknown };
 
     if applied {
         return LockedResult {
@@ -1457,6 +1545,70 @@ fn compromised(err: &claude_lock::LockError) -> LockedResult {
         lock_state: "unavailable",
         ..LockedResult::default()
     }
+}
+
+/// A row that took a Claude Code session's freshly written credential rather
+/// than minting one of its own.
+///
+/// The same answer the file path gives when it finds the store already fresh
+/// under the namespace lock: the peer's credential is newer than anything this
+/// pass could produce, and one more refresh would only spend a grant.
+fn adopted(peer: Credentials) -> LockedResult {
+    LockedResult {
+        credentials: Some(peer),
+        note: Some("a Claude Code session refreshed this item".to_owned()),
+        lock_state: "adopted",
+        ..LockedResult::default()
+    }
+}
+
+/// What an `invalid_grant` means once the item has been re-read.
+///
+/// The grant is dead either way; the question is whose refresh consumed it.
+/// An item that moved since this pass read it says a Claude Code session did,
+/// and that session has already stored the pair the server minted for it — so
+/// the row adopts it. An item that has not moved says the refresh token really
+/// is spent, which is the one case that deserves `needs login`.
+fn after_invalid_grant(
+    fault: &Fault,
+    reader: &dyn KeychainReader,
+    service: &str,
+    before: &Digests,
+) -> LockedResult {
+    // The window a test occupies to write the item while our POST was in
+    // flight, which is the only way this branch is reachable on purpose.
+    // Outside every lock, like the rest of Phase B.
+    fault.pause_point("before_invalid_grant_reread");
+    match location::from_keychain(reader, service) {
+        Resolved::Credentials(peer) if peer.digests() != *before => adopted(*peer),
+        Resolved::Credentials(_) => LockedResult {
+            state: Some(AccountState::NeedsLogin),
+            note: Some(RefreshError::InvalidGrant.to_string()),
+            lock_state: "none",
+            ..LockedResult::default()
+        },
+        // Rejected, and now unreadable: `needs login` would be a guess, and
+        // the wrong one whenever the item is merely locked.
+        _ => LockedResult {
+            state: Some(AccountState::Stale),
+            note: Some("the refresh was rejected and the item could not be re-read".to_owned()),
+            lock_state: "none",
+            ..LockedResult::default()
+        },
+    }
+}
+
+/// Whether a failed write leaves the item's contents unknown rather than
+/// settled.
+///
+/// Only a timeout does. Every other failure is decided either before a child
+/// exists — the three refusals of [`KeychainWriteError`] — or by a child that
+/// ran to completion and reported a status, and in both cases the item was
+/// demonstrably not touched. A timeout killed the child *after* `spawn`
+/// returned, so it may already have written; the verifying read after the
+/// release is what settles it (W4a open question 6).
+fn left_unknown(err: &KeychainWriteError) -> bool {
+    matches!(err, KeychainWriteError::Timeout(_))
 }
 
 /// A refresh that completed and was thrown away rather than written.
@@ -1494,6 +1646,10 @@ fn busy_note(holder_alive: bool, stopped_pids: &[u32]) -> String {
 }
 
 /// The row state a failed keychain write deserves.
+///
+/// [`KeychainWriteError::Timeout`] is mapped here for completeness and is not
+/// reached from the refresh path, which routes a timeout through the verifying
+/// read instead ([`left_unknown`]).
 fn write_refusal_state(err: &KeychainWriteError) -> AccountState {
     match err {
         KeychainWriteError::Locked => {
@@ -1513,6 +1669,35 @@ fn write_refusal_state(err: &KeychainWriteError) -> AccountState {
 fn audit_append(paths: &Paths, event: AuditEvent) {
     if let Err(err) = audit::append(paths, &AuditEntry::new(event)) {
         tracing::error!(error = %err, "an audit entry could not be appended");
+    }
+}
+
+/// The audit entry every path out of a completed refresh owes, appended on the
+/// way out whatever that path was.
+///
+/// A guard rather than a call beside each `return`, because there are a dozen
+/// ways out of Phase C and a thirteenth would otherwise be silent. The default
+/// outcome is [`audit::WriteOutcome::Discarded`]: a refresh that was performed
+/// and never written leaves the item holding a refresh token the server has
+/// usually just rotated away, and nothing else in the system records that the
+/// pass created that situation.
+struct WriteAudit<'a> {
+    shared: &'a Shared,
+    item: &'a MigratedItem,
+    from_digest8: Option<String>,
+    to_digest8: String,
+    outcome: audit::WriteOutcome,
+}
+
+impl Drop for WriteAudit<'_> {
+    fn drop(&mut self) {
+        audit_write(
+            self.shared,
+            self.item,
+            self.from_digest8.take(),
+            &self.to_digest8,
+            self.outcome,
+        );
     }
 }
 

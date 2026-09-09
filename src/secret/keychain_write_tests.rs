@@ -575,7 +575,26 @@ fn the_transport_binary_is_resolved_without_being_told() {
         &PassCtx,
     ) -> Result<(), KeychainWriteError> = write_item;
     let _ = entry;
-    assert!(security_bin().is_absolute(), "never resolved through PATH");
+
+    // A release build resolves one absolute path and nothing else.
+    #[cfg(not(feature = "testing"))]
+    assert!(security_bin().expect("a release build always has one").is_absolute());
+
+    // A `testing` build fails closed instead. `AGENTCTL_SECURITY_BIN` is unset
+    // in this process — a unit test cannot set one safely — and the answer is
+    // a refusal rather than `/usr/bin/security`, so no test can reach the
+    // developer's own keychain by forgetting to wire a stand-in. This is the
+    // assertion that would have stopped a real write, and it is worth more
+    // than the absoluteness of a path nobody here is allowed to use.
+    #[cfg(feature = "testing")]
+    {
+        let refused = security_bin().expect_err("a `testing` build has no default transport");
+        assert!(
+            matches!(refused, KeychainWriteError::Spawn(ref why) if why.contains("no write transport")),
+            "the refusal says why, and names the seam: {refused:?}"
+        );
+        assert!(!refused.is_transient(), "a missing transport is not worth retrying");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -674,7 +693,7 @@ mod against_the_fake_script {
         assert_eq!(class, StderrClass::Other);
         assert!(stderr.contains("not registered with this stand-in"), "{stderr}");
         assert!(
-            !items.join(fake_security::item_file_name(target.service())).exists(),
+            !fake_security::item_path(&items, ACCOUNT, target.service()).exists(),
             "a refused write stores nothing"
         );
     }
@@ -699,7 +718,7 @@ mod against_the_fake_script {
                 .expect_err("exit 36 is a locked keychain");
         assert_eq!(refused, KeychainWriteError::Locked);
         assert!(
-            !items.join(fake_security::item_file_name(target.service())).exists(),
+            !fake_security::item_path(&items, ACCOUNT, target.service()).exists(),
             "a forced failure stores nothing"
         );
     }

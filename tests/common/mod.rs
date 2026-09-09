@@ -95,7 +95,15 @@ pub const USAGE_PATH: &str = "/api/oauth/usage";
 pub const UNKNOWN_ORG: &str = "_unknown-org";
 
 /// The account attribute the fake keychain items carry.
-const KEYCHAIN_ACCOUNT: &str = "example";
+///
+/// Also the `USER` every fixture command runs with, so that
+/// `crate::secret::current_account` — the account the binary's own reads match
+/// on — is the same string the items are stored under and the `dump-keychain`
+/// listing advertises. A fixture whose reader account differed from its items'
+/// would model a divergence it could never detect: reads would find nothing,
+/// or worse, a write naming the listing's account would land in a sibling item
+/// and still look like a success.
+pub const KEYCHAIN_ACCOUNT: &str = "example";
 
 // ---------------------------------------------------------------------------
 // One isolated agentctl
@@ -133,6 +141,12 @@ impl Fixture {
         // developer's desktop from a test run is not acceptable.
         fixture.set("AGENTCTL_NO_BROWSER", "1");
         fixture.set("AGENTCTL_KEYCHAIN_BACKEND", "none");
+        // Pinned rather than inherited: `current_account()` reads `USER` and
+        // falls back to `LOGNAME`, and both must name the account the fake
+        // keychain's items are filed under, or a read matches nothing on the
+        // developer's machine but everything on another.
+        fixture.set("USER", KEYCHAIN_ACCOUNT);
+        fixture.set("LOGNAME", KEYCHAIN_ACCOUNT);
         fixture
     }
 
@@ -384,10 +398,68 @@ impl Fixture {
         self.root.path().join("keychain-items")
     }
 
-    /// The file one item's password is stored in.
+    /// The file one item's password is stored in, under this fixture's own
+    /// account.
     #[must_use]
     pub fn keychain_item_path(&self, service: &str) -> PathBuf {
-        self.items_dir().join(item_file_name(service))
+        self.keychain_item_path_for(KEYCHAIN_ACCOUNT, service)
+    }
+
+    /// The file one item's password would be stored in under `account`.
+    ///
+    /// A generic password is identified by its account *and* its service, so
+    /// this is what a write with the wrong `-a` creates and what a read with
+    /// the right one will never serve: the sibling item invariant I1′ exists
+    /// to prevent.
+    #[must_use]
+    pub fn keychain_item_path_for(&self, account: &str, service: &str) -> PathBuf {
+        self.items_dir().join(item_file_name(account)).join(item_file_name(service))
+    }
+
+    /// Every item file the fake keychain holds, as
+    /// `("<account>/<file>", bytes)`, sorted.
+    ///
+    /// The whole keychain rather than one item, for the tests whose claim is
+    /// "nothing was added, changed or removed" — a claim that has to see a
+    /// sibling under another account to be worth making.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the items directory cannot be read.
+    #[must_use]
+    pub fn keychain_items(&self) -> Vec<(String, Vec<u8>)> {
+        let mut items = Vec::new();
+        for account in self.keychain_accounts() {
+            let dir = self.items_dir().join(&account);
+            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            for entry in entries.filter_map(Result::ok) {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let bytes = fs::read(entry.path()).expect("an item file should be readable");
+                items.push((format!("{account}/{name}"), bytes));
+            }
+        }
+        items.sort();
+        items
+    }
+
+    /// Every account directory the fake keychain has items under.
+    ///
+    /// One entry — this fixture's own account — is what "no sibling item was
+    /// created" looks like.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the items directory cannot be read.
+    #[must_use]
+    pub fn keychain_accounts(&self) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(self.items_dir())
+            .expect("the items directory should exist")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     /// The fake `security(1)` this fixture installed.
@@ -468,7 +540,9 @@ impl Fixture {
     ///
     /// Panics when the item cannot be written.
     pub fn keychain_item(&self, service: &str, blob: &str) -> &Self {
-        let path = self.items_dir().join(item_file_name(service));
+        let path = self.keychain_item_path(service);
+        fs::create_dir_all(path.parent().expect("an item path has a parent"))
+            .expect("the account directory should be creatable");
         fs::write(path, blob).expect("the keychain item should be writable");
         self
     }
@@ -536,6 +610,35 @@ impl Fixture {
     // Running the binary
     // -----------------------------------------------------------------------
 
+    /// Refuses to start a child that could reach the real `security(1)`.
+    ///
+    /// Every fixture must be in one of exactly two states: the fake is wired
+    /// (`AGENTCTL_SECURITY_BIN`), or the keychain is switched off outright
+    /// (`AGENTCTL_KEYCHAIN_BACKEND=none`). A fixture in neither has a reader
+    /// and a write transport with nothing behind them, and the binary is
+    /// built with the `testing` feature, so this is the layer that decides
+    /// whether a test *could* touch the developer's own keychain.
+    ///
+    /// The binary itself now fails closed in that case as well
+    /// (`secret::default_reader`, `keychain_write::security_bin`). This is the
+    /// second half of the same guarantee, here rather than there because a
+    /// test that ends up in that state is a bug in the test, and a refusal
+    /// deep inside the child would surface as a puzzling row instead of as
+    /// the sentence below.
+    ///
+    /// # Panics
+    ///
+    /// Panics when neither variable is set.
+    fn assert_keychain_seam(&self) {
+        let wired = |key: &str| self.env.iter().any(|(name, _)| name == key);
+        assert!(
+            wired("AGENTCTL_SECURITY_BIN") || wired("AGENTCTL_KEYCHAIN_BACKEND"),
+            "this fixture wires neither the fake `security` nor the disabled backend, so the \
+             child would have no keychain seam at all; call `with_keychain()` if the test needs \
+             a keychain, and leave `Fixture::new`'s default alone if it does not"
+        );
+    }
+
     /// An `assert_cmd` handle to the binary, isolated.
     #[must_use]
     pub fn cmd(&self) -> Command {
@@ -543,6 +646,7 @@ impl Fixture {
         // which guesses `target/debug/agentctl` relative to the manifest. This
         // project builds into a tmpfs target directory, so that guess can find
         // a stale binary from some earlier build and silently test it.
+        self.assert_keychain_seam();
         let mut command = Command::new(env!("CARGO_BIN_EXE_agentctl"));
         command.args(["--config-dir", &self.config_dir().to_string_lossy()]);
         command.env("HOME", self.home());
@@ -566,6 +670,7 @@ impl Fixture {
     /// because it runs a command to completion.
     #[must_use]
     pub fn raw(&self) -> StdCommand {
+        self.assert_keychain_seam();
         let mut command = StdCommand::new(env!("CARGO_BIN_EXE_agentctl"));
         command.args(["--config-dir", &self.config_dir().to_string_lossy()]);
         command.env("HOME", self.home());
@@ -708,7 +813,7 @@ pub fn export_spelling(dir: &Path) -> String {
     if trimmed.is_empty() { text } else { trimmed.to_owned() }
 }
 
-/// The file name the fake `security` reads one service's password from.
+/// The name fold the fake `security` applies to an account or a service.
 ///
 /// The fold has to match the `tr -c 'A-Za-z0-9._-' '_'` inside
 /// `fixtures/fake-security.sh`, and the twin of this function in

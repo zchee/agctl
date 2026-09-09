@@ -307,6 +307,14 @@ impl KeychainReader for DisabledReader {
 /// `AGENTCTL_KEYCHAIN_BACKEND=none` selects [`DisabledReader`], and
 /// `AGENTCTL_SECURITY_BIN` points at the fake script from
 /// [`fake_security`].
+///
+/// A `testing` build with **neither** set also gets [`DisabledReader`], and
+/// that is the point: the real `security(1)` is not a fallback there. A test
+/// that has not wired a stand-in has not decided to talk to the developer's
+/// own keychain, and a build that could reach it by omission will eventually
+/// reach it by accident — as one did, from a unit test one line away from a
+/// keychain write. The write side refuses the same way
+/// (`keychain_write::security_bin`).
 pub fn default_reader(ctx: &PassCtx) -> Box<dyn KeychainReader + Send + Sync> {
     #[cfg(feature = "testing")]
     if std::env::var(KEYCHAIN_BACKEND_ENV).is_ok_and(|value| value == "none") {
@@ -314,9 +322,9 @@ pub fn default_reader(ctx: &PassCtx) -> Box<dyn KeychainReader + Send + Sync> {
     }
 
     #[cfg(feature = "testing")]
-    let bin = std::env::var_os(SECURITY_BIN_ENV)
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(SECURITY_BIN));
+    let Some(bin) = std::env::var_os(SECURITY_BIN_ENV).map(std::path::PathBuf::from) else {
+        return Box::new(DisabledReader);
+    };
     #[cfg(not(feature = "testing"))]
     let bin = std::path::PathBuf::from(SECURITY_BIN);
 

@@ -191,6 +191,15 @@ pub enum WriteOutcome {
     Unknown,
     /// The write itself failed and the item was left as it was.
     Failed,
+    /// The refresh was performed and never written: a refusal after the POST
+    /// (a busy store, a drifted lock, an item that changed under us, a hold
+    /// out of budget) threw away a credential the server had already minted.
+    ///
+    /// Worth its own entry rather than silence, because the discard is
+    /// invisible afterwards: the item still holds the *old* refresh token,
+    /// which the server has usually just rotated away, so the next pass may
+    /// report `needs login` for reasons this pass created.
+    Discarded,
 }
 
 /// Which tree a lock artefact belongs to (invariant I11′ containment).

@@ -26,10 +26,15 @@ dump-keychain)
     ;;
 find-generic-password)
     service=''
+    account=''
     while [ $# -gt 0 ]; do
         case "$1" in
         -s)
             service="$2"
+            shift 2
+            ;;
+        -a)
+            account="$2"
             shift 2
             ;;
         *)
@@ -43,8 +48,13 @@ find-generic-password)
         fi
         exit "$AGENTCTL_FAKE_SECURITY_FIND_EXIT"
     fi
+    # A generic password is identified by its account **and** its service, the
+    # way the shipped `security(1)` documents `-a` ("Match \"account\" string").
+    # So the item lives under a per-account directory and an `-a` naming a
+    # different account finds nothing, however familiar the service.
     key=$(printf '%s' "$service" | tr -c 'A-Za-z0-9._-' '_')
-    file="${AGENTCTL_FAKE_SECURITY_ITEMS:-/nonexistent}/$key"
+    who=$(printf '%s' "$account" | tr -c 'A-Za-z0-9._-' '_')
+    file="${AGENTCTL_FAKE_SECURITY_ITEMS:-/nonexistent}/$who/$key"
     if [ -f "$file" ]; then
         cat "$file"
         exit 0
@@ -114,13 +124,18 @@ find-generic-password)
         exit 1
     fi
 
+    # `-U` updates the item matching **both** names and creates one when there
+    # is none, so a line whose `-a` is not the account the reader matches on
+    # lands in a sibling item that no read will ever serve. Keying the file on
+    # the account as well as the service is what lets a test see that.
     key=$(printf '%s' "$service" | tr -c 'A-Za-z0-9._-' '_')
-    mkdir -p "$items"
+    who=$(printf '%s' "$account" | tr -c 'A-Za-z0-9._-' '_')
+    mkdir -p "$items/$who"
     if command -v xxd >/dev/null 2>&1; then
-        printf '%s' "$hex" | xxd -r -p > "$items/$key"
+        printf '%s' "$hex" | xxd -r -p > "$items/$who/$key"
     elif command -v perl >/dev/null 2>&1; then
         printf '%s' "$hex" |
-            perl -e 'my $h = do { local $/; <STDIN> }; print pack("H*", $h);' > "$items/$key"
+            perl -e 'my $h = do { local $/; <STDIN> }; print pack("H*", $h);' > "$items/$who/$key"
     else
         printf 'security: this stand-in needs xxd or perl to decode the -X value\n' >&2
         exit 1

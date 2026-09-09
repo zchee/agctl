@@ -166,7 +166,7 @@ mod against_the_fake_script {
     fn an_item_reads_back_without_its_trailing_newline() {
         let dir = TempDir::new().expect("a temporary directory");
         let items = dir.path().join("items");
-        fake_security::write_item(&items, "Claude Code-credentials", b"{\"a\":1}\n")
+        fake_security::write_item(&items, "example", "Claude Code-credentials", b"{\"a\":1}\n")
             .expect("the item should be writable");
 
         let harness =
@@ -251,8 +251,13 @@ mod against_the_fake_script {
         // Invariant I8: the service name is an argument, the password is not.
         let dir = TempDir::new().expect("a temporary directory");
         let items = dir.path().join("items");
-        fake_security::write_item(&items, "Claude Code-credentials", b"sk-ant-oat01-FAKE")
-            .expect("the item should be writable");
+        fake_security::write_item(
+            &items,
+            "example",
+            "Claude Code-credentials",
+            b"sk-ant-oat01-FAKE",
+        )
+        .expect("the item should be writable");
         let log = dir.path().join("argv.log");
         let harness = wired(&[
             ("AGENTCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned()),

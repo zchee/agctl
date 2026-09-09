@@ -287,10 +287,7 @@ fn ac47_forget_hides_a_service_without_ever_reading_it_again() {
     fixture.cmd().args(["claude", "status"]).assert().stdout(contains("unclaimed"));
 
     assert!(
-        fs::read_to_string(
-            fixture.scratch("keychain-items").join(common::item_file_name(&service))
-        )
-        .is_ok(),
+        fs::read_to_string(fixture.keychain_item_path(&service)).is_ok(),
         "the keychain item itself was never removed"
     );
     fixture.assert_keychain_read_only();

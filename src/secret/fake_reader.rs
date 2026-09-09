@@ -52,10 +52,23 @@ impl FakeReader {
     }
 
     /// Adds a listing entry, as `dump-keychain` would report it.
-    pub fn with_entry(mut self, service: &str) -> Self {
+    ///
+    /// The `acct` attribute is [`current_account`](crate::secret::current_account),
+    /// because that is what a real listing carries: the item was created by a
+    /// process running as this user, and it is the account this reader's own
+    /// `find-generic-password` would match on. A fake that advertised some
+    /// other account would model a keychain no read in this process can serve.
+    pub fn with_entry(self, service: &str) -> Self {
+        let account = crate::secret::current_account();
+        self.with_entry_for(service, Some(&account))
+    }
+
+    /// Adds a listing entry carrying `account`, for the tests whose subject is
+    /// a listing that does *not* describe the item this process can read.
+    pub fn with_entry_for(mut self, service: &str, account: Option<&str>) -> Self {
         self.entries.push(ServiceEntry {
             service: service.to_owned(),
-            account: Some("example".to_owned()),
+            account: account.map(str::to_owned),
             cdat: None,
             mdat: None,
         });

@@ -20,7 +20,7 @@
 //! | `AGENTCTL_FAKE_SECURITY_PREFLIGHT_STDERR` | stderr for `show-keychain-info` |
 //! | `AGENTCTL_FAKE_SECURITY_DUMP` | file to print for `dump-keychain` |
 //! | `AGENTCTL_FAKE_SECURITY_DUMP_EXIT` | exit status for `dump-keychain` |
-//! | `AGENTCTL_FAKE_SECURITY_ITEMS` | directory of item files, named by [`item_file_name`] |
+//! | `AGENTCTL_FAKE_SECURITY_ITEMS` | directory of item files, laid out by [`item_path`] |
 //! | `AGENTCTL_FAKE_SECURITY_FIND_EXIT` | force this exit status for `find-generic-password` |
 //! | `AGENTCTL_FAKE_SECURITY_WRITE_EXIT` | force this exit status for the `-i` write path |
 //! | `AGENTCTL_FAKE_SECURITY_STDERR` | stderr to print with a forced failure |
@@ -44,9 +44,12 @@
 //!   [`allow_service`]); anything else exits 1 with a `security:`-shaped
 //!   message. A write is the one operation where "the test forgot to say
 //!   which item" must not silently succeed;
-//! - **stores the decoded blob** at `<items>/<item_file_name(service)>`, the
-//!   same file the read path serves, so a write followed by a read round-trips
-//!   through the same bytes the transport put on the pipe.
+//! - **stores the decoded blob** at [`item_path`]`(<items>, <account>, <service>)`,
+//!   the same file the read path serves, so a write followed by a read
+//!   round-trips through the same bytes the transport put on the pipe — and a
+//!   write whose `-a` names another account lands in a sibling file that no
+//!   read of the original account will serve, which is what the shipped
+//!   `security(1)` does with `-U` and a mismatched `-a`.
 //!
 //! The log line is written *before* the refusals, so an invocation counts as
 //! an attempted write whether or not it landed — which is what plan AC61's
@@ -96,9 +99,9 @@ pub fn write_fake_security(dir: &Path) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// The file name the stand-in reads one service's password from.
+/// The file name the stand-in folds one account or service name to.
 ///
-/// Service names carry spaces and colons — `Claude Code-credentials`,
+/// Both carry spaces, colons and `@` — `Claude Code-credentials`,
 /// `claude-switcher:user@example.com` — so they are folded to a conservative
 /// alphabet. The shell script performs the identical fold with `tr`, and the
 /// two must be changed together.
@@ -109,14 +112,33 @@ pub fn item_file_name(service: &str) -> String {
         .collect()
 }
 
-/// Writes one item's password into an items directory.
+/// Where the stand-in keeps one item's password.
+///
+/// A generic password is identified by its **account and service together**,
+/// which is what `find-generic-password -a … -s …` matches on and what
+/// `add-generic-password -U` decides "already exists" by. Nesting the service
+/// file under the account is the smallest layout that models that: a read with
+/// the wrong `-a` finds nothing, and a write with the wrong `-a` creates a
+/// sibling rather than updating the item that was read.
+pub fn item_path(items_dir: &Path, account: &str, service: &str) -> PathBuf {
+    items_dir.join(item_file_name(account)).join(item_file_name(service))
+}
+
+/// Writes one item's password into an items directory, under `account`.
 ///
 /// # Errors
 ///
 /// Returns the underlying [`io::Error`] when the file cannot be written.
-pub fn write_item(items_dir: &Path, service: &str, blob: &[u8]) -> io::Result<PathBuf> {
-    std::fs::create_dir_all(items_dir)?;
-    let path = items_dir.join(item_file_name(service));
+pub fn write_item(
+    items_dir: &Path,
+    account: &str,
+    service: &str,
+    blob: &[u8],
+) -> io::Result<PathBuf> {
+    let path = item_path(items_dir, account, service);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(&path, blob)?;
     Ok(path)
 }

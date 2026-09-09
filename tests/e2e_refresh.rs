@@ -704,6 +704,37 @@ fn finds_for(fixture: &Fixture, service: &str) -> usize {
         .count()
 }
 
+/// The account every read of `service` matched on.
+///
+/// Taken out of the argv log rather than assumed, because the point of the
+/// assertion it feeds is that the write and the read agree about the account
+/// — an assertion that would be worthless if both sides came from the same
+/// constant in the test.
+///
+/// # Panics
+///
+/// Panics when the log holds no read of `service`, or when two reads of it
+/// disagree about the account: either means the fixture is not modelling one
+/// keychain item any more.
+fn read_account(fixture: &Fixture, service: &str) -> String {
+    let suffix = format!("-s {service}");
+    let accounts: Vec<String> = fixture
+        .security_log()
+        .iter()
+        .filter(|line| line.starts_with("find-generic-password") && line.ends_with(&suffix))
+        .filter_map(|line| {
+            let rest = line.split_once("-a ")?.1;
+            Some(rest.split_once(' ')?.0.to_owned())
+        })
+        .collect();
+    let first = accounts.first().unwrap_or_else(|| panic!("no read of `{service}` was logged"));
+    assert!(
+        accounts.iter().all(|account| account == first),
+        "every read of `{service}` matched on one account: {accounts:?}"
+    );
+    first.clone()
+}
+
 /// Every write the stand-in recorded, redacted as it logs them.
 fn writes(fixture: &Fixture) -> Vec<String> {
     fixture
@@ -744,6 +775,15 @@ fn ac65_a_migrated_namespace_refreshes_its_own_keychain_item_in_place() {
     fixture.set("RUST_LOG", "agentctl=debug");
     let item = fixture.keychain_item_path(&service);
     let before = fs::read_to_string(&item).expect("the migrated item should be readable");
+    // Absent *before* the pass as well as after: decision D-014 is that a
+    // migrated namespace stays migrated, and a claim about what the pass did
+    // not create is only worth making against a namespace that did not have
+    // it to begin with.
+    assert!(
+        fixture.namespace_entries(ACCT, ORG).is_empty(),
+        "the namespace starts with no plaintext store: {:?}",
+        fixture.namespace_entries(ACCT, ORG)
+    );
 
     let output = fixture
         .cmd()
@@ -798,6 +838,27 @@ fn ac65_a_migrated_namespace_refreshes_its_own_keychain_item_in_place() {
     assert!(write.contains(&format!("-s \"{service}\"")), "it names the namespaced item: {write}");
     assert!(write.contains("-X <REDACTED:"), "and the stand-in redacted the blob: {write}");
 
+    // Invariant I1′ over the *whole* matching key, not half of it. A generic
+    // password is identified by its account and its service together, so a
+    // write whose `-a` is not the `-a` the reads matched on would leave the
+    // item that was read holding the pre-refresh pair and put the fresh one in
+    // a sibling nobody reads — and, against a duplicate planted by another
+    // process, hand that process a live credential across the ACL boundary.
+    let account = read_account(&fixture, &service);
+    assert!(
+        write.contains(&format!("-a \"{account}\"")),
+        "the write names the account the reads matched on (`{account}`): {write}"
+    );
+    assert_eq!(
+        fixture.keychain_accounts(),
+        vec![account.clone()],
+        "and created no sibling item under any other account"
+    );
+    assert!(
+        fixture.keychain_item_path_for(&account, &service).exists(),
+        "the item that was read is the item that exists afterwards"
+    );
+
     // The live item is never a target on this path (invariant I1′): no write
     // names it, and nothing ever created it.
     assert!(
@@ -814,13 +875,17 @@ fn ac65_a_migrated_namespace_refreshes_its_own_keychain_item_in_place() {
     //   2. discovery parsing what it found, for the owned row;
     //   3. discovery parsing it again, for the `unclaimed` row it also emits
     //      because a migrated namespace's service is not a *claimed* one;
-    //   4. the re-read under the three locks (invariant I2′);
-    //   5. the verifying re-read after the release (section 3.4 step 12).
-    // Only 4 and 5 belong to this step; 1–3 are discovery's, unchanged.
+    //   4. the check before the POST, holding nothing: a peer that refreshed
+    //      between 1–3 and here has already minted what this pass would, and
+    //      is adopted instead of racing (invariant I17 allows a read here and
+    //      forbids the POST under the hold);
+    //   5. the re-read under the three locks (invariant I2′);
+    //   6. the verifying re-read after the release (section 3.4 step 12).
+    // Only 4–6 belong to this step; 1–3 are discovery's, unchanged.
     assert_eq!(
         finds_for(&fixture, &service),
-        5,
-        "the item was read exactly five times: {:?}",
+        6,
+        "the item was read exactly six times: {:?}",
         fixture.security_log()
     );
     assert_eq!(
@@ -832,13 +897,13 @@ fn ac65_a_migrated_namespace_refreshes_its_own_keychain_item_in_place() {
 
     // And the whole of what `security` was asked to do, so a later change
     // cannot add an invocation without this failing: one preflight, one
-    // listing, six reads, and the write — which the stand-in logs twice, once
-    // as the argv it was handed and once as the redacted line it parsed off
-    // standard input.
+    // listing, seven reads, and the write — which the stand-in logs twice,
+    // once as the argv it was handed and once as the redacted line it parsed
+    // off standard input.
     let calls = fixture.security_log();
-    assert_eq!(calls.len(), 10, "the exact set of `security` invocations: {calls:?}");
+    assert_eq!(calls.len(), 11, "the exact set of `security` invocations: {calls:?}");
     for (subcommand, expected) in
-        [("show-keychain-info", 1), ("dump-keychain", 1), ("find-generic-password", 6)]
+        [("show-keychain-info", 1), ("dump-keychain", 1), ("find-generic-password", 7)]
     {
         assert_eq!(
             calls.iter().filter(|line| line.starts_with(subcommand)).count(),
@@ -899,6 +964,218 @@ fn ac65_a_migrated_namespace_refreshes_its_own_keychain_item_in_place() {
 }
 
 #[test]
+fn ac65_a_peer_refresh_before_the_post_is_adopted_and_costs_no_grant() {
+    // The window between discovery reading the item and this pass POSTing to
+    // the token endpoint. The file path closes it under its namespace lock —
+    // it re-reads and returns `adopted` without a POST — and invariant I17
+    // forbids this path from holding anything across a network call, so it
+    // asks the same question in Phase B, holding nothing.
+    //
+    // Without the check the pass POSTs with a refresh token the peer has just
+    // spent: the server rotates ours away, our answer is discarded under the
+    // locks, and the row lands on `needs login` for an item that is perfectly
+    // healthy — advice decision D-014 forbids acting on for a migrated
+    // namespace anyway.
+    let server = MockServer::start();
+    let usage = usage_ok(&server);
+    let token = token_ok(&server, 28_800);
+
+    let (fixture, service) = migrated_owned(&server, common::expired_at());
+    let resume = fixture.scratch("resume");
+    let item = fixture.keychain_item_path(&service);
+
+    let child = fixture
+        .raw()
+        .args(["claude", "status", "--json", "--refresh", "--timeout", "30s", "--account", EMAIL])
+        .env("AGENTCTL_FAULT", "pause_before_migrated_reread")
+        .env("AGENTCTL_FAULT_RESUME", &resume)
+        .spawn()
+        .expect("agentctl should start");
+
+    // `discovery::discover` is single-threaded, so three logged reads mean the
+    // first two — the migration probe and the owned row's own — have returned;
+    // the third serves the `unclaimed` row and feeds nothing this test claims.
+    // The pause then holds the next read until the resume file exists, so the
+    // item written here is exactly what the pre-POST check will see.
+    assert!(
+        common::wait_until(OBSERVE_BUDGET, || finds_for(&fixture, &service) >= 3),
+        "discovery should have read the item before the pause"
+    );
+    let peer = common::blob("sk-ant-oat01-peer", "sk-ant-ort01-peer", common::fresh_at());
+    fs::write(&item, &peer).expect("the item should be writable");
+    fs::write(&resume, "go").expect("the resume file should be writable");
+
+    let finished = common::finish(child);
+    let row = owned_row(&finished.stdout);
+    assert_eq!(row["state"], json!("ok"), "the peer's credential answers the row: {row}");
+    assert_eq!(row["lock_state"], json!("adopted"), "and says whose it is: {row}");
+    assert_eq!(
+        row["note"],
+        json!("a Claude Code session refreshed this item"),
+        "in words rather than by omission: {row}"
+    );
+
+    assert_eq!(token.calls(), 0, "no grant was spent: the peer had already minted one");
+    assert!(usage.calls() >= 1, "and the row still answered the user's question");
+    assert!(writes(&fixture).is_empty(), "nothing was written: {:?}", fixture.security_log());
+    assert_eq!(
+        fs::read_to_string(&item).expect("readable"),
+        peer,
+        "the peer's credential is exactly what is still there"
+    );
+    for artefact in fixture.hold_artefacts(ACCT, ORG) {
+        assert!(
+            fs::symlink_metadata(&artefact).is_err(),
+            "`{}` was never created: the adoption precedes every lock",
+            artefact.display()
+        );
+    }
+    // One preflight, one listing, the live row's read, and four reads of the
+    // item: discovery's three and the one before the POST. No hold, so no
+    // re-read under it and no verifying read.
+    assert_eq!(finds_for(&fixture, &service), 4, "{:?}", fixture.security_log());
+    assert_eq!(
+        fixture.security_log().len(),
+        7,
+        "the exact set of `security` invocations: {:?}",
+        fixture.security_log()
+    );
+    // The audit log is for writes and breaks. Nothing was minted here, so
+    // nothing was discarded, and the log has nothing to say.
+    assert!(
+        !fixture.audit_log_path().exists(),
+        "a pass that made no POST records no discarded refresh"
+    );
+}
+
+#[test]
+fn ac65_an_invalid_grant_after_a_peer_refresh_adopts_rather_than_asking_for_a_login() {
+    // The residual window the check above cannot close: the peer wrote while
+    // this pass's POST was already in flight. The server answers
+    // `invalid_grant`, because the peer's refresh consumed the grant — which
+    // is a logout only if the refresh token is still the item's. It is not:
+    // the item moved, so a Claude Code session holds the pair the server
+    // minted, and the row takes theirs.
+    //
+    // The wrong answer here is `needs login`, which sends the user to
+    // `agentctl claude login` — and decision D-014 forbids that from writing a
+    // namespaced item, so the advice would be a dead end for a healthy row.
+    let server = MockServer::start();
+    let usage = usage_ok(&server);
+    let token = server.mock(|when, then| {
+        when.method(POST).path(common::TOKEN_PATH);
+        then.status(400).json_body(json!({
+            "error": "invalid_grant",
+            "error_description": "refresh token is not valid",
+        }));
+    });
+
+    let (fixture, service) = migrated_owned(&server, common::expired_at());
+    let resume = fixture.scratch("resume");
+    let item = fixture.keychain_item_path(&service);
+
+    let child = fixture
+        .raw()
+        .args(["claude", "status", "--json", "--refresh", "--timeout", "30s", "--account", EMAIL])
+        .env("AGENTCTL_FAULT", "pause_before_invalid_grant_reread")
+        .env("AGENTCTL_FAULT_RESUME", &resume)
+        .spawn()
+        .expect("agentctl should start");
+
+    // The POST having been answered is the ordering point: the pre-POST check
+    // has already run and agreed, so the item written here is invisible to it
+    // and visible only to the recovery, which is paused waiting for the
+    // resume file below.
+    assert!(
+        common::wait_until(OBSERVE_BUDGET, || token.calls() == 1),
+        "the refresh POST should have been rejected before the pause"
+    );
+    let peer = common::blob("sk-ant-oat01-peer", "sk-ant-ort01-peer", common::fresh_at());
+    fs::write(&item, &peer).expect("the item should be writable");
+    fs::write(&resume, "go").expect("the resume file should be writable");
+
+    let finished = common::finish(child);
+    let row = owned_row(&finished.stdout);
+    assert_eq!(row["state"], json!("ok"), "a healthy item is not a logout: {row}");
+    assert_ne!(row["state"], json!("needs_login"), "{row}");
+    assert_eq!(row["lock_state"], json!("adopted"), "{row}");
+    assert_eq!(row["note"], json!("a Claude Code session refreshed this item"), "{row}");
+
+    assert_eq!(token.calls(), 1, "the POST did go out; it is the answer that changed");
+    assert!(usage.calls() >= 1, "and the row still answered the user's question");
+    assert!(writes(&fixture).is_empty(), "nothing was written: {:?}", fixture.security_log());
+    assert_eq!(
+        fs::read_to_string(&item).expect("readable"),
+        peer,
+        "the peer's credential is untouched"
+    );
+    for artefact in fixture.hold_artefacts(ACCT, ORG) {
+        assert!(
+            fs::symlink_metadata(&artefact).is_err(),
+            "`{}` was never created: the recovery precedes every lock",
+            artefact.display()
+        );
+    }
+    // Discovery's three, the one before the POST, and the recovery's one.
+    assert_eq!(finds_for(&fixture, &service), 5, "{:?}", fixture.security_log());
+    assert_eq!(
+        fixture.security_log().len(),
+        8,
+        "the exact set of `security` invocations: {:?}",
+        fixture.security_log()
+    );
+    // The POST failed, so nothing was minted and nothing was discarded.
+    assert!(!fixture.audit_log_path().exists(), "a failed POST records no discarded refresh");
+}
+
+#[test]
+fn ac65_a_refusal_after_the_post_records_the_discarded_refresh() {
+    // Plan section 3.9's partial-state contract, for the row it did not have:
+    // a refresh that was *performed* and never written. The item still holds
+    // the pre-refresh refresh token, which the server has usually just rotated
+    // away, so the next pass may report `needs login` for a situation this
+    // pass created — and without an entry that is undiagnosable afterwards.
+    //
+    // `lock_contended` is the cheapest way to reach a post-POST refusal: the
+    // acquire reports the store busy after the POST has already happened.
+    let server = MockServer::start();
+    let _usage = usage_ok(&server);
+    let token = token_ok(&server, 28_800);
+
+    let (mut fixture, service) = migrated_owned(&server, common::expired_at());
+    fixture.fault("lock_contended");
+
+    let stdout = json_pass(&fixture, &[]);
+    let row = owned_row(&stdout);
+    assert_eq!(row["state"], json!("busy"), "{row}");
+    assert_eq!(token.calls(), 1, "the grant was spent");
+    assert!(writes(&fixture).is_empty(), "and never written: {:?}", fixture.security_log());
+
+    let log = fs::read_to_string(fixture.audit_log_path()).expect("the audit log should exist");
+    let entries: Vec<Value> = log
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("each audit line is one JSON object"))
+        .collect();
+    let writes_logged: Vec<&Value> =
+        entries.iter().filter(|entry| entry["event"] == json!("write")).collect();
+    assert_eq!(writes_logged.len(), 1, "one refusal, one entry: {log}");
+    let entry = writes_logged[0];
+    assert_eq!(
+        entry["outcome"],
+        json!("discarded"),
+        "the refresh was performed and thrown away: {entry}"
+    );
+    let sha8 = service.rsplit('-').next().expect("the service name carries a suffix");
+    assert_eq!(entry["target"], json!(format!("namespace:{sha8}")), "{entry}");
+    assert_ne!(
+        entry["from_digest8"], entry["to_digest8"],
+        "and it names both ends of what was lost: {entry}"
+    );
+    assert!(!log.contains("sk-ant-"), "with no token material: {log}");
+}
+
+#[test]
 fn ac65_the_hold_creates_three_locks_and_a_changed_item_discards_the_refresh() {
     // Two claims in one run, because one fault produces both.
     //
@@ -949,12 +1226,12 @@ fn ac65_the_hold_creates_three_locks_and_a_changed_item_discards_the_refresh() {
 
     assert_eq!(token.calls(), 1, "and no second POST was made");
     assert!(writes(&fixture).is_empty(), "nothing was written: {:?}", fixture.security_log());
-    // One preflight, one listing, five reads — the four the positive case
-    // makes before the write, plus the live row's own — and no write and no
+    // One preflight, one listing, six reads — the five the positive case makes
+    // before the write, plus the live row's own — and no write and no
     // verifying read, because the refusal ends the path.
     assert_eq!(
         fixture.security_log().len(),
-        7,
+        8,
         "the exact set of `security` invocations: {:?}",
         fixture.security_log()
     );
@@ -1137,10 +1414,11 @@ fn ac65_a_contended_store_reports_busy_and_writes_nothing() {
         .map(|entry| entry.path())
         .collect();
     assert!(records.is_empty(), "and cleared its record: {records:?}");
-    // No re-read and no verifying read: the acquire never handed back a hold.
+    // No re-read under the hold and no verifying read: the acquire never
+    // handed back a hold. The read before the POST still happened.
     assert_eq!(
         fixture.security_log().len(),
-        6,
+        7,
         "the exact set of `security` invocations: {:?}",
         fixture.security_log()
     );
@@ -1191,7 +1469,7 @@ fn ac65_a_blob_over_the_stdin_limit_spawns_no_write() {
     }
     assert_eq!(
         fixture.security_log().len(),
-        6,
+        7,
         "the exact set of `security` invocations: {:?}",
         fixture.security_log()
     );
