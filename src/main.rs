@@ -79,6 +79,22 @@ fn init_tracing() {
 /// Routes a parsed command line to its implementation, returning the process
 /// exit code.
 ///
+/// [`Command::Claude`] fans out through [`dispatch_claude`]; every other
+/// top-level command is handled here directly, since `completions` is the
+/// only one so far and has no state of its own to share with the rest of the
+/// dispatch table.
+fn dispatch(cli: &Cli, cancel: &Cancel) -> Result<i32, AppError> {
+    match &cli.command {
+        Command::Claude { command } => dispatch_claude(cli, command, cancel),
+        Command::Completions(args) => {
+            let mut stdout = std::io::stdout().lock();
+            commands::completions::run(args, &mut stdout).map(|()| EXIT_OK)
+        }
+    }
+}
+
+/// Routes a parsed `agentctl claude` subcommand.
+///
 /// Every arm is one line. Most commands follow agentctl's own 0/1/2 contract
 /// ([`error`]), so they are mapped to [`EXIT_OK`] on success; `use` and
 /// `exec` instead launch a child the user is meant to interact with, so
@@ -86,8 +102,7 @@ fn init_tracing() {
 /// a fixed one. The constructor stays for the next command that is parsed
 /// before it is implemented, so such an arm fails loudly with exit status 1
 /// rather than exiting 0 having done nothing.
-fn dispatch(cli: &Cli, cancel: &Cancel) -> Result<i32, AppError> {
-    let Command::Claude { command } = &cli.command;
+fn dispatch_claude(cli: &Cli, command: &ClaudeCommand, cancel: &Cancel) -> Result<i32, AppError> {
     match command {
         ClaudeCommand::Status(args) => status::run(cli, args, cancel).map(|()| EXIT_OK),
         ClaudeCommand::Watch(args) => commands::watch::run(cli, args, cancel).map(|()| EXIT_OK),

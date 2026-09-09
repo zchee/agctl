@@ -202,3 +202,65 @@ fn status_rejects_an_account_selector_that_matches_nothing() {
 fn an_unknown_subcommand_is_rejected() {
     agentctl().args(["claude", "bogus"]).assert().failure();
 }
+
+#[test]
+fn top_level_help_lists_completions() {
+    agentctl().arg("--help").assert().success().stdout(contains("completions"));
+}
+
+#[test]
+fn completions_zsh_starts_with_the_compdef_header() {
+    let assert = agentctl().args(["completions", "zsh"]).assert().success();
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("the script is valid UTF-8");
+    assert_eq!(stdout.lines().next(), Some("#compdef agentctl"));
+}
+
+#[test]
+fn completions_bash_defines_the_bash_completion_function() {
+    agentctl().args(["completions", "bash"]).assert().success().stdout(contains("_agentctl"));
+}
+
+#[test]
+fn completions_fish_uses_complete_dash_c() {
+    agentctl()
+        .args(["completions", "fish"])
+        .assert()
+        .success()
+        .stdout(contains("complete -c agentctl"));
+}
+
+#[test]
+fn completions_rejects_an_unknown_shell() {
+    // clap's own usage error for a value outside the `Shell` enum, exit 2
+    // like any other rejected argument (`watch --interval 30s` above).
+    agentctl().args(["completions", "tcsh"]).assert().code(2).stderr(contains("invalid value"));
+}
+
+#[test]
+fn completions_bash_does_not_abort_when_the_reader_closes_early() {
+    // The bash script is the largest of the five (about 45 KiB), comfortably
+    // past any *nix pipe's kernel buffer (16 KiB on macOS, this project's
+    // only supported platform per `AGENTS.md`). That size gap, not timing,
+    // is what makes this deterministic rather than a race: the child's
+    // single `write_all` call necessarily blocks partway through once the
+    // pipe fills, and dropping the read end while it is blocked delivers
+    // `EPIPE` to the writer immediately, regardless of scheduling.
+    use std::io::Read as _;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .args(["completions", "bash"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("the binary should spawn");
+
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut first_byte = [0u8; 1];
+    stdout.read_exact(&mut first_byte).expect("at least one byte should arrive");
+    drop(stdout);
+
+    let status = child.wait().expect("the child should exit, not hang or abort");
+    assert!(status.success(), "a closed reader must not fail the run: {status:?}");
+}

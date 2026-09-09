@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 library API. Phase 1 is a multi-account Claude subscription usage viewer, and the module
 layout follows the data as it moves: `cli.rs` parses (every flag lives there and nowhere
 else) and `main.rs` dispatches one arm per command into `commands/` (`status`, `watch`,
-`login`, `accounts`, `import`, `doctor`); `config/` owns the account registry and
+`login`, `accounts`, `import`, `doctor`, `completions`); `config/` owns the account registry and
 `config/paths.rs` derives every path agentctl is allowed to write; `provider/claude/`
 holds the provider-specific knowledge — namespace and keychain-service naming, credential
 blobs, discovery, OAuth, the usage request — behind the `provider` traits that phase 3

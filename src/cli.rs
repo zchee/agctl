@@ -154,6 +154,16 @@ pub enum Command {
         #[command(subcommand)]
         command: ClaudeCommand,
     },
+    /// Print a shell completion script for agentctl to stdout.
+    Completions(CompletionsArgs),
+}
+
+/// Arguments for `agentctl completions`.
+#[derive(Debug, Args)]
+pub struct CompletionsArgs {
+    /// Which shell to generate a completion script for.
+    #[arg(value_enum)]
+    pub shell: clap_complete::Shell,
 }
 
 /// Subcommands under `agentctl claude`.

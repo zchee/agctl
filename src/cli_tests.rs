@@ -26,8 +26,16 @@ fn parse_err(argv: &[&str]) -> String {
 }
 
 /// Narrows a parsed `Cli` to its `claude` subcommand.
+///
+/// # Panics
+///
+/// Panics if `cli.command` is not [`Command::Claude`] — every call site
+/// parses a `claude …` argv, so any other variant here is this test's own
+/// bug, not something to route around.
 fn claude_of(cli: &Cli) -> &ClaudeCommand {
-    let Command::Claude { command } = &cli.command;
+    let Command::Claude { command } = &cli.command else {
+        panic!("expected a `claude` subcommand, got {:?}", cli.command);
+    };
     command
 }
 

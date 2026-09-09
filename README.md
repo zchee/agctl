@@ -53,10 +53,26 @@ install -m 0755 target/release/agentctl ~/.local/bin/agentctl
 > `scripts/release-gate.sh` builds the release artifact the correct way and proves it
 > carries none of those seams.
 
+### Shell completions
+
+```sh
+# zsh — add to ~/.zshrc
+eval "$(agentctl completions zsh)"
+# or install the file once: agentctl completions zsh > "${fpath[1]}/_agentctl"
+# bash — add to ~/.bashrc
+eval "$(agentctl completions bash)"
+# fish
+agentctl completions fish > ~/.config/fish/completions/agentctl.fish
+```
+
+`elvish` and `powershell` are also accepted. The script is generated from the same
+`clap` definition the binary parses, so it never drifts from the real flag set.
+
 ## Commands
 
-Every command lives under `agentctl claude`. `--config-dir DIR` is global and names
-*agentctl's* store; it is accepted before or after the subcommand.
+Every provider command lives under `agentctl claude`; the one top-level command is
+`agentctl completions`, above. `--config-dir DIR` is global and names *agentctl's* store; it
+is accepted before or after the subcommand.
 
 ### `status` — the table
 
