@@ -21,6 +21,7 @@ use crate::config::AccountRecord;
 use crate::config::paths::DIR_MODE;
 use crate::config::paths::FILE_MODE;
 use crate::config::paths::Paths;
+use crate::config::paths::lexical_normalize;
 use crate::error::AppError;
 use crate::provider::claude::discovery;
 use crate::provider::claude::namespace;
@@ -191,6 +192,17 @@ pub fn ensure_session(
 
     let path = match &opts.claude_config_dir {
         Some(dir) if dir.is_absolute() => {
+            // N-2: refused before anything else, so a `..`/`.` spelling
+            // never reaches `is_live_store_dir`'s comparison (whose own
+            // fallback normalizes defensively, but should not have to be the
+            // only thing standing between a malformed override and the live
+            // directory).
+            if has_dot_component(dir) {
+                return Err(AppError::Config(format!(
+                    "--claude-config-dir `{}` must be an absolute, normalized path",
+                    dir.display()
+                )));
+            }
             if is_live_store_dir(dir, env) {
                 return Err(AppError::Config(format!(
                     "--claude-config-dir `{}` is the live Claude Code configuration directory; \
@@ -236,6 +248,25 @@ pub fn ensure_session(
     Ok(SessionDir { path, mcp_config, linked, missing, already_linked })
 }
 
+/// Whether `dir` has a `.` or `..` segment anywhere in it.
+///
+/// `--claude-config-dir` is refused outright when this is true (N-2): the
+/// override must already be an absolute, normalized path, so a spelling like
+/// `<live>/x/..` (with `x` not yet existing) never reaches a comparison that
+/// assumes the spelling means what it says.
+///
+/// Splits the raw spelling on `/` rather than using [`Path::components`],
+/// which silently normalizes a mid-path `.` away (it reports one only when
+/// it leads a *relative* path) — exactly the segment this check exists to
+/// catch. `..` is unaffected either way: [`Path::components`] always
+/// preserves it. [`Path::to_string_lossy`] cannot hide a `.`/`..` segment
+/// from this split: both are plain ASCII, so lossy replacement of an
+/// invalid byte sequence elsewhere in the path never produces or removes
+/// one.
+fn has_dot_component(p: &Path) -> bool {
+    p.to_string_lossy().split('/').any(|segment| segment == "." || segment == "..")
+}
+
 /// Whether `dir` is the live Claude Code configuration directory itself
 /// (plan section 3.3; a `--claude-config-dir` override equal to it would
 /// symlink and seed on top of the very store a session exists to isolate
@@ -245,12 +276,20 @@ pub fn ensure_session(
 /// directory is still caught; when either side cannot be canonicalized (the
 /// override does not exist yet, most commonly — it is about to be created)
 /// falls back to comparing the normalized spelling instead of skipping the
-/// check.
+/// check. That fallback lexically normalizes both sides first (N-2): a
+/// missing path component makes `canonical` fail, and
+/// `namespace::export_spelling` only NFC-normalizes and trims a trailing
+/// `/` — it does not fold `.`/`..` — so an unfolded `..` could otherwise
+/// dodge the comparison even though it resolves onto the live directory.
 fn is_live_store_dir(dir: &Path, env: &EnvView) -> bool {
     let live = namespace::live_store_dir(env);
     match (namespace::canonical(dir), namespace::canonical(&live)) {
         (Ok(a), Ok(b)) => a == b,
-        _ => namespace::export_spelling(dir) == namespace::export_spelling(&live),
+        _ => {
+            let dir_norm = lexical_normalize(dir);
+            let live_norm = lexical_normalize(&live);
+            namespace::export_spelling(&dir_norm) == namespace::export_spelling(&live_norm)
+        }
     }
 }
 
@@ -268,6 +307,29 @@ fn is_live_store_dir(dir: &Path, env: &EnvView) -> bool {
 /// AC56). Anything at `path` that is not a plain directory is refused,
 /// naming the path, and nothing is created inside the link's target.
 fn create_session_dir(path: &Path) -> Result<(), AppError> {
+    create_session_dir_seamed(path, || {})
+}
+
+/// [`create_session_dir`]'s real body, with `before_create` run as a seam
+/// between the initial existence check and the leaf directory's creation —
+/// production passes a no-op; a test can plant something at `path` in that
+/// window and assert the create fails closed (N-1) instead of racing a real
+/// writer thread.
+///
+/// The check→create window itself used to be closed by a single
+/// `DirBuilder::recursive(true)` call over the whole path: std's
+/// `create_dir_all` maps `mkdir`'s `EEXIST` to `Ok(())` whenever
+/// `path.is_dir()` — which *follows* a symlink — so anything planted at
+/// `path` in that window that resolves to a directory was silently accepted.
+/// The parent chain is still created recursively (nothing security-sensitive
+/// hinges on an intermediate directory here), but the leaf is created with
+/// `recursive(false)`: that is a bare `mkdir`, which fails `EEXIST` for any
+/// existing directory entry — symlink included, since `mkdir` never follows
+/// the final component. An `EEXIST` is then re-`symlink_metadata`'d: a plain
+/// directory means a benign racing `use` won the leaf first and is left
+/// alone; anything else — the symlink this seam exists to test, or an
+/// attacker's regular file — is invariant I19's refusal, naming the path.
+fn create_session_dir_seamed(path: &Path, before_create: impl FnOnce()) -> Result<(), AppError> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => return Ok(()),
         Ok(_) => {
@@ -285,12 +347,41 @@ fn create_session_dir(path: &Path) -> Result<(), AppError> {
             });
         }
     }
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true).mode(DIR_MODE);
-    builder.create(path).map_err(|err| AppError::Io {
-        context: format!("could not create the session directory `{}`", path.display()),
-        source: err,
-    })
+
+    if let Some(parent) = path.parent() {
+        let mut parents = std::fs::DirBuilder::new();
+        parents.recursive(true).mode(DIR_MODE);
+        parents.create(parent).map_err(|err| AppError::Io {
+            context: format!("could not create `{}`", parent.display()),
+            source: err,
+        })?;
+    }
+
+    before_create();
+
+    let mut leaf = std::fs::DirBuilder::new();
+    leaf.recursive(false).mode(DIR_MODE);
+    match leaf.create(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.is_dir() => Ok(()),
+                Ok(_) => Err(AppError::Config(format!(
+                    "`{}` already exists and is not the plain directory agentctl would create \
+                 there; move or remove it before starting this session",
+                    path.display()
+                ))),
+                Err(err) => Err(AppError::Io {
+                    context: format!("could not inspect `{}`", path.display()),
+                    source: err,
+                }),
+            }
+        }
+        Err(err) => Err(AppError::Io {
+            context: format!("could not create the session directory `{}`", path.display()),
+            source: err,
+        }),
+    }
 }
 
 /// `(linked, missing, already_linked)`, [`link_tiers`]'s report — factored

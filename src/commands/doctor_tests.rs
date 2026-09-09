@@ -1086,6 +1086,18 @@ fn isolation_row_reports_migrated_when_a_keychain_item_exists_for_the_namespace(
     );
     assert!(migrated_row.migrated, "a keychain item for this namespace means it has migrated");
 
+    // N-3: `isolation_row` always pushes a seed row (`doctor.rs:937`); this
+    // was previously asserted nowhere, so deleting that push left the suite
+    // green. No `.claude.json` was written in this fixture, so it reports
+    // `absent`.
+    let seed_link = migrated_row
+        .links
+        .iter()
+        .find(|link| link.tier == "seed")
+        .expect("isolation_row always pushes the seed row");
+    assert_eq!(seed_link.name, isolate::SEED_FILE);
+    assert_eq!(seed_link.state, "absent");
+
     let absent_row = isolation_row(
         &store.paths,
         &config,

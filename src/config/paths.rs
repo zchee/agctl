@@ -274,7 +274,13 @@ fn create_dir_mode(dir: &Path) -> Result<(), AppError> {
 /// A `..` that would climb above the path's root is kept as a component, so a
 /// path that escapes cannot compare equal to — or start with — anything the
 /// caller considers a root.
-fn lexical_normalize(p: &Path) -> PathBuf {
+///
+/// `pub(crate)` rather than private: `commands::isolate::is_live_store_dir`
+/// (N-2) reuses it so a `--claude-config-dir` override with a not-yet-existing
+/// component (where `canonicalize` fails and the export-spelling fallback
+/// would otherwise compare the raw, unfolded spelling) cannot dodge the
+/// live-store-dir comparison by hiding a `..` in it.
+pub(crate) fn lexical_normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in p.components() {
         match component {

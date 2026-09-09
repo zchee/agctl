@@ -255,6 +255,72 @@ fn refuses_a_claude_config_dir_override_reaching_the_live_store_dir_through_a_sy
 }
 
 // ---------------------------------------------------------------------------
+// `..`/`.` spellings in a `--claude-config-dir` override (N-2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_a_claude_config_dir_override_with_a_dotdot_segment_even_when_it_would_resolve_onto_the_live_dir()
+ {
+    // Before N-2, `canonical` fails because `does-not-exist` was never
+    // created, and the export-spelling fallback does not fold `..`, so this
+    // spelling read as a different path from `live` and dodged the
+    // live-store-dir refusal even though it resolves onto it.
+    let fx = fixture();
+    let live = live_dir(&fx);
+    let overridden = live.join("does-not-exist").join("..");
+    let opts =
+        SessionOptions { claude_config_dir: Some(overridden.clone()), ..SessionOptions::default() };
+    let err = ensure_session(&fx.paths, &owned_record(), &opts, &fx.env, &ctx())
+        .expect_err("a `..` segment should be refused before anything else");
+    assert!(err.to_string().contains("normalized"), "{err}");
+    assert!(
+        !live.join("does-not-exist").exists(),
+        "the missing component should never have been created"
+    );
+}
+
+#[test]
+fn refuses_a_claude_config_dir_override_with_a_curdir_segment() {
+    let fx = fixture();
+    let live = live_dir(&fx);
+    let overridden = live.join(".");
+    let opts =
+        SessionOptions { claude_config_dir: Some(overridden.clone()), ..SessionOptions::default() };
+    let err = ensure_session(&fx.paths, &owned_record(), &opts, &fx.env, &ctx())
+        .expect_err("a `.` segment should be refused before anything else");
+    assert!(err.to_string().contains("normalized"), "{err}");
+}
+
+#[test]
+fn honours_a_genuinely_different_sibling_of_the_live_dir() {
+    // The dot-segment refusal must not overreach: a plain, normalized path
+    // that merely sits next to the live directory is still accepted.
+    let fx = fixture();
+    let live = live_dir(&fx);
+    let sibling = live.parent().expect("the live dir has a parent").join("sibling-session");
+    let opts =
+        SessionOptions { claude_config_dir: Some(sibling.clone()), ..SessionOptions::default() };
+    let session =
+        ensure_session(&fx.paths, &owned_record(), &opts, &fx.env, &ctx()).expect("should succeed");
+    assert_eq!(session.path, sibling);
+}
+
+#[test]
+fn is_live_store_dir_folds_a_dotdot_spelling_before_comparing() {
+    // Exercises the helper directly, independent of `ensure_session`'s own
+    // front-door refusal of any override carrying a `.`/`..` segment: even a
+    // caller that bypassed the front door must still get the right answer.
+    let fx = fixture();
+    let live = live_dir(&fx);
+
+    let dotdot_spelling = live.join("does-not-exist").join("..");
+    assert!(is_live_store_dir(&dotdot_spelling, &fx.env));
+
+    let sibling = live.parent().expect("the live dir has a parent").join("sibling-session");
+    assert!(!is_live_store_dir(&sibling, &fx.env));
+}
+
+// ---------------------------------------------------------------------------
 // Tier 1 / tier 2 symlinks (AC53)
 // ---------------------------------------------------------------------------
 
@@ -475,6 +541,41 @@ fn refuses_when_the_session_directory_itself_is_a_symlink_to_a_live_directory() 
             .file_type()
             .is_symlink(),
         "the decoy symlink itself is left exactly as it was"
+    );
+}
+
+#[test]
+fn create_session_dir_fails_closed_when_a_symlink_is_planted_in_the_check_create_window() {
+    // N-1: the original shape — `symlink_metadata` finds nothing, then a
+    // single `DirBuilder::recursive(true)` over the whole path — has a
+    // TOCTOU window, because std's `create_dir_all` maps `mkdir`'s `EEXIST`
+    // to `Ok(())` whenever `path.is_dir()`, which *follows* a symlink.
+    // Anything planted at `path` in that window that resolves to a
+    // directory was silently accepted. `before_create` stands in for a
+    // same-user actor winning that race.
+    let root = TempDir::new().expect("a temporary directory should be available");
+    let live_elsewhere = root.path().join("live-elsewhere");
+    std::fs::create_dir_all(&live_elsewhere).expect("the decoy live directory should be creatable");
+    let path = root.path().join("session");
+
+    let err = create_session_dir_seamed(&path, || {
+        std::os::unix::fs::symlink(&live_elsewhere, &path)
+            .expect("the decoy symlink should be creatable in the check-create window");
+    })
+    .expect_err("a symlink planted in the window should be refused, not silently accepted");
+    assert!(err.to_string().contains(&path.display().to_string()), "{err}");
+
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .expect("the decoy symlink is untouched")
+            .file_type()
+            .is_symlink(),
+        "the decoy symlink itself is left exactly as it was"
+    );
+    assert_eq!(
+        std::fs::read_dir(&live_elsewhere).expect("readable").count(),
+        0,
+        "nothing was created inside the symlink's target"
     );
 }
 
