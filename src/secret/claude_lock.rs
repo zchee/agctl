@@ -868,6 +868,39 @@ pub struct Acquisition {
     pub break_record: Option<BreakDraft>,
 }
 
+/// [`acquire`]'s failure, carrying the break it may already have performed.
+///
+/// The break rule `rmdir`s a peer's lock directory at [`Sample`] C and hands
+/// back a [`BreakDraft`]; every way out of [`acquire_with`] after that moment
+/// owes that draft to the audit log, and six of those ways are `Err`. Before
+/// this type they returned a bare [`LockError`], the draft died with the stack
+/// frame, and agentctl had removed another process's lock with nothing durable
+/// to say so — invariant I16's exact prohibition.
+///
+/// So the draft is carried rather than dropped, and it is carried in a struct
+/// with **no `From<LockError>` conversion**: `?` on a [`LockError`] inside
+/// [`acquire_with`] does not compile, so a site added later cannot fall out of
+/// the function without naming the draft it is holding.
+#[derive(Debug)]
+pub struct AcquireFailure {
+    /// Why the acquire failed.
+    pub error: LockError,
+    /// The single break this acquire completed before failing, if any.
+    pub break_record: Option<BreakDraft>,
+}
+
+impl AcquireFailure {
+    /// A failure decided before the break rule could have run at all.
+    ///
+    /// The only use is [`acquire`]'s anchor walk, which happens before
+    /// [`acquire_with`] is entered, so there is no draft in existence to lose.
+    /// Deliberately not a [`From`] impl: a conversion usable by `?` is a
+    /// conversion a future `?` can use at a site where a draft *does* exist.
+    fn before_any_break(error: LockError) -> Self {
+        Self { error, break_record: None }
+    }
+}
+
 /// One held directory and the modification time it had when it was created.
 ///
 /// The modification time is `Option` only because the reading can fail, and
@@ -1103,12 +1136,23 @@ fn plan(anchor: &LockAnchor) -> [LockPlan; 3] {
 ///
 /// # Errors
 ///
-/// [`LockError::WrongTree`] when the store directory is not in the tree
-/// `subject` names and [`LockError::Unreachable`] when the way to it cannot be
-/// walked without following a symbolic link — both **before** anything is
-/// created. Then [`LockError::Cancelled`] when the run is cancelled, and
-/// [`LockError::Io`] when a directory operation fails for a reason that is
-/// not contention.
+/// An [`AcquireFailure`] whose `error` is [`LockError::WrongTree`] when the
+/// store directory is not in the tree `subject` names and
+/// [`LockError::Unreachable`] when the way to it cannot be walked without
+/// following a symbolic link — both **before** anything is created. Then
+/// [`LockError::Cancelled`] when the run is cancelled, and [`LockError::Io`]
+/// when a directory operation fails for a reason that is not contention.
+///
+/// Every one of those carries `break_record`, which the caller owes the audit
+/// log before it maps the error to anything (invariant I16).
+#[expect(
+    clippy::result_large_err,
+    reason = "the lint's remedy is a no-op here: `Acquisition` is 328 bytes and \
+              `AcquireFailure` 240, so the `Result` this returns is 328 bytes \
+              either way — sized by its `Ok` variant, exactly as it was before \
+              the error type carried the draft. Boxing the error would move no \
+              fewer bytes and would add an allocation to the break path"
+)]
 pub fn acquire(
     subject: LockSubject<'_>,
     paths: &Paths,
@@ -1116,9 +1160,12 @@ pub fn acquire(
     clock: &Clock,
     ctx: &PassCtx,
     fault: &Fault,
-) -> Result<Acquisition, LockError> {
+) -> Result<Acquisition, AcquireFailure> {
     let seams = Seams::real(clock.clone());
-    let anchor = LockAnchor::open(subject, paths, env)?;
+    // Spelled out rather than `?`: there is no `From<LockError>` for
+    // `AcquireFailure`, precisely so that no `?` inside the acquire can drop a
+    // draft, and this site is where that costs one line.
+    let anchor = LockAnchor::open(subject, paths, env).map_err(AcquireFailure::before_any_break)?;
     acquire_with(anchor, paths, ctx, fault, &seams)
 }
 
@@ -1127,13 +1174,21 @@ pub fn acquire(
 /// # Errors
 ///
 /// See [`acquire`].
+#[expect(
+    clippy::result_large_err,
+    reason = "the lint's remedy is a no-op here: `Acquisition` is 328 bytes and \
+              `AcquireFailure` 240, so the `Result` this returns is 328 bytes \
+              either way — sized by its `Ok` variant, exactly as it was before \
+              the error type carried the draft. Boxing the error would move no \
+              fewer bytes and would add an allocation to the break path"
+)]
 pub fn acquire_with(
     anchor: LockAnchor,
     paths: &Paths,
     ctx: &PassCtx,
     fault: &Fault,
     seams: &Seams<'_>,
-) -> Result<Acquisition, LockError> {
+) -> Result<Acquisition, AcquireFailure> {
     let anchor = Arc::new(anchor);
     let plans = plan(&anchor);
     let subject = LockSubject { store_dir: anchor.store_dir(), tree: anchor.tree() };
@@ -1142,8 +1197,11 @@ pub fn acquire_with(
     let mut restarts = 0_u32;
 
     loop {
+        // Site 1 of six. On a restart iteration `break_record` can already
+        // hold a completed break, which is why every one of these six spells
+        // the draft out rather than returning a bare error.
         if ctx.cancel().is_cancelled() {
-            return Err(LockError::Cancelled);
+            return Err(AcquireFailure { error: LockError::Cancelled, break_record });
         }
 
         // --- Step 1: resolve staleness, holding nothing -------------------
@@ -1173,11 +1231,25 @@ pub fn acquire_with(
                 // Something is beating, or the clocks disagree. Fall through
                 // to F36's schedule, which is what decides `holder_alive`.
                 Decision::Abandoned(_) => break,
-                Decision::Cancelled => return Err(LockError::Cancelled),
+                // Sites 2 and 3. Both follow a break rule that decided
+                // *this* iteration, so `break_record` is what that decision
+                // just returned — `None` for a cancelled or failed sampling.
+                // Passed anyway: an arm that reasons about the value rather
+                // than passing it is an arm that stops being right when the
+                // rule changes.
+                Decision::Cancelled => {
+                    return Err(AcquireFailure { error: LockError::Cancelled, break_record });
+                }
                 Decision::Failed(message) => {
-                    return Err(LockError::Io {
-                        context: format!("could not resolve `{}`", lock.artefact.path.display()),
-                        message,
+                    return Err(AcquireFailure {
+                        error: LockError::Io {
+                            context: format!(
+                                "could not resolve `{}`",
+                                lock.artefact.path.display()
+                            ),
+                            message,
+                        },
+                        break_record,
                     });
                 }
             }
@@ -1205,12 +1277,25 @@ pub fn acquire_with(
                 Contention::StillHeld { holder_alive } => {
                     return Ok(busy(holder_alive, Vec::new(), break_record));
                 }
-                Contention::Cancelled => return Err(LockError::Cancelled),
+                // Site 4: reachable with a completed break, because the
+                // schedule this cancels runs *after* step 1's break rule.
+                Contention::Cancelled => {
+                    return Err(AcquireFailure { error: LockError::Cancelled, break_record });
+                }
             }
         }
 
         // --- Step 3: the record, before the first mkdir -------------------
-        let record_path = write_held_record(paths, &anchor, &plans, &seams.clock)?;
+        //
+        // Site 5, and the one `agentctl-nq3` was filed for: after `1yj` a
+        // symbolic link at `<namespace_root>/held-locks` makes this fail
+        // deterministically, so a peer's lock could be removed and the only
+        // durable evidence of it discarded, on demand. `?` would do that
+        // again; the match is what carries the draft out.
+        let record_path = match write_held_record(paths, &anchor, &plans, &seams.clock) {
+            Ok(path) => path,
+            Err(error) => return Err(AcquireFailure { error, break_record }),
+        };
 
         // --- Step 4: mkdir ×3 in the peer's nesting -----------------------
         //
@@ -1259,13 +1344,20 @@ pub fn acquire_with(
             Err(TakeFailure::Io { artefact, held, message }) => {
                 release_all(&anchor, &held, seams);
                 let _ = std::fs::remove_file(&record_path);
-                return Err(LockError::Io {
-                    // "take", not "create": this arm is also reached by a
-                    // directory that was created and could not then be
-                    // stated, and "could not create" would contradict its own
-                    // message.
-                    context: format!("could not take `{}`", artefact.path.display()),
-                    message,
+                // Site 6, and after `axs` it is reachable with no `mkdir`
+                // failure at all — an unreadable modification time straight
+                // after agentctl's own `mkdirat`. It can carry a completed
+                // *removal* draft, which is the most valuable one to lose.
+                return Err(AcquireFailure {
+                    error: LockError::Io {
+                        // "take", not "create": this arm is also reached by a
+                        // directory that was created and could not then be
+                        // stated, and "could not create" would contradict its
+                        // own message.
+                        context: format!("could not take `{}`", artefact.path.display()),
+                        message,
+                    },
+                    break_record,
                 });
             }
         }

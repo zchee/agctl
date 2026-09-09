@@ -141,6 +141,17 @@ struct SpyFs {
     /// answers `None` for a chosen path, which is exactly the observable
     /// those causes share and nothing more.
     unreadable_mtime: Mutex<Vec<PathBuf>>,
+    /// Runs cancelled the moment a named directory is removed.
+    ///
+    /// Cancellation in production arrives from a signal or a deadline, which
+    /// is asynchronous to everything a fake clock controls: the clock's own
+    /// hooks all fire *inside* a `sleep`, and a `sleep` reports the
+    /// cancellation to its own caller, so a clock-driven cancel can only ever
+    /// reach the wait it happened in. This hook fires between two waits
+    /// instead, which is what the two cancellation sites *after* a completed
+    /// break need — a user pressing Ctrl-C while the break rule is removing a
+    /// peer's directory.
+    cancel_after_rmdir: Mutex<Vec<(PathBuf, Cancel)>>,
 }
 
 impl SpyFs {
@@ -151,6 +162,7 @@ impl SpyFs {
             retake: Mutex::new(Vec::new()),
             plant_before: Mutex::new(Vec::new()),
             unreadable_mtime: Mutex::new(Vec::new()),
+            cancel_after_rmdir: Mutex::new(Vec::new()),
         }
     }
 
@@ -167,6 +179,11 @@ impl SpyFs {
     /// Makes `path`'s modification time unreadable from now on.
     fn hide_mtime(&self, path: &Path) {
         lock(&self.unreadable_mtime).push(path.to_path_buf());
+    }
+
+    /// Cancels `cancel` the moment `path` is removed.
+    fn cancel_after_rmdir(&self, path: &Path, cancel: Cancel) {
+        lock(&self.cancel_after_rmdir).push((path.to_path_buf(), cancel));
     }
 }
 
@@ -187,6 +204,11 @@ impl LockFs for SpyFs {
         self.timeline.push(Op::Rmdir(at.shown.to_path_buf()));
         if result.is_ok() && lock(&self.retake).iter().any(|held| held.as_path() == at.shown) {
             let _ = self.real.mkdir(at);
+        }
+        for (path, cancel) in lock(&self.cancel_after_rmdir).iter() {
+            if path.as_path() == at.shown {
+                cancel.cancel();
+            }
         }
         result
     }
@@ -478,12 +500,13 @@ impl Fixture {
     }
 
     /// One acquire over this fixture's seams.
+    #[expect(clippy::result_large_err, reason = "mirrors `acquire_with`'s own signature")]
     fn acquire(
         &self,
         seams: &Seams<'_>,
         cancel: &Cancel,
         fault: &Fault,
-    ) -> Result<Acquisition, LockError> {
+    ) -> Result<Acquisition, AcquireFailure> {
         acquire_with(self.anchor(), &self.paths, &ctx_with(cancel), fault, seams)
     }
 
@@ -861,7 +884,8 @@ fn a_cancelled_schedule_is_an_error_not_a_busy() {
     let error = fixture
         .acquire(&seams, &cancel, &Fault::none())
         .expect_err("cancellation is not a busy store");
-    assert_eq!(error, LockError::Cancelled);
+    assert_eq!(error.error, LockError::Cancelled);
+    assert!(error.break_record.is_none(), "nothing was stale, so no break travels with it");
 }
 
 // ---------------------------------------------------------------------------
@@ -1405,7 +1429,7 @@ fn a_lock_whose_modification_time_cannot_be_read_is_refused_at_the_take() {
         let err = fixture
             .acquire(&seams, &cancel, &Fault::none())
             .expect_err("a lock that cannot be re-stated is not a lock agentctl holds");
-        let LockError::Io { context, message } = err else {
+        let LockError::Io { context, message } = err.error else {
             panic!("position {position}: expected `Io`, got {err:?}");
         };
         assert!(
@@ -2037,7 +2061,11 @@ fn a_symlinked_component_above_the_store_is_refused_before_anything_is_created()
     let also_refused =
         acquire(subject, &paths, &env, &Clock::system(), &ctx_with(&cancel), &Fault::none())
             .expect_err("and `acquire` refuses for the same reason");
-    assert!(matches!(also_refused, LockError::Unreachable { .. }), "{also_refused:?}");
+    assert!(matches!(also_refused.error, LockError::Unreachable { .. }), "{also_refused:?}");
+    assert!(
+        also_refused.break_record.is_none(),
+        "and it carries no break: the anchor is walked before the break rule can run"
+    );
 
     for name in [REFRESH_LOCK, STORAGE_WRITE_LOCK] {
         let planted = elsewhere.join("org").join(name);
@@ -2109,6 +2137,223 @@ fn mode_of(path: &Path) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// A completed break survives every failing way out of `acquire_with`
+// (`agentctl-nq3`, invariant I16)
+// ---------------------------------------------------------------------------
+
+/// Does what `status.rs` `refresh_in_place` owes a break, and reads the log
+/// back.
+///
+/// Invariant I16 is about the **audit line**, not about the draft, so these
+/// tests perform the caller's own two statements — `BreakDraft::complete` then
+/// `audit::append` — and then assert on what landed on disk. `acquire_with`
+/// deliberately appends nothing itself: no I/O may grow between Sample C and
+/// the `rmdir`, which is why the draft is returned in the first place.
+fn append_and_read(paths: &Paths, draft: Option<BreakDraft>) -> Vec<LockBreakRecord> {
+    if let Some(draft) = draft {
+        audit::append(paths, &AuditEntry::new(AuditEvent::LockBreak(completed(draft))))
+            .expect("the audit log should be appendable");
+    }
+    audit::tail(paths, 16)
+        .expect("the audit log should be readable")
+        .entries
+        .into_iter()
+        .filter_map(|entry| match entry.event {
+            AuditEvent::LockBreak(record) => Some(record),
+            AuditEvent::Write { .. } => None,
+        })
+        .collect()
+}
+
+/// Asserts the one `broken` line a completed break owes, with its fields.
+fn assert_one_broken_line(records: &[LockBreakRecord], fixture: &Fixture, path: &Path, at: &str) {
+    assert_eq!(records.len(), 1, "{at}: exactly one lock-break line");
+    let record = &records[0];
+    assert_eq!(record.outcome, Outcome::Broken, "{at}: the peer's directory *was* removed");
+    assert_eq!(record.reason, None, "{at}: a clean break records no reason");
+    assert_eq!(record.path, path, "{at}: naming the directory that was removed");
+    assert_eq!(record.store_dir, fixture.store, "{at}: and the store it guards");
+    assert_eq!(record.tree, Tree::Agentctl, "{at}: and which tree that store is in");
+    assert!(record.sample_b.is_some(), "{at}: Sample B survived the failure");
+    assert!(record.sample_c.is_some(), "{at}: and Sample C, the one taken before the `rmdir`");
+    assert_eq!(record.holder_evidence, HolderEvidence3::NoStoppedClaude, "{at}: and the evidence");
+}
+
+#[test]
+fn a_break_survives_a_cancellation_at_the_top_of_a_restart_iteration() {
+    // Err site 1 of six: the `loop`'s own cancellation check, reached on a
+    // second iteration after a `TakeFailure::Exists` restart. The break
+    // happened on the first iteration, so the draft is already complete when
+    // the run is cancelled.
+    let fixture = Fixture::new();
+    fixture.plant(&fixture.legacy, stale_age());
+    let cancel = Cancel::new();
+    // Cancelled while the break rule is unwinding, not during a wait: the run
+    // then survives to the restart and dies at the top of the loop.
+    fixture.fs.cancel_after_rmdir(&fixture.legacy, cancel.clone());
+    // And a peer holds `.storage-write`, which is what forces the restart.
+    fixture.fs.plant_before_mkdir(&fixture.storage);
+
+    let clock = fixture.fake_clock();
+    let holders = FakeHolders::none_stopped();
+    let seams = fixture.seams(&clock, &holders);
+
+    let failure = fixture
+        .acquire(&seams, &cancel, &Fault::none())
+        .expect_err("a cancelled run is an error, not a busy store");
+    assert_eq!(failure.error, LockError::Cancelled);
+
+    // Which cancellation site this is, pinned: only the top-of-loop one is
+    // reached *after* a whole take was attempted and unwound. Site 4's
+    // schedule runs before step 4, so it never gets here.
+    let ops = fixture.timeline.ops();
+    assert!(
+        ops.contains(&Op::Mkdir(fixture.storage.clone(), false)),
+        "the peer held `.storage-write`, so the take failed there: {ops:?}"
+    );
+    assert_eq!(
+        ops.last(),
+        Some(&Op::Rmdir(fixture.primary.clone())),
+        "and the take was unwound in reverse before the loop restarted: {ops:?}"
+    );
+
+    let records = append_and_read(&fixture.paths, failure.break_record);
+    assert_one_broken_line(&records, &fixture, &fixture.legacy, "site 1");
+    assert!(fixture.records().is_empty(), "and the failed take left no held-lock record");
+}
+
+#[test]
+fn a_break_survives_a_cancellation_in_the_contention_wait() {
+    // Err site 4 of six: fact F36's schedule, which runs *after* step 1's
+    // break rule, so a cancellation inside it strands a completed draft.
+    let fixture = Fixture::new();
+    // The primary is alive, so the schedule is entered at all; the legacy
+    // lock is the stale one that gets broken.
+    fixture.plant(&fixture.primary, Duration::from_secs(1));
+    fixture.plant(&fixture.legacy, stale_age());
+    let cancel = Cancel::new();
+    fixture.fs.cancel_after_rmdir(&fixture.legacy, cancel.clone());
+
+    let clock = fixture.fake_clock();
+    let holders = FakeHolders::none_stopped();
+    let seams = fixture.seams(&clock, &holders);
+
+    let failure = fixture
+        .acquire(&seams, &cancel, &Fault::none())
+        .expect_err("a cancelled contention wait is an error");
+    assert_eq!(failure.error, LockError::Cancelled);
+    assert!(fixture.primary.is_dir(), "the live primary was never touched");
+    let ops = fixture.timeline.ops();
+    assert!(
+        !ops.iter().any(|op| matches!(op, Op::Mkdir(..))),
+        "cancelled inside the schedule, so step 4 was never reached: {ops:?}"
+    );
+    assert!(matches!(ops.last(), Some(Op::Sleep(_))), "and it died in a wait: {ops:?}");
+
+    let records = append_and_read(&fixture.paths, failure.break_record);
+    assert_one_broken_line(&records, &fixture, &fixture.legacy, "site 4");
+}
+
+#[test]
+fn a_break_survives_a_held_locks_directory_that_cannot_be_reached() {
+    // Err site 5 of six, and the one `agentctl-nq3` was filed for: after
+    // `1yj` a symbolic link at `<namespace_root>/held-locks` makes step 3
+    // fail deterministically. Before this fix that gave anyone who could
+    // plant one link a repeatable way to have agentctl remove a peer's lock
+    // and write nothing about it.
+    let fixture = Fixture::new();
+    fixture.plant(&fixture.primary, stale_age());
+    let elsewhere = fixture.scratch("elsewhere");
+    fs::create_dir(&elsewhere).expect("the decoy should be creatable");
+    std::os::unix::fs::symlink(&elsewhere, held_locks::dir(&fixture.paths))
+        .expect("the link should be plantable");
+
+    let clock = fixture.fake_clock();
+    let holders = FakeHolders::none_stopped();
+    let seams = fixture.seams(&clock, &holders);
+    let cancel = Cancel::new();
+
+    let failure = fixture
+        .acquire(&seams, &cancel, &Fault::none())
+        .expect_err("a redirected held-locks directory refuses the hold");
+    assert!(
+        matches!(failure.error, LockError::Unreachable { .. }),
+        "the refusal is unchanged: {:?}",
+        failure.error
+    );
+    assert!(!fixture.primary.exists(), "and the peer's lock is gone — which is the point");
+    let ops = fixture.timeline.ops();
+    assert!(
+        !ops.iter().any(|op| matches!(op, Op::Mkdir(..))),
+        "refused at step 3, before the first `mkdir`: {ops:?}"
+    );
+
+    let records = append_and_read(&fixture.paths, failure.break_record);
+    assert_one_broken_line(&records, &fixture, &fixture.primary, "site 5");
+}
+
+#[test]
+fn a_break_survives_a_take_that_could_not_be_completed() {
+    // Err site 6 of six. After `axs` this is reachable with no `mkdir`
+    // failure at all: the second lock is created and its modification time
+    // cannot be read, so the hold is refused. The draft it strands can carry
+    // a completed *removal*, which is the most valuable one to lose.
+    let fixture = Fixture::new();
+    fixture.plant(&fixture.primary, stale_age());
+    fixture.fs.hide_mtime(&fixture.legacy);
+
+    let clock = fixture.fake_clock();
+    let holders = FakeHolders::none_stopped();
+    let seams = fixture.seams(&clock, &holders);
+    let cancel = Cancel::new();
+
+    let failure = fixture
+        .acquire(&seams, &cancel, &Fault::none())
+        .expect_err("a lock that cannot be re-stated is not a lock agentctl holds");
+    assert!(
+        matches!(failure.error, LockError::Io { .. }),
+        "the refusal is unchanged: {:?}",
+        failure.error
+    );
+    let ops = fixture.timeline.ops();
+    assert!(
+        ops.contains(&Op::Mkdir(fixture.legacy.clone(), true)),
+        "the second lock was created — the refusal is the `stat`, not the `mkdir`: {ops:?}"
+    );
+    for path in fixture.all() {
+        assert!(!path.exists(), "nothing is held: `{}`", path.display());
+    }
+    assert!(fixture.records().is_empty(), "and the held-lock record is cleared");
+
+    let records = append_and_read(&fixture.paths, failure.break_record);
+    assert_one_broken_line(&records, &fixture, &fixture.primary, "site 6");
+}
+
+#[test]
+fn the_two_sampling_refusals_carry_no_break_because_they_decided_nothing() {
+    // Err sites 2 and 3 of six, for completeness: a sampling wait that is
+    // cancelled and a sampling that fails both return `record: None`, so the
+    // uniform `break_record` they now pass is `None`. Asserted rather than
+    // reasoned about, because "this arm cannot carry a draft" is exactly the
+    // claim `agentctl-ahh` got wrong for four of the six.
+    let fixture = Fixture::new();
+    fixture.plant(&fixture.primary, stale_age());
+    let clock = fixture.fake_clock();
+    let holders = FakeHolders::none_stopped();
+    let seams = fixture.seams(&clock, &holders);
+    let cancel = Cancel::new();
+    clock.cancel_next_sleep(cancel.clone());
+
+    let failure = fixture
+        .acquire(&seams, &cancel, &Fault::none())
+        .expect_err("a cancelled sampling wait is an error");
+    assert_eq!(failure.error, LockError::Cancelled);
+    assert!(failure.break_record.is_none(), "nothing was decided, so there is nothing to record");
+    assert!(fixture.primary.is_dir(), "and the peer's lock was left exactly as it was");
+    assert!(append_and_read(&fixture.paths, None).is_empty(), "so the audit log stays empty");
+}
+
+// ---------------------------------------------------------------------------
 // The held-locks directory is reached by a walk
 // (`agentctl-p2-held-locks-dir-through-symlink-1yj`)
 // ---------------------------------------------------------------------------
@@ -2143,7 +2388,7 @@ fn a_symlink_at_the_held_locks_directory_refuses_the_hold_before_anything_is_tak
     // An existing variant, and the right one: `Unreachable` is already "the
     // way from the permitted anchor down could not be walked without
     // following a symbolic link". No new error family.
-    let LockError::Unreachable { path, message } = &err else {
+    let LockError::Unreachable { path, message } = &err.error else {
         panic!("expected `Unreachable`, got {err:?}")
     };
     assert_eq!(path, &held_dir, "the refusal names the directory it would not walk");

@@ -1480,39 +1480,52 @@ fn refresh_in_place(
     // --- Phase C: under the three locks -----------------------------------
     let clock = Clock::system();
     let subject = LockSubject { store_dir: ns_dir, tree: Tree::Agentctl };
-    let acquisition =
+    // Split into the draft and the rest **before** either is looked at, so
+    // that invariant I16's append below is one unconditional statement rather
+    // than a call that each way out has to remember. The `Err` half is why:
+    // an acquire that failed may already have `rmdir`ed a peer's lock, and
+    // before `agentctl-nq3` every failing path dropped that evidence.
+    let (break_record, resolved) =
         match claude_lock::acquire(subject, &shared.paths, &shared.env, &clock, ctx, &shared.fault)
         {
-            Ok(acquisition) => acquisition,
-            Err(claude_lock::LockError::Cancelled) => {
-                return refused(
-                    AccountState::Error("cancelled while taking the Claude Code locks".to_owned()),
-                    "unavailable",
-                );
-            }
-            Err(err) => {
-                // Fail closed, for the reason the namespace lock fails closed:
-                // a lock error that is not contention means the guarantee is
-                // gone, and writing without it could race a live session.
-                return LockedResult {
-                    state: Some(AccountState::LockUnavailable),
-                    note: Some(err.to_string()),
-                    lock_state: "unavailable",
-                    ..LockedResult::default()
-                };
-            }
+            Ok(acquisition) => (acquisition.break_record, Ok(acquisition.outcome)),
+            Err(failure) => (failure.break_record, Err(failure.error)),
         };
 
     // Invariant I16: the break the acquire may have performed is recorded
-    // whether it went on to hold anything or reported the store busy. The
-    // record is built by the rule and completed here, because the service name
-    // and which item the write is for are the caller's own knowledge.
-    if let Some(draft) = acquisition.break_record {
+    // whether it went on to hold anything, reported the store busy, or failed.
+    // The record is built by the rule and completed here, because the service
+    // name and which item the write is for are the caller's own knowledge.
+    //
+    // Before the mapping below, and before the held/busy split, so that a
+    // state added to either cannot be added without it.
+    if let Some(draft) = break_record {
         let record = draft.complete(service.to_owned(), Target::Namespace(item.sha8.clone()));
         audit_append(&shared.paths, AuditEvent::LockBreak(record));
     }
 
-    let hold = match acquisition.outcome {
+    let outcome = match resolved {
+        Ok(outcome) => outcome,
+        Err(claude_lock::LockError::Cancelled) => {
+            return refused(
+                AccountState::Error("cancelled while taking the Claude Code locks".to_owned()),
+                "unavailable",
+            );
+        }
+        Err(err) => {
+            // Fail closed, for the reason the namespace lock fails closed: a
+            // lock error that is not contention means the guarantee is gone,
+            // and writing without it could race a live session.
+            return LockedResult {
+                state: Some(AccountState::LockUnavailable),
+                note: Some(err.to_string()),
+                lock_state: "unavailable",
+                ..LockedResult::default()
+            };
+        }
+    };
+
+    let hold = match outcome {
         AcquireOutcome::Held(hold) => hold,
         AcquireOutcome::Busy { holder_alive, stopped_pids } => {
             return LockedResult {
