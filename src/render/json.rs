@@ -285,6 +285,190 @@ pub fn assert_valid(report: &StatusReport) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// `doctor`'s isolation section (plan AC58)
+// ---------------------------------------------------------------------------
+//
+// This is a separate document from [`StatusReport`], not an extension of it:
+// `StatusReport`'s shape is normatively fixed by plan section 3.2 and 3.8, and
+// mixing `doctor`'s isolation facts into it would publish a `status --json`
+// consumer's contract as a side effect of a `doctor` change. No CLI flag
+// reaches this yet — `DoctorArgs` gains nothing in this wave — so today it is
+// exercised only by unit tests that build a [`DoctorReport`] directly and by
+// `doctor`'s own text renderer, which walks the same fields. A later wave that
+// wires up `doctor --json` serializes this type as-is.
+
+/// The report version this build would emit for `doctor --json`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "a future `doctor --json` is the first production constructor")
+)]
+pub const DOCTOR_REPORT_VERSION: u32 = 1;
+
+/// The document `doctor`'s isolation section renders, in table and JSON form
+/// alike (plan AC58).
+///
+/// `doctor.rs` builds [`IsolationRow`]/[`IsolationPolicy`] values directly for
+/// its text renderer today; this wrapper is what a future `doctor --json`
+/// would serialize, exercised for now only by [`assert_valid_doctor`]'s tests.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "a future `doctor --json` is the first production constructor")
+)]
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorReport {
+    /// The document version.
+    pub version: u32,
+    /// One entry per `<acct>/<org>` directory found under `session_root()`.
+    pub isolation: Vec<IsolationRow>,
+    /// The two machine-wide facts that apply regardless of how many sessions
+    /// exist.
+    pub isolation_policy: IsolationPolicy,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "a future `doctor --json` is the first production constructor")
+)]
+impl DoctorReport {
+    /// Builds a report from its two parts.
+    pub fn new(isolation: Vec<IsolationRow>, isolation_policy: IsolationPolicy) -> Self {
+        Self { version: DOCTOR_REPORT_VERSION, isolation, isolation_policy }
+    }
+}
+
+/// One isolated session directory, as `doctor` found it.
+#[derive(Debug, Clone, Serialize)]
+pub struct IsolationRow {
+    /// The registry id this session belongs to, or `unregistered`.
+    pub id: String,
+    /// The session directory itself.
+    pub path: String,
+    /// The two environment variables `use`/`exec`/`env` would export, and
+    /// whether the sha8 they hash to matches the registered one.
+    pub exports: IsolationExports,
+    /// Every `TIER1`/`TIER2_DIRS` entry plus the MCP symlink, and what state
+    /// each is in.
+    pub links: Vec<IsolationLink>,
+    /// The top-level key names of the seeded `.claude.json`, sorted; empty
+    /// when it was never seeded.
+    pub seeded_keys: Vec<String>,
+    /// `seeded_keys` intersected with the never-seed allowlist — non-empty is
+    /// an error condition (plan AC54's leak test).
+    pub leaked_keys: Vec<String>,
+    /// Top-level entries of the live config directory that are on neither
+    /// allowlist, sorted.
+    pub unexposed: Vec<String>,
+    /// The D-019 MCP symlink specifically.
+    pub mcp: IsolationMcp,
+    /// How the live `.claude.json` compares with the seed, by modification
+    /// time.
+    pub drift: IsolationDrift,
+    /// The exact command that tears this session down.
+    pub forget_command: String,
+}
+
+/// [`IsolationRow::exports`].
+#[derive(Debug, Clone, Serialize)]
+pub struct IsolationExports {
+    /// What `CLAUDE_SECURESTORAGE_CONFIG_DIR` would be set to.
+    pub securestorage_dir: String,
+    /// What `CLAUDE_CONFIG_DIR` would be set to — the session path itself.
+    pub config_dir: String,
+    /// Whether `sha8(securestorage_dir)` equals the registry's recorded
+    /// `export_sha8` (plan AC50). `false` for an unregistered or non-`Owned`
+    /// session, which is itself worth flagging.
+    pub sha8_match: bool,
+}
+
+/// One allowlisted entry's symlink state.
+#[derive(Debug, Clone, Serialize)]
+pub struct IsolationLink {
+    /// The file or directory name, e.g. `settings.json` or `mcp.json`.
+    pub name: String,
+    /// `tier1`, `tier2`, or `mcp`.
+    pub tier: &'static str,
+    /// `linked`, `missing-target`, `occupied`, or `absent`.
+    pub state: &'static str,
+    /// The symlink's raw target, when the entry is a symlink at all.
+    pub target: Option<String>,
+}
+
+/// [`IsolationRow::mcp`].
+#[derive(Debug, Clone, Serialize)]
+pub struct IsolationMcp {
+    /// Whether `mcp.json` is a symlink at all.
+    pub linked: bool,
+    /// Its target, when it is one.
+    pub target: Option<String>,
+    /// How many `mcpServers` entries in the target file carry a non-empty
+    /// `env` or `headers` object. `None` when the target could not be read or
+    /// parsed — never a failure, only a gap in the report (D-019 exposure 3:
+    /// a count, never a key name or a value).
+    pub credential_entries: Option<u32>,
+}
+
+/// [`IsolationRow::drift`].
+#[derive(Debug, Clone, Serialize)]
+pub struct IsolationDrift {
+    /// The live `.claude.json`'s modification time, milliseconds since the
+    /// epoch.
+    pub live_mtime_ms: Option<i64>,
+    /// The seeded `.claude.json`'s modification time, same units.
+    pub seed_mtime_ms: Option<i64>,
+    /// Whether the live file is newer than the seed — informational, not an
+    /// error: agentctl never rewrites the seed (invariant I18).
+    pub changed_since_seed: bool,
+}
+
+/// The two machine-wide isolation facts (decisions D-019, D-020).
+#[derive(Debug, Clone, Serialize)]
+pub struct IsolationPolicy {
+    /// `policySettings.disableSideloadFlags`, read from the live
+    /// `settings.json` and the managed profile. `None` when neither file sets
+    /// it.
+    pub disable_sideload_flags: Option<bool>,
+    /// Always `false`: agentctl cannot observe which secure-storage backend a
+    /// session activates from outside it (decision D-020).
+    pub backend_observable: bool,
+}
+
+/// The published doctor schema, compiled into the test binary.
+#[cfg(test)]
+pub const DOCTOR_SCHEMA: &str = include_str!("../../schemas/doctor.v1.json");
+
+/// Validates a [`DoctorReport`] against [`DOCTOR_SCHEMA`], naming every
+/// failure.
+///
+/// A sibling of [`assert_valid`] rather than a case it grows into: `assert_valid`
+/// is called from `commands::status`'s own tests against `status.v1.json`, a
+/// schema normatively scoped to plan sections 3.2/3.8, and widening its
+/// signature to cover a second, unrelated schema would touch call sites this
+/// change has no reason to touch.
+///
+/// # Panics
+///
+/// Panics when the document does not validate, which is the assertion.
+#[cfg(test)]
+pub fn assert_valid_doctor(report: &DoctorReport) {
+    let schema: Value =
+        serde_json::from_str(DOCTOR_SCHEMA).expect("the published doctor schema is valid JSON");
+    let validator =
+        jsonschema::validator_for(&schema).expect("the published doctor schema compiles");
+    let instance = serde_json::to_value(report).expect("a doctor report serializes");
+
+    let errors: Vec<String> = validator
+        .iter_errors(&instance)
+        .map(|err| format!("{}: {err}", err.instance_path()))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "the emitted document does not match schemas/doctor.v1.json:\n{}\n\ndocument:\n{}",
+        errors.join("\n"),
+        serde_json::to_string_pretty(&instance).unwrap_or_default()
+    );
+}
+
 #[cfg(test)]
 #[path = "json_tests.rs"]
 mod tests;

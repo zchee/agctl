@@ -81,6 +81,22 @@ impl Store {
     fn ns_dir(&self, org: &str) -> PathBuf {
         self.paths.namespace_dir(ACCT, org)
     }
+
+    fn session_dir(&self, org: &str) -> PathBuf {
+        self.paths.session_dir(ACCT, org)
+    }
+
+    fn live_dir(&self) -> PathBuf {
+        self.home.join(".claude")
+    }
+}
+
+/// Places a symlink, panicking with a message that names both paths on
+/// failure.
+fn symlink(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap_or_else(|err| {
+        panic!("`{}` -> `{}` should be creatable: {err}", link.display(), target.display())
+    });
 }
 
 /// What `doctor` printed.
@@ -826,4 +842,285 @@ fn the_report_does_not_offer_relocate_for_a_row_that_cannot_be_relocated() {
     report(&store.doctor(), &FakeReader::unlocked(), &store.ctx(), &mut io)
         .expect("the report should succeed");
     assert!(io.text().contains(&format!("accounts relocate {ACCT}")), "{}", io.text());
+}
+
+// ---------------------------------------------------------------------------
+// Isolation (plan AC58)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn link_entry_reports_every_state() {
+    let store = store();
+    let live = store.live_dir();
+    fs::create_dir_all(&live).expect("the live config dir should be creatable");
+    let session_dir = store.session_dir(ORG);
+    fs::create_dir_all(&session_dir).expect("the session directory should be creatable");
+
+    // linked: a symlink whose fully resolved target is the expected live path.
+    let live_settings = live.join("settings.json");
+    fs::write(&live_settings, "{}").expect("the live settings file should be writable");
+    symlink(&live_settings, &session_dir.join("settings.json"));
+
+    // occupied (not a symlink at all): something else was written there.
+    fs::write(session_dir.join("CLAUDE.md"), "not agentctl's")
+        .expect("the file should be writable");
+
+    // absent: nothing there — `skills` is never created.
+
+    // missing-target: a symlink whose target does not exist.
+    symlink(&live.join("projects"), &session_dir.join("projects"));
+
+    // occupied (a symlink, but to the wrong place): points at something real,
+    // just not what agentctl would have placed.
+    let elsewhere = store.home.join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("the decoy directory should be creatable");
+    symlink(&elsewhere, &session_dir.join("shell-snapshots"));
+
+    let settings = link_entry(&session_dir, "settings.json", "tier1", &live_settings);
+    assert_eq!(settings.state, "linked");
+    assert_eq!(settings.target.as_deref(), Some(live_settings.to_string_lossy().as_ref()));
+
+    let claude_md = link_entry(&session_dir, "CLAUDE.md", "tier1", &live.join("CLAUDE.md"));
+    assert_eq!(claude_md.state, "occupied");
+    assert!(claude_md.target.is_none(), "a plain file carries no symlink target");
+
+    let skills = link_entry(&session_dir, "skills", "tier1", &live.join("skills"));
+    assert_eq!(skills.state, "absent");
+
+    let projects = link_entry(&session_dir, "projects", "tier2", &live.join("projects"));
+    assert_eq!(projects.state, "missing-target");
+    assert!(projects.target.is_some(), "a dangling symlink still reports its raw target");
+
+    let snapshots =
+        link_entry(&session_dir, "shell-snapshots", "tier2", &live.join("shell-snapshots"));
+    assert_eq!(snapshots.state, "occupied");
+    assert!(snapshots.target.is_some(), "a symlink to the wrong place still reports its target");
+}
+
+#[test]
+fn seed_keys_reports_the_seeded_set_and_flags_a_leaked_key() {
+    let store = store();
+    let session_dir = store.session_dir(ORG);
+    fs::create_dir_all(&session_dir).expect("the session directory should be creatable");
+    fs::write(
+        session_dir.join(".claude.json"),
+        json!({
+            "hasCompletedOnboarding": true,
+            "theme": "dark",
+            "oauthAccount": {"uuid": "leaked"},
+        })
+        .to_string(),
+    )
+    .expect("the seed fixture should be writable");
+
+    let (seeded, leaked) = seed_keys(&session_dir);
+    assert_eq!(
+        seeded,
+        vec!["hasCompletedOnboarding".to_owned(), "oauthAccount".to_owned(), "theme".to_owned()]
+    );
+    assert_eq!(leaked, vec!["oauthAccount".to_owned()], "oauthAccount is on the never-seed list");
+}
+
+#[test]
+fn seed_keys_is_empty_when_the_session_was_never_seeded() {
+    let store = store();
+    let session_dir = store.session_dir(ORG);
+    fs::create_dir_all(&session_dir).expect("the session directory should be creatable");
+
+    let (seeded, leaked) = seed_keys(&session_dir);
+    assert!(seeded.is_empty());
+    assert!(leaked.is_empty());
+}
+
+#[test]
+fn unexposed_entries_lists_whatever_is_on_neither_allowlist() {
+    let store = store();
+    let live = store.live_dir();
+    fs::create_dir_all(live.join("skills")).expect("a tier1 dir should be creatable");
+    fs::create_dir_all(live.join("projects")).expect("a tier2 dir should be creatable");
+    fs::create_dir_all(live.join("backups")).expect("an unlisted dir should be creatable");
+    fs::create_dir_all(live.join("cache")).expect("an unlisted dir should be creatable");
+    fs::write(live.join("settings.json"), "{}").expect("a tier1 file should be writable");
+    fs::write(live.join("history.jsonl"), "{}").expect("the never-linked file should be writable");
+
+    let unexposed = unexposed_entries(&live);
+    assert_eq!(unexposed, vec!["backups".to_owned(), "cache".to_owned()]);
+}
+
+#[test]
+fn unexposed_entries_is_empty_when_the_live_dir_does_not_exist() {
+    let store = store();
+    assert!(unexposed_entries(&store.live_dir()).is_empty());
+}
+
+#[test]
+fn mcp_credential_entries_counts_only_servers_carrying_env_or_headers() {
+    let store = store();
+    let session_dir = store.session_dir(ORG);
+    fs::create_dir_all(&session_dir).expect("the session directory should be creatable");
+
+    let mut servers = serde_json::Map::new();
+    for i in 1..=9 {
+        servers.insert(format!("plain{i}"), json!({"command": "true"}));
+    }
+    servers.insert(
+        "creds1".to_owned(),
+        json!({"command": "true", "env": {"API_KEY": "leaked-secret-1"}}),
+    );
+    servers.insert(
+        "creds2".to_owned(),
+        json!({"command": "true", "headers": {"Authorization": "Bearer leaked-secret-2"}}),
+    );
+    servers.insert(
+        "creds3".to_owned(),
+        json!({"command": "true", "env": {"TOKEN": "leaked-secret-3"}}),
+    );
+    assert_eq!(servers.len(), 12, "the fixture is twelve servers, three of them credential-shaped");
+
+    let live_claude_json = store.home.join(".claude.json");
+    fs::write(&live_claude_json, json!({"mcpServers": servers}).to_string())
+        .expect("the live `.claude.json` fixture should be writable");
+    symlink(&live_claude_json, &session_dir.join("mcp.json"));
+
+    let row = isolation_row(
+        &store.paths,
+        &AgentctlConfig::default(),
+        &store.env,
+        ACCT,
+        ORG,
+        &session_dir,
+        &[],
+    );
+    assert!(row.mcp.linked);
+    assert_eq!(row.mcp.credential_entries, Some(3));
+
+    // The count is the only thing that may appear: no fixture value leaks
+    // into either representation `doctor` produces.
+    let data = IsolationData { rows: vec![row.clone()], policy: isolation_policy(&store.env) };
+    let text = isolation_section(&data, &store.paths.session_root()).join("\n");
+    let document = json::DoctorReport::new(vec![row], data.policy);
+    json::assert_valid_doctor(&document);
+    let rendered = serde_json::to_string_pretty(&document).expect("a doctor report serializes");
+
+    for leaked in ["leaked-secret-1", "leaked-secret-2", "leaked-secret-3"] {
+        assert!(!text.contains(leaked), "the table must not leak a credential value:\n{text}");
+        assert!(
+            !rendered.contains(leaked),
+            "the JSON document must not leak a credential value:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn mcp_credential_entries_is_unreadable_on_a_parse_failure() {
+    let store = store();
+    let session_dir = store.session_dir(ORG);
+    fs::create_dir_all(&session_dir).expect("the session directory should be creatable");
+    let bogus = store.home.join("bogus.json");
+    fs::write(&bogus, "{ not valid json").expect("the bogus target should be writable");
+    symlink(&bogus, &session_dir.join("mcp.json"));
+
+    let row = isolation_row(
+        &store.paths,
+        &AgentctlConfig::default(),
+        &store.env,
+        ACCT,
+        ORG,
+        &session_dir,
+        &[],
+    );
+    assert!(row.mcp.linked, "it is still a symlink, just not a readable one");
+    assert_eq!(row.mcp.credential_entries, None);
+
+    let data = IsolationData { rows: vec![row], policy: isolation_policy(&store.env) };
+    let text = isolation_section(&data, &store.paths.session_root()).join("\n");
+    assert!(text.contains("credential_entries=unreadable"), "{text}");
+}
+
+#[test]
+fn disable_sideload_flags_reports_true_false_or_not_set() {
+    let dir = TempDir::new().expect("a temporary directory should be creatable");
+    let live = dir.path().join("live-settings.json");
+    let managed = dir.path().join("managed-settings.json");
+
+    assert_eq!(disable_sideload_flags(&live, &managed), None, "neither file exists");
+
+    fs::write(&live, json!({"policySettings": {"disableSideloadFlags": false}}).to_string())
+        .expect("the live settings fixture should be writable");
+    assert_eq!(disable_sideload_flags(&live, &managed), Some(false));
+
+    fs::write(&managed, json!({"policySettings": {"disableSideloadFlags": true}}).to_string())
+        .expect("the managed settings fixture should be writable");
+    assert_eq!(
+        disable_sideload_flags(&live, &managed),
+        Some(true),
+        "true from either file wins over false from the other"
+    );
+}
+
+#[test]
+fn the_isolation_section_says_the_root_is_empty_when_there_are_no_sessions() {
+    let store = store();
+    let data = collect_isolation(&store.doctor(), &AgentctlConfig::default());
+    assert!(data.rows.is_empty());
+
+    let text = isolation_section(&data, &store.paths.session_root()).join("\n");
+    assert!(text.contains("has no isolated sessions"), "{text}");
+    assert!(
+        text.contains(&store.paths.session_root().display().to_string()),
+        "the root's own path is named:\n{text}"
+    );
+}
+
+#[test]
+fn the_report_includes_the_isolation_section_for_a_registered_session() {
+    let store = store();
+    record_owned(&store, ORG, None);
+
+    let session_dir = store.session_dir(ORG);
+    fs::create_dir_all(&session_dir).expect("the session directory should be creatable");
+    let live = store.live_dir();
+    fs::create_dir_all(&live).expect("the live config dir should be creatable");
+    fs::write(live.join("settings.json"), "{}").expect("the live settings file should be writable");
+    symlink(&live.join("settings.json"), &session_dir.join("settings.json"));
+
+    let live_claude_json = store.home.join(".claude.json");
+    fs::write(&live_claude_json, json!({"mcpServers": {}}).to_string())
+        .expect("the live `.claude.json` fixture should be writable");
+    symlink(&live_claude_json, &session_dir.join("mcp.json"));
+
+    fs::write(session_dir.join(".claude.json"), json!({"theme": "dark"}).to_string())
+        .expect("the seed fixture should be writable");
+
+    let mut io = Recorder::default();
+    report(&store.doctor(), &FakeReader::unlocked(), &store.ctx(), &mut io)
+        .expect("the report should succeed");
+    let text = io.text();
+
+    assert!(text.contains("isolation"), "{text}");
+    assert!(text.contains(&format!("id={ACCT}")), "{text}");
+    assert!(text.contains("sha8_match=true"), "{text}");
+    assert!(text.contains("settings.json"), "{text}");
+    assert!(text.contains("linked"), "{text}");
+    assert!(text.contains("agentctl claude use --forget"), "{text}");
+    assert!(text.contains("policySettings.disableSideloadFlags"), "{text}");
+    assert!(text.contains("secure-storage backend"), "{text}");
+}
+
+#[test]
+fn the_report_reports_unregistered_for_a_session_with_no_matching_record() {
+    let store = store();
+    let session_dir = store.session_dir(ORG);
+    fs::create_dir_all(&session_dir).expect("the session directory should be creatable");
+
+    let mut io = Recorder::default();
+    report(&store.doctor(), &FakeReader::unlocked(), &store.ctx(), &mut io)
+        .expect("the report should succeed");
+    let text = io.text();
+
+    assert!(text.contains("id=unregistered"), "{text}");
+    assert!(
+        text.contains(&format!("agentctl claude use --forget {}", session_dir.display())),
+        "an unregistered session is forgotten by path:\n{text}"
+    );
 }

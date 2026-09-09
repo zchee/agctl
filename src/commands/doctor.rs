@@ -41,9 +41,12 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
+use serde_json::Value;
+
 use crate::cli::DoctorArgs;
 use crate::commands::Prompt;
 use crate::commands::Tty;
+use crate::commands::isolate;
 use crate::config::AccountKind;
 use crate::config::AccountRecord;
 use crate::config::AgentctlConfig;
@@ -55,6 +58,7 @@ use crate::provider::claude::credentials::Credentials;
 use crate::provider::claude::discovery;
 use crate::provider::claude::namespace;
 use crate::provider::claude::namespace::EnvView;
+use crate::render::json;
 use crate::runtime::coordinator::Cancel;
 use crate::runtime::coordinator::PassCtx;
 use crate::runtime::proc;
@@ -208,6 +212,10 @@ pub fn report(
 
     out.push(String::new());
     out.extend(attention_section(doctor, &config, &found));
+
+    out.push(String::new());
+    let isolation = collect_isolation(doctor, &config);
+    out.extend(isolation_section(&isolation, &doctor.paths.session_root()));
 
     io.tell(&out.join("\n"));
     Ok(())
@@ -786,6 +794,388 @@ fn is_artefact_name(path: &Path) -> bool {
     // The legacy lock is `<namespace directory>.lock`, so a bare `.lock` with
     // nothing in front of it is not one.
     name.len() > LEGACY_LOCK_SUFFIX.len() && name.ends_with(LEGACY_LOCK_SUFFIX)
+}
+
+// ---------------------------------------------------------------------------
+// Isolation (plan AC58)
+// ---------------------------------------------------------------------------
+
+/// Where a macOS device profile can force Claude Code settings machine-wide
+/// (fact from `.omc/handoffs/w0-s11.md` item 2).
+pub const MANAGED_SETTINGS_PATH: &str =
+    "/Library/Application Support/ClaudeCode/managed-settings.json";
+
+/// Everything the isolation section reports, collected once and rendered
+/// twice: as the lines [`isolation_section`] prints, and as the
+/// [`json::IsolationRow`]/[`json::IsolationPolicy`] values a future
+/// `doctor --json` would serialize verbatim.
+struct IsolationData {
+    rows: Vec<json::IsolationRow>,
+    policy: json::IsolationPolicy,
+}
+
+/// Builds [`IsolationData`] for every session directory under
+/// `session_root()`.
+fn collect_isolation(doctor: &Doctor<'_>, config: &AgentctlConfig) -> IsolationData {
+    let paths = doctor.paths;
+    let env = doctor.env;
+
+    let live_dir = namespace::live_store_dir(env);
+    let unexposed = unexposed_entries(&live_dir);
+
+    let rows = discover_sessions(&paths.session_root())
+        .into_iter()
+        .map(|(acct, org, dir)| isolation_row(paths, config, env, &acct, &org, &dir, &unexposed))
+        .collect();
+
+    let policy = isolation_policy(env);
+    IsolationData { rows, policy }
+}
+
+/// Every `<acct>/<org>` directory under `session_root()`, sorted.
+///
+/// Nothing else is discoverable: a `--claude-config-dir` override lands
+/// wherever the caller pointed it, and this command has no way to enumerate
+/// those.
+fn discover_sessions(session_root: &Path) -> Vec<(String, String, PathBuf)> {
+    let mut found = Vec::new();
+    let Ok(acct_entries) = fs::read_dir(session_root) else {
+        return found;
+    };
+
+    let mut acct_dirs: Vec<PathBuf> = acct_entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    acct_dirs.sort();
+
+    for acct_dir in acct_dirs {
+        let Some(acct) = acct_dir.file_name().and_then(|name| name.to_str()) else { continue };
+        let Ok(org_entries) = fs::read_dir(&acct_dir) else { continue };
+        let mut org_dirs: Vec<PathBuf> = org_entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        org_dirs.sort();
+
+        for org_dir in org_dirs {
+            let Some(org) = org_dir.file_name().and_then(|name| name.to_str()) else { continue };
+            found.push((acct.to_owned(), org.to_owned(), org_dir));
+        }
+    }
+    found
+}
+
+/// One session directory's row.
+fn isolation_row(
+    paths: &Paths,
+    config: &AgentctlConfig,
+    env: &EnvView,
+    acct: &str,
+    org: &str,
+    session_dir: &Path,
+    unexposed: &[String],
+) -> json::IsolationRow {
+    let registered = config.get(acct, org);
+    let id = registered
+        .map(|rec| rec.display_id(&config.accounts))
+        .unwrap_or_else(|| "unregistered".to_owned());
+    let forget_target =
+        if registered.is_some() { id.clone() } else { session_dir.display().to_string() };
+
+    let (securestorage_dir, sha8_match) = match registered.map(|rec| &rec.kind) {
+        Some(AccountKind::Owned { export_spelling, export_sha8 }) => {
+            (export_spelling.clone(), &namespace::sha8(export_spelling) == export_sha8)
+        }
+        _ => (namespace::export_spelling(&paths.namespace_dir(acct, org)), false),
+    };
+
+    let live_dir = namespace::live_store_dir(env);
+    let live_claude_json = namespace::claude_json_path(env);
+
+    let mut links = Vec::with_capacity(isolate::TIER1.len() + isolate::TIER2_DIRS.len() + 1);
+    for name in isolate::TIER1 {
+        links.push(link_entry(session_dir, name, "tier1", &live_dir.join(name)));
+    }
+    for name in isolate::TIER2_DIRS {
+        links.push(link_entry(session_dir, name, "tier2", &live_dir.join(name)));
+    }
+    let mcp_link = link_entry(session_dir, isolate::MCP_LINK, "mcp", &live_claude_json);
+    let mcp = mcp_details(session_dir, &mcp_link);
+    links.push(mcp_link);
+
+    let (seeded_keys, leaked_keys) = seed_keys(session_dir);
+    let drift = drift_of(&live_claude_json, session_dir);
+
+    json::IsolationRow {
+        id,
+        path: session_dir.display().to_string(),
+        exports: json::IsolationExports {
+            securestorage_dir,
+            config_dir: session_dir.display().to_string(),
+            sha8_match,
+        },
+        links,
+        seeded_keys,
+        leaked_keys,
+        unexposed: unexposed.to_vec(),
+        mcp,
+        drift,
+        forget_command: format!("agentctl claude use --forget {forget_target}"),
+    }
+}
+
+/// One allowlisted entry's symlink state, at `session_dir/name`.
+///
+/// `linked` requires the entry to be a symlink whose fully resolved target
+/// equals `canonical(expected_live_path)` — not merely *a* symlink, which is
+/// what makes an entry someone else placed there `occupied` rather than
+/// `linked`.
+fn link_entry(
+    session_dir: &Path,
+    name: &str,
+    tier: &'static str,
+    expected_live_path: &Path,
+) -> json::IsolationLink {
+    let entry_path = session_dir.join(name);
+    let expected_canonical = namespace::canonical(expected_live_path).ok();
+
+    let (state, target) = match fs::symlink_metadata(&entry_path) {
+        Err(_) => ("absent", None),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let raw_target = fs::read_link(&entry_path).ok().map(|t| t.display().to_string());
+            let resolved = namespace::canonical(&entry_path).ok();
+            let state = match (&resolved, &expected_canonical) {
+                (None, _) => "missing-target",
+                (Some(resolved), Some(expected)) if resolved == expected => "linked",
+                _ => "occupied",
+            };
+            (state, raw_target)
+        }
+        Ok(_) => ("occupied", None),
+    };
+
+    json::IsolationLink { name: name.to_owned(), tier, state, target }
+}
+
+/// The D-019 MCP symlink's credential count, reusing the state
+/// [`link_entry`] already computed for it.
+fn mcp_details(session_dir: &Path, mcp_link: &json::IsolationLink) -> json::IsolationMcp {
+    let mcp_path = session_dir.join(isolate::MCP_LINK);
+    let linked =
+        matches!(fs::symlink_metadata(&mcp_path), Ok(meta) if meta.file_type().is_symlink());
+
+    let credential_entries = if linked {
+        match file_store::read_file_following(&mcp_path, discovery::MAX_CLAUDE_JSON_BYTES) {
+            Ok(file_store::ReadOutcome::Present { bytes, .. }) => count_mcp_credentials(&bytes),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    json::IsolationMcp { linked, target: mcp_link.target.clone(), credential_entries }
+}
+
+/// How many `mcpServers` entries carry a non-empty `env` or `headers` object.
+///
+/// `None` only on a JSON parse failure — an absent or malformed `mcpServers`
+/// key in an otherwise valid document is zero servers, not an error (D-019
+/// exposure 3: a count, never a key name or a value).
+fn count_mcp_credentials(bytes: &[u8]) -> Option<u32> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let count = value
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .map(|servers| servers.values().filter(|entry| has_credential_fields(entry)).count())
+        .unwrap_or(0);
+    u32::try_from(count).ok()
+}
+
+/// Whether one `mcpServers` entry carries a non-empty `env` or `headers`
+/// object.
+fn has_credential_fields(entry: &Value) -> bool {
+    let Some(obj) = entry.as_object() else { return false };
+    ["env", "headers"]
+        .iter()
+        .any(|key| obj.get(*key).and_then(Value::as_object).is_some_and(|map| !map.is_empty()))
+}
+
+/// The seeded `.claude.json`'s key set, and which of those keys leaked from
+/// [`isolate::NEVER_SEED`].
+fn seed_keys(session_dir: &Path) -> (Vec<String>, Vec<String>) {
+    let seed_path = session_dir.join(".claude.json");
+    let bytes = match file_store::read_file(&seed_path, discovery::MAX_CLAUDE_JSON_BYTES) {
+        Ok(file_store::ReadOutcome::Present { bytes, .. }) => bytes,
+        _ => return (Vec::new(), Vec::new()),
+    };
+    let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&bytes) else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut seeded: Vec<String> = map.keys().cloned().collect();
+    seeded.sort();
+    let leaked: Vec<String> =
+        seeded.iter().filter(|key| isolate::NEVER_SEED.contains(&key.as_str())).cloned().collect();
+    (seeded, leaked)
+}
+
+/// Top-level entries of the live config directory that are on neither
+/// allowlist (plan section 3.3's tier rule; tier 3 is "everything else").
+fn unexposed_entries(live_dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(live_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter(|name| {
+            !isolate::TIER1.contains(&name.as_str())
+                && !isolate::TIER2_DIRS.contains(&name.as_str())
+                && !isolate::NEVER_LINKED.contains(&name.as_str())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The live `.claude.json`'s modification time against the seed's.
+fn drift_of(live_claude_json: &Path, session_dir: &Path) -> json::IsolationDrift {
+    let seed_path = session_dir.join(".claude.json");
+    let live_mtime_ms = mtime_ms(live_claude_json);
+    let seed_mtime_ms = mtime_ms(&seed_path);
+    let changed_since_seed = matches!(
+        (live_mtime_ms, seed_mtime_ms),
+        (Some(live), Some(seed)) if live > seed
+    );
+    json::IsolationDrift { live_mtime_ms, seed_mtime_ms, changed_since_seed }
+}
+
+/// A path's modification time, milliseconds since the epoch.
+fn mtime_ms(path: &Path) -> Option<i64> {
+    let meta = fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(since_epoch.as_millis()).ok()
+}
+
+/// The two D-019/D-020 machine-wide facts.
+fn isolation_policy(env: &EnvView) -> json::IsolationPolicy {
+    let live_settings = namespace::live_store_dir(env).join("settings.json");
+    let managed_settings = PathBuf::from(MANAGED_SETTINGS_PATH);
+    json::IsolationPolicy {
+        disable_sideload_flags: disable_sideload_flags(&live_settings, &managed_settings),
+        backend_observable: false,
+    }
+}
+
+/// Reads `policySettings.disableSideloadFlags` out of both files, `true` from
+/// either winning over `false`, and both absent or silent yielding `None`.
+///
+/// A pure function of two paths rather than one reading
+/// [`MANAGED_SETTINGS_PATH`] itself, so a unit test can point both arguments
+/// at fixtures instead of the real machine's profile location.
+fn disable_sideload_flags(live_settings: &Path, managed_settings: &Path) -> Option<bool> {
+    let live = read_disable_flag(live_settings);
+    let managed = read_disable_flag(managed_settings);
+    match (live, managed) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
+/// `policySettings.disableSideloadFlags` out of one settings file, if it
+/// exists, parses, and sets it.
+fn read_disable_flag(path: &Path) -> Option<bool> {
+    let bytes = fs::read(path).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("policySettings")?.get("disableSideloadFlags")?.as_bool()
+}
+
+/// Renders [`IsolationData`] as the lines `doctor`'s report prints.
+///
+/// Always printed — `DoctorArgs` has no flag gating this section, so a run
+/// with no isolated sessions still states that plainly, and the two
+/// machine-wide facts print regardless of how many sessions exist.
+fn isolation_section(data: &IsolationData, session_root: &Path) -> Vec<String> {
+    let mut out = vec!["isolation".to_owned()];
+
+    if data.rows.is_empty() {
+        out.push(format!("  {} has no isolated sessions", session_root.display()));
+    }
+
+    for row in &data.rows {
+        out.push(format!("  {}  id={}", row.path, row.id));
+        out.push(format!(
+            "    exports          CLAUDE_SECURESTORAGE_CONFIG_DIR={} CLAUDE_CONFIG_DIR={} \
+             sha8_match={}",
+            row.exports.securestorage_dir, row.exports.config_dir, row.exports.sha8_match
+        ));
+        for link in &row.links {
+            match &link.target {
+                Some(target) => out.push(format!(
+                    "    {:<14} {:<5} {:<14} -> {target}",
+                    link.name, link.tier, link.state
+                )),
+                None => {
+                    out.push(format!("    {:<14} {:<5} {}", link.name, link.tier, link.state));
+                }
+            }
+        }
+        out.push(format!(
+            "    unexposed        {}",
+            if row.unexposed.is_empty() { "none".to_owned() } else { row.unexposed.join(", ") }
+        ));
+        out.push(format!(
+            "    seeded keys      {}",
+            if row.seeded_keys.is_empty() {
+                "not seeded".to_owned()
+            } else {
+                row.seeded_keys.join(", ")
+            }
+        ));
+        if row.leaked_keys.is_empty() {
+            out.push("    leaked keys      none".to_owned());
+        } else {
+            out.push(format!(
+                "    leaked keys      {}  — must never appear in a seeded `.claude.json`",
+                row.leaked_keys.join(", ")
+            ));
+        }
+        out.push(format!(
+            "    mcp              linked={} target={} credential_entries={}",
+            row.mcp.linked,
+            row.mcp.target.as_deref().unwrap_or("(none)"),
+            row.mcp.credential_entries.map_or_else(|| "unreadable".to_owned(), |n| n.to_string()),
+        ));
+        out.push(format!(
+            "    drift            live_mtime_ms={:?} seed_mtime_ms={:?} changed_since_seed={}",
+            row.drift.live_mtime_ms, row.drift.seed_mtime_ms, row.drift.changed_since_seed
+        ));
+        out.push(format!("    forget           {}", row.forget_command));
+    }
+
+    out.push(format!(
+        "  policySettings.disableSideloadFlags   {}",
+        match data.policy.disable_sideload_flags {
+            Some(true) => "true — `--mcp-config` is refused by managed settings; isolated \
+                           sessions will start without MCP"
+                .to_owned(),
+            Some(false) => "false".to_owned(),
+            None => "not set".to_owned(),
+        }
+    ));
+    out.push(
+        "  secure-storage backend: not independently observable from outside a session \
+         (environment-only); as verified, this build's backend factory is a stub, so none is \
+         active — see docs/re-verify.md"
+            .to_owned(),
+    );
+
+    out
 }
 
 #[cfg(test)]

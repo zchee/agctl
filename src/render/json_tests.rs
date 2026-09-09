@@ -478,3 +478,78 @@ fn the_foreign_rows_discovery_synthesizes_validate() {
         .collect();
     assert_eq!(kinds.iter().filter(|kind| **kind == "foreign").count(), 2, "{value}");
 }
+
+// ---------------------------------------------------------------------------
+// `doctor`'s isolation section (plan AC58)
+// ---------------------------------------------------------------------------
+
+/// One fully populated isolation row.
+fn isolation_row() -> IsolationRow {
+    IsolationRow {
+        id: "acct-1".to_owned(),
+        path: "/tmp/claude-sessions/acct-1/org-1".to_owned(),
+        exports: IsolationExports {
+            securestorage_dir: "/tmp/claude/acct-1/org-1".to_owned(),
+            config_dir: "/tmp/claude-sessions/acct-1/org-1".to_owned(),
+            sha8_match: true,
+        },
+        links: vec![
+            IsolationLink {
+                name: "settings.json".to_owned(),
+                tier: "tier1",
+                state: "linked",
+                target: Some("/home/user/.claude/settings.json".to_owned()),
+            },
+            IsolationLink {
+                name: "mcp.json".to_owned(),
+                tier: "mcp",
+                state: "absent",
+                target: None,
+            },
+        ],
+        seeded_keys: vec!["theme".to_owned()],
+        leaked_keys: Vec::new(),
+        unexposed: vec!["cache".to_owned()],
+        mcp: IsolationMcp { linked: false, target: None, credential_entries: None },
+        drift: IsolationDrift {
+            live_mtime_ms: Some(2_000),
+            seed_mtime_ms: Some(1_000),
+            changed_since_seed: true,
+        },
+        forget_command: "agentctl claude use --forget acct-1".to_owned(),
+    }
+}
+
+#[test]
+fn a_doctor_report_with_a_populated_row_validates() {
+    let report = DoctorReport::new(
+        vec![isolation_row()],
+        IsolationPolicy { disable_sideload_flags: Some(true), backend_observable: false },
+    );
+    assert_valid_doctor(&report);
+}
+
+#[test]
+fn a_doctor_report_with_no_sessions_validates() {
+    let report = DoctorReport::new(
+        Vec::new(),
+        IsolationPolicy { disable_sideload_flags: None, backend_observable: false },
+    );
+    assert_valid_doctor(&report);
+}
+
+#[test]
+fn a_doctor_report_with_a_leaked_key_and_a_readable_mcp_count_validates() {
+    let mut row = isolation_row();
+    row.leaked_keys = vec!["oauthAccount".to_owned()];
+    row.mcp = IsolationMcp {
+        linked: true,
+        target: Some("/home/user/.claude.json".to_owned()),
+        credential_entries: Some(3),
+    };
+    let report = DoctorReport::new(
+        vec![row],
+        IsolationPolicy { disable_sideload_flags: Some(false), backend_observable: false },
+    );
+    assert_valid_doctor(&report);
+}

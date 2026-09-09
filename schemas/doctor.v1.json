@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/zchee/agentctl/schemas/doctor.v1.json",
+  "title": "agentctl claude doctor isolation report, version 1",
+  "description": "The `isolation`/`isolation_policy` half of `agentctl claude doctor`'s report (plan AC58). Not yet reachable through a CLI flag; this schema is what a future `doctor --json` would emit, and is validated today against the type `render::json::DoctorReport` builds directly. It carries no token material: nothing here is read from a credential, only from `.claude.json`, a symlink target, and a settings file.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "isolation", "isolation_policy"],
+  "properties": {
+    "version": {
+      "description": "The report version. A consumer must refuse a version it does not know.",
+      "const": 1
+    },
+    "isolation": {
+      "description": "One entry per `<acct>/<org>` directory found under `session_root()`. Empty when no isolated session exists.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/row" }
+    },
+    "isolation_policy": { "$ref": "#/$defs/policy" }
+  },
+  "$defs": {
+    "row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "path",
+        "exports",
+        "links",
+        "seeded_keys",
+        "leaked_keys",
+        "unexposed",
+        "mcp",
+        "drift",
+        "forget_command"
+      ],
+      "properties": {
+        "id": {
+          "description": "The registry id this session belongs to, or `unregistered`.",
+          "type": "string"
+        },
+        "path": {
+          "description": "The session directory itself.",
+          "type": "string"
+        },
+        "exports": { "$ref": "#/$defs/exports" },
+        "links": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/link" }
+        },
+        "seeded_keys": {
+          "description": "The top-level key names of the seeded `.claude.json`, sorted; empty when it was never seeded.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "leaked_keys": {
+          "description": "`seeded_keys` intersected with the never-seed allowlist. Non-empty is an error condition.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "unexposed": {
+          "description": "Top-level entries of the live config directory that are on neither allowlist, sorted.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "mcp": { "$ref": "#/$defs/mcp" },
+        "drift": { "$ref": "#/$defs/drift" },
+        "forget_command": {
+          "description": "The exact command that tears this session down.",
+          "type": "string"
+        }
+      }
+    },
+    "exports": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["securestorage_dir", "config_dir", "sha8_match"],
+      "properties": {
+        "securestorage_dir": {
+          "description": "What CLAUDE_SECURESTORAGE_CONFIG_DIR would be set to.",
+          "type": "string"
+        },
+        "config_dir": {
+          "description": "What CLAUDE_CONFIG_DIR would be set to — the session path itself.",
+          "type": "string"
+        },
+        "sha8_match": {
+          "description": "Whether sha8(securestorage_dir) equals the registry's recorded export_sha8. False for an unregistered or non-owned session.",
+          "type": "boolean"
+        }
+      }
+    },
+    "link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "tier", "state", "target"],
+      "properties": {
+        "name": { "type": "string" },
+        "tier": { "enum": ["tier1", "tier2", "mcp"] },
+        "state": { "enum": ["linked", "missing-target", "occupied", "absent"] },
+        "target": { "type": ["string", "null"] }
+      }
+    },
+    "mcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["linked", "target", "credential_entries"],
+      "properties": {
+        "linked": {
+          "description": "Whether mcp.json is a symlink at all.",
+          "type": "boolean"
+        },
+        "target": { "type": ["string", "null"] },
+        "credential_entries": {
+          "description": "How many mcpServers entries in the target file carry a non-empty env or headers object. Null when the target could not be read or parsed.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        }
+      }
+    },
+    "drift": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["live_mtime_ms", "seed_mtime_ms", "changed_since_seed"],
+      "properties": {
+        "live_mtime_ms": { "type": ["integer", "null"] },
+        "seed_mtime_ms": { "type": ["integer", "null"] },
+        "changed_since_seed": {
+          "description": "Whether the live file is newer than the seed. Informational, not an error.",
+          "type": "boolean"
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["disable_sideload_flags", "backend_observable"],
+      "properties": {
+        "disable_sideload_flags": {
+          "description": "policySettings.disableSideloadFlags, read from the live settings.json and the managed profile. Null when neither file sets it.",
+          "type": ["boolean", "null"]
+        },
+        "backend_observable": {
+          "description": "Always false: agentctl cannot observe which secure-storage backend a session activates from outside it.",
+          "const": false
+        }
+      }
+    }
+  }
+}
