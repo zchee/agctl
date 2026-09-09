@@ -103,6 +103,12 @@ agentctl claude status --all --refresh --timeout 30s
 when it is not, and the email address when that is unique. A keychain item with no
 identity is addressed by its service name.
 
+One address can legitimately appear on two rows — a credential agentctl owns and the one
+Claude Code is signed in as can be the same account with two independent token pairs. The
+owned row says so, with `same identity as live` in its `State` column and
+`"same_identity_as": "live"` in `--json`; the rows stay separate, because each pair
+expires, refreshes and can be revoked on its own.
+
 ### `watch` — the same table, live
 
 ```sh

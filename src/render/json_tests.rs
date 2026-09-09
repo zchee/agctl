@@ -70,6 +70,7 @@ fn row(state: &AccountState, usage: Option<&UsageSnapshot>) -> JsonRow {
         session_reset: session_reset_of(usage),
         weekly_reset: weekly_reset_of(usage),
         note: None,
+        same_identity_as: None,
     }
 }
 
@@ -152,6 +153,7 @@ fn json_row_of(row: &AccountRow) -> JsonRow {
         session_reset: None,
         weekly_reset: None,
         note: row.note.clone(),
+        same_identity_as: None,
     }
 }
 
@@ -373,6 +375,37 @@ fn an_unknown_lock_state_is_rejected_by_the_schema() {
     let validator = jsonschema::validator_for(&schema).expect("the published schema compiles");
     let instance = serde_json::to_value(&report).expect("a report serializes");
     assert!(!validator.is_valid(&instance), "an unlisted lock_state must fail validation");
+}
+
+#[test]
+fn same_identity_as_is_live_or_null_and_the_schema_refuses_anything_else() {
+    // `agentctl-p3-login-live-identity-warning-b90`: the member is additive
+    // and present on every row, so a consumer reads an answer rather than
+    // having to tell an absent member from a null one — the same contract
+    // `credits` keeps. The schema pins the vocabulary, which is what stops a
+    // later build from inventing a third value without a version bump.
+    let plain = row(&AccountState::Ok, None);
+    assert!(plain.same_identity_as.is_none(), "a row is unmarked until a pass says otherwise");
+    let value = serde_json::to_value(report(vec![plain])).expect("a report serializes");
+    assert_eq!(value["rows"][0]["same_identity_as"], json!(null));
+    assert!(
+        value["rows"][0].as_object().expect("a row is an object").contains_key("same_identity_as"),
+        "the member is present even when it is null: {value:#}"
+    );
+
+    let mut marked = row(&AccountState::Ok, None);
+    marked.same_identity_as = Some(SAME_IDENTITY_LIVE);
+    let document = report(vec![marked]);
+    assert_valid(&document);
+    let value = serde_json::to_value(&document).expect("a report serializes");
+    assert_eq!(value["rows"][0]["same_identity_as"], json!("live"));
+
+    let mut improvised = row(&AccountState::Ok, None);
+    improvised.same_identity_as = Some("owned");
+    let schema: Value = serde_json::from_str(SCHEMA).expect("the published schema is valid JSON");
+    let validator = jsonschema::validator_for(&schema).expect("the published schema compiles");
+    let instance = serde_json::to_value(report(vec![improvised])).expect("a report serializes");
+    assert!(!validator.is_valid(&instance), "an unlisted `same_identity_as` must fail validation");
 }
 
 #[test]

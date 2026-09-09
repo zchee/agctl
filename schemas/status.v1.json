@@ -52,7 +52,8 @@
         "next_reset",
         "session_reset",
         "weekly_reset",
-        "note"
+        "note",
+        "same_identity_as"
       ],
       "properties": {
         "id": {
@@ -140,7 +141,12 @@
           "type": ["string", "null"],
           "format": "date-time"
         },
-        "note": { "type": ["string", "null"] }
+        "note": { "type": ["string", "null"] },
+        "same_identity_as": {
+          "description": "Which other credential source on this machine holds the same `(account_uuid, organization_uuid)` pair as this row. `live` means the credentials a Claude Code session is using right now name the same account and organization; null means no other source does. The rows stay separate either way: each is its own token pair, refreshed and revoked on its own. Added alongside the members before it, so version 1 still means what it meant.",
+          "type": ["string", "null"],
+          "enum": ["live", null]
+        }
       }
     },
     "window": {

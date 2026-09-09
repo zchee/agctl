@@ -36,8 +36,10 @@ struct FakeIo {
     confirm: Option<bool>,
     /// The authorize URL the command offered.
     url: Option<String>,
-    /// Everything the command said.
+    /// Everything the command said on standard output.
     said: Vec<String>,
+    /// Everything the command said on standard error.
+    warned: Vec<String>,
     /// How many confirmations were asked for.
     confirmations: usize,
 }
@@ -50,6 +52,7 @@ impl FakeIo {
             confirm: Some(true),
             url: None,
             said: Vec::new(),
+            warned: Vec::new(),
             confirmations: 0,
         }
     }
@@ -68,6 +71,10 @@ impl FakeIo {
 impl LoginIo for FakeIo {
     fn tell(&mut self, message: &str) {
         self.said.push(message.to_owned());
+    }
+
+    fn warn(&mut self, message: &str) {
+        self.warned.push(message.to_owned());
     }
 
     fn open_browser(&mut self, url: &str) {
@@ -154,7 +161,13 @@ fn a_manual_login_writes_the_f40_blob_and_records_an_owned_account() {
     let home = TempDir::new().expect("a temporary directory should be creatable");
     let paths = Paths::with_config_dir(home.path().to_path_buf());
     let cancel = Cancel::new();
-    let login = Login { paths: &paths, manual: true, label: Some("work"), cancel: &cancel };
+    let login = Login {
+        paths: &paths,
+        manual: true,
+        label: Some("work"),
+        live_identity: None,
+        cancel: &cancel,
+    };
     let mut io = FakeIo::new("CODE-A");
 
     let before_ms = jiff::Timestamp::now().as_millisecond();
@@ -234,7 +247,8 @@ fn a_login_without_an_organization_lands_in_the_unknown_org_namespace() {
     let home = TempDir::new().expect("a temporary directory should be creatable");
     let paths = Paths::with_config_dir(home.path().to_path_buf());
     let cancel = Cancel::new();
-    let login = Login { paths: &paths, manual: true, label: None, cancel: &cancel };
+    let login =
+        Login { paths: &paths, manual: true, label: None, live_identity: None, cancel: &cancel };
 
     run_with(&login, &client_for(&server), &mut FakeIo::new("CODE-A"))
         .expect("the login should succeed");
@@ -267,7 +281,8 @@ fn an_identity_the_exchange_omits_is_recovered_from_the_profile() {
     let home = TempDir::new().expect("a temporary directory should be creatable");
     let paths = Paths::with_config_dir(home.path().to_path_buf());
     let cancel = Cancel::new();
-    let login = Login { paths: &paths, manual: true, label: None, cancel: &cancel };
+    let login =
+        Login { paths: &paths, manual: true, label: None, live_identity: None, cancel: &cancel };
 
     run_with(&login, &client_for(&server), &mut FakeIo::new("CODE-A"))
         .expect("the login should succeed");
@@ -294,7 +309,8 @@ fn a_login_whose_identity_stays_unknown_writes_nothing() {
     let home = TempDir::new().expect("a temporary directory should be creatable");
     let paths = Paths::with_config_dir(home.path().to_path_buf());
     let cancel = Cancel::new();
-    let login = Login { paths: &paths, manual: true, label: None, cancel: &cancel };
+    let login =
+        Login { paths: &paths, manual: true, label: None, live_identity: None, cancel: &cancel };
 
     let err = run_with(&login, &client_for(&server), &mut FakeIo::new("CODE-A"))
         .expect_err("an unidentifiable credential cannot be namespaced");
@@ -317,7 +333,8 @@ fn a_forged_state_is_refused_before_the_exchange_and_writes_nothing() {
     let home = TempDir::new().expect("a temporary directory should be creatable");
     let paths = Paths::with_config_dir(home.path().to_path_buf());
     let cancel = Cancel::new();
-    let login = Login { paths: &paths, manual: true, label: None, cancel: &cancel };
+    let login =
+        Login { paths: &paths, manual: true, label: None, live_identity: None, cancel: &cancel };
     let mut io = FakeIo::new("CODE-A");
     io.forged_state = Some("not-the-state-we-sent".to_owned());
 
@@ -345,12 +362,24 @@ fn logging_the_same_account_in_twice_asks_first_and_then_overwrites() {
     let cancel = Cancel::new();
     let client = client_for(&server);
 
-    let first = Login { paths: &paths, manual: true, label: Some("first"), cancel: &cancel };
+    let first = Login {
+        paths: &paths,
+        manual: true,
+        label: Some("first"),
+        live_identity: None,
+        cancel: &cancel,
+    };
     let mut io = FakeIo::new("CODE-A");
     run_with(&first, &client, &mut io).expect("the first login should succeed");
     assert_eq!(io.confirmations, 0, "a fresh account needs no confirmation");
 
-    let second = Login { paths: &paths, manual: true, label: Some("second"), cancel: &cancel };
+    let second = Login {
+        paths: &paths,
+        manual: true,
+        label: Some("second"),
+        live_identity: None,
+        cancel: &cancel,
+    };
     let mut io = FakeIo::new("CODE-A");
     run_with(&second, &client, &mut io).expect("the confirmed overwrite should succeed");
     assert_eq!(io.confirmations, 1, "an existing account must be confirmed over");
@@ -375,7 +404,13 @@ fn a_declined_confirmation_leaves_the_stored_credentials_alone() {
     let paths = Paths::with_config_dir(home.path().to_path_buf());
     let cancel = Cancel::new();
     let client = client_for(&server);
-    let login = Login { paths: &paths, manual: true, label: Some("first"), cancel: &cancel };
+    let login = Login {
+        paths: &paths,
+        manual: true,
+        label: Some("first"),
+        live_identity: None,
+        cancel: &cancel,
+    };
 
     run_with(&login, &client, &mut FakeIo::new("CODE-A")).expect("the first login should succeed");
     let ns_dir = paths.namespace_dir(ACCOUNT, ORGANIZATION);
@@ -383,7 +418,13 @@ fn a_declined_confirmation_leaves_the_stored_credentials_alone() {
 
     let mut io = FakeIo::new("CODE-A");
     io.confirm = Some(false);
-    let declined = Login { paths: &paths, manual: true, label: Some("second"), cancel: &cancel };
+    let declined = Login {
+        paths: &paths,
+        manual: true,
+        label: Some("second"),
+        live_identity: None,
+        cancel: &cancel,
+    };
     let err = run_with(&declined, &client, &mut io).expect_err("a declined login should not write");
 
     assert_eq!(err.exit_code(), crate::error::EXIT_FATAL);
@@ -409,7 +450,8 @@ fn a_non_interactive_overwrite_is_refused_with_a_fatal_status() {
     let paths = Paths::with_config_dir(home.path().to_path_buf());
     let cancel = Cancel::new();
     let client = client_for(&server);
-    let login = Login { paths: &paths, manual: true, label: None, cancel: &cancel };
+    let login =
+        Login { paths: &paths, manual: true, label: None, live_identity: None, cancel: &cancel };
 
     run_with(&login, &client, &mut FakeIo::new("CODE-A")).expect("the first login should succeed");
 
@@ -445,7 +487,8 @@ fn the_same_account_in_two_organizations_gets_sibling_namespaces() {
     let paths = Paths::with_config_dir(home.path().to_path_buf());
     let cancel = Cancel::new();
     let client = client_for(&server);
-    let login = Login { paths: &paths, manual: true, label: None, cancel: &cancel };
+    let login =
+        Login { paths: &paths, manual: true, label: None, live_identity: None, cancel: &cancel };
 
     let mut first = FakeIo::new("CODE-A");
     run_with(&login, &client, &mut first).expect("the first login should succeed");
@@ -471,7 +514,8 @@ fn a_rejected_code_ends_the_login_without_creating_anything() {
     let home = TempDir::new().expect("a temporary directory should be creatable");
     let paths = Paths::with_config_dir(home.path().to_path_buf());
     let cancel = Cancel::new();
-    let login = Login { paths: &paths, manual: true, label: None, cancel: &cancel };
+    let login =
+        Login { paths: &paths, manual: true, label: None, live_identity: None, cancel: &cancel };
 
     let err = run_with(&login, &client_for(&server), &mut FakeIo::new("CODE-A"))
         .expect_err("a rejected code should end the login");
@@ -502,7 +546,8 @@ fn a_superseded_pending_file_is_cleared_before_the_write() {
     std::fs::write(&stray, b"leftover").expect("the stray file should be writable");
 
     let cancel = Cancel::new();
-    let login = Login { paths: &paths, manual: true, label: None, cancel: &cancel };
+    let login =
+        Login { paths: &paths, manual: true, label: None, live_identity: None, cancel: &cancel };
     run_with(&login, &client_for(&server), &mut FakeIo::new("CODE-A"))
         .expect("the login should succeed");
 
@@ -523,7 +568,8 @@ fn the_login_prints_the_authorize_url_it_wants_opened() {
     let home = TempDir::new().expect("a temporary directory should be creatable");
     let paths = Paths::with_config_dir(home.path().to_path_buf());
     let cancel = Cancel::new();
-    let login = Login { paths: &paths, manual: true, label: None, cancel: &cancel };
+    let login =
+        Login { paths: &paths, manual: true, label: None, live_identity: None, cancel: &cancel };
     let mut io = FakeIo::new("CODE-A");
 
     run_with(&login, &client_for(&server), &mut io).expect("the login should succeed");
@@ -562,4 +608,114 @@ fn a_profile_document_without_an_identity_changes_nothing() {
         Some("flat-account"),
         "a flat document is accepted too, since the shape was never captured"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `same identity as live` (`agentctl-p3-login-live-identity-warning-b90`)
+// ---------------------------------------------------------------------------
+
+/// The live identity a test declares, without touching the environment.
+fn live(account_uuid: &str, organization_uuid: Option<&str>) -> Identity {
+    Identity {
+        account_uuid: account_uuid.to_owned(),
+        organization_uuid: organization_uuid.map(str::to_owned),
+        email: Some("user@example.com".to_owned()),
+        org_name: None,
+    }
+}
+
+/// Runs one manual login against a mock exchange and returns the terminal.
+fn login_with_live(paths: &Paths, live_identity: Option<Identity>, server: &MockServer) -> FakeIo {
+    let cancel = Cancel::new();
+    let login = Login { paths, manual: true, label: None, live_identity, cancel: &cancel };
+    let mut io = FakeIo::new("CODE-LIVE");
+    run_with(&login, &client_for(server), &mut io).expect("the login should succeed");
+    io
+}
+
+#[test]
+fn b90_a_login_into_the_live_account_says_so_and_completes_anyway() {
+    // `agentctl-p3-login-live-identity-warning-b90` (login notices when the
+    // new identity is the live one's). Decision D-011: a second independent
+    // token pair for one account is a supported `use --new-only` setup, so
+    // the default is a sentence, not a refusal — the credential is written
+    // and the record recorded exactly as they would have been.
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(Method::POST).path("/v1/oauth/token");
+        then.status(200).json_body(exchange_response(Some(ACCOUNT), Some(ORGANIZATION)));
+    });
+
+    let home = TempDir::new().expect("a temporary directory should be creatable");
+    let paths = Paths::with_config_dir(home.path().to_path_buf());
+    let io = login_with_live(&paths, Some(live(ACCOUNT, Some(ORGANIZATION))), &server);
+
+    mock.assert();
+    let notice = io
+        .warned
+        .iter()
+        .find(|line| line.contains("Claude Code is signed in as"))
+        .unwrap_or_else(|| panic!("the notice should have been printed: {:?}", io.warned));
+    assert!(notice.contains(ACCOUNT), "the notice names the account: {notice}");
+    assert!(notice.contains("both stay valid"), "it says nothing broke: {notice}");
+    assert!(notice.contains("use --live"), "it names the command for a swap: {notice}");
+    assert!(!notice.contains("sk-ant-"), "no token material reaches the notice: {notice}");
+    assert!(
+        io.said.iter().all(|line| !line.contains("Claude Code is signed in as")),
+        "the notice is not on standard output: {:?}",
+        io.said
+    );
+
+    // And the login itself is untouched by it.
+    let ns_dir = paths.namespace_dir(ACCOUNT, ORGANIZATION);
+    assert!(ns_dir.join(file_store::CREDENTIALS_FILE).is_file(), "the credential was written");
+    assert!(
+        AgentctlConfig::load(&paths)
+            .expect("the registry should load")
+            .get(ACCOUNT, ORGANIZATION)
+            .is_some(),
+        "the account was recorded"
+    );
+}
+
+#[test]
+fn b90_a_login_into_a_different_account_says_nothing() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(Method::POST).path("/v1/oauth/token");
+        then.status(200).json_body(exchange_response(Some(ACCOUNT), Some(ORGANIZATION)));
+    });
+
+    let home = TempDir::new().expect("a temporary directory should be creatable");
+    let paths = Paths::with_config_dir(home.path().to_path_buf());
+
+    // Same organization, different account.
+    let other = login_with_live(
+        &paths,
+        Some(live("99999999-9999-4999-8999-999999999999", Some(ORGANIZATION))),
+        &server,
+    );
+    assert!(other.warned.is_empty(), "a different account is not a twin: {:?}", other.warned);
+
+    // Nothing at all says who is live.
+    let unknown = login_with_live(&paths, None, &server);
+    assert!(
+        unknown.warned.is_empty(),
+        "an unknown live account is not a match: {:?}",
+        unknown.warned
+    );
+}
+
+#[test]
+fn b90_an_organization_less_identity_matches_the_unknown_org_the_store_uses() {
+    // A blob that named no organization is stored under `_unknown-org`, and
+    // the comparison has to make the same substitution or the two halves of
+    // one account would never line up. The reverse — a live account with an
+    // organization against a login without one — must still not match.
+    assert!(is_live_identity(Some(&live(ACCOUNT, None)), ACCOUNT, UNKNOWN_ORG));
+    assert!(is_live_identity(Some(&live(ACCOUNT, Some(ORGANIZATION))), ACCOUNT, ORGANIZATION));
+    assert!(!is_live_identity(Some(&live(ACCOUNT, Some(ORGANIZATION))), ACCOUNT, UNKNOWN_ORG));
+    assert!(!is_live_identity(Some(&live(ACCOUNT, None)), ACCOUNT, ORGANIZATION));
+    assert!(!is_live_identity(Some(&live(ACCOUNT, None)), ORGANIZATION, UNKNOWN_ORG));
+    assert!(!is_live_identity(None, ACCOUNT, ORGANIZATION), "nothing known matches nothing");
 }

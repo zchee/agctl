@@ -69,6 +69,7 @@ fn healthy_row(account: &str) -> StatusRow {
         note: None,
         usage: Some(usage(healthy_windows(), CreditsState::Unavailable)),
         visible_by_default: true,
+        same_identity_as_live: false,
     }
 }
 
@@ -82,6 +83,7 @@ fn empty_row(account: &str, state: &str) -> StatusRow {
         note: None,
         usage: None,
         visible_by_default: true,
+        same_identity_as_live: false,
     }
 }
 
@@ -200,6 +202,7 @@ fn degraded_states_render_with_their_notes() {
         note: None,
         usage: Some(usage(Vec::new(), CreditsState::Unavailable)),
         visible_by_default: true,
+        same_identity_as_live: false,
     };
 
     insta::assert_snapshot!(
@@ -272,6 +275,7 @@ fn the_credits_cell_covers_every_state_the_column_can_reach() {
         note: None,
         usage: Some(usage(healthy_windows(), credits)),
         visible_by_default: true,
+        same_identity_as_live: false,
     })
     .collect();
 

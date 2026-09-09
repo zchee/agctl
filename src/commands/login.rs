@@ -45,7 +45,10 @@ use crate::error::AppError;
 use crate::provider::claude;
 use crate::provider::claude::credentials::Credentials;
 use crate::provider::claude::credentials::Digests;
+use crate::provider::claude::credentials::Identity;
+use crate::provider::claude::discovery;
 use crate::provider::claude::namespace;
+use crate::provider::claude::namespace::EnvView;
 use crate::provider::claude::oauth;
 use crate::provider::claude::oauth::OauthClient;
 use crate::provider::claude::oauth::OauthError;
@@ -68,6 +71,14 @@ pub struct Login<'a> {
     pub manual: bool,
     /// The label to record on the account.
     pub label: Option<&'a str>,
+    /// Who the live credentials belong to, when that is known.
+    ///
+    /// Resolved by [`run`] from `.claude.json` (see
+    /// [`discovery::live_identity`]) and carried in rather than read here, so
+    /// that a test can state the machine's live account instead of having to
+    /// change the process environment. `None` means "nothing on this machine
+    /// says who is live", which is never treated as a match.
+    pub live_identity: Option<Identity>,
     /// The process-wide cancellation flag.
     pub cancel: &'a Cancel,
 }
@@ -97,6 +108,17 @@ pub trait LoginIo {
     /// Returns [`AppError::Config`] when there is no terminal to ask at, which
     /// is how a non-interactive run refuses to overwrite (AC41).
     fn confirm(&mut self, question: &str) -> Result<bool, AppError>;
+
+    /// Writes a line the user should read but that no consumer of this
+    /// command's output should have to parse.
+    ///
+    /// Standard error, not standard output: [`LoginIo::tell`] carries the
+    /// authorize URL and the closing "Logged in as …" line, and a script that
+    /// scrapes either of those must not have a new sentence appear in the
+    /// middle of them.
+    fn warn(&mut self, message: &str) {
+        eprintln!("{message}");
+    }
 }
 
 /// Suppresses the browser launch, so the end-to-end suite can drive a real
@@ -169,7 +191,13 @@ impl LoginIo for Terminal {
 pub fn run(config_dir: Option<&Path>, args: &LoginArgs, cancel: &Cancel) -> Result<(), AppError> {
     let paths = Paths::resolve(config_dir)?;
     let client = OauthClient::from_env(&claude::user_agent())?;
-    let login = Login { paths: &paths, manual: args.manual, label: args.label.as_deref(), cancel };
+    let login = Login {
+        paths: &paths,
+        manual: args.manual,
+        label: args.label.as_deref(),
+        live_identity: discovery::live_identity(&EnvView::from_process()),
+        cancel,
+    };
     run_with(&login, &client, &mut Terminal)
 }
 
@@ -244,6 +272,10 @@ pub fn run_with(
         identity.organization_uuid.clone().unwrap_or_else(|| UNKNOWN_ORG.to_owned());
     validate_segment(&account_uuid)?;
     validate_segment(&organization_uuid)?;
+
+    if is_live_identity(login.live_identity.as_ref(), &account_uuid, &organization_uuid) {
+        io.warn(&same_identity_notice(&account_uuid, &organization_uuid));
+    }
 
     if AgentctlConfig::load(login.paths)?.get(&account_uuid, &organization_uuid).is_some() {
         let question = format!(
@@ -335,6 +367,43 @@ pub fn run_with(
         None => io.tell(&format!("Logged in ({id}).")),
     }
     Ok(())
+}
+
+/// Whether the account just authorized is the one Claude Code is using.
+///
+/// UUIDs only, on both sides. The live credential is never read, let alone
+/// compared: two token pairs for one account are *supposed* to differ, so a
+/// comparison of token material would answer a question nobody asked and
+/// would put a second credential in this process's memory to do it.
+///
+/// The organization is compared after the same [`UNKNOWN_ORG`] substitution
+/// the namespace path gets, so a live account whose blob named no
+/// organization matches a login that also named none — they are one account,
+/// and the store would put them in one directory.
+pub fn is_live_identity(
+    live: Option<&Identity>,
+    account_uuid: &str,
+    organization_uuid: &str,
+) -> bool {
+    let Some(live) = live else { return false };
+    let live_org = live.organization_uuid.as_deref().unwrap_or(UNKNOWN_ORG);
+    live.account_uuid == account_uuid && live_org == organization_uuid
+}
+
+/// The sentence a login into the live account prints.
+///
+/// It says the thing a user seeing their own address twice actually needs to
+/// know — that nothing was broken by doing this — and then names the command
+/// for the other intent, swapping which credential Claude Code itself uses
+/// (decision D-018). Two independent token pairs for one account is a
+/// supported setup, not a mistake, so this is a notice and not a warning:
+/// the login proceeds exactly as it would have.
+fn same_identity_notice(account_uuid: &str, organization_uuid: &str) -> String {
+    format!(
+        "Note: `{account_uuid}/{organization_uuid}` is the account Claude Code is signed in as \
+         right now. This login mints a second, independent session; both stay valid. To hand \
+         Claude Code a different account instead, use `agentctl claude use --live <id>`."
+    )
 }
 
 /// Writes one account into the registry.

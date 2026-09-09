@@ -249,7 +249,44 @@ pub fn collect(
     // Results arrive in completion order; the table is in discovery order, so
     // that two runs of `status` on an unchanged machine look the same.
     outcomes.sort_by_key(|outcome| outcome.index);
+    mark_same_identity(&mut outcomes);
     Ok(outcomes)
+}
+
+/// Marks every `Owned` row whose identity is the live credential's.
+///
+/// Why it happens here rather than per row: the answer is not a property of
+/// one account, it is a comparison between two rows, and no worker can see
+/// another's. Doing it once the pass has finished also costs nothing — both
+/// identities are already in hand, so there is no second keychain read, no
+/// second `.claude.json` parse, and no token is compared or even touched.
+/// Only the two UUIDs are.
+///
+/// A live row with no identity (`account_uuid` empty — the keychain was
+/// locked, or the blob and `.claude.json` both named nobody) matches nothing:
+/// "we could not tell who is live" is not evidence that this account is.
+fn mark_same_identity(outcomes: &mut [RowOutcome]) {
+    let live: Vec<(String, String)> = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome.record.kind, AccountKind::Live))
+        .filter(|outcome| !outcome.record.account_uuid.is_empty())
+        .map(|outcome| {
+            (outcome.record.account_uuid.clone(), outcome.record.organization_uuid.clone())
+        })
+        .collect();
+    if live.is_empty() {
+        return;
+    }
+
+    for outcome in outcomes.iter_mut() {
+        // `Owned` alone: a `config_dir` or `foreign` row is somebody else's
+        // item, and a live row is not its own twin.
+        if !matches!(outcome.record.kind, AccountKind::Owned { .. }) {
+            continue;
+        }
+        let key = (outcome.record.account_uuid.clone(), outcome.record.organization_uuid.clone());
+        outcome.same_identity_as_live = live.contains(&key);
+    }
 }
 
 /// Builds the `StatusReport v1` document from a finished pass.
@@ -461,6 +498,10 @@ pub struct RowOutcome {
     pub usage: Option<UsageSnapshot>,
     /// Whether the row appears without `--all`.
     pub visible_by_default: bool,
+    /// Whether an `Owned` row names the same `(account, organization)` pair
+    /// as the live credential, decided by [`mark_same_identity`] once every
+    /// row of the pass exists.
+    pub same_identity_as_live: bool,
 }
 
 impl RowOutcome {
@@ -473,6 +514,7 @@ impl RowOutcome {
             note: self.note.clone(),
             usage: self.usage.clone(),
             visible_by_default: self.visible_by_default,
+            same_identity_as_live: self.same_identity_as_live,
         }
     }
 
@@ -495,6 +537,7 @@ impl RowOutcome {
             session_reset: json::session_reset_of(usage),
             weekly_reset: json::weekly_reset_of(usage),
             note: self.note.clone(),
+            same_identity_as: self.same_identity_as_live.then_some(json::SAME_IDENTITY_LIVE),
         }
     }
 }
@@ -536,6 +579,7 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
         note,
         usage: None,
         visible_by_default,
+        same_identity_as_live: false,
     };
 
     let now_ms = now_ms();

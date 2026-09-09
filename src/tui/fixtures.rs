@@ -58,6 +58,7 @@ pub fn row(index: usize, account: &str, state: AccountState) -> RowOutcome {
         note: None,
         usage: None,
         visible_by_default: true,
+        same_identity_as_live: false,
     }
 }
 

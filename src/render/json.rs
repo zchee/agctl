@@ -50,6 +50,14 @@ pub const REPORT_VERSION: u32 = 1;
 /// about.
 pub const CREDITS_SCOPE: &str = "organization";
 
+/// The value [`JsonRow::same_identity_as`] carries when the row's identity is
+/// the live credential's.
+///
+/// A token rather than a boolean because the question it answers is "the same
+/// as *what*": a later build that can also say `owned` adds a value here
+/// instead of a second member.
+pub const SAME_IDENTITY_LIVE: &str = "live";
+
 /// One whole `status --json` document.
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusReport {
@@ -124,6 +132,18 @@ pub struct JsonRow {
     pub weekly_reset: Option<String>,
     /// The short explanation the table appends to the state.
     pub note: Option<String>,
+    /// Which other credential source on this machine holds the same
+    /// `(account_uuid, organization_uuid)` pair as this row:
+    /// [`SAME_IDENTITY_LIVE`], or `None` when no other does.
+    ///
+    /// Additive next to the members around it, and present on every row
+    /// rather than only on the matching ones, for the reason
+    /// [`JsonCredits`] is: a consumer testing the member gets an answer
+    /// instead of having to tell an absent member from a null one. The rows
+    /// themselves are unchanged — this says two of them describe one account,
+    /// it does not merge them — because each is still a separate token pair
+    /// that expires, refreshes and can be revoked on its own.
+    pub same_identity_as: Option<&'static str>,
 }
 
 /// One usage window.

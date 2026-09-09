@@ -1887,3 +1887,125 @@ fn ac8_a_row_keyed_by_a_service_name_caches_like_any_other() {
         "the cached numbers are rendered rather than an empty row"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `same identity as live` (`agentctl-p3-login-live-identity-warning-b90`)
+// ---------------------------------------------------------------------------
+
+/// A second owned account, so "only the matching row is marked" is a claim
+/// about a choice rather than about the only row in the table.
+const OTHER_ACCT: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+/// Its organization.
+const OTHER_ORG: &str = "ffffffff-0000-1111-2222-333333333333";
+
+/// `owned_config`, plus a second owned account that is nobody's twin.
+fn owned_config_with_stranger(store: &Store) -> AgentctlConfig {
+    let mut config = owned_config(store);
+    let ns_dir = store.paths.namespace_dir(OTHER_ACCT, OTHER_ORG);
+    let spelling = export_spelling(&ns_dir);
+    let mut record = new_record(
+        OTHER_ACCT.to_owned(),
+        OTHER_ORG.to_owned(),
+        AccountKind::Owned { export_sha8: sha8(&spelling), export_spelling: spelling },
+    )
+    .expect("the fixture identifiers are valid path segments");
+    record.email = Some("stranger@example.com".to_owned());
+    config.upsert(record);
+    config
+}
+
+/// The one row of `kind`, by account UUID.
+fn row_for<'a>(rows: &'a [RowOutcome], kind: &str, account_uuid: &str) -> &'a RowOutcome {
+    rows.iter()
+        .find(|row| row.record.kind.name() == kind && row.record.account_uuid == account_uuid)
+        .unwrap_or_else(|| panic!("a `{kind}` row for `{account_uuid}` should exist"))
+}
+
+#[test]
+fn b90_the_owned_twin_of_the_live_account_is_marked_and_nothing_else_is() {
+    // `agentctl-p3-login-live-identity-warning-b90` (status marks the Owned
+    // row when its identity is the live one's). One account, two independent
+    // token pairs — a legitimate `use --new-only` setup (decision D-011) —
+    // renders as two rows carrying one email address, which is the confusion
+    // the note exists to resolve. The tokens deliberately differ: sameness of
+    // *identity* is the claim, and nothing here compares token material.
+    let store = store();
+    let server = MockServer::start();
+    usage_ok(&server);
+
+    write_credential_file(&store, &blob("sk-ant-oat01-owned", "sk-ant-ort01-owned", fresh_at()));
+    let config = owned_config_with_stranger(&store);
+    let live_blob = blob("sk-ant-oat01-live", "sk-ant-ort01-live", fresh_at());
+    let reader = reader_with(&[(LIVE_SERVICE.to_owned(), live_blob)]);
+    let found = discover_with(&store, &config, &reader);
+    let outcomes = pass(&store, &server, found, Setup::new(&server));
+
+    let twin = row_for(&outcomes, "owned", ACCT);
+    let live = row_for(&outcomes, "live", ACCT);
+    let stranger = row_for(&outcomes, "owned", OTHER_ACCT);
+    assert!(twin.same_identity_as_live, "the owned row names the live account");
+    assert!(!live.same_identity_as_live, "the live row is not its own twin");
+    assert!(!stranger.same_identity_as_live, "a different account is not marked");
+
+    // The table says it in the state cell, next to the state it qualifies.
+    let report = Report {
+        rows: outcomes.iter().map(RowOutcome::to_status_row).collect(),
+        now: Timestamp::now(),
+        tz: TimeZone::UTC,
+        show_all: false,
+    };
+    let rendered = table::render(&report);
+    assert_eq!(
+        rendered.matches(crate::render::SAME_IDENTITY_NOTE).count(),
+        1,
+        "exactly one row carries the note:\n{rendered}"
+    );
+
+    // The document says it per row, and every row answers the question.
+    let value = document(&outcomes, false, false);
+    let rows = value["rows"].as_array().expect("rows is an array");
+    let marked: Vec<&serde_json::Value> =
+        rows.iter().filter(|row| row["same_identity_as"] == json!("live")).collect();
+    assert_eq!(marked.len(), 1, "one marked row: {value:#}");
+    assert_eq!(marked[0]["kind"], json!("owned"));
+    assert_eq!(marked[0]["account_uuid"], json!(ACCT));
+    assert_eq!(marked[0]["organization_uuid"], json!(ORG));
+    for row in rows.iter().filter(|row| row["account_uuid"] != json!(ACCT)) {
+        assert_eq!(row["same_identity_as"], json!(null), "an unrelated row: {row:#}");
+    }
+    // The live row itself is present, unmarked, and still its own row: the
+    // marking says two rows describe one account, it does not merge them.
+    assert!(
+        rows.iter().any(|row| row["kind"] == json!("live") && row["same_identity_as"].is_null()),
+        "the live row is unmarked: {value:#}"
+    );
+}
+
+#[test]
+fn b90_a_live_row_with_no_identity_marks_nothing() {
+    // The keychain holds no live item and no `.claude.json` names an account,
+    // so the live row's `account_uuid` is empty. "We could not tell who is
+    // live" must not read as "this account is", which an unguarded string
+    // comparison against the empty account UUID would eventually make it.
+    let store = store();
+    let server = MockServer::start();
+    usage_ok(&server);
+
+    write_credential_file(&store, &blob("sk-ant-oat01-owned", "sk-ant-ort01-owned", fresh_at()));
+    let config = owned_config(&store);
+    let found = discover_with(&store, &config, &FakeReader::unlocked());
+    let outcomes = pass(&store, &server, found, Setup::new(&server));
+
+    assert!(
+        outcomes
+            .iter()
+            .any(|row| row.record.kind.name() == "live" && row.record.account_uuid.is_empty()),
+        "the live row has no identity to compare"
+    );
+    assert!(!row_for(&outcomes, "owned", ACCT).same_identity_as_live);
+    let value = document(&outcomes, false, false);
+    for row in value["rows"].as_array().expect("rows is an array") {
+        assert_eq!(row["same_identity_as"], json!(null), "nothing is marked: {row:#}");
+    }
+}

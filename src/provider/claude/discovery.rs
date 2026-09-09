@@ -154,6 +154,24 @@ pub fn discover(
     Discovery { rows, preflight, listing }
 }
 
+/// Who the live credentials belong to, from `.claude.json` alone (fact F33).
+///
+/// For a caller that wants the live *identity* and has no business holding
+/// the live *credential* — `login`, which needs to know whether the account
+/// it has just authorized is the one already in use. [`live_row`] prefers the
+/// keychain blob's own identity and falls back to this; a caller that is not
+/// building a row deliberately does not get that first half, because reading
+/// the item means reading a token pair, and a notice is not worth a
+/// credential read (nor the subprocess, nor the prompt on a locked keychain).
+///
+/// The two answers can differ only between a login through Claude Code and
+/// its next write of `.claude.json`, and the cost of being wrong in that
+/// window is a notice that is printed or omitted, so the weaker source is the
+/// right one here.
+pub fn live_identity(env: &EnvView) -> Option<Identity> {
+    claude_json_identity(&namespace::claude_json_path(env))
+}
+
 /// Builds the row for whatever Claude Code is using right now.
 fn live_row(
     service: &str,

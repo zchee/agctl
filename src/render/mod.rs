@@ -21,6 +21,15 @@ use jiff::tz::TimeZone;
 
 use crate::usage::model::UsageSnapshot;
 
+/// What the `State` column appends to a row whose account and organization
+/// UUIDs are the live credential's.
+///
+/// A note rather than a state, because it is not a problem: two independent
+/// token pairs for one account are a legitimate `use --new-only` setup
+/// (decision D-011), and both sessions stay valid. What the reader needs is
+/// the reason the same address appears twice.
+pub const SAME_IDENTITY_NOTE: &str = "same identity as live";
+
 /// One account, ready to render.
 #[derive(Debug, Clone)]
 pub struct StatusRow {
@@ -40,14 +49,31 @@ pub struct StatusRow {
     pub usage: Option<UsageSnapshot>,
     /// Whether the row appears without `--all`.
     pub visible_by_default: bool,
+    /// Whether this row's `(account, organization)` pair is the live
+    /// credential's, which is what puts [`SAME_IDENTITY_NOTE`] in the state
+    /// cell.
+    pub same_identity_as_live: bool,
 }
 
 impl StatusRow {
-    /// The state column's full text: the state, then the note in parentheses.
+    /// The state column's full text: the state, then its notes in parentheses.
+    ///
+    /// Two notes are joined with a semicolon rather than one replacing the
+    /// other: a row can be both `expired` for a stated reason and the live
+    /// account's twin, and dropping either would answer half the reader's
+    /// question.
     pub fn state_cell(&self) -> String {
-        match &self.note {
-            Some(note) if !note.is_empty() => format!("{} ({note})", self.state),
-            _ => self.state.clone(),
+        let mut notes: Vec<&str> = Vec::new();
+        if let Some(note) = self.note.as_deref().filter(|note| !note.is_empty()) {
+            notes.push(note);
+        }
+        if self.same_identity_as_live {
+            notes.push(SAME_IDENTITY_NOTE);
+        }
+        if notes.is_empty() {
+            self.state.clone()
+        } else {
+            format!("{} ({})", self.state, notes.join("; "))
         }
     }
 }

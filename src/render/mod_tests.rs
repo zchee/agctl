@@ -13,6 +13,7 @@ fn row(account: &str, visible: bool) -> StatusRow {
         note: None,
         usage: None,
         visible_by_default: visible,
+        same_identity_as_live: false,
     }
 }
 
@@ -26,6 +27,7 @@ fn empty_row(account: &str, state: &str) -> StatusRow {
         note: None,
         usage: None,
         visible_by_default: true,
+        same_identity_as_live: false,
     }
 }
 
@@ -68,6 +70,32 @@ fn a_note_is_appended_to_the_state_in_parentheses() {
 
     row.note = Some(String::new());
     assert_eq!(row.state_cell(), "ok", "an empty note adds no empty parentheses");
+}
+
+#[test]
+fn the_same_identity_note_joins_the_row_s_own_note_rather_than_replacing_it() {
+    // `agentctl-p3-login-live-identity-warning-b90`: a row can be both in a
+    // state that needs explaining and the live account's twin, and a reader
+    // who is told only one of the two has been told the less useful half.
+    let mut row = row("alice", true);
+    assert_eq!(row.state_cell(), "ok");
+
+    row.same_identity_as_live = true;
+    assert_eq!(row.state_cell(), format!("ok ({SAME_IDENTITY_NOTE})"));
+
+    row.note = Some("the stored credential is gone".to_owned());
+    assert_eq!(
+        row.state_cell(),
+        format!("ok (the stored credential is gone; {SAME_IDENTITY_NOTE})"),
+        "the row's own note comes first: it is about this row, the marker is about two"
+    );
+
+    row.same_identity_as_live = false;
+    assert_eq!(
+        row.state_cell(),
+        "ok (the stored credential is gone)",
+        "an unmarked row renders exactly as it did before the marker existed"
+    );
 }
 
 #[test]

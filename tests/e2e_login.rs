@@ -299,3 +299,101 @@ fn ac27_sigterm_with_a_staged_write_removes_the_temporary_file() {
         "emergency cleanup removed the temporary file holding the new refresh token"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `same identity as live` (`agentctl-p3-login-live-identity-warning-b90`)
+// ---------------------------------------------------------------------------
+
+/// Writes a `.claude.json` naming `acct`/`org` as the signed-in account.
+///
+/// The file Claude Code keeps its `oauthAccount` in (fact F33), which is
+/// where `login` learns who is live. Deliberately not the keychain: a notice
+/// is not worth reading a token pair, and this way a `login` still touches no
+/// credential but the one it is minting.
+fn claude_json(fixture: &Fixture, acct: &str, org: &str) {
+    fs::write(
+        fixture.home().join(".claude.json"),
+        json!({
+            "oauthAccount": {
+                "accountUuid": acct,
+                "emailAddress": "user@example.com",
+                "organizationUuid": org,
+                "organizationName": "Example Org",
+            }
+        })
+        .to_string(),
+    )
+    .expect("`.claude.json` should be writable");
+}
+
+#[test]
+fn b90_a_login_into_the_live_account_notices_on_stderr_and_still_logs_in() {
+    // `agentctl-p3-login-live-identity-warning-b90` (login notices when the
+    // new identity is the live one's), through the binary. Standard error, so
+    // that the "Logged in as …" line a script may be reading stays the only
+    // new thing on standard output; exit 0 and a credential on disk, because
+    // a second independent session of one account is a supported setup
+    // (decision D-011) and the default must not refuse it.
+    let server = MockServer::start();
+    let token = exchange(&server, Some(EXCHANGE_ORG));
+
+    let mut fixture = Fixture::new();
+    fixture.endpoints(&server.base_url());
+    claude_json(&fixture, EXCHANGE_ACCT, EXCHANGE_ORG);
+
+    let mut session = common::start_login(&fixture, &[], &[]);
+    let state = session.state.clone();
+    session.paste(&format!("minted-code#{state}"));
+    let finished = session.finish();
+
+    assert_eq!(finished.code(), 0, "the login completes: stderr:\n{}", finished.stderr);
+    assert_eq!(token.calls(), 1);
+    assert!(
+        finished.stderr.contains("Claude Code is signed in as"),
+        "the notice is on standard error:\n{}",
+        finished.stderr
+    );
+    assert!(finished.stderr.contains(EXCHANGE_ACCT), "it names the account:\n{}", finished.stderr);
+    assert!(
+        finished.stderr.contains("use --live"),
+        "it names the command that swaps instead:\n{}",
+        finished.stderr
+    );
+    assert!(
+        !finished.stdout.contains("Claude Code is signed in as"),
+        "and not on standard output:\n{}",
+        finished.stdout
+    );
+    assert!(
+        finished.stdout.contains("Logged in as user@example.com"),
+        "the usual closing line is unchanged:\n{}",
+        finished.stdout
+    );
+    assert!(
+        fixture.ns_dir(EXCHANGE_ACCT, EXCHANGE_ORG).join(".credentials.json").is_file(),
+        "the credential was written exactly as it would have been"
+    );
+}
+
+#[test]
+fn b90_a_login_into_another_account_says_nothing_about_the_live_one() {
+    let server = MockServer::start();
+    exchange(&server, Some(EXCHANGE_ORG));
+
+    let mut fixture = Fixture::new();
+    fixture.endpoints(&server.base_url());
+    // Somebody else is live, so there is nothing to say.
+    claude_json(&fixture, "99999999-9999-4999-8999-999999999999", EXCHANGE_ORG);
+
+    let mut session = common::start_login(&fixture, &[], &[]);
+    let state = session.state.clone();
+    session.paste(&format!("minted-code#{state}"));
+    let finished = session.finish();
+
+    assert_eq!(finished.code(), 0, "stderr:\n{}", finished.stderr);
+    assert!(
+        !finished.stderr.contains("Claude Code is signed in as"),
+        "no notice for a different account:\n{}",
+        finished.stderr
+    );
+}

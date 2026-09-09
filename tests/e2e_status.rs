@@ -823,3 +823,121 @@ fn ac48_an_unavailable_flock_stops_the_refresh() {
         "nothing was staged"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `same identity as live` (`agentctl-p3-login-live-identity-warning-b90`)
+// ---------------------------------------------------------------------------
+
+/// A second owned account, so "absent elsewhere" is a claim about a choice
+/// and not about the only other row in the table.
+const STRANGER_ACCT: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+/// Its organization.
+const STRANGER_ORG: &str = "ffffffff-0000-4111-8222-333333333333";
+
+/// A live keychain item and two owned namespaces: one the live account's
+/// twin, one a stranger.
+fn twin_fixture(server: &MockServer) -> Fixture {
+    usage_ok(server);
+
+    let mut fixture = Fixture::new();
+    fixture.with_keychain().endpoints(&server.base_url());
+    fixture.dump(&[LIVE_SERVICE]);
+    // The live item and the owned file name one account and carry different
+    // token pairs, which is what a second `login` leaves behind: two
+    // independent sessions, one identity.
+    fixture.keychain_item(
+        LIVE_SERVICE,
+        &common::blob("sk-ant-oat01-live", "sk-ant-ort01-live", common::fresh_at()),
+    );
+    fixture.write_registry(vec![
+        fixture.owned_record(ACCT, ORG),
+        fixture.owned_record(STRANGER_ACCT, STRANGER_ORG),
+    ]);
+    fixture.write_credentials(
+        ACCT,
+        ORG,
+        &common::blob("sk-ant-oat01-owned", "sk-ant-ort01-owned", common::fresh_at()),
+    );
+    fixture.write_credentials(
+        STRANGER_ACCT,
+        STRANGER_ORG,
+        &common::identified_blob(
+            "sk-ant-oat01-stranger",
+            "sk-ant-ort01-stranger",
+            common::fresh_at(),
+            STRANGER_ACCT,
+            Some(STRANGER_ORG),
+        ),
+    );
+    fixture
+}
+
+#[test]
+fn b90_the_table_marks_only_the_owned_row_that_is_the_live_account() {
+    // `agentctl-p3-login-live-identity-warning-b90` (status marks the Owned
+    // row when its identity is the live one's), through the binary. The
+    // symptom this answers is one email address appearing on two rows with no
+    // explanation; the note is in the State column, next to the state it
+    // qualifies, and it costs no extra keychain read — both identities were
+    // already in the pass.
+    let server = MockServer::start();
+    let fixture = twin_fixture(&server);
+
+    let assert = fixture.cmd().args(["claude", "status"]).assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is UTF-8");
+
+    assert_eq!(
+        stdout.matches("same identity as live").count(),
+        1,
+        "exactly one row carries the note:\n{stdout}"
+    );
+    let marked = stdout
+        .lines()
+        .find(|line| line.contains("same identity as live"))
+        .unwrap_or_else(|| panic!("the marked row should be rendered:\n{stdout}"));
+    assert!(marked.contains(EMAIL), "it is the owned twin's row: {marked}");
+    assert!(!marked.contains("sk-ant"), "no token material reaches the table: {marked}");
+    fixture.assert_keychain_read_only();
+}
+
+#[test]
+fn b90_the_json_report_names_the_live_twin_and_leaves_every_other_row_null() {
+    let server = MockServer::start();
+    let fixture = twin_fixture(&server);
+
+    let assert = fixture.cmd().args(["claude", "status", "--json"]).assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is UTF-8");
+    let document: Value = serde_json::from_str(&stdout).expect("the report is JSON");
+    let rows = document["rows"].as_array().expect("rows is an array");
+
+    // One object per credential source, unchanged: the member says two rows
+    // describe one account, it does not merge them.
+    assert!(
+        rows.iter().any(|row| row["kind"] == json!("live")),
+        "the live row is still its own row:\n{stdout}"
+    );
+
+    let marked: Vec<&Value> =
+        rows.iter().filter(|row| row["same_identity_as"] == json!("live")).collect();
+    assert_eq!(marked.len(), 1, "one marked row:\n{stdout}");
+    assert_eq!(marked[0]["kind"], json!("owned"));
+    assert_eq!(marked[0]["account_uuid"], json!(ACCT));
+    assert_eq!(marked[0]["organization_uuid"], json!(ORG));
+
+    for row in rows
+        .iter()
+        .filter(|row| row["kind"] != json!("owned") || row["account_uuid"] != json!(ACCT))
+    {
+        assert_eq!(row["same_identity_as"], json!(null), "an unrelated row:\n{row:#}");
+    }
+    // Every row answers the question, so a consumer never has to tell an
+    // absent member from a null one.
+    for row in rows {
+        assert!(
+            row.as_object().expect("a row is an object").contains_key("same_identity_as"),
+            "the member is present on every row:\n{row:#}"
+        );
+    }
+    fixture.assert_keychain_read_only();
+}
