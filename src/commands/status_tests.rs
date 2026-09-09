@@ -1258,6 +1258,10 @@ fn document(outcomes: &[RowOutcome], show_all: bool, raw: bool) -> serde_json::V
     let report = Report {
         rows: outcomes.iter().map(RowOutcome::to_status_row).collect(),
         now: Timestamp::now(),
+        // UTC rather than the machine's zone: the document carries RFC 3339
+        // instants and nothing here renders a local time, so a test that read
+        // `TZ` would only be able to fail somewhere else.
+        tz: TimeZone::UTC,
         show_all,
     };
     let document = json_report(outcomes, &report, raw);
@@ -1434,6 +1438,7 @@ fn the_rendered_table_carries_the_row_the_pass_produced() {
     let report = Report {
         rows: outcomes.iter().map(RowOutcome::to_status_row).collect(),
         now: Timestamp::now(),
+        tz: TimeZone::UTC,
         show_all: false,
     };
     let rendered = table::render(&report);
@@ -1482,6 +1487,7 @@ fn credits_ride_on_the_same_response_the_windows_came_from() {
     let report = Report {
         rows: outcomes.iter().map(RowOutcome::to_status_row).collect(),
         now: Timestamp::now(),
+        tz: TimeZone::UTC,
         show_all: false,
     };
     let rendered = table::render(&report);

@@ -29,7 +29,11 @@ use httpmock::Method::GET;
 use httpmock::Method::POST;
 use httpmock::Mock;
 use httpmock::MockServer;
+use jiff::Timestamp;
+use jiff::civil::Weekday;
+use jiff::tz::TimeZone;
 use predicates::str::contains;
+use serde_json::Value;
 use serde_json::json;
 
 /// The mock that answers a usage GET with the captured body.
@@ -38,6 +42,212 @@ fn usage_ok(server: &MockServer) -> Mock<'_> {
         when.method(GET).path(USAGE_PATH);
         then.status(200).body(USAGE_BODY);
     })
+}
+
+// ---------------------------------------------------------------------------
+// The two reset columns (user request of 2026-09-09)
+// ---------------------------------------------------------------------------
+//
+// The binary has no clock seam — `commands::status` stamps the report with
+// `Timestamp::now()` — so these tests move the *fixture* instead: the captured
+// body's `resets_at` values are rewritten relative to the moment the test
+// starts. That makes both halves of the cell exactly assertable, the countdown
+// because the offsets are chosen to floor to a constant and the clock time
+// because it is derived from the same instant the fixture carries.
+
+/// How far ahead the five-hour reset is placed, in milliseconds: 1h12m30s.
+///
+/// The thirty seconds are slack. `render_countdown` floors, so a reset exactly
+/// 1h12m out would render `1h11m` as soon as the binary's clock read later
+/// than the test's; half a minute of headroom keeps `1h12m` exact without
+/// making the assertion depend on how fast the process starts.
+const SESSION_AHEAD_MS: i64 = 3_600_000 + 12 * 60_000 + 30_000;
+
+/// How far ahead the seven-day reset is placed: 2d6h30m, same slack.
+const WEEKLY_AHEAD_MS: i64 = 2 * 86_400_000 + 6 * 3_600_000 + 30 * 60_000;
+
+/// `Timestamp::now()`, truncated to a whole second.
+///
+/// Both halves of the cell are minute-resolution, and a whole second keeps the
+/// RFC 3339 spellings this test compares readable in a failure message.
+fn now_to_the_second() -> Timestamp {
+    let now = Timestamp::now();
+    Timestamp::from_second(now.as_second()).expect("a truncated `now` is still a timestamp")
+}
+
+/// `now` plus `millis`.
+fn ahead(now: Timestamp, millis: i64) -> Timestamp {
+    Timestamp::from_millisecond(now.as_millisecond() + millis)
+        .expect("a few days from now is still a timestamp")
+}
+
+/// The captured usage body with its resets moved to `session_at` and
+/// `weekly_at`.
+///
+/// The capture's own values are absolute instants from the day it was taken,
+/// so a countdown asserted against them would read differently every day and
+/// eventually just `now`. Only those fields move; every other byte is the real
+/// response.
+fn usage_body_resetting_at(session_at: Timestamp, weekly_at: Timestamp) -> String {
+    let mut body: Value =
+        serde_json::from_str(USAGE_BODY).expect("the captured usage body is valid JSON");
+    body["five_hour"]["resets_at"] = json!(session_at.to_string());
+    body["seven_day"]["resets_at"] = json!(weekly_at.to_string());
+    for limit in body["limits"].as_array_mut().expect("the captured body carries `limits`") {
+        let moved = if limit["kind"] == json!("session") { session_at } else { weekly_at };
+        limit["resets_at"] = json!(moved.to_string());
+    }
+    body.to_string()
+}
+
+/// The cell a reset column should carry for `at`, seen from `tz`.
+///
+/// Derived from `Zoned`'s own components rather than through the `strftime`
+/// format the renderer uses, so this is a second derivation of the answer and
+/// not the implementation restated. The prefix rule is only half-applied: both
+/// instants are inside a week of each other by construction, so the date form
+/// cannot arise here (the unit tests in `src/render/reset_tests.rs` cover it).
+fn expected_cell(now: Timestamp, at: Timestamp, tz: &TimeZone, countdown: &str) -> String {
+    let now_local = now.to_zoned(tz.clone());
+    let at_local = at.to_zoned(tz.clone());
+    let hour = match at_local.hour() % 12 {
+        0 => 12,
+        hour => hour,
+    };
+    let meridiem = if at_local.hour() < 12 { "AM" } else { "PM" };
+    let clock = format!("{hour}:{:02} {meridiem}", at_local.minute());
+    if now_local.date() == at_local.date() {
+        format!("{clock} ({countdown})")
+    } else {
+        format!("{} {clock} ({countdown})", weekday(at_local.weekday()))
+    }
+}
+
+/// The abbreviation `%a` produces, spelled out rather than borrowed.
+fn weekday(day: Weekday) -> &'static str {
+    match day {
+        Weekday::Monday => "Mon",
+        Weekday::Tuesday => "Tue",
+        Weekday::Wednesday => "Wed",
+        Weekday::Thursday => "Thu",
+        Weekday::Friday => "Fri",
+        Weekday::Saturday => "Sat",
+        Weekday::Sunday => "Sun",
+    }
+}
+
+/// A fixture holding one fresh owned account, answering usage with `body`.
+fn owned_fixture(server: &MockServer, body: String) -> Fixture {
+    server.mock(|when, then| {
+        when.method(GET).path(USAGE_PATH);
+        then.status(200).body(body);
+    });
+
+    let mut fixture = Fixture::new();
+    fixture.endpoints(&server.base_url());
+    fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
+    fixture.write_credentials(
+        ACCT,
+        ORG,
+        &common::blob("sk-ant-oat01-fresh", "sk-ant-ort01-fresh", common::fresh_at()),
+    );
+    fixture
+}
+
+#[test]
+fn the_reset_columns_are_printed_in_the_zone_tz_selects() {
+    // The user's request of 2026-09-09: each reset column says *when* the
+    // window rolls over, not only how long is left. "When" is a local time, so
+    // the run has to honour `TZ` — and the same two instants must print
+    // differently in Tokyo and in UTC, which is the assertion at the end.
+    let now = now_to_the_second();
+    let session_at = ahead(now, SESSION_AHEAD_MS);
+    let weekly_at = ahead(now, WEEKLY_AHEAD_MS);
+
+    let server = MockServer::start();
+    let fixture = owned_fixture(&server, usage_body_resetting_at(session_at, weekly_at));
+
+    let tokyo = TimeZone::get("Asia/Tokyo").expect("the platform tzdb should know Asia/Tokyo");
+    let tokyo_session = expected_cell(now, session_at, &tokyo, "1h12m");
+    let tokyo_weekly = expected_cell(now, weekly_at, &tokyo, "2d6h");
+    let utc_session = expected_cell(now, session_at, &TimeZone::UTC, "1h12m");
+    let utc_weekly = expected_cell(now, weekly_at, &TimeZone::UTC, "2d6h");
+    assert_ne!(
+        tokyo_session, utc_session,
+        "+09:00 and UTC cannot spell the same clock time, so this test can tell them apart"
+    );
+
+    let assert = fixture
+        .cmd()
+        .env("TZ", "Asia/Tokyo")
+        .args(["claude", "status", "--account", EMAIL])
+        .assert()
+        .success()
+        .stdout(contains("5h reset"))
+        .stdout(contains("Weekly reset"))
+        .stdout(contains(tokyo_session.clone()))
+        .stdout(contains(tokyo_weekly.clone()));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is UTF-8");
+    assert!(!stdout.contains("Next reset"), "the countdown-only column is gone:\n{stdout}");
+    assert!(
+        !stdout.contains(&utc_session),
+        "the `TZ=Asia/Tokyo` run printed a UTC clock time:\n{stdout}"
+    );
+
+    // The same fixture, the other zone. Nothing about the fetch changed, so
+    // this run may well be served from the 300 s cache — which is the point:
+    // the zone decides the rendering and nothing else.
+    let assert = fixture
+        .cmd()
+        .env("TZ", "UTC")
+        .args(["claude", "status", "--account", EMAIL])
+        .assert()
+        .success()
+        .stdout(contains(utc_session))
+        .stdout(contains(utc_weekly));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is UTF-8");
+    assert!(!stdout.contains(&tokyo_session), "`TZ=UTC` was ignored:\n{stdout}");
+    fixture.assert_keychain_read_only();
+}
+
+#[test]
+fn the_json_report_carries_each_named_windows_own_reset() {
+    // The document keeps every instant in UTC — the local rendering is the
+    // table's business — and `next_reset` still means what it meant, which is
+    // why the two new members sit beside it rather than replacing it.
+    let now = now_to_the_second();
+    let session_at = ahead(now, SESSION_AHEAD_MS);
+    let weekly_at = ahead(now, WEEKLY_AHEAD_MS);
+
+    let server = MockServer::start();
+    let fixture = owned_fixture(&server, usage_body_resetting_at(session_at, weekly_at));
+
+    let assert = fixture
+        .cmd()
+        .env("TZ", "Asia/Tokyo")
+        .args(["claude", "status", "--json", "--account", EMAIL])
+        .assert()
+        .success();
+
+    let document: Value = serde_json::from_slice(&assert.get_output().stdout)
+        .expect("`--json` should print one JSON document and nothing else");
+    let row = document["rows"]
+        .as_array()
+        .expect("`rows` is an array")
+        .iter()
+        .find(|row| row["email"] == json!(EMAIL))
+        .unwrap_or_else(|| panic!("the owned account is in the document:\n{document}"));
+
+    assert_eq!(row["session_reset"], json!(session_at.to_string()));
+    assert_eq!(row["weekly_reset"], json!(weekly_at.to_string()));
+    assert_eq!(
+        row["next_reset"],
+        json!(session_at.to_string()),
+        "`next_reset` is still the soonest across every window"
+    );
+    fixture.assert_keychain_read_only();
 }
 
 /// The mock that answers a refresh POST with a rotated token pair.

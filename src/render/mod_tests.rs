@@ -34,6 +34,7 @@ fn hidden_rows_are_counted_but_not_shown_by_default() {
     let report = Report {
         rows: vec![row("alice", true), row("sibling", false), row("switcher", false)],
         now: ts(),
+        tz: TimeZone::UTC,
         show_all: false,
     };
 
@@ -44,8 +45,14 @@ fn hidden_rows_are_counted_but_not_shown_by_default() {
 
 #[test]
 fn all_shows_every_row_and_reports_nothing_hidden() {
-    let report =
-        Report { rows: vec![row("alice", true), row("sibling", false)], now: ts(), show_all: true };
+    // UTC because nothing here renders a reset; a fixed zone keeps the row
+    // arithmetic under test independent of where the suite runs.
+    let report = Report {
+        rows: vec![row("alice", true), row("sibling", false)],
+        now: ts(),
+        tz: TimeZone::UTC,
+        show_all: true,
+    };
 
     assert_eq!(report.shown().len(), 2);
     assert_eq!(report.hidden_count(), 0, "nothing is hidden once --all is given");

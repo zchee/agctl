@@ -1,10 +1,19 @@
 //! The `status` table.
 //!
-//! Nine columns, fixed by plan section 3.1:
+//! Ten columns. Plan section 3.1 fixed nine of them, ending in a single
+//! `Next reset` countdown; on the user's request of 2026-09-09 that one cell
+//! became two, so that the five-hour window and the seven-day all-models
+//! window each say when they roll over rather than only the sooner of the two
+//! saying how long it has left:
 //!
 //! ```text
-//! Account | Org | Plan | 5h | Weekly | Fable (weekly) | Credits | Next reset | State
+//! Account | Org | Plan | 5h | Weekly | Fable (weekly) | Credits | 5h reset | Weekly reset | State
 //! ```
+//!
+//! Each reset cell is [`crate::render::reset::render_reset`] — an absolute
+//! local time and a countdown. The JSON report's `next_reset` member is
+//! untouched by that change: it is a published interface, and the soonest
+//! reset across every window is still a fact a consumer may be reading.
 //!
 //! # Continuation rows
 //!
@@ -13,10 +22,12 @@
 //! them would hide a limit the user is subject to (risk R3), and widening the
 //! table per account would make two accounts unalignable. So each gets a
 //! continuation row directly under its account: the first cell names the
-//! window (`↳ opus (weekly)`, `↳ monthly_foo (unknown kind)`) and the
-//! percentage sits in the `Weekly` column. The label, not the column, is what
-//! says what the number means — which is why an unknown kind renders its kind
-//! string verbatim rather than being quietly filed as weekly.
+//! window (`↳ opus (weekly)`, `↳ monthly_foo (unknown kind)`), the
+//! percentage sits in the `Weekly` column and the reset in `Weekly reset` —
+//! `5h reset` stays blank, because such a window is never the five-hour one.
+//! The label, not the column, is what says what the number means — which is
+//! why an unknown kind renders its kind string verbatim rather than being
+//! quietly filed as weekly.
 //!
 //! # Empty cells
 //!
@@ -31,11 +42,10 @@ use tabled::settings::Style;
 use crate::provider::claude::usage::HEADLINE_SCOPE;
 use crate::render::Report;
 use crate::render::StatusRow;
+use crate::render::reset;
 use crate::usage::model::CreditsState;
 use crate::usage::model::LimitWindow;
-use crate::usage::model::UsageSnapshot;
 use crate::usage::model::WindowKind;
-use crate::usage::model::render_countdown;
 
 /// What an unavailable figure looks like.
 pub const EMPTY_CELL: &str = "—";
@@ -44,8 +54,18 @@ pub const EMPTY_CELL: &str = "—";
 pub const CONTINUATION_MARKER: &str = "↳";
 
 /// The column headings, in order.
-pub const HEADINGS: [&str; 9] =
-    ["Account", "Org", "Plan", "5h", "Weekly", "Fable (weekly)", "Credits", "Next reset", "State"];
+pub const HEADINGS: [&str; 10] = [
+    "Account",
+    "Org",
+    "Plan",
+    "5h",
+    "Weekly",
+    "Fable (weekly)",
+    "Credits",
+    "5h reset",
+    "Weekly reset",
+    "State",
+];
 
 /// Renders a whole report: the table, then the hidden-row footer.
 ///
@@ -84,7 +104,7 @@ pub fn footer(hidden: usize) -> String {
 }
 
 /// One account's own row.
-fn account_record(row: &StatusRow, report: &Report) -> [String; 9] {
+fn account_record(row: &StatusRow, report: &Report) -> [String; 10] {
     let usage = row.usage.as_ref();
     [
         row.account.clone(),
@@ -94,15 +114,14 @@ fn account_record(row: &StatusRow, report: &Report) -> [String; 9] {
         usage.map_or_else(empty, |u| percent_cell(u.window(&WindowKind::WeeklyAll))),
         usage.map_or_else(empty, |u| percent_cell(u.scoped_window(HEADLINE_SCOPE))),
         usage.map_or_else(empty, |u| credits_cell(&u.credits)),
-        usage.map_or_else(empty, |u| reset_cell(u, report)),
+        reset_cell(usage.and_then(|u| u.window(&WindowKind::Session)), report),
+        reset_cell(usage.and_then(|u| u.window(&WindowKind::WeeklyAll)), report),
         row.state_cell(),
     ]
 }
 
 /// One window that has no column of its own.
-fn continuation_record(window: &LimitWindow, report: &Report) -> [String; 9] {
-    let reset =
-        window.resets_at.map_or_else(empty, |resets_at| render_countdown(report.now, resets_at));
+fn continuation_record(window: &LimitWindow, report: &Report) -> [String; 10] {
     [
         format!("  {CONTINUATION_MARKER} {}", window.label()),
         String::new(),
@@ -111,7 +130,11 @@ fn continuation_record(window: &LimitWindow, report: &Report) -> [String; 9] {
         percent_cell(Some(window)),
         String::new(),
         String::new(),
-        reset,
+        // Not the five-hour window — that one has a column of its own and
+        // never reaches here — so the cell is left blank rather than being
+        // given an em dash, which would claim a figure was unavailable.
+        String::new(),
+        reset_cell(Some(window), report),
         String::new(),
     ]
 }
@@ -152,9 +175,18 @@ fn credits_cell(credits: &CreditsState) -> String {
     }
 }
 
-/// The soonest reset across the row's windows, as a countdown.
-fn reset_cell(usage: &UsageSnapshot, report: &Report) -> String {
-    usage.next_reset().map_or_else(empty, |resets_at| render_countdown(report.now, resets_at))
+/// One reset column's cell: when that window rolls over, locally, and how
+/// long that is.
+///
+/// An em dash covers both ways of having nothing to say — the response
+/// described no such window, or described one with no `resets_at` — because
+/// the reader's question is about the figure, not about which of the two
+/// happened.
+fn reset_cell(window: Option<&LimitWindow>, report: &Report) -> String {
+    match window.and_then(|window| window.resets_at) {
+        Some(resets_at) => reset::render_reset(report.now, resets_at, &report.tz),
+        None => empty(),
+    }
 }
 
 /// The em dash, as an owned string.

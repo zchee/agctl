@@ -1,9 +1,12 @@
 use jiff::Timestamp;
+use jiff::tz::Offset;
+use jiff::tz::TimeZone;
 use serde_json::Value;
 use serde_json::json;
 
 use super::*;
 use crate::provider::claude::usage::credits_from_body;
+use crate::usage::model::UsageSnapshot;
 use crate::usage::model::clamp_percent;
 use crate::usage::model::percent_floor;
 
@@ -13,7 +16,20 @@ const CREDITS_ON: &str = include_str!("../../fixtures/claude/usage-extra-usage-e
 
 /// The fixed "now" every snapshot is rendered against, so a countdown is a
 /// constant rather than a moving target.
+///
+/// 09:00 on Tuesday 2026-09-08 in the zone below.
 const NOW: &str = "2026-09-08T00:00:00Z";
+
+/// The zone every snapshot is rendered in.
+///
+/// Injected rather than [`TimeZone::system`], and a fixed offset rather than a
+/// named entry, for two reasons: a snapshot recorded in one zone must not be
+/// re-recorded in another, and `+09:00` puts the weekly reset on a different
+/// *local* day from its UTC day, so the snapshots pin the local-calendar rule
+/// rather than accidentally agreeing with UTC.
+fn tz() -> TimeZone {
+    TimeZone::fixed(Offset::constant(9))
+}
 
 fn ts(text: &str) -> Timestamp {
     text.parse::<Timestamp>().expect("the test literal should be a valid RFC 3339 timestamp")
@@ -70,7 +86,29 @@ fn empty_row(account: &str, state: &str) -> StatusRow {
 }
 
 fn report(rows: Vec<StatusRow>, show_all: bool) -> Report {
-    Report { rows, now: ts(NOW), show_all }
+    Report { rows, now: ts(NOW), tz: tz(), show_all }
+}
+
+/// The cells of the rendered row whose first column contains `needle`.
+///
+/// The reset columns are asserted by position rather than by `contains`,
+/// because "the `5h reset` cell is blank" is a claim about a column and a
+/// substring search cannot make it.
+fn cells_of(rendered: &str, needle: &str) -> Vec<String> {
+    let line = rendered
+        .lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no row contains `{needle}`:\n{rendered}"));
+    line.split('|').map(|cell| cell.trim().to_owned()).collect()
+}
+
+/// Where one heading sits, so the assertions below name columns rather than
+/// indices and a reordering fails loudly instead of silently.
+fn column(heading: &str) -> usize {
+    HEADINGS
+        .iter()
+        .position(|candidate| *candidate == heading)
+        .unwrap_or_else(|| panic!("`{heading}` is not one of the headings: {HEADINGS:?}"))
 }
 
 #[test]
@@ -279,6 +317,9 @@ fn the_footer_agrees_with_itself_on_number() {
 
 #[test]
 fn the_column_order_is_the_one_the_plan_fixes() {
+    // Nine of these are plan section 3.1's; `5h reset` and `Weekly reset`
+    // replaced the single `Next reset` countdown on the user's request of
+    // 2026-09-09.
     assert_eq!(
         HEADINGS,
         [
@@ -289,8 +330,78 @@ fn the_column_order_is_the_one_the_plan_fixes() {
             "Weekly",
             "Fable (weekly)",
             "Credits",
-            "Next reset",
+            "5h reset",
+            "Weekly reset",
             "State"
         ]
     );
+}
+
+#[test]
+fn both_reset_columns_carry_a_local_time_and_a_countdown() {
+    // The healthy windows reset at 02:13:40Z and 20:00:00Z, which in +09:00
+    // are 11:13 the same local morning and 05:00 on Friday the 11th. The
+    // weekly cell is the point of the whole column: `2d20h` alone never said
+    // which morning.
+    let rendered = render(&report(vec![healthy_row("alice@example.com")], false));
+    let cells = cells_of(&rendered, "alice@example.com");
+
+    assert_eq!(cells[column("5h reset")], "11:13 AM (2h13m)", "got:\n{rendered}");
+    assert_eq!(cells[column("Weekly reset")], "Fri 5:00 AM (2d20h)", "got:\n{rendered}");
+}
+
+#[test]
+fn a_row_with_only_a_weekly_window_leaves_the_five_hour_reset_an_em_dash() {
+    let mut row = healthy_row("alice@example.com");
+    row.usage = Some(usage(
+        vec![window(WindowKind::WeeklyAll, 35.0, Some("2026-09-10T20:00:00Z"))],
+        CreditsState::Unavailable,
+    ));
+
+    let rendered = render(&report(vec![row], false));
+    let cells = cells_of(&rendered, "alice@example.com");
+
+    assert_eq!(cells[column("5h reset")], EMPTY_CELL, "got:\n{rendered}");
+    assert_eq!(cells[column("Weekly reset")], "Fri 5:00 AM (2d20h)", "got:\n{rendered}");
+}
+
+#[test]
+fn a_window_that_carries_no_reset_is_an_em_dash_rather_than_a_bare_countdown() {
+    // A window with a percentage and no `resets_at` is a real shape — the
+    // captured body has one — and the percentage columns must still fill.
+    let mut row = healthy_row("alice@example.com");
+    row.usage = Some(usage(
+        vec![window(WindowKind::Session, 21.0, None), window(WindowKind::WeeklyAll, 35.0, None)],
+        CreditsState::Unavailable,
+    ));
+
+    let rendered = render(&report(vec![row], false));
+    let cells = cells_of(&rendered, "alice@example.com");
+
+    assert_eq!(cells[column("5h")], "21%", "the figure is there; only the reset is missing");
+    assert_eq!(cells[column("5h reset")], EMPTY_CELL, "got:\n{rendered}");
+    assert_eq!(cells[column("Weekly reset")], EMPTY_CELL, "got:\n{rendered}");
+}
+
+#[test]
+fn a_continuation_rows_reset_sits_in_the_weekly_column() {
+    // Such a window is never the five-hour one, so that cell stays blank —
+    // not an em dash, which would claim a figure was unavailable.
+    let mut windows = healthy_windows();
+    windows.push(window(
+        WindowKind::Unknown("monthly_foo".to_owned()),
+        7.0,
+        Some("2026-10-01T00:00:00Z"),
+    ));
+
+    let mut row = healthy_row("alice@example.com");
+    row.usage = Some(usage(windows, CreditsState::Unavailable));
+
+    let rendered = render(&report(vec![row], false));
+    let cells = cells_of(&rendered, "↳ monthly_foo");
+
+    assert_eq!(cells[column("5h reset")], "", "got:\n{rendered}");
+    // Twenty-three days out: past a week, so the date names the day rather
+    // than a weekday that would come round again first.
+    assert_eq!(cells[column("Weekly reset")], "Oct 1 9:00 AM (23d0h)", "got:\n{rendered}");
 }

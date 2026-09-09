@@ -111,6 +111,17 @@ pub struct JsonRow {
     pub credits: JsonCredits,
     /// The soonest reset across every window, RFC 3339.
     pub next_reset: Option<String>,
+    /// When the five-hour session window rolls over, RFC 3339.
+    ///
+    /// Additive next to [`JsonRow::next_reset`] rather than a replacement for
+    /// it: the table's two reset columns need one named window each, and a
+    /// consumer already reading `next_reset` must not have to change. In UTC,
+    /// like every other instant in the document — the table's local rendering
+    /// is presentation, and a consumer that wants it has `generated_at` and a
+    /// zone of its own.
+    pub session_reset: Option<String>,
+    /// When the seven-day all-models window rolls over, RFC 3339.
+    pub weekly_reset: Option<String>,
     /// The short explanation the table appends to the state.
     pub note: Option<String>,
 }
@@ -247,6 +258,28 @@ pub fn credits_of(usage: Option<&UsageSnapshot>) -> JsonCredits {
 /// The `next_reset` member for a row that may not have fetched anything.
 pub fn next_reset_of(usage: Option<&UsageSnapshot>) -> Option<String> {
     usage.and_then(UsageSnapshot::next_reset).map(|resets_at| resets_at.to_string())
+}
+
+/// The `session_reset` member: the five-hour window's own reset.
+pub fn session_reset_of(usage: Option<&UsageSnapshot>) -> Option<String> {
+    window_reset_of(usage, &WindowKind::Session)
+}
+
+/// The `weekly_reset` member: the seven-day all-models window's own reset.
+pub fn weekly_reset_of(usage: Option<&UsageSnapshot>) -> Option<String> {
+    window_reset_of(usage, &WindowKind::WeeklyAll)
+}
+
+/// One named window's reset, for a row that may not have fetched anything.
+///
+/// `None` covers both a response that described no such window and one that
+/// described it without a `resets_at`, which is the same distinction the
+/// table's em dash declines to make.
+fn window_reset_of(usage: Option<&UsageSnapshot>, kind: &WindowKind) -> Option<String> {
+    usage
+        .and_then(|usage| usage.window(kind))
+        .and_then(|window| window.resets_at)
+        .map(|resets_at| resets_at.to_string())
 }
 
 /// The published schema, compiled into the test binary.

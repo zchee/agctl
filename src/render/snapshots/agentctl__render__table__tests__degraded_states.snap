@@ -2,8 +2,8 @@
 source: src/render/table_tests.rs
 expression: "render(&report(vec![rate_limited, detected, no_limits], false))"
 ---
- Account           | Org  | Plan | 5h  | Weekly | Fable (weekly) | Credits | Next reset | State                                                                        
--------------------+------+------+-----+--------+----------------+---------+------------+------------------------------------------------------------------------------
- alice@example.com | Acme | max  | 21% | 35%    | 56%            | n/a     | 2h13m      | rate-limited (retry in 30s) (showing cached values)                          
- bob@example.com   | Acme | —    | —   | —      | —              | —       | —          | claude session detected — refresh refused (lock .oauth_refresh.lock, age 3s) 
- carol@example.com | Acme | —    | —   | —      | —              | n/a     | —          | no subscription limits (API/console account?)
+ Account           | Org  | Plan | 5h  | Weekly | Fable (weekly) | Credits | 5h reset         | Weekly reset        | State                                                                        
+-------------------+------+------+-----+--------+----------------+---------+------------------+---------------------+------------------------------------------------------------------------------
+ alice@example.com | Acme | max  | 21% | 35%    | 56%            | n/a     | 11:13 AM (2h13m) | Fri 5:00 AM (2d20h) | rate-limited (retry in 30s) (showing cached values)                          
+ bob@example.com   | Acme | —    | —   | —      | —              | —       | —                | —                   | claude session detected — refresh refused (lock .oauth_refresh.lock, age 3s) 
+ carol@example.com | Acme | —    | —   | —      | —              | n/a     | —                | —                   | no subscription limits (API/console account?)

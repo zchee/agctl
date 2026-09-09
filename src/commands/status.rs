@@ -40,6 +40,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use serde_json::Map;
 use serde_json::Value;
 use tracing::field::Empty;
@@ -158,9 +159,14 @@ pub fn run(cli: &Cli, args: &StatusArgs, cancel: &Cancel) -> Result<(), AppError
         .filter(|outcome| (args.all || outcome.visible_by_default) && outcome.state.is_failure())
         .count();
 
+    // The zone the two reset columns are printed in. `TimeZone::system()`
+    // reads *this* process's `TZ` and `/etc/localtime` — agentctl's own
+    // environment, not another process's — and falls back to UTC rather than
+    // failing when neither says anything.
     let report = Report {
         rows: outcomes.iter().map(RowOutcome::to_status_row).collect(),
         now: Timestamp::now(),
+        tz: TimeZone::system(),
         show_all: args.all,
     };
 
@@ -457,6 +463,8 @@ impl RowOutcome {
             windows: json::windows_of(usage),
             credits: json::credits_of(usage),
             next_reset: json::next_reset_of(usage),
+            session_reset: json::session_reset_of(usage),
+            weekly_reset: json::weekly_reset_of(usage),
             note: self.note.clone(),
         }
     }

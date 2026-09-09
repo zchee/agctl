@@ -50,6 +50,8 @@
         "windows",
         "credits",
         "next_reset",
+        "session_reset",
+        "weekly_reset",
         "note"
       ],
       "properties": {
@@ -124,6 +126,16 @@
         "credits": { "$ref": "#/$defs/credits" },
         "next_reset": {
           "description": "The soonest window reset across this row, RFC 3339.",
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "session_reset": {
+          "description": "When the five-hour session window rolls over, RFC 3339. Null when the response described no session window, or described one with no reset. Added alongside `next_reset` rather than replacing it, so version 1 still means what it meant.",
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "weekly_reset": {
+          "description": "When the seven-day all-models window rolls over, RFC 3339. Null on the same terms as `session_reset`. Not the per-model weekly window, whose reset is in `windows`.",
           "type": ["string", "null"],
           "format": "date-time"
         },

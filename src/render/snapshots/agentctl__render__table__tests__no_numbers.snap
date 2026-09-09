@@ -2,6 +2,6 @@
 source: src/render/table_tests.rs
 expression: rendered
 ---
- Account           | Org  | Plan | 5h | Weekly | Fable (weekly) | Credits | Next reset | State           
--------------------+------+------+----+--------+----------------+---------+------------+-----------------
- alice@example.com | Acme | —    | —  | —      | —              | —       | —          | keychain locked
+ Account           | Org  | Plan | 5h | Weekly | Fable (weekly) | Credits | 5h reset | Weekly reset | State           
+-------------------+------+------+----+--------+----------------+---------+----------+--------------+-----------------
+ alice@example.com | Acme | —    | —  | —      | —              | —       | —        | —            | keychain locked

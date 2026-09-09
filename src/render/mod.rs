@@ -13,9 +13,11 @@
 //! are settled before a row is built.
 
 pub mod json;
+pub mod reset;
 pub mod table;
 
 use jiff::Timestamp;
+use jiff::tz::TimeZone;
 
 use crate::usage::model::UsageSnapshot;
 
@@ -58,6 +60,11 @@ pub struct Report {
     /// The moment the report was built; every countdown is relative to it, so
     /// a table cannot show two cells computed against different clocks.
     pub now: Timestamp,
+    /// The zone the reset columns are printed in, for the same reason [`Report::now`]
+    /// is carried: one report, one zone, so two cells cannot disagree about
+    /// what "Sunday" means. `commands::status` fills it from
+    /// [`TimeZone::system`]; a test injects a fixed one.
+    pub tz: TimeZone,
     /// Whether `--all` was given.
     pub show_all: bool,
 }

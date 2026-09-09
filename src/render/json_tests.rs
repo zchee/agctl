@@ -67,6 +67,8 @@ fn row(state: &AccountState, usage: Option<&UsageSnapshot>) -> JsonRow {
         windows: windows_of(usage),
         credits: credits_of(usage),
         next_reset: next_reset_of(usage),
+        session_reset: session_reset_of(usage),
+        weekly_reset: weekly_reset_of(usage),
         note: None,
     }
 }
@@ -147,6 +149,8 @@ fn json_row_of(row: &AccountRow) -> JsonRow {
         windows: Vec::new(),
         credits: JsonCredits::unavailable(),
         next_reset: None,
+        session_reset: None,
+        weekly_reset: None,
         note: row.note.clone(),
     }
 }
@@ -190,6 +194,62 @@ fn windows_carry_the_kind_the_label_and_both_percentages() {
     );
     assert_eq!(row.next_reset.as_deref(), Some("2026-09-10T00:00:00Z"));
     assert_valid(&report(vec![row]));
+}
+
+#[test]
+fn the_two_reset_members_name_their_own_window_and_are_nullable() {
+    // The table's two reset columns need one named window each; these are
+    // those two windows' resets, additive beside `next_reset` so that a
+    // consumer already reading it sees no change.
+    let usage = snapshot(
+        vec![
+            window(WindowKind::Session, 21.0, false),
+            window(WindowKind::WeeklyAll, 35.0, false),
+            window(WindowKind::WeeklyScoped("Fable".to_owned()), 56.0, true),
+        ],
+        CreditsState::Unavailable,
+    );
+    let both = row(&AccountState::Ok, Some(&usage));
+    assert_eq!(both.session_reset.as_deref(), Some("2026-09-10T00:00:00Z"));
+    assert_eq!(both.weekly_reset.as_deref(), Some("2026-09-10T00:00:00Z"));
+    assert_eq!(
+        both.next_reset.as_deref(),
+        Some("2026-09-10T00:00:00Z"),
+        "the soonest-across-every-window member is unchanged by the addition"
+    );
+    assert_valid(&report(vec![both]));
+
+    // `weekly_reset` is the all-models window alone. A per-model weekly one
+    // has a column of its own in the table and stays in `windows` here.
+    let scoped = snapshot(
+        vec![window(WindowKind::WeeklyScoped("Fable".to_owned()), 56.0, true)],
+        CreditsState::Unavailable,
+    );
+    let scoped = row(&AccountState::Ok, Some(&scoped));
+    assert_eq!(scoped.session_reset, None);
+    assert_eq!(scoped.weekly_reset, None);
+    assert_valid(&report(vec![scoped]));
+
+    // A window carrying no `resets_at` is as null as no window at all: the
+    // member answers "when does it roll over", and there is no answer.
+    let mut unresetting = window(WindowKind::Session, 21.0, false);
+    unresetting.resets_at = None;
+    let unresetting = snapshot(vec![unresetting], CreditsState::Unavailable);
+    let unresetting = row(&AccountState::Ok, Some(&unresetting));
+    assert_eq!(unresetting.session_reset, None);
+    assert_valid(&report(vec![unresetting]));
+
+    // A row that fetched nothing carries both members as null rather than
+    // dropping them, for the same reason `credits` is on every row.
+    let nothing = row(&AccountState::NeedsLogin, None);
+    let document = report(vec![nothing]);
+    assert_valid(&document);
+    let value = serde_json::to_value(&document).expect("a report serializes");
+    let object = value["rows"][0].as_object().expect("a row is an object");
+    for member in ["session_reset", "weekly_reset"] {
+        assert!(object.contains_key(member), "`{member}` is null, not absent: {value}");
+        assert!(object[member].is_null(), "`{member}` should be null here: {value}");
+    }
 }
 
 #[test]

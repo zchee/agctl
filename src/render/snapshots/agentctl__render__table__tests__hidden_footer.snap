@@ -2,7 +2,7 @@
 source: src/render/table_tests.rs
 expression: rendered
 ---
- Account           | Org  | Plan | 5h  | Weekly | Fable (weekly) | Credits | Next reset | State 
--------------------+------+------+-----+--------+----------------+---------+------------+-------
- alice@example.com | Acme | max  | 21% | 35%    | 56%            | n/a     | 2h13m      | ok    
+ Account           | Org  | Plan | 5h  | Weekly | Fable (weekly) | Credits | 5h reset         | Weekly reset        | State 
+-------------------+------+------+-----+--------+----------------+---------+------------------+---------------------+-------
+ alice@example.com | Acme | max  | 21% | 35%    | 56%            | n/a     | 11:13 AM (2h13m) | Fri 5:00 AM (2d20h) | ok    
 2 entries hidden (--all)
