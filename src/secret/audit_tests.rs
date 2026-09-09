@@ -34,6 +34,12 @@ fn sample(mtime_ns: i64, age_ms: u64) -> LockSample {
 
 /// A break record with every member populated, so a shape assertion can see
 /// the whole key set at once.
+///
+/// `outcome: broken` with `reason: retaken` is the one combination that
+/// populates both: a lock that *was* removed and that a peer took back before
+/// agentctl could re-create it. Every other reason implies `abandoned`, and a
+/// clean break carries no reason at all — which is what
+/// [`a_clean_break_records_no_reason`] pins.
 fn break_record() -> LockBreakRecord {
     LockBreakRecord {
         path: PathBuf::from("/home/example/.claude/.oauth_refresh.lock"),
@@ -48,7 +54,7 @@ fn break_record() -> LockBreakRecord {
         interval_monotonic_ms: 12_004,
         holder_evidence: HolderEvidence::NoStoppedClaude,
         outcome: BreakOutcome::Broken,
-        reason: BreakReason::Stale,
+        reason: Some(BreakReason::Retaken),
     }
 }
 
@@ -63,7 +69,8 @@ fn an_entry_round_trips_through_the_log() {
     assert_eq!(id.agentctl_pid, std::process::id());
 
     let read = tail(&paths, 10).expect("the log should be readable");
-    assert_eq!(read, vec![entry]);
+    assert_eq!(read.entries, vec![entry]);
+    assert!(read.unreadable.is_empty(), "nothing was damaged");
 }
 
 #[test]
@@ -71,7 +78,29 @@ fn a_break_record_round_trips_through_the_log() {
     let (_dir, paths) = store();
     let entry = AuditEntry::new(AuditEvent::LockBreak(break_record()));
     append(&paths, &entry).expect("the log should be appendable");
-    assert_eq!(tail(&paths, 1).expect("readable"), vec![entry]);
+    assert_eq!(tail(&paths, 1).expect("readable").entries, vec![entry]);
+}
+
+#[test]
+fn a_clean_break_records_no_reason() {
+    // The other half of the `reason` cardinality, and the half the vocabulary
+    // is built around: every word in `BreakReason` is a reason *not* to have
+    // broken a lock, so a break with nothing to explain writes no `reason` key
+    // rather than inventing a seventh word for success.
+    let mut record = break_record();
+    record.reason = None;
+    let entry = AuditEntry::new(AuditEvent::LockBreak(record));
+    let value: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&entry).expect("serializable"))
+            .expect("valid JSON");
+    let object = value.as_object().expect("an object");
+    assert!(!object.contains_key("reason"), "{object:?}");
+    assert_eq!(object["outcome"], "broken");
+    assert_eq!(object.len(), 16, "one key fewer than the fully populated shape");
+
+    let (_dir, paths) = store();
+    append(&paths, &entry).expect("appendable");
+    assert_eq!(tail(&paths, 1).expect("readable").entries, vec![entry], "and it round-trips");
 }
 
 #[test]
@@ -101,6 +130,7 @@ fn tail_returns_the_last_entries_oldest_first() {
 
     let last_two = tail(&paths, 2).expect("readable");
     let digests: Vec<String> = last_two
+        .entries
         .iter()
         .map(|entry| match &entry.event {
             AuditEvent::Write { to_digest8, .. } => to_digest8.clone(),
@@ -108,27 +138,77 @@ fn tail_returns_the_last_entries_oldest_first() {
         })
         .collect();
     assert_eq!(digests, ["bbbbbbbb", "cccccccc"]);
-    assert_eq!(tail(&paths, 99).expect("readable").len(), 3, "asking for more is not an error");
+    assert_eq!(
+        tail(&paths, 99).expect("readable").entries.len(),
+        3,
+        "asking for more is not an error"
+    );
 }
 
 #[test]
 fn tail_of_an_absent_log_is_no_entries() {
     let (_dir, paths) = store();
-    assert!(tail(&paths, 5).expect("an absent log is not a failure").is_empty());
+    let read = tail(&paths, 5).expect("an absent log is not a failure");
+    assert!(read.entries.is_empty());
+    assert!(read.unreadable.is_empty());
 }
 
 #[test]
-fn tail_names_the_line_it_cannot_read() {
+fn tail_names_the_line_it_cannot_read_and_returns_the_rest() {
+    // Inverted from "a corrupt line is reported, not skipped", which enshrined
+    // the opposite of the contract: one damaged line must not take `doctor`
+    // down. The line number is still reported — the caller names it — but the
+    // entries that *did* parse come back, because `doctor` explaining nothing
+    // and `use --undo` refusing to run is the failure mode this log exists to
+    // survive.
     let (_dir, paths) = store();
     append(&paths, &AuditEntry::new(write_event("aaaaaaaa", None))).expect("appendable");
     let path = log_path(&paths);
     let mut text = std::fs::read_to_string(&path).expect("readable");
     text.push_str("{\"ts\":\"not a timestamp\"}\n");
-    std::fs::write(&path, text).expect("writable");
+    rewrite_log(&path, &text);
 
-    let failure = tail(&paths, 5).expect_err("a corrupt line is reported, not skipped");
-    let message = failure.to_string();
-    assert!(message.contains("line 2"), "{message}");
+    let read = tail(&paths, 5).expect("a corrupt line is skipped, not fatal");
+
+    assert_eq!(read.entries.len(), 1, "the good entry is still returned");
+    let AuditEvent::Write { to_digest8, .. } = &read.entries[0].event else { panic!("a write") };
+    assert_eq!(to_digest8, "aaaaaaaa");
+    assert_eq!(read.unreadable.len(), 1, "and the bad one is named: {:?}", read.unreadable);
+    assert_eq!(read.unreadable[0].0, 2, "by line number");
+    assert!(!read.unreadable[0].1.is_empty(), "with a reason");
+}
+
+#[test]
+fn a_truncated_last_line_does_not_hide_the_entries_before_it() {
+    // The crash this is really about, and the reason the fix is not cosmetic:
+    // `append` is one `write` plus an `fsync`, so a process killed between them
+    // — or a short write at `ENOSPC` — leaves the final line half-written. That
+    // line is by construction inside the last `n`, so a `tail` that failed on it
+    // would fail on **every** read after such a crash, which is exactly when
+    // `doctor` and `use --undo` are needed.
+    let (_dir, paths) = store();
+    for digest in ["aaaaaaaa", "bbbbbbbb"] {
+        append(&paths, &AuditEntry::new(write_event(digest, None))).expect("appendable");
+    }
+    let path = log_path(&paths);
+    let whole = std::fs::read_to_string(&path).expect("readable");
+    // Truncate mid-line: the last entry keeps its first ten bytes and nothing
+    // else, which is what a killed `write` leaves behind.
+    let mut lines: Vec<&str> = whole.lines().collect();
+    let last = lines.pop().expect("two lines");
+    let cut = last.get(..10).expect("a line longer than ten bytes");
+    rewrite_log(&path, &format!("{}\n{cut}", lines.join("\n")));
+
+    let read = tail(&paths, 5).expect("a truncated tail is not fatal");
+
+    assert_eq!(read.entries.len(), 1, "the earlier entry survives");
+    assert_eq!(read.unreadable.len(), 1, "and the truncated one is named");
+    assert_eq!(read.unreadable[0].0, 2);
+}
+
+/// Replaces the log's contents, for the tests that damage it deliberately.
+fn rewrite_log(path: &std::path::Path, text: &str) {
+    std::fs::write(path, text).expect("the log should be writable");
 }
 
 #[test]
@@ -143,7 +223,8 @@ fn an_entry_with_members_this_build_does_not_know_still_reads() {
     std::fs::write(&path, format!("{widened}\n")).expect("writable");
 
     let read = tail(&paths, 1).expect("an unknown member is not a failure");
-    assert_eq!(read.len(), 1);
+    assert_eq!(read.entries.len(), 1);
+    assert!(read.unreadable.is_empty(), "an unknown member is not damage either");
 }
 
 #[test]
@@ -221,7 +302,7 @@ fn a_break_record_serialises_with_the_plans_field_names() {
     assert_eq!(object["target"], "live");
     assert_eq!(object["holder_evidence"], "no_stopped_claude");
     assert_eq!(object["outcome"], "broken");
-    assert_eq!(object["reason"], "stale");
+    assert_eq!(object["reason"], "retaken");
     let sample_a = object["sample_a"].as_object().expect("an object");
     let sample_keys: Vec<&str> = sample_a.keys().map(String::as_str).collect();
     assert_eq!(sample_keys, ["at", "mtime_ns", "age_ms"]);
@@ -259,7 +340,7 @@ fn a_first_write_records_itself_as_one() {
     let (_dir, paths) = store();
     append(&paths, &AuditEntry::new(write_event("aabbccdd", None))).expect("appendable");
     let read = tail(&paths, 1).expect("readable");
-    let AuditEvent::Write { from_digest8, .. } = &read[0].event else {
+    let AuditEvent::Write { from_digest8, .. } = &read.entries[0].event else {
         panic!("a write");
     };
     assert_eq!(*from_digest8, None, "no outgoing credential means the item was absent");
@@ -301,10 +382,17 @@ fn the_vocabulary_serialises_to_the_documented_tokens() {
         (BreakReason::ClockJump, "\"clock_jump\""),
         (BreakReason::Retaken, "\"retaken\""),
         (BreakReason::HolderStopped, "\"holder_stopped\""),
-        (BreakReason::Stale, "\"stale\""),
     ] {
         assert_eq!(serde_json::to_string(&value).expect("serializable"), token);
     }
+    // Six words, and no seventh. `stale` was a member of this enum and appears
+    // nowhere in plan section 3.8: staleness is the *precondition* of the break
+    // rule, so a reason saying so would be the only member that is not a reason
+    // to have left a lock alone.
+    assert!(
+        serde_json::from_str::<BreakReason>("\"stale\"").is_err(),
+        "the vocabulary is exactly section 3.8's six words"
+    );
     for (value, token) in [
         (WriteOutcome::Applied, "\"applied\""),
         (WriteOutcome::Unknown, "\"unknown\""),

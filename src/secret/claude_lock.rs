@@ -53,7 +53,37 @@
 //! That distinction is load-bearing, not stylistic: the false version of the
 //! argument would license a tolerance-based modification-time comparison, and
 //! the true one forbids it. Every comparison here is exact.
+//!
+//! # Why the hold is addressed by descriptor and not by path
+//!
+//! Every operation this module performs — `mkdir`, `stat`, `rmdir` — is
+//! relative to a directory descriptor obtained by **one** `O_NOFOLLOW`
+//! component walk per acquire ([`LockAnchor`]), and never to a path resolved
+//! afresh from the root.
+//!
+//! A path-based hold is redirectable, and the redirection defeats every check
+//! around it. A same-user attacker who can create one symbolic link under
+//! `<config dir>/claude` — the threat class `file_store`'s walk and
+//! `doctor --remove-stale` were both written for — plants `<acct>` as a link to
+//! `~/.claude`. Then `mkdir("<root>/<acct>/<org>/.oauth_refresh.lock")` creates
+//! Claude Code's **live** lock, `rmdir` removes one, and the lexical
+//! containment check that invariant I11′ rests on still says the path is inside
+//! `namespace_root()`, because as a *spelling* it is. The held-lock record and
+//! the audit entry would both say `tree: agentctl` while the break landed in
+//! the live store — simultaneously "break a live lock" and "escape the root".
+//!
+//! A descriptor closes it in both directions: the walk refuses the link before
+//! anything is created, and the `rmdir` that gives a lock back lands in the
+//! same inode the `mkdir` took it in, so no rename between them can move it.
+//! The same walk is what makes [`Tree`] a derived fact rather than a caller's
+//! claim, because the anchor it starts from is chosen by the tree and a store
+//! that is not below that anchor cannot be reached from it at all.
 
+use std::ffi::OsStr;
+use std::ffi::OsString;
+use std::os::fd::AsFd;
+use std::os::fd::BorrowedFd;
+use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,21 +92,37 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
-use serde::Deserialize;
-use serde::Serialize;
-
 use crate::config::paths::DIR_MODE;
 use crate::config::paths::FILE_MODE;
 use crate::config::paths::Paths;
 use crate::provider::claude::namespace;
+use crate::provider::claude::namespace::EnvView;
 use crate::runtime::cleanup;
 use crate::runtime::cleanup::CleanupToken;
 use crate::runtime::coordinator::Cancel;
 use crate::runtime::coordinator::PassCtx;
 use crate::runtime::fault::Fault;
 use crate::runtime::proc;
+use crate::secret::file_store;
 use crate::secret::foreign_activity::REFRESH_LOCK;
 use crate::secret::foreign_activity::STORAGE_WRITE_LOCK;
+use crate::secret::held_locks;
+
+/// The words this module records a break in, and the record it writes.
+///
+/// Re-exported from [`crate::secret::audit`] rather than declared here, because
+/// the record is appended to the audit log and a second declaration of the same
+/// fields would duplicate the log's provenance members. The aliases
+/// keep the names the break rule reads best — `Sample`, `Outcome`, `Reason` —
+/// pointing at the one type each.
+pub use crate::secret::audit::BreakOutcome as Outcome;
+pub use crate::secret::audit::BreakReason as Reason;
+pub use crate::secret::audit::HolderEvidence as HolderEvidence3;
+pub use crate::secret::audit::LockBreakRecord;
+pub use crate::secret::audit::LockSample as Sample;
+pub use crate::secret::audit::Target;
+pub use crate::secret::audit::Tree;
+pub use crate::secret::held_locks::HeldLockRecord;
 
 /// The peer's heartbeat period (fact F45's `update`).
 ///
@@ -147,9 +193,6 @@ pub const CONFIG_HOLD_BUDGET: Duration = Duration::from_millis(1200);
 /// probe before it reports the store busy.
 pub const MAX_RESTARTS: u32 = 3;
 
-/// The directory under `namespace_root()` holding one file per live hold.
-pub const HELD_LOCKS_DIR: &str = "held-locks";
-
 /// One lock family's `proper-lockfile` options.
 ///
 /// Two families exist and they do not share options (spike S13, S13-1): the
@@ -194,44 +237,20 @@ pub const CONFIG_PROFILE: LockProfile = LockProfile {
     hold_budget: CONFIG_HOLD_BUDGET,
 };
 
-/// Which directory tree a hold or a break is in.
+/// What one hold is about: the store directory, and which tree it is in.
 ///
-/// Recorded because invariant I11′'s containment is the plan's largest
-/// relaxation: in W4a every removal stays inside `namespace_root()`, and only
-/// W4b lets one reach the live `~/.claude`. `doctor` and `--remove-stale`
-/// need to be able to tell the two apart without guessing from a path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Tree {
-    /// A store directory agentctl created and owns.
-    Agentctl,
-    /// The live Claude Code store.
-    Live,
-}
-
-/// What a live hold writes to disk before it takes anything.
-///
-/// Fact F45's locks are directories and the kernel releases nothing when a
-/// process dies, so this file is the only evidence a crash leaves behind —
-/// which is why it is written **before** the first `mkdir` (section 3.4 step
-/// 6) and cleared after the last `rmdir`. `doctor` reads it to explain
-/// directories nobody can otherwise account for, and `--remove-stale` uses it
-/// to justify accepting a path outside `namespace_root()` (section 3.9 row 2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HeldLockRecord {
-    /// The agentctl process that took the locks. Named unambiguously and
-    /// grouped with the provenance fields, because a bare `pid` beside a
-    /// holder-evidence field would read as the *holder's* pid (architect
-    /// NEW-10).
-    pub agentctl_pid: u32,
-    /// Which tree the locks are in.
+/// The two travel together because the tree is **checked** against the store
+/// directory rather than believed (see [`LockAnchor::open`]): invariant I11′'s
+/// containment is the plan's largest relaxation — in W4a every removal stays
+/// inside `namespace_root()`, and only W4b lets one reach the live
+/// `~/.claude` — and a `tree` a caller could simply assert would put that
+/// containment in the caller's hands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockSubject<'a> {
+    /// The credential store directory the locks guard.
+    pub store_dir: &'a Path,
+    /// Which tree the caller believes it is in.
     pub tree: Tree,
-    /// The store directory the hold is about.
-    pub store_dir: PathBuf,
-    /// Every directory the hold intends to create, in acquisition order.
-    pub paths: Vec<PathBuf>,
-    /// When the record was written, RFC 3339.
-    pub taken_at: String,
 }
 
 /// Why a lock could not be taken, held or trusted.
@@ -254,6 +273,26 @@ pub enum LockError {
     /// The run was cancelled while waiting.
     #[error("cancelled while acquiring the Claude Code locks")]
     Cancelled,
+    /// **Containment**: the store directory is not in the tree the caller
+    /// named, so the hold — and any break inside it — would land somewhere
+    /// invariant I11′ does not allow.
+    #[error("`{}` is not {}, so agentctl will not lock it as one", .store_dir.display(), .tree.label())]
+    WrongTree {
+        /// The store directory as the caller spelled it.
+        store_dir: PathBuf,
+        /// The tree the caller claimed it was in.
+        tree: Tree,
+    },
+    /// The way from the permitted anchor down to the store directory could not
+    /// be walked without following a symbolic link, or a component of it is
+    /// missing or is not a directory.
+    #[error("`{}` cannot be locked: {message}", .path.display())]
+    Unreachable {
+        /// The directory the walk was heading for.
+        path: PathBuf,
+        /// What the walk refused, in its own words.
+        message: String,
+    },
     /// A filesystem operation failed for a reason that is not contention.
     #[error("{context}: {message}")]
     Io {
@@ -354,35 +393,73 @@ pub enum FsError {
     Other(String),
 }
 
-/// The two directory operations a `proper-lockfile` lock is made of.
+/// One lock artefact, addressed the way it is operated on.
 ///
-/// A trait, not a pair of functions, for one reason: acceptance criterion
-/// AC62 asserts that `.storage-write` is attempted **once** and that no wait
-/// happens while anything is held, and both are claims about the *sequence*
-/// of operations. A spy that records the sequence can check them; no
+/// A descriptor and a **name**, never a path, because a path is re-resolved
+/// from the root on every syscall and a symbolic link planted anywhere along
+/// it redirects the operation. That is not hypothetical: with `<acct>` replaced
+/// by a link, `mkdir("<root>/<acct>/<org>/.oauth_refresh.lock")` creates the
+/// live store's lock while every lexical check still says the path is inside
+/// `namespace_root()`. `dir` is opened once per acquire by an `O_NOFOLLOW`
+/// component walk and kept for the life of the hold, so the directory the
+/// `rmdir` lands in is the same inode the `mkdir` landed in.
+#[derive(Clone, Copy)]
+pub struct LockSlot<'a> {
+    /// The directory the artefact lives in, opened `O_DIRECTORY | O_NOFOLLOW`.
+    pub dir: BorrowedFd<'a>,
+    /// The artefact's own name inside `dir`: exactly one component.
+    pub name: &'a OsStr,
+    /// What the artefact is called in a record or a message. Carried rather
+    /// than derived so a test's spy can record a timeline a reader recognises;
+    /// **no operation is ever performed on it.**
+    pub shown: &'a Path,
+}
+
+impl std::fmt::Debug for LockSlot<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockSlot").field("name", &self.name).field("shown", &self.shown).finish()
+    }
+}
+
+/// The three directory operations a `proper-lockfile` lock is made of, all
+/// relative to an already-opened directory.
+///
+/// A trait, not three functions, for one reason: acceptance criterion AC62
+/// asserts that `.storage-write` is attempted **once** and that no wait happens
+/// while anything is held, and both are claims about the *sequence* of
+/// operations. A spy that records the sequence can check them; no
 /// after-the-fact inspection of the filesystem can.
 pub trait LockFs: Send + Sync {
-    /// One non-blocking `mkdir` at 0700.
+    /// One non-blocking `mkdirat` at 0700.
     ///
     /// # Errors
     ///
     /// [`FsError::Exists`] when somebody already holds it.
-    fn mkdir(&self, path: &Path) -> Result<(), FsError>;
+    fn mkdir(&self, at: LockSlot<'_>) -> Result<(), FsError>;
 
     /// `rmdir`, which is `unlinkat` with `AT_REMOVEDIR`.
     ///
     /// # Errors
     ///
     /// [`FsError::NotFound`] when it has already gone.
-    fn rmdir(&self, path: &Path) -> Result<(), FsError>;
+    fn rmdir(&self, at: LockSlot<'_>) -> Result<(), FsError>;
+
+    /// The artefact's modification time, or `None` when it is not there.
+    ///
+    /// Part of this trait rather than a free function so that **every** read
+    /// the protocol makes is relative to the same descriptor as the write: a
+    /// path-based `stat` beside descriptor-based `mkdir` and `rmdir` would
+    /// leave the sampling — the whole evidence base of the break rule — open to
+    /// the redirection the descriptor exists to close.
+    fn mtime(&self, at: LockSlot<'_>) -> Option<SystemTime>;
 }
 
 /// The real directory operations.
 pub struct RealFs;
 
 impl LockFs for RealFs {
-    fn mkdir(&self, path: &Path) -> Result<(), FsError> {
-        match rustix::fs::mkdir(path, LOCK_DIR_MODE) {
+    fn mkdir(&self, at: LockSlot<'_>) -> Result<(), FsError> {
+        match rustix::fs::mkdirat(at.dir, at.name, LOCK_DIR_MODE) {
             Ok(()) => Ok(()),
             Err(rustix::io::Errno::EXIST) => Err(FsError::Exists),
             Err(rustix::io::Errno::NOENT) => Err(FsError::NotFound),
@@ -390,15 +467,202 @@ impl LockFs for RealFs {
         }
     }
 
-    fn rmdir(&self, path: &Path) -> Result<(), FsError> {
+    fn rmdir(&self, at: LockSlot<'_>) -> Result<(), FsError> {
         // `AT_REMOVEDIR` is the whole point: `unlink` and `remove_file`
         // cannot remove a directory, which is the defect `agentctl-nz5`
-        // records one module over.
-        match rustix::fs::unlinkat(rustix::fs::CWD, path, rustix::fs::AtFlags::REMOVEDIR) {
+        // records one module over. It also refuses anything that is not a
+        // directory, so a regular file or a symbolic link at the artefact's
+        // name is never removed.
+        match rustix::fs::unlinkat(at.dir, at.name, rustix::fs::AtFlags::REMOVEDIR) {
             Ok(()) => Ok(()),
             Err(rustix::io::Errno::NOENT) => Err(FsError::NotFound),
             Err(errno) => Err(FsError::Other(errno.to_string())),
         }
+    }
+
+    fn mtime(&self, at: LockSlot<'_>) -> Option<SystemTime> {
+        // `AT_SYMLINK_NOFOLLOW`: a link where a lock directory should be is
+        // somebody else's plant, and this is what keeps the sampling from
+        // reading the target's modification time instead of the link's. Such a
+        // path is also unremovable by the break — `AT_REMOVEDIR` refuses a
+        // link — which is the safe side of that trade.
+        let flags = rustix::fs::AtFlags::SYMLINK_NOFOLLOW;
+        let stat = rustix::fs::statat(at.dir, at.name, flags).ok()?;
+        modified(&stat)
+    }
+}
+
+/// A `statat` result's modification time, at full resolution.
+///
+/// Nanoseconds are load-bearing: the comparison between two samples is exact,
+/// and a conversion that rounded would silently grant the tolerance section
+/// 3.8 forbids.
+fn modified(stat: &rustix::fs::Stat) -> Option<SystemTime> {
+    let secs = stat.st_mtime;
+    let nanos = u32::try_from(stat.st_mtime_nsec).ok()?;
+    let Ok(forward) = u64::try_from(secs) else {
+        // Before 1970. The seconds run backwards from the epoch and the
+        // nanoseconds still run forwards from there, so the two are applied in
+        // opposite directions rather than added.
+        let back = u64::try_from(secs.checked_neg()?).ok()?;
+        return SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::from_secs(back))?
+            .checked_add(Duration::from_nanos(u64::from(nanos)));
+    };
+    SystemTime::UNIX_EPOCH.checked_add(Duration::new(forward, nanos))
+}
+
+/// Which of a hold's two directories one artefact lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Which {
+    /// Inside the store directory: the primary lock and `.storage-write`.
+    Store,
+    /// Beside it, in the store directory's parent: the legacy lock.
+    Parent,
+}
+
+/// One lock artefact's identity: where it lives, what it is called there, and
+/// what it is called to a human.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Artefact {
+    /// Which of the hold's two directories holds the name.
+    dir: Which,
+    /// The name inside that directory.
+    name: OsString,
+    /// The path a record and a message spell.
+    path: PathBuf,
+}
+
+/// The two directory descriptors every lock of one hold is addressed through.
+///
+/// Opened by a single `O_NOFOLLOW` component walk from the anchor the *tree*
+/// permits — [`Paths::namespace_root`] for [`Tree::Agentctl`], the live store's
+/// parent for [`Tree::Live`] — and kept for the life of the hold. Two
+/// consequences, and both are the point:
+///
+/// - a symbolic link anywhere below the anchor is refused **before** the first
+///   `mkdir`, so nothing is created in whatever it pointed at;
+/// - `tree` stops being a claim and becomes a derived fact, which is what
+///   invariant I11′'s containment needs it to be.
+pub struct LockAnchor {
+    /// The store directory itself.
+    store: OwnedFd,
+    /// Its parent: the legacy lock is `<store>.lock`, *beside* the store rather
+    /// than inside it (fact F17).
+    parent: OwnedFd,
+    /// The store directory's own name inside `parent` — the spelling the walk
+    /// accepted, which is what the legacy lock's name is built from.
+    store_name: OsString,
+    /// The store directory as the caller spelled it, for records and messages.
+    store_dir: PathBuf,
+    /// Which tree the walk proved it is in.
+    tree: Tree,
+}
+
+impl LockAnchor {
+    /// Opens the two descriptors a hold of `subject` needs, refusing a store
+    /// that is not in the tree it claims and a way to it that cannot be walked
+    /// without following a symbolic link.
+    ///
+    /// # Errors
+    ///
+    /// [`LockError::WrongTree`] when the store directory is neither under
+    /// [`Paths::namespace_root`] (for [`Tree::Agentctl`]) nor the live store
+    /// itself (for [`Tree::Live`]), and [`LockError::Unreachable`] when the
+    /// walk refuses a component or cannot find one.
+    pub fn open(subject: LockSubject<'_>, paths: &Paths, env: &EnvView) -> Result<Self, LockError> {
+        let store_dir = subject.store_dir;
+        let wrong_tree =
+            || LockError::WrongTree { store_dir: store_dir.to_path_buf(), tree: subject.tree };
+
+        // The anchor is chosen by the tree, and the walk from it is what makes
+        // the choice binding: a store that is not below the anchor cannot be
+        // reached from it at all (`strip_prefix` fails inside the walk), and one
+        // that is below it is reached one `O_NOFOLLOW` component at a time.
+        let anchor = match subject.tree {
+            Tree::Agentctl => {
+                if !paths.is_under_namespace_root(store_dir) {
+                    return Err(wrong_tree());
+                }
+                paths.namespace_root()
+            }
+            Tree::Live => {
+                // Equality, not containment: `live` means *the* live store, the
+                // one this environment names, and nothing else. W4b is the
+                // increment that lets a break reach it, and a store that merely
+                // sits beside it is not it.
+                if store_dir != namespace::live_store_dir(env) {
+                    return Err(wrong_tree());
+                }
+                // The legacy lock is the store's sibling, so the anchor has to
+                // be the parent — and the store's own component is still walked
+                // `O_NOFOLLOW` below it.
+                store_dir.parent().ok_or_else(wrong_tree)?.to_path_buf()
+            }
+        };
+
+        let store_name = store_dir.file_name().ok_or_else(wrong_tree)?.to_os_string();
+        let store = file_store::open_dir_under(&anchor, store_dir).map_err(|err| {
+            LockError::Unreachable { path: store_dir.to_path_buf(), message: err.to_string() }
+        })?;
+
+        // The parent by descriptor rather than by a second walk: `..` inside an
+        // already-opened directory is never a symbolic link, so this reaches
+        // the store's real parent — which is also the directory `realpath`
+        // would have named, without `realpath`'s willingness to follow a link
+        // planted at the store itself.
+        let flags = rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC;
+        let parent = rustix::fs::openat(&store, "..", flags, rustix::fs::Mode::empty()).map_err(
+            |errno| LockError::Unreachable {
+                path: store_dir.to_path_buf(),
+                message: format!("its parent directory could not be opened: {errno}"),
+            },
+        )?;
+
+        Ok(Self {
+            store,
+            parent,
+            store_name,
+            store_dir: store_dir.to_path_buf(),
+            tree: subject.tree,
+        })
+    }
+
+    /// The store directory this hold is about.
+    pub fn store_dir(&self) -> &Path {
+        &self.store_dir
+    }
+
+    /// Which tree the walk proved the store directory is in.
+    pub fn tree(&self) -> Tree {
+        self.tree
+    }
+
+    /// The slot one artefact of this hold is operated on through.
+    fn slot<'a>(&'a self, of: &'a Artefact) -> LockSlot<'a> {
+        let dir = match of.dir {
+            Which::Store => self.store.as_fd(),
+            Which::Parent => self.parent.as_fd(),
+        };
+        LockSlot { dir, name: &of.name, shown: &of.path }
+    }
+
+    /// A slot for one name inside the store directory, for a caller that wants
+    /// to run the break rule against a single artefact.
+    pub fn in_store<'a>(&'a self, name: &'a OsStr, shown: &'a Path) -> LockSlot<'a> {
+        LockSlot { dir: self.store.as_fd(), name, shown }
+    }
+}
+
+impl std::fmt::Debug for LockAnchor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockAnchor")
+            .field("store_dir", &self.store_dir)
+            .field("tree", &self.tree)
+            .finish()
     }
 }
 
@@ -408,31 +672,6 @@ impl LockFs for RealFs {
 /// A test pins it against [`DIR_MODE`], which is the crate's one spelling of
 /// the same number.
 const LOCK_DIR_MODE: rustix::fs::Mode = rustix::fs::Mode::RWXU;
-
-/// What the holder check found, and the only vocabulary the audit log uses
-/// for it.
-///
-/// Three values, and **none of them names a process or claims a store was
-/// identified** (plan AC80). Attribution to a particular store directory
-/// would need another process's environment, and phase 2 reads none — the
-/// mechanism was deleted as a class, not bounded, after the review found
-/// unrelated plaintext secrets in that output (ruling 4). The rule is
-/// therefore coarser and **strictly more conservative**: a stopped `claude`
-/// anywhere blocks a break, whether or not it has anything to do with this
-/// store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HolderEvidence3 {
-    /// A same-user `claude` is stopped. Abandon.
-    StoppedClaudePresent,
-    /// Every same-user `claude` was readable and none is stopped.
-    NoStoppedClaude,
-    /// The question could not be answered. **Not** the same as
-    /// `NoStoppedClaude`: recording "none found" after failing to look is a
-    /// false negative, and a false negative here licenses a break (spike
-    /// V12).
-    None,
-}
 
 /// Whether any same-user `claude` process is stopped.
 pub trait HolderEvidence: Send + Sync {
@@ -488,7 +727,7 @@ static PROC_HOLDERS: ProcHolders = ProcHolders;
 /// it on drop and from the emergency cleanup registry, both of which outlive
 /// any borrow the caller could lend.
 pub struct Seams<'a> {
-    /// The two directory operations.
+    /// The three directory operations.
     pub fs: Arc<dyn LockFs>,
     /// The holder check. Borrowed, and asked its question at the moment the
     /// rule asks it rather than in advance.
@@ -508,104 +747,70 @@ impl Seams<'static> {
 // The audit record for a break (section 3.8)
 // ---------------------------------------------------------------------------
 
-/// One modification-time sample.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Sample {
-    /// When the sample was taken, RFC 3339.
-    pub at: String,
-    /// The lock directory's modification time, in nanoseconds since the Unix
-    /// epoch. Recorded at full resolution because the comparison between
-    /// samples is exact and a rounded record could not be used to check it.
-    pub mtime_ns: i128,
-    /// How old the lock was at that moment.
-    pub age_ms: u64,
-}
-
-/// Whether a break happened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Outcome {
-    /// The directory was removed.
-    Broken,
-    /// It was left alone.
-    Abandoned,
-}
-
-/// Why, in exactly section 3.8's words.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Reason {
-    /// A sample differed from the one before it, so something is beating.
-    HeartbeatObserved,
-    /// The lock was not old enough for its profile.
-    TooYoung,
-    /// It disappeared between samples. Written to no audit entry: nothing
-    /// was there and nothing was done.
-    Vanished,
-    /// The two clocks disagreed by more than [`CLOCK_SKEW_TOLERANCE`].
-    ClockJump,
-    /// It was recreated between the `rmdir` and agentctl's own `mkdir`.
-    Retaken,
-    /// A same-user `claude` is stopped.
-    HolderStopped,
-}
-
-/// The audit entry for one break attempt (section 3.8's JSON).
+/// Everything the break rule can observe about one break, waiting for the two
+/// fields only its caller knows.
 ///
-/// Written **after** the decision, never in the gap between Sample C and the
-/// `rmdir`: version 1 of this design appended it there, which is
-/// milliseconds a wedged holder can use to resume and heartbeat while still
-/// believing it holds the lock. This implementation goes further and
-/// performs no I/O in [`resolve_stale`] at all — the record is *returned*, so
-/// "after the decision" is true by construction rather than by care.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LockBreakRecord {
-    /// When the decision was reached, RFC 3339.
-    pub ts: String,
-    /// Milliseconds on the monotonic clock since this process started.
-    pub monotonic_ms: u64,
-    /// The agentctl process that decided. Never the holder's pid — see
-    /// [`HolderEvidence::stopped_pids`].
-    pub agentctl_pid: u32,
-    /// Always `lock_break`.
-    pub event: String,
-    /// The lock directory.
-    pub path: PathBuf,
-    /// The store directory it belongs to. Filled by [`acquire`], which knows
-    /// it; [`resolve_stale`] on its own is given only a lock path.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub store_dir: Option<PathBuf>,
-    /// Which tree, likewise filled by [`acquire`].
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tree: Option<Tree>,
-    /// The keychain service the swap was for. Filled by the W4a caller.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service: Option<String>,
-    /// `live` or `namespace:<sha8>`. Filled by the W4a caller.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target: Option<String>,
+/// The record is [`LockBreakRecord`] — one field list, one JSON shape,
+/// section 3.8's — and it is deliberately **not** reachable from here as a
+/// pile of `Option`s. The rule fills the thirteen members it can see; the swap
+/// supplies `service` and `target`, which it alone knows; and
+/// [`complete`](BreakDraft::complete) is the only way to get from one to the
+/// other, so no field can arrive at the log empty because a caller forgot it.
+///
+/// The draft is *returned* rather than appended, which is what makes "no I/O
+/// between Sample C and the `rmdir`" true by construction: there is no logging
+/// call in [`resolve_stale`] to grow one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakDraft {
+    /// The lock directory, as the hold spells it.
+    path: PathBuf,
+    /// The store directory it guards.
+    store_dir: PathBuf,
+    /// Which tree that store is in.
+    tree: Tree,
     /// The first sample.
-    pub sample_a: Sample,
-    /// The sample [`STALE_SAMPLE_INTERVAL`] later.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sample_b: Option<Sample>,
+    sample_a: Sample,
+    /// The sample [`STALE_SAMPLE_INTERVAL`] later, when the rule got that far.
+    sample_b: Option<Sample>,
     /// The sample taken immediately before the `rmdir`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sample_c: Option<Sample>,
+    sample_c: Option<Sample>,
     /// How much wall-clock time passed between A and B.
-    pub interval_wall_ms: u64,
+    interval_wall_ms: u64,
     /// How much monotonic time passed between A and B. The two are compared,
     /// which is what catches a clock step in either direction.
-    pub interval_monotonic_ms: u64,
+    interval_monotonic_ms: u64,
     /// What the holder check found.
-    pub holder_evidence: HolderEvidence3,
+    holder_evidence: HolderEvidence3,
     /// Whether the directory was removed.
-    pub outcome: Outcome,
+    outcome: Outcome,
     /// Why not, when it was not — and `retaken` when it was removed and
-    /// immediately taken by somebody else. Absent for a clean break: every
-    /// member of the vocabulary is a reason *not* to have broken one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<Reason>,
+    /// immediately taken by somebody else.
+    reason: Option<Reason>,
+}
+
+impl BreakDraft {
+    /// Fills in the swap's own two fields and hands back the record to append.
+    ///
+    /// `service` is the keychain item the swap is for and `target` says which
+    /// item that is; both belong to the caller because the rule is given a lock
+    /// artefact and nothing else.
+    pub fn complete(self, service: String, target: Target) -> LockBreakRecord {
+        LockBreakRecord {
+            path: self.path,
+            store_dir: self.store_dir,
+            tree: self.tree,
+            service,
+            target,
+            sample_a: self.sample_a,
+            sample_b: self.sample_b,
+            sample_c: self.sample_c,
+            interval_wall_ms: self.interval_wall_ms,
+            interval_monotonic_ms: self.interval_monotonic_ms,
+            holder_evidence: self.holder_evidence,
+            outcome: self.outcome,
+            reason: self.reason,
+        }
+    }
 }
 
 /// What [`resolve_stale`] decided.
@@ -622,14 +827,14 @@ pub enum Decision {
     Failed(String),
 }
 
-/// A break attempt's decision and its audit entry.
+/// A break attempt's decision and the draft record for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BreakOutcome {
+pub struct BreakAttempt {
     /// What happened.
     pub decision: Decision,
-    /// The entry to append, or `None` when there is nothing to record: a
-    /// lock that vanished, a cancelled wait, or a failed operation.
-    pub record: Option<LockBreakRecord>,
+    /// The draft to complete and append, or `None` when there is nothing to
+    /// record: a lock that vanished, a cancelled wait, or a failed operation.
+    pub record: Option<BreakDraft>,
 }
 
 // ---------------------------------------------------------------------------
@@ -662,13 +867,13 @@ pub struct Acquisition {
     /// Held or busy.
     pub outcome: AcquireOutcome,
     /// The single break this acquire attempted, if any.
-    pub break_record: Option<LockBreakRecord>,
+    pub break_record: Option<BreakDraft>,
 }
 
 /// One held directory and the modification time it had when it was created.
 #[derive(Debug, Clone)]
 struct HeldOne {
-    path: PathBuf,
+    artefact: Artefact,
     mtime: Option<SystemTime>,
 }
 
@@ -680,8 +885,7 @@ struct HeldOne {
 /// `register_restore` rather than `register_tmp_path`, because that one
 /// unlinks and cannot remove a directory.
 pub struct HeldLocks {
-    store_dir: PathBuf,
-    tree: Tree,
+    anchor: Arc<LockAnchor>,
     held: Vec<HeldOne>,
     record_path: PathBuf,
     first_mkdir: Instant,
@@ -696,12 +900,12 @@ pub struct HeldLocks {
 impl HeldLocks {
     /// The store directory this hold is about.
     pub fn store_dir(&self) -> &Path {
-        &self.store_dir
+        self.anchor.store_dir()
     }
 
     /// Which tree the hold is in.
     pub fn tree(&self) -> Tree {
-        self.tree
+        self.anchor.tree()
     }
 
     /// The held-lock record's path, so `doctor` and the tests can name it.
@@ -711,7 +915,7 @@ impl HeldLocks {
 
     /// The directories held, in acquisition order.
     pub fn paths(&self) -> Vec<PathBuf> {
-        self.held.iter().map(|one| one.path.clone()).collect()
+        self.held.iter().map(|one| one.artefact.path.clone()).collect()
     }
 
     /// How long the hold has lasted, from the first `mkdir`.
@@ -744,8 +948,8 @@ impl HeldLocks {
     /// [`LockError::BudgetExceeded`].
     pub fn drift_check(&self) -> Result<(), LockError> {
         for one in &self.held {
-            if mtime_of(&one.path) != one.mtime {
-                return Err(LockError::Compromised(one.path.clone()));
+            if self.fs.mtime(self.anchor.slot(&one.artefact)) != one.mtime {
+                return Err(LockError::Compromised(one.artefact.path.clone()));
             }
         }
 
@@ -766,7 +970,7 @@ impl HeldLocks {
         }
         self.released = true;
         for one in self.held.iter().rev() {
-            let _ = self.fs.rmdir(&one.path);
+            let _ = self.fs.rmdir(self.anchor.slot(&one.artefact));
         }
         let _ = std::fs::remove_file(&self.record_path);
         if let Some(token) = self.cleanup.take() {
@@ -791,8 +995,8 @@ impl Drop for HeldLocks {
 impl std::fmt::Debug for HeldLocks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HeldLocks")
-            .field("store_dir", &self.store_dir)
-            .field("tree", &self.tree)
+            .field("store_dir", &self.store_dir())
+            .field("tree", &self.tree())
             .field("paths", &self.paths())
             .field("record", &self.record_path)
             .finish()
@@ -801,32 +1005,61 @@ impl std::fmt::Debug for HeldLocks {
 
 /// One of the three locks a credential-store hold is made of.
 struct LockPlan {
-    path: PathBuf,
+    artefact: Artefact,
     profile: LockProfile,
 }
 
 /// The three directories, in the peer's own nesting.
 ///
-/// Primary first, then the legacy lock beside the **resolved** spelling of
-/// the store directory, then `.storage-write` innermost (facts F46 and the
-/// corrected F58). The order is the peer's, not a preference: taking
-/// `.storage-write` first would be a genuine ABBA deadlock against a session
-/// whose own nesting is refresh body → persist → `.storage-write`.
-fn plan(store_dir: &Path) -> [LockPlan; 3] {
-    // The legacy lock is named after the resolved directory (fact F17), and
-    // on macOS the resolved and lexical spellings differ in the common case
-    // rather than the exotic one — `$TMPDIR` lives under `/var`, a link to
-    // `/private/var`. When the directory cannot be resolved at all there is
-    // nothing better than the lexical spelling, and the `mkdir` below will
-    // fail honestly if that spelling is wrong.
-    let resolved = namespace::canonical(store_dir).unwrap_or_else(|_| store_dir.to_path_buf());
-    let mut legacy = resolved.into_os_string();
-    legacy.push(LEGACY_LOCK_SUFFIX);
+/// Primary first, then the legacy lock beside the store directory, then
+/// `.storage-write` innermost (facts F46 and the corrected F58). The order is
+/// the peer's, not a preference: taking `.storage-write` first would be a
+/// genuine ABBA deadlock against a session whose own nesting is refresh body →
+/// persist → `.storage-write`.
+///
+/// The legacy lock's name comes from the **opened chain** — the store
+/// directory's own component as the `O_NOFOLLOW` walk accepted it, placed in
+/// the parent that walk reached — and not from `realpath`. Fact F17 says the
+/// peer names it after the resolved directory, and this produces exactly that
+/// directory entry, because a walk that refused every symbolic link below the
+/// anchor has already resolved everything `realpath` would have: the parent
+/// descriptor is the resolved parent's inode. Calling `canonicalize` instead
+/// would ask the kernel to *follow* a link planted at the store, which is
+/// precisely the redirection this hold must not accept — the lexical and
+/// resolved spellings of the path differ on macOS in the common case
+/// (`$TMPDIR` lives under `/var`, a link to `/private/var`), and both name the
+/// same entry in the same directory.
+fn plan(anchor: &LockAnchor) -> [LockPlan; 3] {
+    let mut legacy_name = anchor.store_name.clone();
+    legacy_name.push(LEGACY_LOCK_SUFFIX);
+    let legacy_path = match anchor.store_dir.parent() {
+        Some(parent) => parent.join(&legacy_name),
+        // Unreachable: `LockAnchor::open` refuses a store directory with no
+        // parent. Spelled rather than unwrapped so it stays unreachable.
+        None => PathBuf::from(&legacy_name),
+    };
 
     [
-        LockPlan { path: store_dir.join(REFRESH_LOCK), profile: REFRESH_PROFILE },
-        LockPlan { path: PathBuf::from(legacy), profile: REFRESH_PROFILE },
-        LockPlan { path: store_dir.join(STORAGE_WRITE_LOCK), profile: STORAGE_WRITE_PROFILE },
+        LockPlan {
+            artefact: Artefact {
+                dir: Which::Store,
+                name: OsString::from(REFRESH_LOCK),
+                path: anchor.store_dir.join(REFRESH_LOCK),
+            },
+            profile: REFRESH_PROFILE,
+        },
+        LockPlan {
+            artefact: Artefact { dir: Which::Parent, name: legacy_name, path: legacy_path },
+            profile: REFRESH_PROFILE,
+        },
+        LockPlan {
+            artefact: Artefact {
+                dir: Which::Store,
+                name: OsString::from(STORAGE_WRITE_LOCK),
+                path: anchor.store_dir.join(STORAGE_WRITE_LOCK),
+            },
+            profile: STORAGE_WRITE_PROFILE,
+        },
     ]
 }
 
@@ -849,37 +1082,42 @@ fn plan(store_dir: &Path) -> [LockPlan; 3] {
 ///
 /// # Errors
 ///
-/// [`LockError::Cancelled`] when the run is cancelled, and
+/// [`LockError::WrongTree`] when the store directory is not in the tree
+/// `subject` names and [`LockError::Unreachable`] when the way to it cannot be
+/// walked without following a symbolic link — both **before** anything is
+/// created. Then [`LockError::Cancelled`] when the run is cancelled, and
 /// [`LockError::Io`] when a directory operation fails for a reason that is
 /// not contention.
 pub fn acquire(
-    store_dir: &Path,
-    tree: Tree,
+    subject: LockSubject<'_>,
     paths: &Paths,
+    env: &EnvView,
     clock: &Clock,
     ctx: &PassCtx,
     fault: &Fault,
 ) -> Result<Acquisition, LockError> {
     let seams = Seams::real(clock.clone());
-    acquire_with(store_dir, tree, paths, ctx, fault, &seams)
+    let anchor = LockAnchor::open(subject, paths, env)?;
+    acquire_with(anchor, paths, ctx, fault, &seams)
 }
 
-/// [`acquire`] over injected seams.
+/// [`acquire`] over injected seams and an already-opened anchor.
 ///
 /// # Errors
 ///
 /// See [`acquire`].
 pub fn acquire_with(
-    store_dir: &Path,
-    tree: Tree,
+    anchor: LockAnchor,
     paths: &Paths,
     ctx: &PassCtx,
     fault: &Fault,
     seams: &Seams<'_>,
 ) -> Result<Acquisition, LockError> {
-    let plans = plan(store_dir);
-    let mut break_record: Option<LockBreakRecord> = None;
-    let mut broken_path: Option<PathBuf> = None;
+    let anchor = Arc::new(anchor);
+    let plans = plan(&anchor);
+    let subject = LockSubject { store_dir: anchor.store_dir(), tree: anchor.tree() };
+    let mut break_record: Option<BreakDraft> = None;
+    let mut broken: Option<Artefact> = None;
     let mut restarts = 0_u32;
 
     loop {
@@ -889,7 +1127,8 @@ pub fn acquire_with(
 
         // --- Step 1: resolve staleness, holding nothing -------------------
         for lock in &plans {
-            let Some(mtime) = mtime_of(&lock.path) else { continue };
+            let at = anchor.slot(&lock.artefact);
+            let Some(mtime) = seams.fs.mtime(at) else { continue };
             let age = age_of(&seams.clock, mtime);
             if age < lock.profile.stale && !fault.is("lock_stale") {
                 continue;
@@ -900,17 +1139,12 @@ pub fn acquire_with(
                 return Ok(busy(false, Vec::new(), break_record));
             }
 
-            let outcome = resolve_stale_with(&lock.path, &lock.profile, ctx, fault, seams);
-            let mut record = outcome.record;
-            if let Some(entry) = record.as_mut() {
-                entry.store_dir = Some(store_dir.to_path_buf());
-                entry.tree = Some(tree);
-            }
-            break_record = record;
+            let outcome = resolve_stale_with(subject, at, &lock.profile, ctx, fault, seams);
+            break_record = outcome.record;
 
             match outcome.decision {
                 // Gone, either way: carry on to the mkdirs.
-                Decision::Broken => broken_path = Some(lock.path.clone()),
+                Decision::Broken => broken = Some(lock.artefact.clone()),
                 Decision::Abandoned(Reason::Vanished) => {}
                 Decision::Abandoned(Reason::HolderStopped) => {
                     return Ok(busy(false, seams.holders.stopped_pids(), break_record));
@@ -921,7 +1155,7 @@ pub fn acquire_with(
                 Decision::Cancelled => return Err(LockError::Cancelled),
                 Decision::Failed(message) => {
                     return Err(LockError::Io {
-                        context: format!("could not resolve `{}`", lock.path.display()),
+                        context: format!("could not resolve `{}`", lock.artefact.path.display()),
                         message,
                     });
                 }
@@ -935,8 +1169,8 @@ pub fn acquire_with(
         // `retaken`, and it ends the acquire: at most one break, so there is
         // no second one to attempt, and waiting out the new holder would be
         // waiting out a lock agentctl itself just freed.
-        if let Some(broken) = broken_path.as_deref()
-            && mtime_of(broken).is_some()
+        if let Some(artefact) = broken.as_ref()
+            && seams.fs.mtime(anchor.slot(artefact)).is_some()
         {
             if let Some(entry) = break_record.as_mut() {
                 entry.reason = Some(Reason::Retaken);
@@ -944,8 +1178,8 @@ pub fn acquire_with(
             return Ok(busy(true, Vec::new(), break_record));
         }
 
-        if let Some(mtime) = mtime_of(&primary.path) {
-            match contention_wait(&primary.path, mtime, ctx, seams) {
+        if let Some(mtime) = seams.fs.mtime(anchor.slot(&primary.artefact)) {
+            match contention_wait(anchor.slot(&primary.artefact), mtime, ctx, seams) {
                 Contention::Released => {}
                 Contention::StillHeld { holder_alive } => {
                     return Ok(busy(holder_alive, Vec::new(), break_record));
@@ -955,7 +1189,7 @@ pub fn acquire_with(
         }
 
         // --- Step 3: the record, before the first mkdir -------------------
-        let record_path = write_held_record(paths, store_dir, tree, &plans, &seams.clock)?;
+        let record_path = write_held_record(paths, &anchor, &plans, &seams.clock)?;
 
         // --- Step 4: mkdir ×3 in the peer's nesting -----------------------
         //
@@ -964,11 +1198,10 @@ pub fn acquire_with(
         // moment the primary exists, so measuring from the end would
         // understate exactly the term the budget is derived from.
         let first_mkdir = seams.clock.monotonic();
-        match take_all(&plans, seams, fault) {
+        match take_all(&anchor, &plans, seams, fault) {
             Ok(held) => {
                 let hold = HeldLocks {
-                    store_dir: store_dir.to_path_buf(),
-                    tree,
+                    anchor: Arc::clone(&anchor),
                     held,
                     record_path,
                     first_mkdir,
@@ -982,15 +1215,15 @@ pub fn acquire_with(
                 let hold = register_emergency_release(hold);
                 return Ok(Acquisition { outcome: AcquireOutcome::Held(hold), break_record });
             }
-            Err(TakeFailure::Exists { path, held }) => {
-                release_all(&held, seams);
+            Err(TakeFailure::Exists { artefact, held }) => {
+                release_all(&anchor, &held, seams);
                 let _ = std::fs::remove_file(&record_path);
 
                 // A lock recreated between our own `rmdir` and our own
                 // `mkdir` is the one case section 3.8 calls `retaken`, and it
                 // ends the acquire: at most one break, so there is no second
                 // one to attempt.
-                if broken_path.as_deref() == Some(path.as_path())
+                if broken.as_ref() == Some(&artefact)
                     && let Some(entry) = break_record.as_mut()
                 {
                     entry.reason = Some(Reason::Retaken);
@@ -1002,11 +1235,11 @@ pub fn acquire_with(
                     return Ok(busy(false, Vec::new(), break_record));
                 }
             }
-            Err(TakeFailure::Io { path, held, message }) => {
-                release_all(&held, seams);
+            Err(TakeFailure::Io { artefact, held, message }) => {
+                release_all(&anchor, &held, seams);
                 let _ = std::fs::remove_file(&record_path);
                 return Err(LockError::Io {
-                    context: format!("could not create `{}`", path.display()),
+                    context: format!("could not create `{}`", artefact.path.display()),
                     message,
                 });
             }
@@ -1018,17 +1251,17 @@ pub fn acquire_with(
 fn busy(
     holder_alive: bool,
     stopped_pids: Vec<u32>,
-    break_record: Option<LockBreakRecord>,
+    break_record: Option<BreakDraft>,
 ) -> Acquisition {
     Acquisition { outcome: AcquireOutcome::Busy { holder_alive, stopped_pids }, break_record }
 }
 
 /// Why the three `mkdir`s did not all succeed.
 enum TakeFailure {
-    /// Somebody holds `path`; `held` is what was taken before that.
-    Exists { path: PathBuf, held: Vec<HeldOne> },
-    /// `path` could not be created at all.
-    Io { path: PathBuf, held: Vec<HeldOne>, message: String },
+    /// Somebody holds `artefact`; `held` is what was taken before that.
+    Exists { artefact: Artefact, held: Vec<HeldOne> },
+    /// `artefact` could not be created at all.
+    Io { artefact: Artefact, held: Vec<HeldOne>, message: String },
 }
 
 /// `mkdir`s the three in order, recording each one's modification time.
@@ -1037,28 +1270,32 @@ enum TakeFailure {
 /// `.storage-write`, whose profile carries `retries: 0` precisely so that
 /// none of fact F47's ten-step ladder enters the hold.
 fn take_all(
+    anchor: &LockAnchor,
     plans: &[LockPlan; 3],
     seams: &Seams,
     fault: &Fault,
 ) -> Result<Vec<HeldOne>, TakeFailure> {
     let mut held: Vec<HeldOne> = Vec::with_capacity(plans.len());
     for (position, lock) in plans.iter().enumerate() {
+        let at = anchor.slot(&lock.artefact);
         let contended = position == 0 && fault.is("lock_contended");
-        let result = if contended { Err(FsError::Exists) } else { seams.fs.mkdir(&lock.path) };
+        let result = if contended { Err(FsError::Exists) } else { seams.fs.mkdir(at) };
         match result {
-            Ok(()) => held.push(HeldOne { path: lock.path.clone(), mtime: mtime_of(&lock.path) }),
+            Ok(()) => {
+                held.push(HeldOne { artefact: lock.artefact.clone(), mtime: seams.fs.mtime(at) })
+            }
             Err(FsError::Exists) => {
-                return Err(TakeFailure::Exists { path: lock.path.clone(), held });
+                return Err(TakeFailure::Exists { artefact: lock.artefact.clone(), held });
             }
             Err(FsError::NotFound) => {
                 return Err(TakeFailure::Io {
-                    path: lock.path.clone(),
+                    artefact: lock.artefact.clone(),
                     held,
                     message: "the parent directory is not there".to_owned(),
                 });
             }
             Err(FsError::Other(message)) => {
-                return Err(TakeFailure::Io { path: lock.path.clone(), held, message });
+                return Err(TakeFailure::Io { artefact: lock.artefact.clone(), held, message });
             }
         }
     }
@@ -1066,9 +1303,9 @@ fn take_all(
 }
 
 /// Releases what was taken, in reverse order.
-fn release_all(held: &[HeldOne], seams: &Seams<'_>) {
+fn release_all(anchor: &LockAnchor, held: &[HeldOne], seams: &Seams<'_>) {
     for one in held.iter().rev() {
-        let _ = seams.fs.rmdir(&one.path);
+        let _ = seams.fs.rmdir(anchor.slot(&one.artefact));
     }
 }
 
@@ -1079,12 +1316,16 @@ fn release_all(held: &[HeldOne], seams: &Seams<'_>) {
 /// [`cleanup::register_restore`] and not `register_tmp_path`, because that
 /// one unlinks and a lock is a **directory**.
 fn register_emergency_release(mut hold: HeldLocks) -> HeldLocks {
-    let paths: Vec<PathBuf> = hold.held.iter().rev().map(|one| one.path.clone()).collect();
+    let artefacts: Vec<Artefact> = hold.held.iter().rev().map(|one| one.artefact.clone()).collect();
     let record = hold.record_path.clone();
     let fs = Arc::clone(&hold.fs);
+    // The anchor's descriptors are moved into the closure as well, because the
+    // release has to land in the directories the `mkdir`s landed in — a signal
+    // handler re-resolving a path is a signal handler that can be redirected.
+    let anchor = Arc::clone(&hold.anchor);
     hold.cleanup = Some(cleanup::register_restore(Box::new(move || {
-        for path in paths {
-            let _ = fs.rmdir(&path);
+        for artefact in &artefacts {
+            let _ = fs.rmdir(anchor.slot(artefact));
         }
         let _ = std::fs::remove_file(&record);
     })));
@@ -1117,7 +1358,12 @@ enum Contention {
 /// A lock that disappears at any sample ends the wait immediately: that is
 /// the case where a live session releases the lock and the swap should carry
 /// on (plan AC68), not report a refusal.
-fn contention_wait(path: &Path, first: SystemTime, ctx: &PassCtx, seams: &Seams<'_>) -> Contention {
+fn contention_wait(
+    at: LockSlot<'_>,
+    first: SystemTime,
+    ctx: &PassCtx,
+    seams: &Seams<'_>,
+) -> Contention {
     let mut waited = Duration::ZERO;
     for _ in 0..CONTENTION_ROUNDS {
         let nap = CONTENTION_ROUND_BASE.saturating_add(round_jitter());
@@ -1125,12 +1371,12 @@ fn contention_wait(path: &Path, first: SystemTime, ctx: &PassCtx, seams: &Seams<
             return Contention::Cancelled;
         }
         waited = waited.saturating_add(nap);
-        if mtime_of(path).is_none() {
+        if seams.fs.mtime(at).is_none() {
             return Contention::Released;
         }
     }
 
-    let Some(second) = mtime_of(path) else { return Contention::Released };
+    let Some(second) = seams.fs.mtime(at) else { return Contention::Released };
     if second != first {
         return Contention::StillHeld { holder_alive: true };
     }
@@ -1142,7 +1388,7 @@ fn contention_wait(path: &Path, first: SystemTime, ctx: &PassCtx, seams: &Seams<
     if seams.clock.sleep(top_up, ctx.cancel()) {
         return Contention::Cancelled;
     }
-    match mtime_of(path) {
+    match seams.fs.mtime(at) {
         None => Contention::Released,
         Some(third) => Contention::StillHeld { holder_alive: third != first },
     }
@@ -1188,43 +1434,39 @@ fn round_jitter() -> Duration {
 /// unobservable to any sampling rule. The window is two syscalls wide and is
 /// the residual risk R36 accepts.
 pub fn resolve_stale(
-    lock_path: &Path,
+    subject: LockSubject<'_>,
+    at: LockSlot<'_>,
     profile: &LockProfile,
     clock: &Clock,
     holders: &dyn HolderEvidence,
     ctx: &PassCtx,
-) -> BreakOutcome {
+) -> BreakAttempt {
     let seams = Seams { fs: Arc::new(RealFs), holders, clock: clock.clone() };
-    resolve_stale_with(lock_path, profile, ctx, &Fault::none(), &seams)
+    resolve_stale_with(subject, at, profile, ctx, &Fault::none(), &seams)
 }
 
 /// [`resolve_stale`] over injected seams.
 pub fn resolve_stale_with(
-    lock_path: &Path,
+    subject: LockSubject<'_>,
+    at: LockSlot<'_>,
     profile: &LockProfile,
     ctx: &PassCtx,
     fault: &Fault,
     seams: &Seams<'_>,
-) -> BreakOutcome {
+) -> BreakAttempt {
     let clock = &seams.clock;
 
     // --- Sample A -------------------------------------------------------
     let wall_a = clock.wall();
     let mono_a = clock.monotonic();
-    let Some(mtime_a) = mtime_of(lock_path) else { return vanished() };
+    let Some(mtime_a) = seams.fs.mtime(at) else { return vanished() };
     let age_a = elapsed(wall_a, mtime_a);
     let sample_a = sample(wall_a, mtime_a, age_a);
 
-    let mut record = LockBreakRecord {
-        ts: rfc3339(wall_a),
-        monotonic_ms: monotonic_ms(clock),
-        agentctl_pid: std::process::id(),
-        event: "lock_break".to_owned(),
-        path: lock_path.to_path_buf(),
-        store_dir: None,
-        tree: None,
-        service: None,
-        target: None,
+    let mut record = BreakDraft {
+        path: at.shown.to_path_buf(),
+        store_dir: subject.store_dir.to_path_buf(),
+        tree: subject.tree,
         sample_a,
         sample_b: None,
         sample_c: None,
@@ -1236,24 +1478,24 @@ pub fn resolve_stale_with(
     };
 
     if age_a < profile.stale {
-        return abandoned(record, Reason::TooYoung, clock);
+        return abandoned(record, Reason::TooYoung);
     }
 
     // --- Holder evidence ------------------------------------------------
     record.holder_evidence = seams.holders.stopped_claude_present();
     if record.holder_evidence == HolderEvidence3::StoppedClaudePresent {
-        return abandoned(record, Reason::HolderStopped, clock);
+        return abandoned(record, Reason::HolderStopped);
     }
 
     // --- The sampling wait ----------------------------------------------
     if clock.sleep(STALE_SAMPLE_INTERVAL, ctx.cancel()) {
-        return BreakOutcome { decision: Decision::Cancelled, record: None };
+        return BreakAttempt { decision: Decision::Cancelled, record: None };
     }
 
     // --- Sample B -------------------------------------------------------
     let wall_b = clock.wall();
     let mono_b = clock.monotonic();
-    let Some(mtime_b) = mtime_of(lock_path) else { return vanished() };
+    let Some(mtime_b) = seams.fs.mtime(at) else { return vanished() };
     let age_b = elapsed(wall_b, mtime_b);
     record.sample_b = Some(sample(wall_b, mtime_b, age_b));
 
@@ -1263,7 +1505,7 @@ pub fn resolve_stale_with(
     record.interval_monotonic_ms = millis(mono_delta);
 
     if mtime_b != mtime_a {
-        return abandoned(record, Reason::HeartbeatObserved, clock);
+        return abandoned(record, Reason::HeartbeatObserved);
     }
     // The clock check comes **before** the age check, and the order is the
     // finding rather than a preference: a wall clock that has stepped
@@ -1271,67 +1513,71 @@ pub fn resolve_stale_with(
     // would report `too_young` for what is really a clock jump — the wrong
     // diagnosis, and one that hides the condition architect N-3 added.
     if clock_skew(wall_delta, forward, mono_delta) > CLOCK_SKEW_TOLERANCE {
-        return abandoned(record, Reason::ClockJump, clock);
+        return abandoned(record, Reason::ClockJump);
     }
     if age_b < profile.stale {
-        return abandoned(record, Reason::TooYoung, clock);
+        return abandoned(record, Reason::TooYoung);
     }
 
     // The injected resume: a holder that was wedged and comes back in
     // exactly the window Sample C exists to close.
     if fault.is("lock_resume_after_sample_b") {
-        touch(lock_path);
+        touch(at);
     }
 
     // --- Sample C, then the rmdir, with nothing in between --------------
     let wall_c = clock.wall();
-    let Some(mtime_c) = mtime_of(lock_path) else { return vanished() };
+    let Some(mtime_c) = seams.fs.mtime(at) else { return vanished() };
     if mtime_c != mtime_b {
         record.sample_c = Some(sample(wall_c, mtime_c, elapsed(wall_c, mtime_c)));
-        return abandoned(record, Reason::HeartbeatObserved, clock);
+        return abandoned(record, Reason::HeartbeatObserved);
     }
-    let removal = seams.fs.rmdir(lock_path);
+    let removal = seams.fs.rmdir(at);
 
     // Everything below is after the decision. Nothing above allocates, logs
     // or appends between Sample C and the `rmdir`.
     record.sample_c = Some(sample(wall_c, mtime_c, elapsed(wall_c, mtime_c)));
     match removal {
         Ok(()) => {
-            record.ts = rfc3339(clock.wall());
             record.outcome = Outcome::Broken;
             record.reason = None;
             tracing::info!(
-                path = %lock_path.display(),
+                path = %at.shown.display(),
                 holder_evidence = ?record.holder_evidence,
                 "removed a stale Claude Code lock"
             );
-            BreakOutcome { decision: Decision::Broken, record: Some(record) }
+            BreakAttempt { decision: Decision::Broken, record: Some(record) }
         }
         Err(FsError::NotFound) => vanished(),
-        Err(FsError::Exists) => BreakOutcome {
+        Err(FsError::Exists) => BreakAttempt {
             decision: Decision::Failed(
                 "the lock path is not an empty directory; refusing to remove it".to_owned(),
             ),
             record: None,
         },
         Err(FsError::Other(message)) => {
-            BreakOutcome { decision: Decision::Failed(message), record: None }
+            BreakAttempt { decision: Decision::Failed(message), record: None }
         }
     }
 }
 
 /// The lock disappeared: nothing was there and nothing was done, so section
 /// 3.8 writes no audit entry.
-fn vanished() -> BreakOutcome {
-    BreakOutcome { decision: Decision::Abandoned(Reason::Vanished), record: None }
+fn vanished() -> BreakAttempt {
+    BreakAttempt { decision: Decision::Abandoned(Reason::Vanished), record: None }
 }
 
-/// Stamps an abandoned decision onto the record.
-fn abandoned(mut record: LockBreakRecord, reason: Reason, clock: &Clock) -> BreakOutcome {
-    record.ts = rfc3339(clock.wall());
+/// Stamps an abandoned decision onto the draft.
+///
+/// No clock reading here any more: the entry's `ts` and `monotonic_ms` belong
+/// to [`crate::secret::audit::AuditEntry`], which stamps them where the line is
+/// written. That
+/// is also the honest place for them — they say when the *entry* was made, and
+/// a decision that is returned rather than logged has not been recorded yet.
+fn abandoned(mut record: BreakDraft, reason: Reason) -> BreakAttempt {
     record.outcome = Outcome::Abandoned;
     record.reason = Some(reason);
-    BreakOutcome { decision: Decision::Abandoned(reason), record: Some(record) }
+    BreakAttempt { decision: Decision::Abandoned(reason), record: Some(record) }
 }
 
 /// How far apart the two clocks' views of the interval are.
@@ -1366,17 +1612,20 @@ fn signed_delta(from: SystemTime, to: SystemTime) -> (Duration, bool) {
 const RECORD_NAME_ATTEMPTS: u32 = 8;
 
 /// Writes the held-lock record, before anything is taken.
+///
+/// The record is [`held_locks::HeldLockRecord`] — the reader's own type, not a
+/// second declaration of the same fields — so `doctor` and this writer cannot
+/// disagree about a name or a `tree` spelling.
 fn write_held_record(
     paths: &Paths,
-    store_dir: &Path,
-    tree: Tree,
+    anchor: &LockAnchor,
     plans: &[LockPlan; 3],
     clock: &Clock,
 ) -> Result<PathBuf, LockError> {
     use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let dir = paths.namespace_root().join(HELD_LOCKS_DIR);
+    let dir = held_locks::dir(paths);
     if !dir.is_dir() {
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(true).mode(DIR_MODE);
@@ -1388,9 +1637,15 @@ fn write_held_record(
 
     let record = HeldLockRecord {
         agentctl_pid: std::process::id(),
-        tree,
-        store_dir: store_dir.to_path_buf(),
-        paths: plans.iter().map(|lock| lock.path.clone()).collect(),
+        // Read here rather than at the removal, because the point of the field
+        // is to say which process this was: a `doctor` run months later can
+        // only compare a recorded start time against the one the id carries
+        // now, and a recycled id then reads as recycled instead of as the
+        // holder.
+        agentctl_start_time: proc::self_start_time(&Cancel::new()),
+        tree: anchor.tree(),
+        store_dir: anchor.store_dir().to_path_buf(),
+        paths: plans.iter().map(|lock| lock.artefact.path.clone()).collect(),
         taken_at: rfc3339(clock.wall()),
     };
     let json = serde_json::to_string(&record).map_err(|err| LockError::Io {
@@ -1429,31 +1684,11 @@ fn write_held_record(
     })
 }
 
-/// Reads a held-lock record, if it has a readable one.
-///
-/// `None` for every failure: an unreadable or half-written record means the
-/// writer crashed, which is exactly the state it exists to describe and not a
-/// reason to fail a `doctor` run.
-pub fn read_held_record(path: &Path) -> Option<HeldLockRecord> {
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.len() > 64 * 1024 {
-        return None;
-    }
-    serde_json::from_slice(&bytes).ok()
-}
-
-/// Every held-lock record this store knows about.
-pub fn held_records(paths: &Paths) -> Vec<(PathBuf, HeldLockRecord)> {
-    let dir = paths.namespace_root().join(HELD_LOCKS_DIR);
-    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
-    let mut out: Vec<(PathBuf, HeldLockRecord)> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter_map(|path| read_held_record(&path).map(|record| (path, record)))
-        .collect();
-    out.sort_by(|left, right| left.0.cmp(&right.0));
-    out
-}
+// There is deliberately no reader here. `held_locks::read_all` is the crate's
+// one, and it is the careful one: it opens each record `O_NOFOLLOW` and stops
+// at a 4 KiB cap, where the reader this module used to carry followed symbolic
+// links and allowed 64 KiB. Two readers of the same file, one of them safe, is
+// a choice waiting to be made wrongly.
 
 // ---------------------------------------------------------------------------
 // Small shared helpers
@@ -1473,17 +1708,6 @@ fn millis(of: Duration) -> u64 {
     u64::try_from(of.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// One lock directory's modification time, without following a symbolic
-/// link.
-///
-/// A link where a lock directory should be is somebody else's plant, and
-/// `symlink_metadata` is what keeps this from reading the target's time
-/// instead. Such a path is also unremovable by the break: `rmdir` on a
-/// symbolic link fails, which is the safe side of that trade.
-fn mtime_of(path: &Path) -> Option<SystemTime> {
-    std::fs::symlink_metadata(path).ok()?.modified().ok()
-}
-
 /// How long ago `mtime` was, saturating at zero for a clock that has gone
 /// backwards.
 fn elapsed(now: SystemTime, mtime: SystemTime) -> Duration {
@@ -1497,40 +1721,54 @@ fn age_of(clock: &Clock, mtime: SystemTime) -> Duration {
 
 /// Builds one audit sample.
 fn sample(at: SystemTime, mtime: SystemTime, age: Duration) -> Sample {
-    Sample { at: rfc3339(at), mtime_ns: nanos_since_epoch(mtime), age_ms: millis(age) }
+    Sample { at: timestamp(at), mtime_ns: nanos_since_epoch(mtime), age_ms: millis(age) }
 }
 
 /// A `SystemTime` as nanoseconds since the Unix epoch, negative before it.
-fn nanos_since_epoch(at: SystemTime) -> i128 {
+///
+/// `i64` rather than the plan's `i128`, for a mechanical reason rather than a
+/// preference: a 128-bit integer does not survive serde's buffering of a
+/// flattened field, and this number reaches the log through
+/// [`crate::secret::audit::AuditEntry`]'s `flatten`. Nanoseconds since 1970 fit
+/// in an `i64` until the year 2262.
+fn nanos_since_epoch(at: SystemTime) -> i64 {
     match at.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(since) => i128::try_from(since.as_nanos()).unwrap_or(i128::MAX),
-        Err(before) => {
-            i128::try_from(before.duration().as_nanos()).map_or(i128::MIN, |nanos| -nanos)
-        }
+        Ok(since) => i64::try_from(since.as_nanos()).unwrap_or(i64::MAX),
+        Err(before) => i64::try_from(before.duration().as_nanos()).map_or(i64::MIN, |nanos| -nanos),
     }
+}
+
+/// A `SystemTime` as the `jiff::Timestamp` the audit record carries, or the
+/// epoch when it cannot be represented.
+fn timestamp(at: SystemTime) -> jiff::Timestamp {
+    jiff::Timestamp::from_microsecond(micros_since_epoch(at)).unwrap_or(jiff::Timestamp::UNIX_EPOCH)
 }
 
 /// A `SystemTime` as RFC 3339, or the epoch when it cannot be represented.
 ///
-/// Stored as a string rather than a `jiff::Timestamp` to match the lock body
-/// and the account registry, which do the same and keep `jiff`'s optional
-/// serde support out of the manifest.
+/// The held-lock record stores its `taken_at` as a string rather than a
+/// `jiff::Timestamp` to match the namespace lock body and the account
+/// registry, which do the same and keep `jiff`'s optional serde support out of
+/// the manifest.
 fn rfc3339(at: SystemTime) -> String {
-    let micros = match at.duration_since(SystemTime::UNIX_EPOCH) {
+    timestamp(at).to_string()
+}
+
+/// A `SystemTime` in whole microseconds since the epoch, saturating.
+fn micros_since_epoch(at: SystemTime) -> i64 {
+    match at.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(since) => i64::try_from(since.as_micros()).unwrap_or(i64::MAX),
         Err(before) => {
             i64::try_from(before.duration().as_micros()).map_or(i64::MIN, |micros| -micros)
         }
-    };
-    jiff::Timestamp::from_microsecond(micros).unwrap_or(jiff::Timestamp::UNIX_EPOCH).to_string()
+    }
 }
 
 /// Sets a lock's modification time to now, for the injected-resume fault.
-fn touch(path: &Path) {
+fn touch(at: LockSlot<'_>) {
     let now =
         rustix::fs::Timestamps { last_access: now_timespec(), last_modification: now_timespec() };
-    let _ =
-        rustix::fs::utimensat(rustix::fs::CWD, path, &now, rustix::fs::AtFlags::SYMLINK_NOFOLLOW);
+    let _ = rustix::fs::utimensat(at.dir, at.name, &now, rustix::fs::AtFlags::SYMLINK_NOFOLLOW);
 }
 
 /// The current time as a `Timespec`.

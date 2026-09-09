@@ -203,49 +203,138 @@ pub fn self_start_time(cancel: &Cancel) -> Option<String> {
 /// Two kinds of "could not read" are **not** unreadable, and both matter for
 /// the answer to be useful at all. A process id that has gone between the
 /// listing and the classification no longer exists, so it cannot be a stopped
-/// holder. And a process the kernel refuses to describe belongs to another
-/// user (`EPERM`), so it cannot be a *same-user* `claude`; on this machine
-/// that is 313 of about 700 processes, so counting those as unreadable would
-/// make the evidence permanently inconclusive.
+/// holder. And a process the kernel refuses to describe *and that this process
+/// may not signal* belongs to another user, so it cannot be a *same-user*
+/// `claude`; on this machine that is 313 of about 700 processes, so counting
+/// those as unreadable would make the evidence permanently inconclusive.
+///
+/// The second half of that sentence is load-bearing. `EPERM` alone does not
+/// mean "somebody else's": a sandbox profile carrying `(deny process-info*)`
+/// — and the manual checks for decisions D-016/D-023 run under
+/// `sandbox-exec` — makes `proc_pidinfo` answer `EPERM` for **every** process,
+/// this user's included. Reading that as "not ours" would return an empty list
+/// from a sweep that classified nothing, `no_stopped_claude` would follow, and
+/// a `SIGSTOP`ped session's lock would be broken on modification times alone:
+/// the exact false negative spike V12 identified. So the two are told apart by
+/// `kill(pid, 0)`, which succeeds only for a process this one may signal.
 ///
 /// # Errors
 ///
 /// [`ProcError::Listing`] when the process list itself could not be read, and
-/// [`ProcError::Incomplete`] when a process of ours could not be classified.
+/// [`ProcError::Incomplete`] when a process of ours could not be classified
+/// **and** no stopped `claude` was found anyway — see [`sweep`] for why the
+/// second half of that condition is there.
 pub fn claude_processes() -> Result<Vec<(u32, Holder)>, ProcError> {
     let uid = rustix::process::getuid().as_raw();
+    sweep(ffi::all_pids()?.into_iter().map(|pid| (pid, look(uid, pid))))
+}
+
+/// What one process looked like to the sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    /// A same-user `claude`, in this state.
+    Claude(Holder),
+    /// Readable, and not a same-user `claude`.
+    Other,
+    /// Gone between the listing and the classification.
+    Gone,
+    /// Still there, ours, and **not classified** — the one shape a stopped
+    /// `claude` can hide in.
+    Unclassified,
+}
+
+/// Turns per-process observations into the evidence the break rule asks for.
+///
+/// Separated from the syscalls so the aggregation — "one unclassified process
+/// of ours makes the whole sweep incomplete" — is checkable without a sandbox.
+///
+/// One asymmetry, and it is deliberate: a **stopped** `claude` that was found
+/// is returned even when some other process could not be classified. The
+/// question section 3.8 asks is "is any same-user `claude` stopped?", and a
+/// `yes` does not become less true for having stopped looking. Discarding it
+/// would turn a positive into `none` and let the break proceed on modification
+/// times alone — the very outcome the incompleteness check exists to prevent.
+/// Incompleteness only ever suppresses a **negative**.
+fn sweep(seen: impl IntoIterator<Item = (u32, Seen)>) -> Result<Vec<(u32, Holder)>, ProcError> {
     let mut found = Vec::new();
     let mut unreadable = 0_usize;
-
-    for pid in ffi::all_pids()? {
-        match ffi::bsd_info(pid) {
-            Ok(info) => {
-                if info.pbi_uid != uid {
-                    continue;
-                }
-                match ffi::name(pid) {
-                    Some(name) if name == CLAUDE_PROCESS_NAME => {
-                        found.push((pid, holder_from_status(info.pbi_status)));
-                    }
-                    Some(_) => {}
-                    // Ours, still there, and unnameable: the one case that
-                    // could hide a stopped `claude`.
-                    None if exists(pid) => unreadable = unreadable.saturating_add(1),
-                    None => {}
-                }
+    let mut stopped = false;
+    for (pid, seen) in seen {
+        match seen {
+            Seen::Claude(state) => {
+                stopped = stopped || state == Holder::Stopped;
+                found.push((pid, state));
             }
-            Err(ffi::InfoError::Refused | ffi::InfoError::Gone) => {}
-            Err(ffi::InfoError::Unreadable) if exists(pid) => {
-                unreadable = unreadable.saturating_add(1);
-            }
-            Err(ffi::InfoError::Unreadable) => {}
+            Seen::Other | Seen::Gone => {}
+            Seen::Unclassified => unreadable = unreadable.saturating_add(1),
         }
     }
 
-    if unreadable > 0 {
+    if unreadable > 0 && !stopped {
         return Err(ProcError::Incomplete { unreadable });
     }
     Ok(found)
+}
+
+/// Classifies one process id, asking the kernel only what it needs.
+fn look(uid: u32, pid: u32) -> Seen {
+    classify(
+        uid,
+        ffi::bsd_info(pid).map(|info| (info.pbi_uid, info.pbi_status)),
+        || ffi::name(pid),
+        || signalable(pid),
+    )
+}
+
+/// [`look`]'s decision, with every kernel answer already in hand.
+///
+/// `name` and `signalable` are taken as closures because each costs a syscall
+/// and most processes need neither; they are *parameters* rather than calls so
+/// that the `EPERM` row — a process the kernel describes to nobody yet this
+/// process may signal — is reachable in a test.
+fn classify(
+    uid: u32,
+    info: Result<(u32, u32), ffi::InfoError>,
+    name: impl FnOnce() -> Option<String>,
+    signalable: impl Fn() -> bool,
+) -> Seen {
+    match info {
+        Ok((owner, status)) => {
+            if owner != uid {
+                return Seen::Other;
+            }
+            match name() {
+                Some(name) if name == CLAUDE_PROCESS_NAME => {
+                    Seen::Claude(holder_from_status(status))
+                }
+                Some(_) => Seen::Other,
+                // Ours, still there, and unnameable: the one case that could
+                // hide a stopped `claude`.
+                None if signalable() => Seen::Unclassified,
+                None => Seen::Gone,
+            }
+        }
+        // `EPERM` means "another user's" only when we also cannot signal it.
+        Err(ffi::InfoError::Refused) if signalable() => Seen::Unclassified,
+        Err(ffi::InfoError::Refused) => Seen::Other,
+        Err(ffi::InfoError::Gone) => Seen::Gone,
+        // A short answer from a mismatched kernel struct would come back for
+        // every process alike, so one that cannot be signalled either is not
+        // ours and cannot hide a same-user holder.
+        Err(ffi::InfoError::Unreadable) if signalable() => Seen::Unclassified,
+        Err(ffi::InfoError::Unreadable) => Seen::Other,
+    }
+}
+
+/// Whether this process may signal `pid`, which is what makes it **ours**.
+///
+/// Distinct from [`exists`], which counts `EPERM` as existing: here `EPERM` is
+/// the answer that means "not ours", and conflating the two is what let an
+/// unreadable same-user process table pass for an empty one.
+fn signalable(pid: u32) -> bool {
+    let Ok(raw) = i32::try_from(pid) else { return false };
+    let Some(pid) = Pid::from_raw(raw) else { return false };
+    matches!(rustix::process::test_kill_process(pid), Ok(()))
 }
 
 /// The three `libproc` calls, and the only `unsafe` in the crate.

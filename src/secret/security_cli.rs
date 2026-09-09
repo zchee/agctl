@@ -50,6 +50,24 @@ pub const READ_TIMEOUT: Duration = Duration::from_millis(2000);
 /// The budget for `dump-keychain`, which walks every item.
 pub const DUMP_TIMEOUT: Duration = Duration::from_millis(10_000);
 
+/// The preflight's argv.
+///
+/// The three argv arrays live in constants, and the calls below are built from
+/// them, so that [`argv_shapes`] enumerates what the child actually gets rather
+/// than a second list that has to be kept in step by hand (plan section 9.3's
+/// argv-construction assertion).
+pub const PREFLIGHT_ARGV: [&str; 1] = ["show-keychain-info"];
+
+/// The dump's argv.
+pub const DUMP_ARGV: [&str; 1] = ["dump-keychain"];
+
+/// The read's argv, flags only.
+///
+/// Two values are interleaved into it — the account after `-a` and the service
+/// name after `-s` — and neither is a secret (invariant I8): the password comes
+/// back on standard output, which is what `-w` asks for.
+pub const READ_ARGV_FLAGS: [&str; 4] = ["find-generic-password", "-a", "-w", "-s"];
+
 /// `security(1)`'s exit status for a locked keychain (fact F34).
 pub const EXIT_LOCKED: i32 = 36;
 
@@ -173,9 +191,24 @@ fn drain<R: Read>(reader: Option<R>) -> Vec<u8> {
     buffer
 }
 
+/// The argv arrays this module can hand to `security(1)`.
+///
+/// Read by the argv-construction assertion in plan section 9.3 together with
+/// [`keychain_write::argv_shapes`](crate::secret::keychain_write::argv_shapes);
+/// between them the two lists are the complete set of argv the crate builds.
+/// The read shape is its flags: the account and the service name are values,
+/// and a shape that included them would be a shape per account.
+///
+/// `test` as well as `testing`, so the assertion runs in a plain unit-test
+/// build too; neither spelling reaches a release artifact.
+#[cfg(any(test, feature = "testing"))]
+pub fn argv_shapes() -> Vec<Vec<&'static str>> {
+    vec![PREFLIGHT_ARGV.to_vec(), DUMP_ARGV.to_vec(), READ_ARGV_FLAGS.to_vec()]
+}
+
 impl KeychainReader for SecurityCli {
     fn preflight(&self) -> KeychainStatus {
-        match self.run(&["show-keychain-info"], READ_TIMEOUT) {
+        match self.run(&PREFLIGHT_ARGV, READ_TIMEOUT) {
             Ok(output) if output.code == Some(0) => KeychainStatus::Unlocked,
             Ok(output) if output.code == Some(EXIT_LOCKED) => KeychainStatus::Locked,
             Ok(output) => match classify_stderr(&output.stderr) {
@@ -197,7 +230,7 @@ impl KeychainReader for SecurityCli {
         let entries = match cached {
             Some(entries) => entries,
             None => {
-                let output = self.run(&["dump-keychain"], DUMP_TIMEOUT)?;
+                let output = self.run(&DUMP_ARGV, DUMP_TIMEOUT)?;
                 if output.code != Some(0) {
                     return Err(output.failure());
                 }
@@ -211,7 +244,11 @@ impl KeychainReader for SecurityCli {
     }
 
     fn read(&self, service: &str) -> Result<Option<Vec<u8>>, KeychainError> {
-        let args = ["find-generic-password", "-a", self.account.as_str(), "-w", "-s", service];
+        // Assembled from the flag constant rather than spelled again, so the
+        // enumeration in `argv_shapes` cannot drift from what is passed.
+        let [subcommand, account_flag, password_flag, service_flag] = READ_ARGV_FLAGS;
+        let args =
+            [subcommand, account_flag, self.account.as_str(), password_flag, service_flag, service];
         let output = self.run(&args, READ_TIMEOUT)?;
         match output.code {
             Some(0) => Ok(Some(trim_trailing_newline(output.stdout))),

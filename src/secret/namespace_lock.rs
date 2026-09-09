@@ -121,10 +121,16 @@ pub struct LockBody {
     /// pid.
     ///
     /// Filled from [`crate::runtime::proc::self_start_time`] at acquire time,
-    /// which reads `ps -o lstart=` once per process. `null` when `ps` could not
-    /// be run: `doctor` then falls back to the process id alone, which is
-    /// weaker but still useful, rather than the acquire failing over a
-    /// diagnostic field.
+    /// which asks the kernel directly — in-process, no child (decision D-022)
+    /// — and remembers the answer. `null` when the kernel would not answer:
+    /// `doctor` then falls back to the process id alone, which is weaker but
+    /// still useful, rather than the acquire failing over a diagnostic field.
+    ///
+    /// The string is **compared, never parsed**, so its spelling is private to
+    /// `proc`. One consequence is visible and self-clearing: a body written by
+    /// a build that predates D-022 carries the old spelling, so it compares
+    /// unequal once and `doctor` prints `dead (pid recycled)` for a holder that
+    /// may be alive, until the next acquire rewrites it.
     pub pid_start_time: Option<String>,
     /// When the lock was taken, RFC 3339.
     pub acquired_at: String,

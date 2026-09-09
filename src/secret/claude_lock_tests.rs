@@ -23,6 +23,9 @@ use std::sync::Mutex;
 use std::time::Instant;
 use std::time::SystemTime;
 
+use crate::secret::audit::AuditEntry;
+use crate::secret::audit::AuditEvent;
+
 use super::*;
 
 // ---------------------------------------------------------------------------
@@ -110,6 +113,11 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// The real directory operations, recorded — and optionally with a peer that
 /// retakes a lock the instant it is released.
+///
+/// Every operation is passed through with the **same slot** it was given, so
+/// the spy cannot accidentally turn a descriptor-relative operation into a
+/// path-based one; what it records is the slot's `shown` path, which exists for
+/// exactly this purpose.
 struct SpyFs {
     timeline: Shared,
     real: RealFs,
@@ -144,28 +152,38 @@ impl SpyFs {
 }
 
 impl LockFs for SpyFs {
-    fn mkdir(&self, path: &Path) -> Result<(), FsError> {
-        if lock(&self.plant_before).iter().any(|planted| planted == path) {
+    fn mkdir(&self, at: LockSlot<'_>) -> Result<(), FsError> {
+        if lock(&self.plant_before).iter().any(|planted| planted.as_path() == at.shown) {
             // The peer's own `mkdir`, not agentctl's: deliberately not
             // recorded, because the timeline is a record of what agentctl did.
-            let _ = self.real.mkdir(path);
+            let _ = self.real.mkdir(at);
         }
-        let result = self.real.mkdir(path);
-        self.timeline.push(Op::Mkdir(path.to_path_buf(), result.is_ok()));
+        let result = self.real.mkdir(at);
+        self.timeline.push(Op::Mkdir(at.shown.to_path_buf(), result.is_ok()));
         result
     }
 
-    fn rmdir(&self, path: &Path) -> Result<(), FsError> {
-        let result = self.real.rmdir(path);
-        self.timeline.push(Op::Rmdir(path.to_path_buf()));
-        if result.is_ok() && lock(&self.retake).iter().any(|held| held == path) {
-            let _ = self.real.mkdir(path);
+    fn rmdir(&self, at: LockSlot<'_>) -> Result<(), FsError> {
+        let result = self.real.rmdir(at);
+        self.timeline.push(Op::Rmdir(at.shown.to_path_buf()));
+        if result.is_ok() && lock(&self.retake).iter().any(|held| held.as_path() == at.shown) {
+            let _ = self.real.mkdir(at);
         }
         result
+    }
+
+    fn mtime(&self, at: LockSlot<'_>) -> Option<SystemTime> {
+        // Passed through and deliberately **not** recorded: the timeline is
+        // what agentctl did to the filesystem, and a `stat` does nothing to it.
+        self.real.mtime(at)
     }
 }
 
 /// Applies scheduled actions to the filesystem.
+///
+/// By path, because these are a *peer's* actions — a Claude Code session
+/// heartbeating or releasing its own lock — and a peer holds no descriptor of
+/// agentctl's.
 ///
 /// A wall-clock step is applied by the caller, under its own lock, because it
 /// changes the clock rather than the world.
@@ -174,7 +192,7 @@ fn apply(actions: &[Action]) {
         match action {
             Action::Mtime(path, at) => set_mtime(path, *at),
             Action::Remove(path) => {
-                let _ = RealFs.rmdir(path);
+                let _ = fs::remove_dir(path);
             }
             Action::WallJump(..) => {}
         }
@@ -359,6 +377,10 @@ impl HolderEvidence for FakeHolders {
 struct Fixture {
     _root: tempfile::TempDir,
     paths: Paths,
+    /// The environment the live store's spelling comes from, which is what
+    /// `Tree::Live` is checked against.
+    env: EnvView,
+    tree: Tree,
     store: PathBuf,
     primary: PathBuf,
     legacy: PathBuf,
@@ -369,20 +391,41 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// A store inside agentctl's own tree.
+    ///
+    /// Under `namespace_root()`, because that is now a **precondition** rather
+    /// than a convention: `Tree::Agentctl` with a store anywhere else is
+    /// refused before anything is created (review P1-2).
     fn new() -> Self {
+        Self::in_tree(Tree::Agentctl)
+    }
+
+    /// A store that *is* the live one this environment names — the only store
+    /// `Tree::Live` accepts.
+    fn live() -> Self {
+        Self::in_tree(Tree::Live)
+    }
+
+    fn in_tree(tree: Tree) -> Self {
         let root = tempfile::tempdir().expect("a temporary directory");
-        let store = root.path().join("store");
-        fs::create_dir_all(&store).expect("the store directory should be creatable");
         let paths = Paths::with_config_dir(root.path().join("config"));
         paths.ensure_dirs().expect("the agentctl store should be creatable");
+        let env = EnvView::with_home(root.path().to_path_buf());
+        let store = match tree {
+            Tree::Agentctl => paths.namespace_dir("acct", "org"),
+            Tree::Live => namespace::live_store_dir(&env),
+        };
+        fs::create_dir_all(&store).expect("the store directory should be creatable");
 
         let timeline = Shared::default();
         let fs_spy = Arc::new(SpyFs::new(timeline.clone()));
-        let [primary, legacy, storage] = plan(&store).map(|lock| lock.path);
+        let [primary, legacy, storage] = lock_paths(&store);
 
         Self {
             _root: root,
             paths,
+            env,
+            tree,
             store,
             primary,
             legacy,
@@ -398,9 +441,36 @@ impl Fixture {
         [self.primary.clone(), self.legacy.clone(), self.storage.clone()]
     }
 
+    /// What this fixture's hold is about.
+    fn subject(&self) -> LockSubject<'_> {
+        LockSubject { store_dir: &self.store, tree: self.tree }
+    }
+
+    /// The two descriptors a hold of this store is addressed through.
+    ///
+    /// A fresh one per acquire, exactly as production does: the walk is what
+    /// refuses a redirected store, so re-using one would be re-using a check.
+    fn anchor(&self) -> LockAnchor {
+        LockAnchor::open(self.subject(), &self.paths, &self.env)
+            .expect("the store is reachable and is in the tree it claims")
+    }
+
+    /// One acquire over this fixture's seams.
+    fn acquire(
+        &self,
+        seams: &Seams<'_>,
+        cancel: &Cancel,
+        fault: &Fault,
+    ) -> Result<Acquisition, LockError> {
+        acquire_with(self.anchor(), &self.paths, &ctx_with(cancel), fault, seams)
+    }
+
     /// Plants a lock directory whose modification time is `age` old.
+    ///
+    /// By path: a planted lock is a *peer's*, and this is how the peer makes
+    /// one.
     fn plant(&self, path: &Path, age: Duration) {
-        RealFs.mkdir(path).expect("the lock directory should be creatable");
+        fs::create_dir(path).expect("the lock directory should be creatable");
         set_mtime(path, self.base.checked_sub(age).expect("a plausible age"));
     }
 
@@ -416,10 +486,34 @@ impl Fixture {
         }
     }
 
-    /// The held-lock records this store currently has.
-    fn records(&self) -> Vec<(PathBuf, HeldLockRecord)> {
-        held_records(&self.paths)
+    /// The held-lock records this store currently has, through the one reader.
+    fn records(&self) -> Vec<held_locks::HeldLockFile> {
+        held_locks::read_all(&self.paths)
     }
+}
+
+/// The three lock paths one store's hold uses.
+///
+/// Spelled here rather than taken from [`plan`], so the fixture states the
+/// expectation instead of confirming the module against itself. The legacy lock
+/// is the store's sibling (fact F17).
+fn lock_paths(store: &Path) -> [PathBuf; 3] {
+    let parent = store.parent().expect("a store directory has a parent");
+    let mut legacy = store.file_name().expect("a store directory has a name").to_os_string();
+    legacy.push(LEGACY_LOCK_SUFFIX);
+    [store.join(REFRESH_LOCK), parent.join(legacy), store.join(STORAGE_WRITE_LOCK)]
+}
+
+/// A descriptor for `dir`, for the tests that are about the real directory
+/// operations rather than about a hold.
+fn dir_fd(dir: &Path) -> std::os::fd::OwnedFd {
+    file_store::open_dir_under(dir, dir).expect("the directory should be openable")
+}
+
+/// One lock directory's modification time, by path, the way a peer would read
+/// it.
+fn mtime_of(path: &Path) -> Option<SystemTime> {
+    fs::symlink_metadata(path).ok()?.modified().ok()
 }
 
 /// A pass context with a generous deadline and its own cancellation flag.
@@ -460,15 +554,7 @@ fn acquire_creates_all_three_in_the_peers_nesting() {
     let seams = fixture.seams(&clock, &holders);
     let cancel = Cancel::new();
 
-    let acquired = acquire_with(
-        &fixture.store,
-        Tree::Agentctl,
-        &fixture.paths,
-        &ctx_with(&cancel),
-        &Fault::none(),
-        &seams,
-    )
-    .expect("an uncontended store");
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("an uncontended store");
 
     let AcquireOutcome::Held(hold) = acquired.outcome else { panic!("expected a hold") };
     assert_eq!(hold.store_dir(), fixture.store, "the hold knows what it is about");
@@ -497,14 +583,19 @@ fn acquire_creates_all_three_in_the_peers_nesting() {
     // first `mkdir` — which is why a crash leaves evidence at all.
     let records = fixture.records();
     assert_eq!(records.len(), 1, "one record per live hold");
-    let (path, record) = &records[0];
-    assert_eq!(path, hold.record_path());
-    assert_eq!(record.agentctl_pid, std::process::id());
-    assert_eq!(record.tree, Tree::Agentctl);
-    assert_eq!(record.store_dir, fixture.store);
-    assert_eq!(record.paths, fixture.all().to_vec());
-    assert!(!record.taken_at.is_empty());
-    assert_eq!(mode_of(path), FILE_MODE, "0600, like every other file agentctl writes");
+    let held = &records[0];
+    assert_eq!(held.file, hold.record_path());
+    assert_eq!(held.record.agentctl_pid, std::process::id());
+    assert_eq!(
+        held.record.agentctl_start_time,
+        proc::self_start_time(&Cancel::new()),
+        "and when that process started, so a recycled id cannot pass for it"
+    );
+    assert_eq!(held.record.tree, Tree::Agentctl);
+    assert_eq!(held.record.store_dir, fixture.store);
+    assert_eq!(held.record.paths, fixture.all().to_vec());
+    assert!(!held.record.taken_at.is_empty());
+    assert_eq!(mode_of(&held.file), FILE_MODE, "0600, like every other file agentctl writes");
 
     drop(hold);
     for path in fixture.all() {
@@ -515,22 +606,18 @@ fn acquire_creates_all_three_in_the_peers_nesting() {
 
 #[test]
 fn releasing_runs_in_reverse_order() {
-    let fixture = Fixture::new();
+    // In the live tree, which is also this file's one check that a hold of the
+    // live store is reachable at all: `Tree::Live` accepts exactly the store
+    // directory the environment names.
+    let fixture = Fixture::live();
     let clock = fixture.fake_clock();
     let holders = FakeHolders::none_stopped();
     let seams = fixture.seams(&clock, &holders);
     let cancel = Cancel::new();
 
-    let acquired = acquire_with(
-        &fixture.store,
-        Tree::Live,
-        &fixture.paths,
-        &ctx_with(&cancel),
-        &Fault::none(),
-        &seams,
-    )
-    .expect("an uncontended store");
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("an uncontended store");
     let AcquireOutcome::Held(hold) = acquired.outcome else { panic!("expected a hold") };
+    assert_eq!(hold.tree(), Tree::Live);
     drop(hold);
 
     // Deduplicated by first appearance: another module's test may drain the
@@ -564,15 +651,9 @@ fn storage_write_is_one_non_blocking_attempt_per_round() {
     let seams = fixture.seams(&clock, &holders);
     let cancel = Cancel::new();
 
-    let acquired = acquire_with(
-        &fixture.store,
-        Tree::Agentctl,
-        &fixture.paths,
-        &ctx_with(&cancel),
-        &Fault::none(),
-        &seams,
-    )
-    .expect("a contended store is busy, not an error");
+    let acquired = fixture
+        .acquire(&seams, &cancel, &Fault::none())
+        .expect("a contended store is busy, not an error");
 
     let AcquireOutcome::Busy { holder_alive, stopped_pids } = acquired.outcome else {
         panic!("expected busy")
@@ -621,15 +702,7 @@ fn an_eexist_at_each_position_releases_everything_and_restarts() {
     let holders = FakeHolders::none_stopped();
     let seams = fixture.seams(&clock, &holders);
     let cancel = Cancel::new();
-    let acquired = acquire_with(
-        &fixture.store,
-        Tree::Agentctl,
-        &fixture.paths,
-        &ctx_with(&cancel),
-        &Fault::none(),
-        &seams,
-    )
-    .expect("busy, not an error");
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("busy, not an error");
     assert!(matches!(acquired.outcome, AcquireOutcome::Busy { .. }));
     assert_eq!(
         fixture.timeline.ops()[0],
@@ -649,15 +722,7 @@ fn an_eexist_at_each_position_releases_everything_and_restarts() {
     fixture.plant(&fixture.legacy, Duration::from_secs(1));
     let clock = fixture.fake_clock();
     let seams = fixture.seams(&clock, &holders);
-    let acquired = acquire_with(
-        &fixture.store,
-        Tree::Agentctl,
-        &fixture.paths,
-        &ctx_with(&cancel),
-        &Fault::none(),
-        &seams,
-    )
-    .expect("busy, not an error");
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("busy, not an error");
     assert!(matches!(acquired.outcome, AcquireOutcome::Busy { .. }));
     assert_eq!(
         fixture.timeline.ops()[..3],
@@ -675,15 +740,7 @@ fn an_eexist_at_each_position_releases_everything_and_restarts() {
     fixture.plant(&fixture.storage, Duration::from_secs(1));
     let clock = fixture.fake_clock();
     let seams = fixture.seams(&clock, &holders);
-    let acquired = acquire_with(
-        &fixture.store,
-        Tree::Agentctl,
-        &fixture.paths,
-        &ctx_with(&cancel),
-        &Fault::none(),
-        &seams,
-    )
-    .expect("busy, not an error");
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("busy, not an error");
     assert!(matches!(acquired.outcome, AcquireOutcome::Busy { .. }));
     assert_eq!(
         fixture.timeline.ops()[..5],
@@ -721,15 +778,7 @@ fn a_beating_primary_is_waited_on_the_peers_own_schedule() {
         ),
     );
 
-    let acquired = acquire_with(
-        &fixture.store,
-        Tree::Agentctl,
-        &fixture.paths,
-        &ctx_with(&cancel),
-        &Fault::none(),
-        &seams,
-    )
-    .expect("busy, not an error");
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("busy, not an error");
 
     let AcquireOutcome::Busy { holder_alive, stopped_pids } = acquired.outcome else {
         panic!("expected busy")
@@ -767,15 +816,7 @@ fn a_primary_released_during_the_schedule_lets_the_acquisition_proceed() {
     // The session releases the lock during the first round.
     clock.schedule_on_sleep(1, Action::Remove(fixture.primary.clone()));
 
-    let acquired = acquire_with(
-        &fixture.store,
-        Tree::Agentctl,
-        &fixture.paths,
-        &ctx_with(&cancel),
-        &Fault::none(),
-        &seams,
-    )
-    .expect("the holder let go");
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("the holder let go");
     assert!(matches!(acquired.outcome, AcquireOutcome::Held(_)), "the swap completes");
 }
 
@@ -789,15 +830,9 @@ fn a_cancelled_schedule_is_an_error_not_a_busy() {
     let cancel = Cancel::new();
     clock.cancel_next_sleep(cancel.clone());
 
-    let error = acquire_with(
-        &fixture.store,
-        Tree::Agentctl,
-        &fixture.paths,
-        &ctx_with(&cancel),
-        &Fault::none(),
-        &seams,
-    )
-    .expect_err("cancellation is not a busy store");
+    let error = fixture
+        .acquire(&seams, &cancel, &Fault::none())
+        .expect_err("cancellation is not a busy store");
     assert_eq!(error, LockError::Cancelled);
 }
 
@@ -811,10 +846,38 @@ fn run_rule(
     clock: &Arc<FakeClock>,
     holders: &dyn HolderEvidence,
     fault: &Fault,
-) -> BreakOutcome {
+) -> BreakAttempt {
+    run_rule_on(fixture, REFRESH_LOCK, &REFRESH_PROFILE, clock, holders, fault)
+}
+
+/// Runs the break rule against one named artefact inside the store.
+///
+/// The anchor is opened here rather than handed in because the slot borrows
+/// from it: the descriptor has to outlive the rule that operates through it,
+/// which is the same reason production keeps it for the life of the hold.
+fn run_rule_on(
+    fixture: &Fixture,
+    name: &str,
+    profile: &LockProfile,
+    clock: &Arc<FakeClock>,
+    holders: &dyn HolderEvidence,
+    fault: &Fault,
+) -> BreakAttempt {
     let cancel = Cancel::new();
     let seams = fixture.seams(clock, holders);
-    resolve_stale_with(&fixture.primary, &REFRESH_PROFILE, &ctx_with(&cancel), fault, &seams)
+    let anchor = fixture.anchor();
+    let shown = fixture.store.join(name);
+    let at = anchor.in_store(OsStr::new(name), &shown);
+    resolve_stale_with(fixture.subject(), at, profile, &ctx_with(&cancel), fault, &seams)
+}
+
+/// The record a draft becomes, with the two fields only a swap knows.
+///
+/// Every assertion about a break goes through this, because that is the only
+/// way to get a record at all: `BreakDraft::complete` is not optional, so a
+/// caller cannot reach the log with `service` and `target` unset.
+fn completed(draft: BreakDraft) -> LockBreakRecord {
+    draft.complete(namespace::LIVE_SERVICE.to_owned(), Target::Live)
 }
 
 #[test]
@@ -828,11 +891,12 @@ fn a_lock_nobody_is_beating_is_broken_once() {
 
     assert_eq!(outcome.decision, Decision::Broken);
     assert!(!fixture.primary.exists(), "the directory is gone");
-    let record = outcome.record.expect("a break is audited");
+    let record = completed(outcome.record.expect("a break is audited"));
     assert_eq!(record.outcome, Outcome::Broken);
     assert_eq!(record.reason, None, "every reason in the vocabulary is a reason NOT to break");
-    assert_eq!(record.event, "lock_break");
     assert_eq!(record.path, fixture.primary);
+    assert_eq!(record.store_dir, fixture.store, "the rule is told which store it is resolving");
+    assert_eq!(record.tree, Tree::Agentctl, "and which tree that store is in");
     assert_eq!(record.holder_evidence, HolderEvidence3::NoStoppedClaude);
     let (a, b, c) = samples(&record);
     assert_eq!(a.mtime_ns, b.mtime_ns, "all three samples recorded, and identical");
@@ -851,7 +915,7 @@ fn a_single_heartbeat_before_sample_a_is_a_positive() {
     // break safe is not that nothing ever wrote to the directory, but that
     // nothing wrote to it across the sampling interval.
     let fixture = Fixture::new();
-    RealFs.mkdir(&fixture.primary).expect("creatable");
+    fs::create_dir(&fixture.primary).expect("creatable");
     // A real heartbeat, and then silence: the holder wedged 61 s ago.
     set_mtime(&fixture.primary, fixture.base);
     set_mtime(&fixture.primary, fixture.base.checked_sub(stale_age()).expect("a plausible age"));
@@ -990,9 +1054,11 @@ fn the_public_rule_runs_against_the_real_clock_and_filesystem() {
     let fixture = Fixture::new();
     fixture.plant(&fixture.primary, Duration::from_secs(1));
     let cancel = Cancel::new();
+    let anchor = fixture.anchor();
 
     let outcome = resolve_stale(
-        &fixture.primary,
+        fixture.subject(),
+        anchor.in_store(OsStr::new(REFRESH_LOCK), &fixture.primary),
         &REFRESH_PROFILE,
         &Clock::system(),
         &ProcHolders,
@@ -1040,26 +1106,25 @@ fn each_profile_has_its_own_staleness_window() {
     fixture.plant(&fixture.storage, Duration::from_secs(20));
     let clock = fixture.fake_clock();
     let holders = FakeHolders::none_stopped();
-    let cancel = Cancel::new();
-    let seams = fixture.seams(&clock, &holders);
 
-    let too_young = resolve_stale_with(
-        &fixture.storage,
+    let too_young = run_rule_on(
+        &fixture,
+        STORAGE_WRITE_LOCK,
         &REFRESH_PROFILE,
-        &ctx_with(&cancel),
+        &clock,
+        &holders,
         &Fault::none(),
-        &seams,
     );
     assert_eq!(too_young.decision, Decision::Abandoned(Reason::TooYoung), "60 s window");
 
     let clock = fixture.fake_clock();
-    let seams = fixture.seams(&clock, &holders);
-    let broken = resolve_stale_with(
-        &fixture.storage,
+    let broken = run_rule_on(
+        &fixture,
+        STORAGE_WRITE_LOCK,
         &STORAGE_WRITE_PROFILE,
-        &ctx_with(&cancel),
+        &clock,
+        &holders,
         &Fault::none(),
-        &seams,
     );
     assert_eq!(broken.decision, Decision::Broken, "15 s window");
 }
@@ -1150,10 +1215,11 @@ fn a_stopped_same_user_claude_abandons_the_break_before_any_wait() {
     assert_eq!(outcome.decision, Decision::Abandoned(Reason::HolderStopped));
     assert!(fixture.primary.is_dir());
     assert!(clock.slept().is_empty(), "abandoned before the 12-second wait is entered");
-    let record = outcome.record.expect("an abandoned break is audited");
+    let record = completed(outcome.record.expect("an abandoned break is audited"));
     assert_eq!(record.holder_evidence, HolderEvidence3::StoppedClaudePresent);
-    assert_eq!(record.agentctl_pid, std::process::id(), "our own pid, never the holder's");
-    let json = serde_json::to_string(&record).expect("serializable");
+    let entry = AuditEntry::new(AuditEvent::LockBreak(record));
+    assert_eq!(entry.agentctl_pid, std::process::id(), "our own pid, never the holder's");
+    let json = serde_json::to_string(&entry).expect("serializable");
     assert!(!json.contains("41207"), "the audit entry names no holder pid (AC80)");
 }
 
@@ -1184,8 +1250,10 @@ fn a_cancelled_sampling_wait_decides_nothing_and_audits_nothing() {
     clock.cancel_next_sleep(cancel.clone());
     let seams = fixture.seams(&clock, &holders);
 
+    let anchor = fixture.anchor();
     let outcome = resolve_stale_with(
-        &fixture.primary,
+        fixture.subject(),
+        anchor.in_store(OsStr::new(REFRESH_LOCK), &fixture.primary),
         &REFRESH_PROFILE,
         &ctx_with(&cancel),
         &Fault::none(),
@@ -1209,15 +1277,7 @@ fn a_lock_retaken_after_the_rmdir_is_busy_and_is_not_broken_twice() {
     let seams = fixture.seams(&clock, &holders);
     let cancel = Cancel::new();
 
-    let acquired = acquire_with(
-        &fixture.store,
-        Tree::Agentctl,
-        &fixture.paths,
-        &ctx_with(&cancel),
-        &Fault::none(),
-        &seams,
-    )
-    .expect("busy, not an error");
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("busy, not an error");
 
     let AcquireOutcome::Busy { holder_alive, .. } = acquired.outcome else {
         panic!("expected busy")
@@ -1226,8 +1286,8 @@ fn a_lock_retaken_after_the_rmdir_is_busy_and_is_not_broken_twice() {
     let record = acquired.break_record.expect("the break is audited");
     assert_eq!(record.outcome, Outcome::Broken, "the directory *was* removed");
     assert_eq!(record.reason, Some(Reason::Retaken), "and immediately retaken");
-    assert_eq!(record.store_dir.as_deref(), Some(fixture.store.as_path()));
-    assert_eq!(record.tree, Some(Tree::Agentctl));
+    assert_eq!(record.store_dir, fixture.store);
+    assert_eq!(record.tree, Tree::Agentctl);
     assert_eq!(
         fixture.timeline.ops().iter().filter(|op| matches!(op, Op::Rmdir(_))).count(),
         1,
@@ -1248,15 +1308,7 @@ fn only_one_break_is_attempted_per_acquire() {
     let seams = fixture.seams(&clock, &holders);
     let cancel = Cancel::new();
 
-    let acquired = acquire_with(
-        &fixture.store,
-        Tree::Agentctl,
-        &fixture.paths,
-        &ctx_with(&cancel),
-        &Fault::none(),
-        &seams,
-    )
-    .expect("busy, not an error");
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("busy, not an error");
 
     assert!(matches!(acquired.outcome, AcquireOutcome::Busy { .. }));
     assert!(!fixture.primary.exists(), "the first stale lock was broken");
@@ -1282,15 +1334,8 @@ fn a_third_party_touching_any_held_lock_is_refusal_a() {
         let seams = fixture.seams(&clock, &holders);
         let cancel = Cancel::new();
 
-        let acquired = acquire_with(
-            &fixture.store,
-            Tree::Agentctl,
-            &fixture.paths,
-            &ctx_with(&cancel),
-            &Fault::none(),
-            &seams,
-        )
-        .expect("an uncontended store");
+        let acquired =
+            fixture.acquire(&seams, &cancel, &Fault::none()).expect("an uncontended store");
         let AcquireOutcome::Held(hold) = acquired.outcome else { panic!("expected a hold") };
 
         assert_eq!(hold.drift_check(), Ok(()), "nothing has moved yet");
@@ -1323,15 +1368,7 @@ fn a_hold_past_its_budget_refuses_rather_than_writing() {
     let seams = fixture.seams(&clock, &holders);
     let cancel = Cancel::new();
 
-    let acquired = acquire_with(
-        &fixture.store,
-        Tree::Agentctl,
-        &fixture.paths,
-        &ctx_with(&cancel),
-        &Fault::none(),
-        &seams,
-    )
-    .expect("an uncontended store");
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("an uncontended store");
     let AcquireOutcome::Held(mut hold) = acquired.outcome else { panic!("expected a hold") };
 
     // Reaching the budget takes three seconds of real time, so the hold's own
@@ -1364,15 +1401,7 @@ fn the_measured_hold_stays_inside_the_budget() {
     };
     let cancel = Cancel::new();
 
-    let acquired = acquire_with(
-        &fixture.store,
-        Tree::Agentctl,
-        &fixture.paths,
-        &ctx_with(&cancel),
-        &Fault::none(),
-        &seams,
-    )
-    .expect("an uncontended store");
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("an uncontended store");
     let AcquireOutcome::Held(hold) = acquired.outcome else { panic!("expected a hold") };
     hold.drift_check().expect("nothing moved, and the budget is not spent");
     let reported = hold.hold_elapsed();
@@ -1401,21 +1430,15 @@ fn the_injected_leak_leaves_the_directories_and_a_record_that_names_them() {
     // Plan AC64's last clause. `doctor --remove-stale`'s reader is S19's
     // half, so this asserts on the **record file** — the shape S19 reads —
     // rather than on `doctor` output, which is not on this branch.
-    let fixture = Fixture::new();
+    let fixture = Fixture::live();
     let clock = fixture.fake_clock();
     let holders = FakeHolders::none_stopped();
     let seams = fixture.seams(&clock, &holders);
     let cancel = Cancel::new();
 
-    let acquired = acquire_with(
-        &fixture.store,
-        Tree::Live,
-        &fixture.paths,
-        &ctx_with(&cancel),
-        &Fault::from_list("swap_lock_leak"),
-        &seams,
-    )
-    .expect("an uncontended store");
+    let acquired = fixture
+        .acquire(&seams, &cancel, &Fault::from_list("swap_lock_leak"))
+        .expect("an uncontended store");
     let AcquireOutcome::Held(hold) = acquired.outcome else { panic!("expected a hold") };
     let record_path = hold.record_path().to_path_buf();
     drop(hold);
@@ -1423,22 +1446,20 @@ fn the_injected_leak_leaves_the_directories_and_a_record_that_names_them() {
     for path in fixture.all() {
         assert!(path.is_dir(), "leaked, as a crashed hold would leave it: `{}`", path.display());
     }
-    let record = read_held_record(&record_path).expect("the record survives the leak");
-    assert_eq!(record.tree, Tree::Live, "and says which tree they are in");
-    assert_eq!(record.paths, fixture.all().to_vec(), "naming every leaked directory");
-    assert_eq!(record.agentctl_pid, std::process::id());
-    assert_eq!(
-        held_records(&fixture.paths).len(),
-        1,
-        "and it is discoverable without knowing its name"
-    );
+    let records = fixture.records();
+    let held = records.first().expect("the record survives the leak");
+    assert_eq!(records.len(), 1, "and it is discoverable without knowing its name");
+    assert_eq!(held.file, record_path);
+    assert_eq!(held.record.tree, Tree::Live, "and says which tree they are in");
+    assert_eq!(held.record.paths, fixture.all().to_vec(), "naming every leaked directory");
+    assert_eq!(held.record.agentctl_pid, std::process::id());
 
     // Left as found: the leaked directories are what a crashed hold leaves,
     // and the temporary directory takes them with it. The registry still
     // holds this hold's restore closure, which is harmless — the paths are
     // gone by the time anything could run it.
     for path in fixture.all() {
-        let _ = RealFs.rmdir(&path);
+        let _ = fs::remove_dir(&path);
     }
 }
 
@@ -1470,16 +1491,16 @@ fn lock_child_harness() {
     crate::runtime::signals::install(cancel.clone()).expect("the signal thread should start");
     std::panic::set_hook(Box::new(|_| cleanup::emergency()));
 
-    let store = dir.join("store");
-    fs::create_dir_all(&store).expect("the store should be creatable");
     let paths = Paths::with_config_dir(dir.join("config"));
     paths.ensure_dirs().expect("the agentctl store should be creatable");
+    let store = child_store(&dir);
+    fs::create_dir_all(&store).expect("the store should be creatable");
 
     let ctx = PassCtx::standalone(cancel, Instant::now() + Duration::from_secs(60));
     let acquired = acquire(
-        &store,
-        Tree::Agentctl,
+        LockSubject { store_dir: &store, tree: Tree::Agentctl },
         &paths,
+        &EnvView::with_home(dir.clone()),
         &Clock::system(),
         &ctx,
         &Fault::from_list("swap_lock_leak"),
@@ -1532,9 +1553,14 @@ fn run_child(role: &str) -> (tempfile::TempDir, std::process::Child) {
     panic!("the child never reported that it was holding");
 }
 
+/// The store directory the child locks, inside its own namespace root.
+fn child_store(dir: &Path) -> PathBuf {
+    Paths::with_config_dir(dir.join("config")).namespace_dir("acct", "org")
+}
+
 /// The three lock paths the child took, given its temporary directory.
 fn child_locks(dir: &Path) -> [PathBuf; 3] {
-    plan(&dir.join("store")).map(|lock| lock.path)
+    lock_paths(&child_store(dir))
 }
 
 #[test]
@@ -1570,8 +1596,8 @@ fn a_panic_releases_every_lock_the_panicking_process_was_holding() {
 }
 
 /// The held-lock records under a child's store.
-fn held_records_in(dir: &Path) -> Vec<(PathBuf, HeldLockRecord)> {
-    held_records(&Paths::with_config_dir(dir.join("config")))
+fn held_records_in(dir: &Path) -> Vec<held_locks::HeldLockFile> {
+    held_locks::read_all(&Paths::with_config_dir(dir.join("config")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1630,17 +1656,23 @@ fn a_break_record_carries_one_pid_and_it_is_ours() {
     // read as the *holder's* pid, and an implementation that wrote one there
     // would have passed AC80. The field is named unambiguously and the record
     // has no other.
+    // Asserted on the **audit entry**, because that is the object section 3.8
+    // fixes and the only shape a record ever reaches a file in: the provenance
+    // fields — `ts`, `monotonic_ms`, `agentctl_pid` — belong to the entry, and
+    // a second copy of them inside the record would duplicate them here.
     let fixture = Fixture::new();
     fixture.plant(&fixture.primary, stale_age());
     let clock = fixture.fake_clock();
     let holders = FakeHolders::none_stopped();
     let outcome = run_rule(&fixture, &clock, &holders, &Fault::none());
-    let record = outcome.record.expect("audited");
+    let record = completed(outcome.record.expect("audited"));
 
-    let json = serde_json::to_value(&record).expect("serializable");
+    let entry = AuditEntry::new(AuditEvent::LockBreak(record));
+    let json = serde_json::to_value(&entry).expect("serializable");
     let object = json.as_object().expect("an object");
     let pid_keys: Vec<&String> = object.keys().filter(|key| key.contains("pid")).collect();
     assert_eq!(pid_keys, vec!["agentctl_pid"], "one pid field, unambiguously ours");
+    assert_eq!(object["agentctl_pid"], std::process::id());
     assert_eq!(object["event"], "lock_break");
     assert!(object.contains_key("sample_a"));
     assert!(object.contains_key("interval_wall_ms"));
@@ -1656,6 +1688,7 @@ fn the_held_lock_record_has_the_shape_the_stale_remover_reads() {
     // reader; this pins the shape both halves agreed on.
     let record = HeldLockRecord {
         agentctl_pid: 4242,
+        agentctl_start_time: Some("2026-09-09T00:00:00Z".to_owned()),
         tree: Tree::Live,
         store_dir: PathBuf::from("/store"),
         paths: vec![PathBuf::from("/store/.oauth_refresh.lock")],
@@ -1666,6 +1699,7 @@ fn the_held_lock_record_has_the_shape_the_stale_remover_reads() {
         json,
         serde_json::json!({
             "agentctl_pid": 4242,
+            "agentctl_start_time": "2026-09-09T00:00:00Z",
             "tree": "live",
             "store_dir": "/store",
             "paths": ["/store/.oauth_refresh.lock"],
@@ -1674,6 +1708,19 @@ fn the_held_lock_record_has_the_shape_the_stale_remover_reads() {
     );
     let round_trip: HeldLockRecord = serde_json::from_value(json).expect("the shape round-trips");
     assert_eq!(round_trip, record);
+
+    // And a record from a build that predates the start time still reads: the
+    // field defaults to "unknown" rather than making the record unparseable,
+    // which would turn a leak nobody can explain into a leak nobody can clear.
+    let older = serde_json::json!({
+        "agentctl_pid": 4242,
+        "tree": "live",
+        "store_dir": "/store",
+        "paths": ["/store/.oauth_refresh.lock"],
+        "taken_at": "2026-09-09T00:00:00Z",
+    });
+    let read: HeldLockRecord = serde_json::from_value(older).expect("an older record still reads");
+    assert_eq!(read.agentctl_start_time, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -1710,14 +1757,42 @@ fn every_profile_refuses_to_retry_under_the_hold() {
 }
 
 #[test]
-fn the_legacy_lock_sits_beside_the_resolved_store_directory() {
-    // Fact F17/F46, and on macOS the resolved and lexical spellings differ in
-    // the common case: `$TMPDIR` lives under `/var`, a link to `/private/var`.
+fn the_legacy_lock_is_the_entry_the_resolved_spelling_names() {
+    // Fact F17/F46: the peer names the legacy lock after `realpath` of the
+    // store directory. agentctl does not call `realpath` — it walks to the
+    // store one `O_NOFOLLOW` component at a time and creates the artefact
+    // relative to the parent that walk reached — and this test is what proves
+    // the two land on the same directory entry, which is the whole reason
+    // dropping `canonicalize` is safe.
+    //
+    // The distinction is visible on macOS in the common case rather than the
+    // exotic one: `$TMPDIR` lives under `/var`, a link to `/private/var`, so
+    // the lexical and resolved spellings of every fixture path differ.
     let fixture = Fixture::new();
+    let clock = fixture.fake_clock();
+    let holders = FakeHolders::none_stopped();
+    let seams = fixture.seams(&clock, &holders);
+    let cancel = Cancel::new();
+
+    let plans = plan(&fixture.anchor()).map(|lock| lock.artefact.path);
+    assert_eq!(plans.to_vec(), fixture.all().to_vec(), "the plan spells them lexically");
+    assert_eq!(fixture.primary, fixture.store.join(REFRESH_LOCK));
+    assert_eq!(fixture.storage, fixture.store.join(STORAGE_WRITE_LOCK));
+
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("an uncontended store");
+    let AcquireOutcome::Held(hold) = acquired.outcome else { panic!("expected a hold") };
+
     let resolved = namespace::canonical(&fixture.store).expect("the store resolves");
-    assert_eq!(fixture.legacy, PathBuf::from(format!("{}.lock", resolved.display())));
-    assert_eq!(fixture.primary, fixture.store.join(".oauth_refresh.lock"));
-    assert_eq!(fixture.storage, fixture.store.join(".storage-write"));
+    let peers_spelling = PathBuf::from(format!("{}{LEGACY_LOCK_SUFFIX}", resolved.display()));
+    assert_ne!(peers_spelling, fixture.legacy, "the two spellings really do differ here");
+    assert!(
+        peers_spelling.is_dir(),
+        "the lock agentctl made is the one `{}` names",
+        peers_spelling.display()
+    );
+
+    drop(hold);
+    assert!(!peers_spelling.exists(), "and releasing it removes that same entry");
 }
 
 #[test]
@@ -1725,11 +1800,14 @@ fn the_real_operations_make_and_remove_a_directory() {
     // `AT_REMOVEDIR` is the whole point: `unlink` cannot remove a directory,
     // which is the defect `agentctl-nz5` records.
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let lock = dir.path().join(".oauth_refresh.lock");
+    let lock = dir.path().join(REFRESH_LOCK);
+    let fd = dir_fd(dir.path());
+    let at = LockSlot { dir: fd.as_fd(), name: OsStr::new(REFRESH_LOCK), shown: &lock };
 
-    RealFs.mkdir(&lock).expect("creatable");
+    RealFs.mkdir(at).expect("creatable");
     assert!(lock.is_dir(), "a directory, as `proper-lockfile` makes it");
-    assert_eq!(RealFs.mkdir(&lock), Err(FsError::Exists), "a second attempt is contention");
+    assert_eq!(RealFs.mkdir(at), Err(FsError::Exists), "a second attempt is contention");
+    assert_eq!(RealFs.mtime(at), mtime_of(&lock), "and the same directory a path would stat");
     // Darwin answers `EPERM` here rather than `EISDIR`; either way `unlink`
     // will not remove a directory, which is exactly why
     // `cleanup::register_tmp_path` cannot clean a lock up and
@@ -1739,24 +1817,127 @@ fn the_real_operations_make_and_remove_a_directory() {
         "`unlink` cannot remove a directory on any platform this runs on"
     );
     assert!(lock.is_dir(), "and it is still there");
-    RealFs.rmdir(&lock).expect("removable with AT_REMOVEDIR");
+    RealFs.rmdir(at).expect("removable with AT_REMOVEDIR");
     assert!(!lock.exists());
-    assert_eq!(RealFs.rmdir(&lock), Err(FsError::NotFound));
+    assert_eq!(RealFs.rmdir(at), Err(FsError::NotFound));
+    assert_eq!(RealFs.mtime(at), None, "and a lock that is gone has no modification time");
 }
 
 #[test]
 fn a_symlink_where_a_lock_should_be_is_never_removed() {
-    // A link at a lock path is somebody else's plant. `symlink_metadata`
+    // A link at a lock path is somebody else's plant. `AT_SYMLINK_NOFOLLOW`
     // keeps the sampling from reading the target's modification time, and
-    // `rmdir` refuses a link outright — the safe side of that trade.
+    // `AT_REMOVEDIR` refuses a link outright — the safe side of that trade.
     let dir = tempfile::tempdir().expect("a temporary directory");
     let target = dir.path().join("target");
     fs::create_dir(&target).expect("creatable");
-    let link = dir.path().join(".oauth_refresh.lock");
+    let link = dir.path().join(REFRESH_LOCK);
     std::os::unix::fs::symlink(&target, &link).expect("linkable");
+    let fd = dir_fd(dir.path());
+    let at = LockSlot { dir: fd.as_fd(), name: OsStr::new(REFRESH_LOCK), shown: &link };
 
-    assert!(matches!(RealFs.rmdir(&link), Err(FsError::Other(_))), "a link is not removed");
+    assert!(matches!(RealFs.rmdir(at), Err(FsError::Other(_))), "a link is not removed");
     assert!(link.exists(), "and is still there");
+    assert_ne!(
+        RealFs.mtime(at),
+        mtime_of(&target),
+        "and the sample is the link's own time, never the target's"
+    );
+}
+
+#[test]
+fn a_symlinked_component_above_the_store_is_refused_before_anything_is_created() {
+    // Review P0-1, reproduced. A same-user attacker who can create one
+    // symbolic link under `<config>/claude` plants `<acct>` as a link to the
+    // live store. Every lexical check still says
+    // `<root>/<acct>/<org>/.oauth_refresh.lock` is inside `namespace_root()`,
+    // so a path-based hold would `mkdir` — and later `rmdir` — Claude Code's
+    // live locks while the record and the audit entry both said
+    // `tree: agentctl`.
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let paths = Paths::with_config_dir(root.path().join("config"));
+    paths.ensure_dirs().expect("the agentctl store should be creatable");
+
+    // The attacker's target, shaped like a real store so that a redirected
+    // hold would succeed rather than fail for some unrelated reason.
+    let elsewhere = root.path().join("elsewhere");
+    fs::create_dir_all(elsewhere.join("org")).expect("the target should be creatable");
+    std::os::unix::fs::symlink(&elsewhere, paths.namespace_root().join("acct"))
+        .expect("the link should be creatable");
+
+    let store = paths.namespace_dir("acct", "org");
+    assert!(
+        paths.is_under_namespace_root(&store),
+        "the lexical check is satisfied — that is the point"
+    );
+
+    let cancel = Cancel::new();
+    let env = EnvView::with_home(root.path().to_path_buf());
+    let subject = LockSubject { store_dir: &store, tree: Tree::Agentctl };
+
+    // No seams are injected, and none could be: the refusal happens while the
+    // anchor is being opened, which is before any `LockFs` is consulted. That
+    // ordering is the guarantee — a hold that cannot be addressed cannot be
+    // attempted.
+    let refused = LockAnchor::open(subject, &paths, &env)
+        .expect_err("a symbolic link on the way to the store is refused");
+    assert!(matches!(refused, LockError::Unreachable { .. }), "{refused:?}");
+
+    // And the same refusal through the entry point a caller uses, so it cannot
+    // be reached by skipping the anchor.
+    let also_refused =
+        acquire(subject, &paths, &env, &Clock::system(), &ctx_with(&cancel), &Fault::none())
+            .expect_err("and `acquire` refuses for the same reason");
+    assert!(matches!(also_refused, LockError::Unreachable { .. }), "{also_refused:?}");
+
+    for name in [REFRESH_LOCK, STORAGE_WRITE_LOCK] {
+        let planted = elsewhere.join("org").join(name);
+        assert!(!planted.exists(), "nothing was created in the target: `{}`", planted.display());
+    }
+    let legacy = elsewhere.join(format!("org{LEGACY_LOCK_SUFFIX}"));
+    assert!(!legacy.exists(), "and no legacy lock beside it either");
+    assert!(held_locks::read_all(&paths).is_empty(), "and no held-lock record claims one");
+}
+
+#[test]
+fn a_store_outside_the_namespace_root_cannot_claim_the_agentctl_tree() {
+    // Review P1-2. `tree` is the field `doctor`, `--remove-stale`'s attested
+    // branch and invariant I11′'s containment all key on, so it is derived
+    // from the store directory rather than believed.
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let paths = Paths::with_config_dir(root.path().join("config"));
+    paths.ensure_dirs().expect("the agentctl store should be creatable");
+    let env = EnvView::with_home(root.path().to_path_buf());
+    let store = root.path().join("somewhere-else");
+    fs::create_dir(&store).expect("creatable");
+
+    let refused =
+        LockAnchor::open(LockSubject { store_dir: &store, tree: Tree::Agentctl }, &paths, &env)
+            .expect_err("a store outside the root is not agentctl's");
+    assert_eq!(refused, LockError::WrongTree { store_dir: store.clone(), tree: Tree::Agentctl });
+    assert!(refused.to_string().contains("agentctl's own tree"), "{refused}");
+}
+
+#[test]
+fn a_store_that_is_not_the_live_one_cannot_claim_the_live_tree() {
+    // The other half of P1-2, and the one that matters most: `live` is the
+    // increment W4b adds, and it means *the* store this environment names.
+    let fixture = Fixture::new();
+    let refused = LockAnchor::open(
+        LockSubject { store_dir: &fixture.store, tree: Tree::Live },
+        &fixture.paths,
+        &fixture.env,
+    )
+    .expect_err("agentctl's own namespace is not the live store");
+    assert_eq!(
+        refused,
+        LockError::WrongTree { store_dir: fixture.store.clone(), tree: Tree::Live }
+    );
+
+    // And the live store itself is accepted, so the check is not simply "no".
+    let live = Fixture::live();
+    LockAnchor::open(live.subject(), &live.paths, &live.env)
+        .expect("the live store is the live store");
 }
 
 // ---------------------------------------------------------------------------

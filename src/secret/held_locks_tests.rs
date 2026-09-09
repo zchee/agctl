@@ -49,6 +49,35 @@ fn record_json(pid: u32, tree: &str, store_dir: &str, paths: &[&str]) -> String 
 }
 
 #[test]
+fn the_record_writer_and_reader_are_the_same_type() {
+    // W2-F2: the writer used to declare its own struct with its own `Tree`,
+    // wire-compatible with this one only by inspection — one spelled `Tree`
+    // `snake_case` and the other `lowercase`, which agree for today's two
+    // variants and would diverge the moment a two-word one arrived. There is
+    // now one type and one `Tree`, and this is the assertion that says so.
+    let record = HeldLockRecord {
+        agentctl_pid: 7,
+        agentctl_start_time: None,
+        tree: Tree::Agentctl,
+        store_dir: PathBuf::from("/store"),
+        paths: Vec::new(),
+        taken_at: "2026-09-09T12:00:00Z".to_owned(),
+    };
+    let written = serde_json::to_string(&record).expect("serializable");
+    assert!(written.contains("\"tree\":\"agentctl\""), "{written}");
+    assert_eq!(
+        std::any::TypeId::of::<HeldLockRecord>(),
+        std::any::TypeId::of::<crate::secret::claude_lock::HeldLockRecord>(),
+        "the lock protocol writes this very type, not a look-alike"
+    );
+    assert_eq!(
+        std::any::TypeId::of::<Tree>(),
+        std::any::TypeId::of::<crate::secret::audit::Tree>(),
+        "and one `Tree` serves the record, the audit log and `doctor`"
+    );
+}
+
+#[test]
 fn read_all_parses_the_shape_claude_lock_writes() {
     let store = store();
     let file = write_record(
@@ -177,6 +206,72 @@ fn attests_compares_whole_paths_and_never_a_parent() {
         !record.attests(Path::new("/Users/someone/.claude/.oauth_refresh.lock/inner")),
         "and neither is anything below one"
     );
+}
+
+#[test]
+fn a_record_whose_process_is_gone_is_a_leak() {
+    // The question `--remove-stale`'s attested branch asks. A reaped child is
+    // the only process id a test may assert is dead: it is one this process
+    // created and waited for.
+    let store = store();
+    let mut child =
+        std::process::Command::new("/usr/bin/true").spawn().expect("`true` should be runnable");
+    let dead = child.id();
+    child.wait().expect("the child should be waitable");
+
+    write_record(&store, "dead.json", &record_json(dead, "live", "/store", &[]));
+    let found = read_all(&store.paths);
+    let record = &found.first().expect("one record").record;
+
+    assert!(record.writer_is_gone(&Cancel::new()), "a reaped process is holding nothing");
+}
+
+#[test]
+fn a_live_process_that_did_not_write_the_record_is_gone_too() {
+    // Plan review P2-2, and the reason the start time is recorded at all: a
+    // process id the kernel has handed to somebody else must not keep a real
+    // leak unrecoverable for as long as that unrelated process runs. This
+    // process is a live one that certainly did not write the record.
+    let first = store();
+    let ours = std::process::id();
+    let cancel = Cancel::new();
+
+    let mismatched = format!(
+        r#"{{"agentctl_pid":{ours},"agentctl_start_time":"1999-01-01T00:00:00Z",
+           "tree":"live","store_dir":"/store","paths":[],"taken_at":"2026-09-09T12:00:00Z"}}"#
+    );
+    write_record(&first, "recycled.json", &mismatched);
+    let found = read_all(&first.paths);
+    let record = &found.first().expect("one record").record;
+    assert!(record.writer_is_gone(&cancel), "the id is live, but not the process that wrote this");
+
+    // And the honest negative: this process, with the start time it really
+    // has, is holding its own record.
+    let second = store();
+    let start = proc::self_start_time(&cancel).expect("this platform answers");
+    let matching = format!(
+        r#"{{"agentctl_pid":{ours},"agentctl_start_time":"{start}",
+           "tree":"live","store_dir":"/store","paths":[],"taken_at":"2026-09-09T12:00:00Z"}}"#
+    );
+    write_record(&second, "held.json", &matching);
+    let found = read_all(&second.paths);
+    let record = &found.first().expect("one record").record;
+    assert!(!record.writer_is_gone(&cancel), "a live writer is holding, not leaking");
+}
+
+#[test]
+fn an_unknown_start_time_is_not_evidence_of_anything() {
+    // A record from a build that predates the field falls back to the process
+    // id alone. Reading "unknown" as "mismatched" would turn every one of them
+    // into a permitted removal.
+    let store = store();
+    let ours = std::process::id();
+    write_record(&store, "older.json", &record_json(ours, "live", "/store", &[]));
+    let found = read_all(&store.paths);
+    let record = &found.first().expect("one record").record;
+
+    assert_eq!(record.agentctl_start_time, None);
+    assert!(!record.writer_is_gone(&Cancel::new()), "a live process id is still a live holder");
 }
 
 #[test]

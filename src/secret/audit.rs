@@ -194,6 +194,13 @@ pub enum WriteOutcome {
 }
 
 /// Which tree a lock artefact belongs to (invariant I11′ containment).
+///
+/// The crate's one spelling of the distinction: the lock protocol
+/// ([`claude_lock`](crate::secret::claude_lock)) records it, the held-lock
+/// records ([`held_locks`](crate::secret::held_locks)) carry it, and `doctor`
+/// prints it. It lives here because this is the module both of the others
+/// depend on, and because two enums that agreed only for today's two variants
+/// would diverge the moment a third arrived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tree {
@@ -201,6 +208,16 @@ pub enum Tree {
     Agentctl,
     /// The live Claude Code store. Only W4b can break a lock here.
     Live,
+}
+
+impl Tree {
+    /// The words `doctor` prints for this tree.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Agentctl => "agentctl's own tree",
+            Self::Live => "the live store",
+        }
+    }
 }
 
 /// One `stat` of a lock directory.
@@ -248,7 +265,15 @@ pub enum BreakOutcome {
     Abandoned,
 }
 
-/// Why a break happened or did not.
+/// Why a break did not happen — or, for `retaken`, what happened to the
+/// artefact after one did.
+///
+/// Every member is a reason **not** to have broken a lock, which is why a
+/// clean break carries no reason at all
+/// ([`LockBreakRecord::reason`] is an `Option`). Plan section 3.8 fixes the
+/// six words; there is deliberately no seventh meaning "it was stale", because
+/// staleness is the precondition of the whole rule rather than an outcome of
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BreakReason {
@@ -267,15 +292,23 @@ pub enum BreakReason {
     /// A same-user `claude` process is stopped, so the break was abandoned
     /// whether or not that process is the holder.
     HolderStopped,
-    /// Every condition held and the artefact was stale.
-    Stale,
 }
 
 /// The record of one break decision (plan section 3.8).
 ///
 /// Defined here rather than beside the lock protocol so the two lanes that
 /// need it — the module that decides, and the module that writes the line —
-/// share one field list and one JSON shape.
+/// share one field list and one JSON shape. It is **the** shape: nested in
+/// [`AuditEvent::LockBreak`], serde's internal tag and
+/// [`AuditEntry`]'s `flatten` reproduce section 3.8's object exactly, and a
+/// second declaration of these fields anywhere else would duplicate the
+/// provenance members the moment it reached [`append`].
+///
+/// Only [`claude_lock`](crate::secret::claude_lock) builds one, and it cannot
+/// build one in halves: the rule fills everything it can observe and the
+/// caller supplies `service` and `target` through
+/// `BreakDraft::complete`, so no field arrives at the log empty because
+/// somebody forgot it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockBreakRecord {
     /// The lock directory itself.
@@ -304,8 +337,14 @@ pub struct LockBreakRecord {
     pub holder_evidence: HolderEvidence,
     /// Whether the artefact was removed.
     pub outcome: BreakOutcome,
-    /// Why.
-    pub reason: BreakReason,
+    /// Why not, when it was not — and `retaken` when it was removed and a peer
+    /// took it back before agentctl could.
+    ///
+    /// Absent for a clean break: every member of [`BreakReason`] is a reason
+    /// *not* to have broken a lock, so a break with nothing to explain records
+    /// no reason rather than inventing a word for success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<BreakReason>,
 }
 
 /// One entry's identity: the timestamp it carries and the process that wrote
@@ -373,23 +412,44 @@ pub fn append(paths: &Paths, entry: &AuditEntry) -> Result<AuditId, AppError> {
     Ok(entry.id())
 }
 
-/// The last `n` entries, oldest first.
+/// What one [`tail`] read found: the entries it could parse, and the lines it
+/// could not.
+///
+/// Two lists rather than a `Result`, because the caller's job is to *report*
+/// this file and one damaged line must not take the report down with it. The
+/// damaged line is not exotic: [`append`] is one `write` plus an `fsync`, so a
+/// process killed between them — or a short write at `ENOSPC` — leaves a
+/// truncated final line, which is by construction inside the last `n`. Failing
+/// the whole read for it would mean `doctor` could explain no entry at all, and
+/// `use --undo` could not run, exactly after the crash they are the recovery
+/// for.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Tail {
+    /// The entries that parsed, oldest first.
+    pub entries: Vec<AuditEntry>,
+    /// One `(line number, reason)` pair per line that did not, so `doctor` can
+    /// name it instead of hiding it.
+    pub unreadable: Vec<(usize, String)>,
+}
+
+/// The last `n` entries, oldest first, plus the lines in that window that could
+/// not be read.
 ///
 /// An absent log is no entries rather than an error: a store that has never
-/// written a keychain item has nothing to explain.
+/// written a keychain item has nothing to explain. A line carrying *unknown
+/// members* is not unreadable either — serde ignores them, so a log written by
+/// a later agentctl still reads here (principle P3).
 ///
 /// # Errors
 ///
-/// Returns [`AppError::Io`] when the log exists but cannot be read, and
-/// [`AppError::Config`] naming the line number when a line is not an entry
-/// this build understands. A line carrying *unknown members* is not that case:
-/// serde ignores them, so a log written by a later agentctl still reads here
-/// (principle P3).
-pub fn tail(paths: &Paths, n: usize) -> Result<Vec<AuditEntry>, AppError> {
+/// Returns [`AppError::Io`] when the log exists but cannot be opened or read at
+/// all. That is a different failure from a line this build cannot parse, and it
+/// is the only one that leaves the caller with nothing to report.
+pub fn tail(paths: &Paths, n: usize) -> Result<Tail, AppError> {
     let path = log_path(paths);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Tail::default()),
         Err(err) => {
             return Err(AppError::Io {
                 context: format!("could not read the audit log `{}`", path.display()),
@@ -401,24 +461,19 @@ pub fn tail(paths: &Paths, n: usize) -> Result<Vec<AuditEntry>, AppError> {
     let numbered: Vec<(usize, &str)> = text
         .lines()
         .enumerate()
-        .map(|(index, line)| (index + 1, line.trim()))
+        .map(|(index, line)| (index.saturating_add(1), line.trim()))
         .filter(|(_, line)| !line.is_empty())
         .collect();
 
     let start = numbered.len().saturating_sub(n);
-    numbered
-        .get(start..)
-        .unwrap_or_default()
-        .iter()
-        .map(|(number, line)| {
-            serde_json::from_str::<AuditEntry>(line).map_err(|err| {
-                AppError::Config(format!(
-                    "`{}` line {number} is not an audit entry this build understands: {err}",
-                    path.display()
-                ))
-            })
-        })
-        .collect()
+    let mut tail = Tail::default();
+    for (number, line) in numbered.get(start..).unwrap_or_default() {
+        match serde_json::from_str::<AuditEntry>(line) {
+            Ok(entry) => tail.entries.push(entry),
+            Err(err) => tail.unreadable.push((*number, err.to_string())),
+        }
+    }
+    Ok(tail)
 }
 
 /// The first [`DIGEST_PREFIX_LEN`] hex digits of a digest, for an entry.

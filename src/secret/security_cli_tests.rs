@@ -329,3 +329,42 @@ mod against_the_fake_script {
         assert_eq!(err, KeychainError::Locked);
     }
 }
+
+#[test]
+fn the_crate_builds_exactly_the_four_argv_shapes_section_93_lists() {
+    // Plan section 9.3's argv-construction assertion, both halves at once. It
+    // replaced a literal grep that tripped over the fake script, and it is
+    // enumerated from the constants the children actually receive: `read`
+    // destructures `READ_ARGV_FLAGS`, `run_write` passes `WRITE_ARGV`, and the
+    // two preflight shapes are the constants themselves.
+    //
+    // The union is the whole set of argv the crate builds for `security(1)`.
+    // Three read shapes and one write shape — and the write shape carries no
+    // value at all, because fact F42's line goes to standard input (invariant
+    // I15).
+    let mut shapes = argv_shapes();
+    shapes.extend(crate::secret::keychain_write::argv_shapes());
+
+    assert_eq!(
+        shapes,
+        vec![
+            vec!["show-keychain-info"],
+            vec!["dump-keychain"],
+            vec!["find-generic-password", "-a", "-w", "-s"],
+            vec!["-i"],
+        ]
+    );
+
+    for shape in &shapes {
+        assert!(!shape.contains(&"-E"), "no process-environment flag: {shape:?}");
+        assert!(!shape.contains(&"-f"), "and no full-command-line match: {shape:?}");
+        assert!(
+            !shape.iter().any(|argument| argument.contains("add-generic-password")),
+            "the write subcommand is on standard input, never in argv: {shape:?}"
+        );
+        assert!(
+            !shape.iter().any(|argument| argument.contains("delete")),
+            "nothing here deletes an item: {shape:?}"
+        );
+    }
+}

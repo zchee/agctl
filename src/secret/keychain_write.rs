@@ -324,19 +324,47 @@ pub fn write_item(
     line: KeychainStdinLine,
     ctx: &PassCtx,
 ) -> Result<(), KeychainWriteError> {
-    write_item_through(&security_bin(), target, account, line, ctx)
+    write_item_through_inner(&security_bin(), target, account, line, ctx)
 }
 
-/// [`write_item`] with the transport binary named.
+/// [`write_item`] with the transport binary named — **a test seam, and
+/// compiled only for tests.**
 ///
-/// Split out so the unit tests can point the write at the fake `security`
+/// It exists so the unit tests can point the write at the fake `security`
 /// without setting an environment variable: `std::env::set_var` is `unsafe` in
 /// edition 2024 and would race every other test in this binary.
+///
+/// It is `cfg`-gated because in a release build it would be a way for any
+/// future caller in this crate to hand fact F42's line — the hex-encoded blob,
+/// which is to say both tokens — to the standard input of a program of its
+/// choosing, bypassing [`security_bin`]'s "an absolute path, never resolved
+/// through `PATH`" guarantee. Invariant I1′ is compile-time about *which item*
+/// is written; this is what makes it compile-time about *which binary receives
+/// the plaintext*.
 ///
 /// # Errors
 ///
 /// As [`write_item`].
+#[cfg(any(test, feature = "testing"))]
 pub fn write_item_through(
+    bin: &Path,
+    target: &WriteTarget,
+    account: &str,
+    line: KeychainStdinLine,
+    ctx: &PassCtx,
+) -> Result<(), KeychainWriteError> {
+    write_item_through_inner(bin, target, account, line, ctx)
+}
+
+/// The whole write, with the binary already chosen.
+///
+/// Unexported: [`write_item`] is the only way in from production code, and it
+/// resolves the binary itself.
+///
+/// # Errors
+///
+/// As [`write_item`].
+fn write_item_through_inner(
     bin: &Path,
     target: &WriteTarget,
     account: &str,
@@ -395,12 +423,22 @@ pub fn write_item_through(
 /// function does not know what `hex` encodes, and the value it returns is
 /// wrapped in a `SecretString` by its only caller.
 ///
+/// `pub(crate)` rather than `pub`: it returns a bare `String` containing the
+/// hex, and the crate has exactly one legitimate caller for it — the line
+/// builder inside the single exposure site. It cannot reach [`write_item`],
+/// which takes a `KeychainStdinLine`, but a caller could still build the string
+/// and log it.
+///
 /// # Errors
 ///
 /// Returns [`KeychainWriteError::Unquotable`] when a name would change what
 /// the line means, and [`KeychainWriteError::LineTooLong`] when the finished
 /// line — trailing newline included — exceeds [`SECURITY_STDIN_LIMIT`].
-pub fn line_text(account: &str, service: &str, hex: &str) -> Result<String, KeychainWriteError> {
+pub(crate) fn line_text(
+    account: &str,
+    service: &str,
+    hex: &str,
+) -> Result<String, KeychainWriteError> {
     quotable("account", account)?;
     quotable("service", service)?;
     let line = format!("add-generic-password -U -a \"{account}\" -s \"{service}\" -X \"{hex}\"\n");
@@ -432,7 +470,10 @@ fn quotable(field: &'static str, value: &str) -> Result<(), KeychainWriteError> 
 /// a text grep that tripped over the fake script. `security_cli` enumerates
 /// its own three read shapes; between them the two lists are the complete set
 /// of argv the crate builds.
-#[cfg(feature = "testing")]
+///
+/// `test` as well as `testing`, so the assertion runs in a plain unit-test
+/// build too; neither spelling reaches a release artifact.
+#[cfg(any(test, feature = "testing"))]
 pub fn argv_shapes() -> Vec<Vec<&'static str>> {
     vec![WRITE_ARGV.to_vec()]
 }

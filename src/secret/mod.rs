@@ -1,16 +1,22 @@
-//! Reading secrets. Never writing them.
+//! Reading secrets, and — from exactly one module — writing them.
 //!
 //! [`KeychainReader`] is deliberately a *reader*. It has no `write` and no
-//! `delete`, and it never will in phase 1: invariant I1 says no code path
-//! writes or deletes a keychain item, and the cheapest way to make that true
-//! is to give the rest of the crate no vocabulary for saying it (plan AC15,
-//! AC25). The `security(1)` transport for writes exists — fact F29 records
-//! how Claude Code does it — and is phase-2 work, behind the same trait
-//! growing a second, separately reviewed method.
+//! `delete`, and it never grows one: invariant I1 said no code path writes or
+//! deletes a keychain item, and the cheapest way to keep the second half of
+//! that true is to give the rest of the crate no vocabulary for saying it
+//! (plan AC15, AC25). Phase 2 adds the write side as a **separate** module,
+//! [`keychain_write`], rather than as a method on the trait: it is the only
+//! module that names `add-generic-password`, it accepts only a `WriteTarget`
+//! it constructed itself (invariant I1′), and `delete-generic-password`
+//! appears nowhere in the crate at all.
 //!
 //! The submodules split by mechanism:
 //!
-//! - [`security_cli`] runs `/usr/bin/security` under a time budget.
+//! - [`security_cli`] runs `/usr/bin/security` under a time budget, and only
+//!   ever with one of three read subcommands.
+//! - [`keychain_write`] is the one write transport: fact F42's stdin form, one
+//!   argv array, no secret in it.
+//! - [`audit`] is the append-only log of every write and every lock break.
 //! - [`file_store`] is agentctl's own credential file, in Claude Code's
 //!   on-disk shape (fact F40).
 //! - [`namespace_lock`] is the `flock` that makes a namespace single-writer.

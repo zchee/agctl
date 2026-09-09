@@ -663,6 +663,10 @@ fn plant_record(store: &Store, pid: u32, store_dir: &Path, held: &[&Path]) -> Pa
     fs::create_dir_all(&dir).expect("the held-locks directory should be creatable");
     let record = held_locks::HeldLockRecord {
         agentctl_pid: pid,
+        // Left unknown deliberately: a record that names no start time is what
+        // a build before the field wrote, and it must still be actionable — the
+        // process id alone is then the whole evidence, exactly as in phase 1.
+        agentctl_start_time: None,
         tree: held_locks::Tree::Live,
         store_dir: store_dir.to_path_buf(),
         paths: held.iter().map(|path| path.to_path_buf()).collect(),

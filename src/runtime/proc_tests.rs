@@ -214,20 +214,34 @@ fn a_reaped_child_is_reported_as_dead() {
 // AC80 — the holder check reads process state and nothing else
 // ---------------------------------------------------------------------------
 
+/// This process's user id, for the per-process classification assertions.
+fn our_uid() -> u32 {
+    rustix::process::getuid().as_raw()
+}
+
 #[test]
 fn claude_processes_finds_a_stopped_same_user_claude() {
     // Plan AC80's live half. The child is a copy of `/bin/sleep` named
     // `claude`, which is what makes the kernel account for it under that
     // name; the real Claude Code binary is never run and never signalled.
+    //
+    // The running half is asserted per process rather than through the whole
+    // sweep, because the sweep's verdict legitimately depends on every other
+    // process on the machine: one of ours that the kernel will not describe
+    // makes it `Incomplete`, which is the honest answer and not this test's
+    // subject.
     let child = OwnChild::spawn_named("claude");
-    let found = claude_processes().expect("the process table is readable on this machine");
-    assert!(
-        found.iter().any(|(pid, state)| *pid == child.pid() && *state == Holder::Alive),
-        "a running same-user `claude` is listed as alive: {found:?}"
+    assert_eq!(
+        look(our_uid(), child.pid()),
+        Seen::Claude(Holder::Alive),
+        "a running same-user `claude` is seen, and seen as alive"
     );
 
     child.stop();
-    let found = claude_processes().expect("the process table is readable on this machine");
+    assert_eq!(look(our_uid(), child.pid()), Seen::Claude(Holder::Stopped));
+    // And through the sweep, which reports a stopped `claude` it found even if
+    // it could not classify everything else — the asymmetry `sweep` documents.
+    let found = claude_processes().expect("a stopped `claude` is an answer, not an incomplete one");
     assert!(
         found.iter().any(|(pid, state)| *pid == child.pid() && *state == Holder::Stopped),
         "a stopped same-user `claude` is listed as stopped: {found:?}"
@@ -237,14 +251,19 @@ fn claude_processes_finds_a_stopped_same_user_claude() {
 #[test]
 fn a_name_that_merely_contains_claude_is_not_a_match() {
     // Fact F57's two banned matchers in one assertion: `Claude.app`'s helpers
-    // contain "Claude" and a `-f`-style match would sweep in command lines.
+    // contain "Claude" and a match on the full command line would sweep in
+    // arguments as well as names.
+    //
+    // Per process for the reason above: what is under test is the matcher, not
+    // whether every other process on a busy machine happened to be readable.
     let helper = OwnChild::spawn_named("Claude Helper");
     let prefixed = OwnChild::spawn_named("claude-code");
-    let found = claude_processes().expect("the process table is readable on this machine");
     for other in [&helper, &prefixed] {
-        assert!(
-            !found.iter().any(|(pid, _)| *pid == other.pid()),
-            "only an exact, case-sensitive `claude` matches: {found:?}"
+        assert_eq!(
+            look(our_uid(), other.pid()),
+            Seen::Other,
+            "only an exact, case-sensitive `claude` matches: `{:?}`",
+            ffi::name(other.pid())
         );
     }
 }
@@ -290,6 +309,85 @@ fn partial_evidence_is_an_error_rather_than_a_shorter_list() {
     let incomplete = ProcError::Incomplete { unreadable: 3 };
     assert_eq!(incomplete.to_string(), "3 process(es) exist but could not be classified");
     assert!(matches!(claude_processes(), Ok(_) | Err(ProcError::Incomplete { .. })));
+}
+
+#[test]
+fn a_refused_process_we_can_still_signal_is_unclassified_not_absent() {
+    // Review P1-4. `EPERM` from `proc_pidinfo` means "another user's" only
+    // when this process also cannot signal it. Under a sandbox profile
+    // carrying `(deny process-info*)` — and the manual checks for D-016/D-023
+    // run under `sandbox-exec` — **every** process answers `EPERM`, our own
+    // included, and reading that as "not ours" would make the sweep return an
+    // empty list having classified nothing: `no_stopped_claude`, and a
+    // `SIGSTOP`ped session's lock broken on modification times alone.
+    //
+    // The sandbox cannot be entered from inside a test, so the two answers are
+    // driven directly: same `EPERM`, opposite `kill(pid, 0)`.
+    let ours = classify(0, Err(ffi::InfoError::Refused), || None, || true);
+    assert_eq!(ours, Seen::Unclassified, "a process we may signal is ours and was not classified");
+
+    let theirs = classify(0, Err(ffi::InfoError::Refused), || None, || false);
+    assert_eq!(theirs, Seen::Other, "and one we may not signal is somebody else's");
+
+    // Which is what makes the difference between the two verdicts the break
+    // rule keys on.
+    assert_eq!(
+        sweep([(4242, ours)]).err(),
+        Some(ProcError::Incomplete { unreadable: 1 }),
+        "an unclassified process of ours makes the whole sweep incomplete"
+    );
+    assert_eq!(sweep([(4242, theirs)]).ok(), Some(Vec::new()), "somebody else's is skipped");
+}
+
+#[test]
+fn one_unreadable_process_of_ours_is_enough_to_make_the_sweep_incomplete() {
+    // The aggregation on its own, including the shape that hid the false
+    // negative: a sweep that found a `claude` **and** failed to read one
+    // process of ours is still incomplete, because the one it could not read
+    // may be another, stopped, `claude`.
+    let seen = [
+        (1, Seen::Other),
+        (2, Seen::Claude(Holder::Alive)),
+        (3, Seen::Gone),
+        (4, Seen::Unclassified),
+    ];
+    assert_eq!(sweep(seen).err(), Some(ProcError::Incomplete { unreadable: 1 }));
+
+    let complete = [(1, Seen::Other), (2, Seen::Claude(Holder::Stopped)), (3, Seen::Gone)];
+    assert_eq!(sweep(complete).ok(), Some(vec![(2, Holder::Stopped)]));
+}
+
+#[test]
+fn a_stopped_claude_that_was_found_survives_an_incomplete_sweep() {
+    // The asymmetry, stated as a test because getting it wrong is a
+    // credential: incompleteness must suppress a *negative* — "no stopped
+    // `claude`", which would license a break — and never a positive. A `yes`
+    // does not become less true for having stopped looking, and discarding it
+    // would map a found stopped holder to `none` and let the break proceed on
+    // modification times alone.
+    let masked = [(7, Seen::Claude(Holder::Stopped)), (8, Seen::Unclassified)];
+    assert_eq!(
+        sweep(masked).ok(),
+        Some(vec![(7, Holder::Stopped)]),
+        "an unreadable process cannot hide a stopped `claude` that was found"
+    );
+
+    let alive_only = [(7, Seen::Claude(Holder::Alive)), (8, Seen::Unclassified)];
+    assert_eq!(
+        sweep(alive_only).err(),
+        Some(ProcError::Incomplete { unreadable: 1 }),
+        "a running one is not an answer to the question the rule asks"
+    );
+}
+
+#[test]
+fn the_signal_probe_tells_our_own_process_from_another_users() {
+    // The distinguishing call, against the two processes every machine has:
+    // this one, and `launchd`.
+    assert!(signalable(std::process::id()), "we may signal ourselves");
+    assert!(!signalable(1), "and not `launchd`, which runs as root");
+    assert!(exists(1), "even though it plainly exists — which is the distinction");
+    assert!(!signalable(IMPOSSIBLE_PID));
 }
 
 #[test]

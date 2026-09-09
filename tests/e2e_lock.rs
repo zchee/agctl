@@ -243,19 +243,19 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_stale_remover_still_refuses_a_path_outside_the_namespace_root() {
+fn the_stale_remover_refuses_a_path_outside_the_namespace_root_without_a_record() {
     // Plan AC64's last clause is "`swap_lock_leak` leaves them and `doctor`
-    // names them", and section 3.9 row 2 is what makes the leaked
-    // directories recoverable: `--remove-stale` accepts a path outside
-    // `namespace_root()` **only** when a held-lock record names that exact
-    // path and the recorded process is dead.
+    // names them", and section 3.9 row 2 is what makes the leaked directories
+    // recoverable: `--remove-stale` accepts a path outside `namespace_root()`
+    // **only** when a held-lock record names that exact path and the process
+    // that wrote it is gone.
     //
-    // That reader is S19's half and is not on this branch, so the record
-    // side is asserted in `secret/claude_lock_tests.rs` — on the record file
-    // itself, whose shape both lanes agreed — and this test pins the
-    // behaviour S19 must *change* rather than the behaviour it will add. It
-    // is a canary: when S19 lands, the refusal below becomes conditional and
-    // this test is the one that says so out loud.
+    // This is the "only" half. The store below has no held-lock record at all,
+    // so the refusal is unconditional — and it stays unconditional now that
+    // the attested branch exists, which is why the name says *without a
+    // record* rather than reading as a blanket refusal. The positive half, and
+    // every other negative, live in `commands/doctor_tests.rs` and
+    // `tests/e2e_accounts.rs`.
     let store = tempfile::tempdir().expect("a temporary directory");
     let config = tempfile::tempdir().expect("a temporary directory");
     let outside = store.path().join(".oauth_refresh.lock");
@@ -272,6 +272,6 @@ fn the_stale_remover_still_refuses_a_path_outside_the_namespace_root() {
         .output()
         .expect("the binary should run");
 
-    assert!(!output.status.success(), "a path outside the store is refused today");
+    assert!(!output.status.success(), "a path outside the store, with no record, is refused");
     assert!(outside.is_dir(), "and nothing is removed");
 }

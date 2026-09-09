@@ -17,8 +17,10 @@
 //!   `~/.claude` by construction, so without this the recovery command for
 //!   premortem PM9 would not exist (architect N-2, critic M1).
 //!
-//! The write side is [`crate::secret::claude_lock`]'s, which produces exactly
-//! the shape read here.
+//! The write side is [`crate::secret::claude_lock`]'s, and it writes
+//! [`HeldLockRecord`] itself rather than a second declaration of the same
+//! fields — two types that were wire-compatible only by inspection is how a
+//! reader and a writer in different lanes end up disagreeing about a spelling.
 
 use std::fs;
 use std::path::Path;
@@ -28,6 +30,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::config::paths::Paths;
+use crate::runtime::coordinator::Cancel;
+use crate::runtime::proc;
 use crate::secret::file_store;
 use crate::secret::file_store::ReadOutcome;
 
@@ -54,30 +58,29 @@ pub fn dir(paths: &Paths) -> PathBuf {
 /// Named in the record rather than inferred from the path, because the whole
 /// point of invariant I11′'s containment is being able to tell a lock agentctl
 /// took inside its own tree from one it took in the live `~/.claude`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Tree {
-    /// A store agentctl owns, under [`Paths::namespace_root`].
-    Agentctl,
-    /// The live store a Claude Code session of the user's own is using.
-    Live,
-}
-
-impl Tree {
-    /// The word `doctor` prints for this tree.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Agentctl => "agentctl's own tree",
-            Self::Live => "the live store",
-        }
-    }
-}
+///
+/// Re-exported rather than declared: [`crate::secret::audit`] holds the crate's
+/// one spelling, so the writer's `tree` and the reader's cannot drift apart.
+pub use crate::secret::audit::Tree;
 
 /// One held-lock record, as it is written before the first `mkdir`.
+///
+/// This is the shape [`claude_lock`](crate::secret::claude_lock) writes — it
+/// serializes *this* type — so the reader and the writer cannot disagree about
+/// a field name or a `tree` spelling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldLockRecord {
     /// The agentctl process that took the locks.
     pub agentctl_pid: u32,
+    /// When that process started, so a recycled process id cannot pass for the
+    /// one that wrote the record.
+    ///
+    /// `None` when it could not be read, and `None` in a record written by a
+    /// build that predates the field: both mean "unknown", and an unknown start
+    /// time falls back to the process id alone, which is weaker but is what
+    /// phase 1 had. Filled from [`proc::self_start_time`].
+    #[serde(default)]
+    pub agentctl_start_time: Option<String>,
     /// Which tree they are in.
     pub tree: Tree,
     /// The credential store directory being locked.
@@ -89,6 +92,30 @@ pub struct HeldLockRecord {
 }
 
 impl HeldLockRecord {
+    /// Whether the process that wrote this record is gone, so the directories
+    /// it names are a leak rather than a live hold.
+    ///
+    /// Two ways to be gone, and the second is why the start time is recorded at
+    /// all: the process id no longer exists (or is a zombie, which has already
+    /// exited), **or** it exists and started at a different moment, which means
+    /// the kernel handed the id to somebody else. Without the second test an
+    /// unrelated long-lived process inheriting the id would block recovery from
+    /// a real leak for as long as it ran.
+    ///
+    /// Both start times must be readable for a mismatch to count. An unknown
+    /// one is not evidence of anything, and reading it as one would turn every
+    /// record written by an older build into a permitted removal.
+    pub fn writer_is_gone(&self, cancel: &Cancel) -> bool {
+        if proc::holder(self.agentctl_pid, cancel) == proc::Holder::Dead {
+            return true;
+        }
+        let Some(recorded) = self.agentctl_start_time.as_deref() else { return false };
+        match proc::start_time(self.agentctl_pid, cancel) {
+            Some(now) => now != recorded,
+            None => false,
+        }
+    }
+
     /// Whether this record vouches for `path`.
     ///
     /// Exact paths, compared component by component: this is the check that

@@ -966,6 +966,38 @@ pub fn remove_dir_under(anchor: &Path, path: &Path) -> Result<(), FileStoreError
     })
 }
 
+/// Opens one existing directory below `anchor` without ever following a
+/// symbolic link, for a caller that then operates relative to the descriptor.
+///
+/// The same walk [`remove_dir_under`] performs, exposed on its own because
+/// [`claude_lock`](crate::secret::claude_lock) holds three lock artefacts
+/// inside a directory it does not own: it must resolve the way to that
+/// directory **once**, and then `mkdir`, `stat` and `rmdir` relative to what
+/// the walk produced. Re-resolving the path at each of those steps is what let
+/// a symbolic link planted at `<acct>` redirect the whole protocol out of the
+/// namespace root.
+///
+/// # Errors
+///
+/// [`FileStoreError::RefusedSymlink`] for a link anywhere below `anchor`,
+/// [`FileStoreError::OutsideNamespaceRoot`] when `dir` does not spell a
+/// location below `anchor`, [`FileStoreError::NotRegular`] for a component
+/// that exists and is not a directory, and [`FileStoreError::Io`] when a
+/// component is missing.
+pub fn open_dir_under(anchor: &Path, dir: &Path) -> Result<OwnedFd, FileStoreError> {
+    let Some(chain) = open_chain(anchor, dir, Walk::MustExist)? else {
+        return Err(FileStoreError::io(
+            format!("`{}` is not there", dir.display()),
+            io::Error::from(io::ErrorKind::NotFound),
+        ));
+    };
+    chain
+        .into_iter()
+        .next_back()
+        .map(|step| step.fd)
+        .ok_or_else(|| FileStoreError::OutsideNamespaceRoot(dir.to_path_buf()))
+}
+
 /// Opens `ns_dir` for an operation that was not handed the [`Paths`] it came
 /// from.
 ///

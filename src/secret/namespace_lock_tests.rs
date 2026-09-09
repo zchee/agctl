@@ -33,7 +33,7 @@ fn acquiring_writes_a_body_naming_this_process() {
         crate::runtime::proc::self_start_time(&Cancel::new()),
         "the body names when this process started, so a recycled pid is detectable"
     );
-    assert!(body.pid_start_time.is_some(), "`ps -o lstart=` answers on this platform");
+    assert!(body.pid_start_time.is_some(), "the kernel answers on this platform");
 
     assert_eq!(guard.path(), paths.lock_path("acct", "org"));
     let mode = std::fs::metadata(guard.path()).expect("the lock file exists").permissions().mode();

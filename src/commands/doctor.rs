@@ -401,6 +401,10 @@ fn held_locks_section(doctor: &Doctor<'_>) -> Vec<String> {
     for held in &records {
         let pid = held.record.agentctl_pid;
         let state = proc::holder(pid, doctor.cancel);
+        // The same question `--remove-stale` asks, so the report cannot offer a
+        // removal the command would refuse — or withhold one it would allow: a
+        // recycled process id is alive without being the writer.
+        let gone = held.record.writer_is_gone(doctor.cancel);
         out.push(format!(
             "  {}  pid {pid} ({}), {}, taken {}",
             held.file.display(),
@@ -418,7 +422,7 @@ fn held_locks_section(doctor: &Doctor<'_>) -> Vec<String> {
             continue;
         }
         for path in present {
-            if state == proc::Holder::Dead {
+            if gone {
                 out.push(format!(
                     "    {}  leaked — `doctor --remove-stale {} --yes` removes it",
                     path.display(),
@@ -1034,11 +1038,11 @@ fn permit_for(doctor: &Doctor<'_>, path: &Path) -> Result<Permit, AppError> {
     }
 
     for held in &attesting {
-        let pid = held.record.agentctl_pid;
-        // `holder` answers `Dead` both for a pid that is gone and for a
-        // zombie, which is the state that matters here: a zombie has already
-        // exited, so it is holding nothing and never will again.
-        if proc::holder(pid, doctor.cancel) != proc::Holder::Dead {
+        // `writer_is_gone` answers yes for a pid that is gone, for a zombie —
+        // which has already exited, so it is holding nothing and never will
+        // again — and for a pid the kernel has since handed to a different
+        // process, which the recorded start time is what detects.
+        if !held.record.writer_is_gone(doctor.cancel) {
             continue;
         }
         let Some(anchor) = held.record.anchor() else { continue };
