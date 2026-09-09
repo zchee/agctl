@@ -56,9 +56,13 @@ install -m 0755 target/release/agentctl ~/.local/bin/agentctl
 ### Shell completions
 
 ```sh
-# zsh — add to ~/.zshrc
+# zsh — add to ~/.zshrc, after compinit (the script calls compdef, which
+# only exists once the completion system is loaded)
+autoload -Uz compinit && compinit
 eval "$(agentctl completions zsh)"
-# or install the file once: agentctl completions zsh > "${fpath[1]}/_agentctl"
+# or install the file once into a directory you own and put on fpath:
+mkdir -p ~/.zfunc && agentctl completions zsh > ~/.zfunc/_agentctl
+fpath=(~/.zfunc $fpath)   # before compinit in ~/.zshrc
 # bash — add to ~/.bashrc
 eval "$(agentctl completions bash)"
 # fish
@@ -66,7 +70,9 @@ agentctl completions fish > ~/.config/fish/completions/agentctl.fish
 ```
 
 `elvish` and `powershell` are also accepted. The script is generated from the same
-`clap` definition the binary parses, so it never drifts from the real flag set.
+`clap` definition the binary parses, so it never drifts from the real flag set. On
+bash older than 4.4 (macOS ships 3.2) the candidates come back sorted alphabetically
+rather than in the order the help text lists them; everything else is the same.
 
 ## Commands
 
