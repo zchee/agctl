@@ -252,9 +252,18 @@ counted; `--all` shows them.
 
 ## Security posture
 
-- **agentctl never writes the keychain.** The only `security(1)` subcommands it issues are
-  `show-keychain-info`, `find-generic-password` and `dump-keychain` — all reads. There is
-  no code path that adds, updates or deletes a keychain item.
+- **agentctl writes exactly one class of keychain item, and deletes none.** The
+  `security(1)` subcommands it issues are `show-keychain-info`,
+  `find-generic-password` and `dump-keychain` — all reads — plus
+  `add-generic-password -U`, on standard input, for one case: a namespace agentctl
+  created that a Claude Code session has since migrated into the keychain. That item is
+  refreshed in place under Claude Code's own lock protocol, and its name is derived from
+  the account registry, so no other item is nameable as a target. The live
+  `Claude Code-credentials` item is never written. There is no
+  `delete-generic-password` code path at all, and no secret ever appears in a command
+  line: the credential goes to `security -i` over a pipe. Every write is appended to
+  `~/.config/agentctl/claude/keychain-writes.jsonl`, which records digest prefixes and
+  never token material.
 - **agentctl never writes under a live Claude Code configuration directory, and never
   touches `.claude.json`.** Every file it creates is under its own configuration
   directory.
@@ -272,13 +281,21 @@ counted; `--all` shows them.
   refresh POST, agentctl checks the write target, takes the lock, re-checks for a Claude
   Code session under the lock, and re-checks once more immediately before the rename. Any
   surprise at any of those points ends in a refusal. There is no flag that overrides it: a
-  row reading `claude session detected — refresh refused` is the system working.
+  row reading `claude session detected — refresh refused` is the system working. A
+  namespace a session has *migrated* into the keychain is the one activity that is not a
+  refusal: agentctl refreshes that item instead of the file, and refuses again if the item
+  changes while the refresh is in flight.
 - **A row agentctl does not own is never refreshed and, when expired, is not even
   fetched.** Its owner refreshes it; agentctl reports.
-- `doctor --remove-stale` is the single exception to "agentctl removes nothing", and it is
-  fenced by the seven conditions — and the one record-attested exception to the first of
-  them — listed under
-  [`doctor`](#doctor--what-is-actually-on-this-machine).
+- **agentctl removes a lock artefact it did not create in exactly two circumstances.**
+  `doctor --remove-stale`, fenced by the seven conditions — and the one record-attested
+  exception to the first of them — listed under
+  [`doctor`](#doctor--what-is-actually-on-this-machine); and, as a protocol peer, a stale
+  Claude Code lock **inside agentctl's own directory tree** while refreshing a migrated
+  namespace's keychain item. The second takes twelve seconds of modification-time
+  sampling before it removes anything, stands down if any `claude` process is stopped,
+  and appends the whole decision to the audit log whether it broke the lock or abandoned
+  the attempt. Neither can reach the live `~/.claude`.
 
 ## The usage endpoint
 

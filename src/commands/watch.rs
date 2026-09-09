@@ -247,6 +247,7 @@ impl Pass for Session {
 
         let shared = Shared {
             paths: Arc::clone(&self.paths),
+            env: self.env.clone(),
             client: (self.client_factory)(),
             refresher: Arc::clone(&self.refresher),
             reader_factory: Arc::clone(&self.reader_factory),

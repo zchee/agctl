@@ -184,6 +184,34 @@ impl Fixture {
         self.config_dir().join("claude").join(".locks").join(format!("{acct}.{org}.lock"))
     }
 
+    /// The append-only log of every keychain write and every lock break.
+    #[must_use]
+    pub fn audit_log_path(&self) -> PathBuf {
+        self.config_dir().join("claude").join("keychain-writes.jsonl")
+    }
+
+    /// Where agentctl records the Claude Code locks it is holding.
+    #[must_use]
+    pub fn held_locks_dir(&self) -> PathBuf {
+        self.config_dir().join("claude").join("held-locks")
+    }
+
+    /// The three lock directories one credential-store hold creates, in the
+    /// order the peer's own nesting takes them (facts F46, F58).
+    ///
+    /// The legacy lock is the store directory's *sibling*, named after the
+    /// store's own last component — which for an agentctl namespace is the
+    /// organization directory (fact F17).
+    #[must_use]
+    pub fn hold_artefacts(&self, acct: &str, org: &str) -> [PathBuf; 3] {
+        let ns_dir = self.ns_dir(acct, org);
+        [
+            ns_dir.join(".oauth_refresh.lock"),
+            self.config_dir().join("claude").join(acct).join(format!("{org}.lock")),
+            ns_dir.join(".storage-write"),
+        ]
+    }
+
     /// The live store directory Claude Code would read (`$HOME/.claude`).
     #[must_use]
     pub fn live_store_dir(&self) -> PathBuf {
@@ -700,6 +728,25 @@ pub fn migration_service(ns_dir: &Path) -> String {
     format!("{LIVE_SERVICE}-{}", sha8(&export_spelling(ns_dir)))
 }
 
+/// The same, for the directory's *canonical* spelling.
+///
+/// A second name for one directory, and the reason discovery looks for both
+/// (plan AC20): a user handed a path through a symbolic link makes the session
+/// hash the spelling it was *given*, so the canonical spelling hashes
+/// differently. Under `$TMPDIR` on macOS the two always differ — `/var` is a
+/// link to `/private/var` — which is what makes this a usable fixture.
+///
+/// # Panics
+///
+/// Panics when `ns_dir` cannot be resolved, which means the caller has not
+/// created it yet.
+#[must_use]
+pub fn canonical_migration_service(ns_dir: &Path) -> String {
+    let resolved = fs::canonicalize(ns_dir)
+        .unwrap_or_else(|err| panic!("`{}` should resolve: {err}", ns_dir.display()));
+    format!("{LIVE_SERVICE}-{}", sha8(&export_spelling(&resolved)))
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem facts
 // ---------------------------------------------------------------------------
@@ -797,6 +844,36 @@ pub fn wait_until(budget: Duration, mut ready: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// One block of log output with its terminal escape sequences removed.
+///
+/// `tracing_subscriber`'s formatter styles field names and separators even when
+/// standard error is a pipe, so a test that reads `field=value` out of a log
+/// line has to strip the escapes first: the `=` itself is wrapped in them, and
+/// the sequences contain digits, so neither a literal `"field="` search nor
+/// "skip to the first digit" survives them.
+#[must_use]
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // A control sequence introduced by `[` runs to its final byte, which is
+        // the first character in 0x40..=0x7e after the introducer. Anything
+        // else after the escape is a two-character sequence.
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Sends `SIGTERM` to one process id.
 ///
 /// Through `/bin/kill` rather than a signal crate: this is a test asking the
@@ -872,17 +949,24 @@ pub fn finish(child: Child) -> Output {
 ///
 /// Plan AC61 counts `add-generic-password` lines in the suite-wide log against
 /// this list, so it has to be exactly the tests that write — one line each. In
-/// W2 that is the three S18 tests below, all in `tests/e2e_keychain.rs`; W3
-/// and W4 add the refresh-in-place and swap tests as they land.
+/// W2 that was the three S18 tests below, all in `tests/e2e_keychain.rs`; W3
+/// adds the refresh-in-place test, and W4 adds the swap tests as they land.
+///
+/// A name here does **not** mean the named test records its own calls into the
+/// aggregate — none of them does, and one that did would push the count over.
+/// `ac61_…` replays one write per name in a single process and asserts the
+/// aggregate holds exactly that many, so this list is the count of tests in
+/// the suite that are *allowed* to write.
 ///
 /// The count is asserted **positively**: a list this long and a log with no
 /// write lines in it is a failure, not a pass, because "the write path did
 /// nothing" is exactly the way this criterion could otherwise be satisfied
 /// (critic M8).
-pub const KEYCHAIN_WRITE_TESTS: [&str; 3] = [
+pub const KEYCHAIN_WRITE_TESTS: [&str; 4] = [
     "ac59_the_write_transport_reads_one_line_from_stdin_and_redacts_the_hex",
     "ac60_a_service_no_test_registered_is_refused_and_stores_nothing",
     "ac61_what_the_write_path_stores_is_what_the_binary_reads",
+    "ac65_a_migrated_namespace_refreshes_its_own_keychain_item_in_place",
 ];
 
 /// Fact F42's keychain update line, for a test that means to write one.

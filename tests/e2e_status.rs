@@ -488,6 +488,13 @@ fn ac34_a_migrated_namespace_is_read_from_the_keychain_and_never_written() {
     // Plan AC34, fact F35: a Claude Code session has moved this namespace's
     // credentials into the keychain. agentctl displays them from there and
     // stops writing the file entirely (invariant I2).
+    //
+    // The row's *state* is no longer `migrated to keychain`: decision D-015
+    // makes a migrated namespace refreshable in place, so an item the registry
+    // predicts and that is fresh reads as `ok` with the service in its note
+    // (plan AC66, `tests/e2e_refresh.rs`). What AC34 is about is unchanged and
+    // is what the rest of this test asserts — the numbers come from the
+    // keychain, and the plaintext file is not touched, not even its inode.
     let server = MockServer::start();
     let usage = usage_ok(&server);
     let token = token_ok(&server);
@@ -515,9 +522,9 @@ fn ac34_a_migrated_namespace_is_read_from_the_keychain_and_never_written() {
         .args(["claude", "status", "--refresh", "--account", EMAIL])
         .assert()
         .success()
-        .stdout(contains("migrated to keychain"));
+        .stdout(contains(&service));
 
-    assert_eq!(token.calls(), 0, "a migrated namespace is never refreshed");
+    assert_eq!(token.calls(), 0, "a fresh migrated item needs no refresh");
     assert_eq!(usage.calls(), 1, "it is still displayed, from the keychain");
     assert_eq!(fs::read(&path).expect("readable"), before, "the file was left exactly as it was");
     assert_eq!(common::inode_of(&path), before_inode);

@@ -16,12 +16,14 @@
 mod common;
 
 use std::fs;
+use std::path::PathBuf;
 use std::process::Child;
 use std::time::Duration;
 
 use common::ACCT;
 use common::EMAIL;
 use common::Fixture;
+use common::LIVE_SERVICE;
 use common::ORG;
 use common::USAGE_BODY;
 use common::USAGE_PATH;
@@ -86,6 +88,23 @@ fn only_row(stdout: &str) -> Value {
         .and_then(|rows| rows.first())
         .cloned()
         .unwrap_or_else(|| panic!("the document should carry one row:\n{stdout}"))
+}
+
+/// The `owned` row of a `status --json` document.
+///
+/// A migrated namespace's keychain item is not a *claimed* service — only the
+/// live item and an imported configuration directory's are — so discovery also
+/// emits an `unclaimed` row for the same item, and `--account` matches it too
+/// because the blob names the same address. The row under test is the one the
+/// registry owns.
+fn owned_row(stdout: &str) -> Value {
+    let document: Value = serde_json::from_str(stdout)
+        .unwrap_or_else(|err| panic!("stdout should be one JSON document: {err}\n{stdout}"));
+    document["rows"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["kind"] == json!("owned")))
+        .cloned()
+        .unwrap_or_else(|| panic!("the document should carry an owned row:\n{stdout}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -645,4 +664,536 @@ fn ac48_the_lock_body_names_the_process_holding_it() {
     );
 
     kill(child);
+}
+
+// ---------------------------------------------------------------------------
+// AC65, AC66 — a migrated namespace refreshes its own keychain item in place
+// ---------------------------------------------------------------------------
+
+/// A store whose one owned namespace a Claude Code session has migrated into
+/// the keychain (fact F35, decision D-015).
+///
+/// The namespace *directory* is still there and `.credentials.json` is gone,
+/// which is exactly what a session leaves behind: it writes the namespaced
+/// item and deletes the file. The item is registered as a write target with
+/// the stand-in, because a write it was not told about must not silently
+/// succeed.
+fn migrated_owned(server: &MockServer, expires_at_ms: i64) -> (Fixture, String) {
+    let mut fixture = Fixture::new();
+    fixture.with_keychain().endpoints(&server.base_url());
+    fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
+    fs::create_dir_all(fixture.ns_dir(ACCT, ORG)).expect("the namespace should be creatable");
+
+    let service = common::migration_service(&fixture.ns_dir(ACCT, ORG));
+    fixture.dump(&[&service]);
+    fixture.keychain_item(
+        &service,
+        &common::blob("sk-ant-oat01-migrated", "sk-ant-ort01-migrated", expires_at_ms),
+    );
+    fixture.allow_write(&service);
+    (fixture, service)
+}
+
+/// How many times the stand-in was asked to read one service's password.
+fn finds_for(fixture: &Fixture, service: &str) -> usize {
+    let suffix = format!("-s {service}");
+    fixture
+        .security_log()
+        .iter()
+        .filter(|line| line.starts_with("find-generic-password") && line.ends_with(&suffix))
+        .count()
+}
+
+/// Every write the stand-in recorded, redacted as it logs them.
+fn writes(fixture: &Fixture) -> Vec<String> {
+    fixture
+        .security_log()
+        .into_iter()
+        .filter(|line| line.starts_with("add-generic-password"))
+        .collect()
+}
+
+/// Runs one pass and hands back its stdout.
+fn json_pass(fixture: &Fixture, extra: &[&str]) -> String {
+    let mut command = fixture.cmd();
+    command.args(["claude", "status", "--json", "--refresh", "--account", EMAIL]);
+    command.args(extra);
+    let assert = command.assert();
+    let output = assert.get_output().clone();
+    String::from_utf8(output.stdout).expect("stdout is UTF-8")
+}
+
+#[test]
+fn ac65_a_migrated_namespace_refreshes_its_own_keychain_item_in_place() {
+    // Plan AC65, decision D-015. One read of the item before the POST, one
+    // POST, one write to *that* item under Claude Code's own lock protocol
+    // against agentctl's own directory, the locks gone afterwards, the live
+    // item untouched, and the plaintext file never resurrected.
+    //
+    // This test is named in `common::KEYCHAIN_WRITE_TESTS`, so it does not
+    // record its calls into the suite-wide aggregate: AC61 replays one write
+    // per name there and requires the count to match exactly.
+    let server = MockServer::start();
+    let usage = usage_ok(&server);
+    let token = token_ok(&server, 28_800);
+
+    let (mut fixture, service) = migrated_owned(&server, common::expired_at());
+    // The hold's own duration is only observable through the log line the
+    // release writes, and invariant I17's number is worth asserting rather
+    // than assuming.
+    fixture.set("RUST_LOG", "agentctl=debug");
+    let item = fixture.keychain_item_path(&service);
+    let before = fs::read_to_string(&item).expect("the migrated item should be readable");
+
+    let output = fixture
+        .cmd()
+        .args(["claude", "status", "--json", "--refresh", "--account", EMAIL])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let stderr = common::strip_ansi(&String::from_utf8(output.stderr).expect("stderr is UTF-8"));
+
+    // Invariant I17: the hold, from the first `mkdir` to the last `rmdir`,
+    // stays inside the budget derived from fact F53's give-up floor.
+    let released = stderr
+        .lines()
+        .find(|line| line.contains("released the credential-store hold"))
+        .unwrap_or_else(|| panic!("the release should have been logged:\n{stderr}"));
+    let field = released
+        .split_once("hold_ms=")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("the release line should carry `hold_ms`: {released}"));
+    let hold_ms: u64 =
+        field.parse().unwrap_or_else(|err| panic!("`hold_ms={field}` should be a number: {err}"));
+    assert!(
+        released.contains("budget_ms=3000"),
+        "and the budget it is measured against: {released}"
+    );
+    assert!(hold_ms < 3000, "the hold was {hold_ms} ms, at or past its 3 000 ms budget");
+
+    let row = owned_row(&stdout);
+    assert_eq!(row["state"], json!("ok"), "the row reports the credential, not the migration");
+    assert_eq!(
+        row["lock_state"],
+        json!("migrated_refreshed"),
+        "and says the item itself was refreshed: {row}"
+    );
+    assert_eq!(row["source"], json!("keychain"), "{row}");
+
+    assert_eq!(token.calls(), 1, "exactly one refresh POST");
+    assert!(usage.calls() >= 1, "and the row still answered the user's question");
+
+    // The item was updated in place, and it is the item that changed.
+    let after = fs::read_to_string(&item).expect("the migrated item should still be readable");
+    assert_ne!(after, before, "the namespaced item now holds the refreshed pair");
+    assert!(after.contains("sk-ant-oat01-rotated"), "with the new access token: {after}");
+    assert!(after.contains("sk-ant-ort01-rotated"), "and the rotated refresh token: {after}");
+
+    // Exactly one write, naming that item, with the blob redacted.
+    let write_lines = writes(&fixture);
+    assert_eq!(write_lines.len(), 1, "exactly one keychain write: {write_lines:?}");
+    let write = &write_lines[0];
+    assert!(write.contains(&format!("-s \"{service}\"")), "it names the namespaced item: {write}");
+    assert!(write.contains("-X <REDACTED:"), "and the stand-in redacted the blob: {write}");
+
+    // The live item is never a target on this path (invariant I1′): no write
+    // names it, and nothing ever created it.
+    assert!(
+        !write.contains(&format!("-s \"{LIVE_SERVICE}\"")),
+        "the live item is not what was written: {write}"
+    );
+    assert!(
+        !fixture.keychain_item_path(LIVE_SERVICE).exists(),
+        "and the live item was never created at all"
+    );
+
+    // The exact number of reads of the item, and why each one exists:
+    //   1. `foreign_activity::detect`, confirming the migration is real;
+    //   2. discovery parsing what it found, for the owned row;
+    //   3. discovery parsing it again, for the `unclaimed` row it also emits
+    //      because a migrated namespace's service is not a *claimed* one;
+    //   4. the re-read under the three locks (invariant I2′);
+    //   5. the verifying re-read after the release (section 3.4 step 12).
+    // Only 4 and 5 belong to this step; 1–3 are discovery's, unchanged.
+    assert_eq!(
+        finds_for(&fixture, &service),
+        5,
+        "the item was read exactly five times: {:?}",
+        fixture.security_log()
+    );
+    assert_eq!(
+        finds_for(&fixture, LIVE_SERVICE),
+        1,
+        "and the live row read its own item exactly once: {:?}",
+        fixture.security_log()
+    );
+
+    // And the whole of what `security` was asked to do, so a later change
+    // cannot add an invocation without this failing: one preflight, one
+    // listing, six reads, and the write — which the stand-in logs twice, once
+    // as the argv it was handed and once as the redacted line it parsed off
+    // standard input.
+    let calls = fixture.security_log();
+    assert_eq!(calls.len(), 10, "the exact set of `security` invocations: {calls:?}");
+    for (subcommand, expected) in
+        [("show-keychain-info", 1), ("dump-keychain", 1), ("find-generic-password", 6)]
+    {
+        assert_eq!(
+            calls.iter().filter(|line| line.starts_with(subcommand)).count(),
+            expected,
+            "`{subcommand}` was issued {expected} time(s): {calls:?}"
+        );
+    }
+    assert_eq!(
+        calls.iter().filter(|line| line.as_str() == "-i").count(),
+        1,
+        "and exactly one write transport was spawned: {calls:?}"
+    );
+
+    // The namespace is still migrated: no plaintext store, and no lock
+    // artefact left behind (decision D-014, invariant I5′).
+    assert!(
+        fixture.namespace_entries(ACCT, ORG).is_empty(),
+        "the namespace holds nothing at all: {:?}",
+        fixture.namespace_entries(ACCT, ORG)
+    );
+    for artefact in fixture.hold_artefacts(ACCT, ORG) {
+        assert!(
+            fs::symlink_metadata(&artefact).is_err(),
+            "`{}` should have been released",
+            artefact.display()
+        );
+    }
+    let records: Vec<PathBuf> = fs::read_dir(fixture.held_locks_dir())
+        .expect("the held-locks directory should exist once a hold has happened")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    assert!(records.is_empty(), "the held-lock record was cleared: {records:?}");
+
+    // The audit line, carrying digest prefixes and nothing else.
+    let log = fs::read_to_string(fixture.audit_log_path()).expect("the audit log should exist");
+    let entries: Vec<Value> = log
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("each audit line is one JSON object"))
+        .collect();
+    assert_eq!(entries.len(), 1, "one write, one entry: {log}");
+    let entry = &entries[0];
+    assert_eq!(entry["event"], json!("write"), "{entry}");
+    assert_eq!(entry["outcome"], json!("applied"), "{entry}");
+    let sha8 = service.rsplit('-').next().expect("the service name carries a suffix");
+    assert_eq!(entry["target"], json!(format!("namespace:{sha8}")), "{entry}");
+    for field in ["from_digest8", "to_digest8"] {
+        let value = entry[field].as_str().unwrap_or_default();
+        assert_eq!(value.len(), 8, "`{field}` is a digest prefix: {entry}");
+        assert!(
+            value.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "`{field}` is lowercase hex: {entry}"
+        );
+    }
+    assert_ne!(entry["from_digest8"], entry["to_digest8"], "the write changed the item: {entry}");
+    assert!(!log.contains("sk-ant-"), "and no line carries token material: {log}");
+}
+
+#[test]
+fn ac65_the_hold_creates_three_locks_and_a_changed_item_discards_the_refresh() {
+    // Two claims in one run, because one fault produces both.
+    //
+    // `pause_before_migrated_write` holds open the window between the refresh
+    // POST returning and the locks being taken — outside the hold, so nothing
+    // Claude Code wants is held while the test interleaves (invariant I17).
+    // The test rewrites the item in that window, which is what a live session
+    // finishing its own refresh would do; the re-read under the locks then
+    // disagrees with what the refresh was computed from, and the refreshed
+    // credential is discarded rather than written over theirs (invariant I2′).
+    //
+    // `swap_lock_leak` makes the hold leave its directories and its record
+    // behind exactly as a crashed hold would, which is what turns "the three
+    // locks were taken, in the peer's own nesting" into an assertion rather
+    // than an inference.
+    let server = MockServer::start();
+    let _usage = usage_ok(&server);
+    let token = token_ok(&server, 28_800);
+
+    let (fixture, service) = migrated_owned(&server, common::expired_at());
+    let resume = fixture.scratch("resume");
+    let item = fixture.keychain_item_path(&service);
+
+    let child = fixture
+        .raw()
+        .args(["claude", "status", "--refresh", "--timeout", "30s", "--account", EMAIL])
+        .env("AGENTCTL_FAULT", "pause_before_migrated_write,swap_lock_leak")
+        .env("AGENTCTL_FAULT_RESUME", &resume)
+        .spawn()
+        .expect("agentctl should start");
+
+    assert!(
+        common::wait_until(OBSERVE_BUDGET, || token.calls() == 1),
+        "the refresh POST should have gone out before the pause"
+    );
+    // A live session finishes its own refresh while ours is in flight.
+    fs::write(&item, common::blob("sk-ant-oat01-peer", "sk-ant-ort01-peer", common::fresh_at()))
+        .expect("the item should be writable");
+    fs::write(&resume, "go").expect("the resume file should be writable");
+
+    let finished = common::finish(child);
+    assert_eq!(finished.code(), 2, "a discarded refresh is a degraded row\n{}", finished.stderr);
+    assert!(
+        finished.stdout.contains("refresh discarded: the item changed under us"),
+        "stdout:\n{}",
+        finished.stdout
+    );
+
+    assert_eq!(token.calls(), 1, "and no second POST was made");
+    assert!(writes(&fixture).is_empty(), "nothing was written: {:?}", fixture.security_log());
+    // One preflight, one listing, five reads — the four the positive case
+    // makes before the write, plus the live row's own — and no write and no
+    // verifying read, because the refusal ends the path.
+    assert_eq!(
+        fixture.security_log().len(),
+        7,
+        "the exact set of `security` invocations: {:?}",
+        fixture.security_log()
+    );
+    let served = fs::read_to_string(&item).expect("readable");
+    assert!(served.contains("sk-ant-oat01-peer"), "the peer's credential survived: {served}");
+
+    // The leaked hold names all three directories, in the peer's nesting.
+    let artefacts = fixture.hold_artefacts(ACCT, ORG);
+    for artefact in &artefacts {
+        let meta = fs::symlink_metadata(artefact)
+            .unwrap_or_else(|err| panic!("`{}` should exist: {err}", artefact.display()));
+        assert!(meta.is_dir(), "`{}` is a directory, as the peer makes them", artefact.display());
+    }
+
+    // And the record that brackets them, which is the only evidence a crashed
+    // hold leaves (fact F45).
+    let records: Vec<PathBuf> = fs::read_dir(fixture.held_locks_dir())
+        .expect("the held-locks directory should exist")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(records.len(), 1, "one leaked hold, one record: {records:?}");
+    let body: Value =
+        serde_json::from_str(&fs::read_to_string(&records[0]).expect("the record is readable"))
+            .expect("the record is JSON");
+    assert_eq!(body["tree"], json!("agentctl"), "the break stayed in agentctl's tree: {body}");
+    assert_eq!(
+        body["store_dir"].as_str().unwrap_or_default(),
+        fixture.ns_dir(ACCT, ORG).to_string_lossy(),
+        "and it names the namespace it locked: {body}"
+    );
+    let named: Vec<String> = body["paths"]
+        .as_array()
+        .expect("the record lists the directories it took")
+        .iter()
+        .map(|value| value.as_str().unwrap_or_default().to_owned())
+        .collect();
+    let expected: Vec<String> =
+        artefacts.iter().map(|path| path.to_string_lossy().into_owned()).collect();
+    assert_eq!(named, expected, "in the order the peer's own nesting takes them: {body}");
+}
+
+#[test]
+fn ac66_a_fresh_migrated_namespace_is_no_longer_terminal() {
+    // Plan AC66: `migrated to keychain` used to end the row. It no longer
+    // does — a fresh item reads as `ok`, from the keychain, with no POST and
+    // no write, and the note says which item the numbers came from.
+    let server = MockServer::start();
+    let usage = usage_ok(&server);
+    let token = token_ok(&server, 28_800);
+
+    let (fixture, service) = migrated_owned(&server, common::fresh_at());
+
+    let stdout = json_pass(&fixture, &[]);
+    let row = owned_row(&stdout);
+    assert_eq!(row["state"], json!("ok"), "a fresh migrated item is not a degraded row: {row}");
+    assert_eq!(row["lock_state"], json!("none"), "no lock was taken at all: {row}");
+    assert_eq!(row["source"], json!("keychain"), "{row}");
+    assert_eq!(
+        row["note"],
+        json!(format!("keychain service `{service}`")),
+        "and the row still says where the credential lives: {row}"
+    );
+
+    assert_eq!(token.calls(), 0, "a fresh credential is not refreshed");
+    assert!(usage.calls() >= 1, "it is displayed, from the keychain");
+    assert!(writes(&fixture).is_empty(), "and nothing was written: {:?}", fixture.security_log());
+    assert!(fixture.namespace_entries(ACCT, ORG).is_empty(), "no plaintext store was created");
+    // One preflight, one listing, four reads: the live item once and this one
+    // three times, all of them discovery's.
+    assert_eq!(
+        fixture.security_log().len(),
+        6,
+        "the exact set of `security` invocations: {:?}",
+        fixture.security_log()
+    );
+    fixture.assert_keychain_read_only();
+}
+
+#[test]
+fn ac65_an_item_under_the_canonical_spelling_is_never_refreshed() {
+    // Invariant I1′. Discovery looks for both spellings of a namespace
+    // (plan AC20), but only the item whose name the registry *predicts* —
+    // `WriteTarget::migrated`, from the record's own `export_sha8` — can be a
+    // write target. An item under the canonical spelling's name belongs to
+    // this directory just as plainly and is still refused, because agentctl
+    // never created a namespace for that name.
+    let server = MockServer::start();
+    let usage = usage_ok(&server);
+    let token = token_ok(&server, 28_800);
+
+    let mut fixture = Fixture::new();
+    fixture.with_keychain().endpoints(&server.base_url());
+    fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
+    let ns_dir = fixture.ns_dir(ACCT, ORG);
+    fs::create_dir_all(&ns_dir).expect("the namespace should be creatable");
+
+    let canonical = common::canonical_migration_service(&ns_dir);
+    assert_ne!(
+        canonical,
+        common::migration_service(&ns_dir),
+        "the fixture needs the two spellings to differ, which under $TMPDIR they do"
+    );
+    fixture.dump(&[&canonical]);
+    fixture.keychain_item(
+        &canonical,
+        &common::blob("sk-ant-oat01-canonical", "sk-ant-ort01-canonical", common::expired_at()),
+    );
+    fixture.allow_write(&canonical);
+
+    let stdout = json_pass(&fixture, &[]);
+    let row = owned_row(&stdout);
+    assert_eq!(row["state"], json!("migrated_to_keychain"), "the row stays terminal: {row}");
+    assert_eq!(row["lock_state"], json!("migrated"), "{row}");
+    assert_eq!(
+        row["note"],
+        json!("item name does not match the recorded export spelling; refusing to refresh"),
+        "and says why it will not be refreshed: {row}"
+    );
+
+    assert_eq!(token.calls(), 0, "no refresh was attempted");
+    assert_eq!(usage.calls(), 0, "an expired credential agentctl may not refresh is not spent");
+    assert!(writes(&fixture).is_empty(), "nothing was written: {:?}", fixture.security_log());
+    for artefact in fixture.hold_artefacts(ACCT, ORG) {
+        assert!(
+            fs::symlink_metadata(&artefact).is_err(),
+            "`{}` was never created: no lock is taken before the name is checked",
+            artefact.display()
+        );
+    }
+    assert_eq!(
+        fixture.security_log().len(),
+        6,
+        "the exact set of `security` invocations: {:?}",
+        fixture.security_log()
+    );
+    fixture.assert_keychain_read_only();
+}
+
+#[test]
+fn ac65_a_contended_store_reports_busy_and_writes_nothing() {
+    // Plan section 3.4's `busy`. `lock_contended` makes every attempt at the
+    // primary lock come back `EEXIST`, which is what a live session holding it
+    // looks like: the acquire releases what it took, restarts from the
+    // lock-free probe, and after `MAX_RESTARTS` reports the store busy — never
+    // waiting while holding anything (architect N-1).
+    //
+    // A lock artefact that is present *before* the pass starts is a stronger
+    // refusal and a different one: discovery reports `claude session detected`
+    // and no refresh is attempted at all (plan AC21). This is the arm that
+    // only the acquire can reach.
+    let server = MockServer::start();
+    let _usage = usage_ok(&server);
+    let token = token_ok(&server, 28_800);
+
+    let (mut fixture, service) = migrated_owned(&server, common::expired_at());
+    fixture.fault("lock_contended");
+    let item = fixture.keychain_item_path(&service);
+    let before = fs::read_to_string(&item).expect("readable");
+
+    let stdout = json_pass(&fixture, &[]);
+    let row = owned_row(&stdout);
+    assert_eq!(row["state"], json!("busy"), "{row}");
+    assert_eq!(row["lock_state"], json!("busy"), "{row}");
+    assert_eq!(token.calls(), 1, "the POST had already happened; only the write was refused");
+    assert!(writes(&fixture).is_empty(), "nothing was written: {:?}", fixture.security_log());
+    assert_eq!(fs::read_to_string(&item).expect("readable"), before, "the item is untouched");
+
+    // Every restart released what it had taken, and the last one left nothing.
+    for artefact in fixture.hold_artefacts(ACCT, ORG) {
+        assert!(
+            fs::symlink_metadata(&artefact).is_err(),
+            "`{}` was released on the way out",
+            artefact.display()
+        );
+    }
+    let records: Vec<PathBuf> = fs::read_dir(fixture.held_locks_dir())
+        .expect("the held-locks directory should exist")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    assert!(records.is_empty(), "and cleared its record: {records:?}");
+    // No re-read and no verifying read: the acquire never handed back a hold.
+    assert_eq!(
+        fixture.security_log().len(),
+        6,
+        "the exact set of `security` invocations: {:?}",
+        fixture.security_log()
+    );
+    fixture.assert_keychain_read_only();
+}
+
+#[test]
+fn ac65_a_blob_over_the_stdin_limit_spawns_no_write() {
+    // Refusal D, invariant I15. Fact F42's line is bounded at 4 032 bytes
+    // *including* its newline, and Claude Code's own fallback for a longer one
+    // is to put the hex in argv. agentctl has no such fallback: the line is
+    // refused, and the refusal is decided before any lock is taken and before
+    // any child exists.
+    let server = MockServer::start();
+    let _usage = usage_ok(&server);
+    let token = server.mock(|when, then| {
+        when.method(POST).path(common::TOKEN_PATH);
+        then.status(200).json_body(json!({
+            "access_token": "sk-ant-oat01-".to_owned() + &"a".repeat(2400),
+            "refresh_token": "sk-ant-ort01-rotated",
+            "token_type": "Bearer",
+            "expires_in": 28_800,
+            "scope": "user:inference user:profile",
+        }));
+    });
+
+    let (fixture, service) = migrated_owned(&server, common::expired_at());
+    let item = fixture.keychain_item_path(&service);
+    let before = fs::read_to_string(&item).expect("readable");
+
+    let stdout = json_pass(&fixture, &[]);
+    let row = owned_row(&stdout);
+    assert_eq!(row["state"], json!("error"), "{row}");
+    assert_eq!(
+        row["state_label"],
+        json!("blob exceeds the keychain stdin limit"),
+        "and names the limit rather than a syscall: {row}"
+    );
+    assert_eq!(token.calls(), 1);
+    assert!(writes(&fixture).is_empty(), "no write was attempted: {:?}", fixture.security_log());
+    assert_eq!(fs::read_to_string(&item).expect("readable"), before, "the item is untouched");
+    for artefact in fixture.hold_artefacts(ACCT, ORG) {
+        assert!(
+            fs::symlink_metadata(&artefact).is_err(),
+            "`{}` was never created: the refusal precedes the locks",
+            artefact.display()
+        );
+    }
+    assert_eq!(
+        fixture.security_log().len(),
+        6,
+        "the exact set of `security` invocations: {:?}",
+        fixture.security_log()
+    );
+    fixture.assert_keychain_read_only();
 }

@@ -15,10 +15,18 @@
 //! that says `claude session detected` is the system working.
 //!
 //! Rows agentctl does *not* own — the live credential, a foreign
-//! configuration directory, a namespace whose credentials a session has
-//! migrated into the keychain — are never refreshed and, when expired, are
-//! not even fetched (decision D-001, plan AC5). Their owner refreshes them;
+//! configuration directory — are never refreshed and, when expired, are not
+//! even fetched (decision D-001, plan AC5). Their owner refreshes them;
 //! agentctl reports.
+//!
+//! A namespace agentctl created that a Claude Code session has since migrated
+//! into the keychain is the one case that used to be in that list and is not
+//! any more. agentctl still owns the namespace, so it refreshes the *keychain
+//! item* in place — under Claude Code's own lock protocol, against agentctl's
+//! own directory, and never the live item (decision D-015, plan AC65/AC66).
+//! The plaintext store is not resurrected: the namespace stays migrated
+//! (decision D-014). An item under a name the registry cannot predict is
+//! still terminal.
 //!
 //! # A failed fetch shows the last good numbers
 //!
@@ -83,6 +91,15 @@ use crate::runtime::coordinator::run_pass;
 use crate::runtime::fault::Fault;
 use crate::secret::KeychainReader;
 use crate::secret::ServiceEntry;
+use crate::secret::audit;
+use crate::secret::audit::AuditEntry;
+use crate::secret::audit::AuditEvent;
+use crate::secret::audit::Target;
+use crate::secret::claude_lock;
+use crate::secret::claude_lock::AcquireOutcome;
+use crate::secret::claude_lock::Clock;
+use crate::secret::claude_lock::LockSubject;
+use crate::secret::claude_lock::Tree;
 use crate::secret::file_store;
 use crate::secret::file_store::CREDENTIALS_FILE;
 use crate::secret::file_store::FileSnapshot;
@@ -95,6 +112,10 @@ use crate::secret::file_store::WriteRequest;
 use crate::secret::foreign_activity;
 use crate::secret::foreign_activity::ForeignActivity;
 use crate::secret::foreign_activity::OwnedMeta;
+use crate::secret::keychain_write;
+use crate::secret::keychain_write::KeychainWriteError;
+use crate::secret::keychain_write::OwnedSha8;
+use crate::secret::keychain_write::WriteTarget;
 use crate::secret::location;
 use crate::secret::location::Resolved;
 use crate::secret::namespace_lock;
@@ -143,6 +164,7 @@ pub fn run(cli: &Cli, args: &StatusArgs, cancel: &Cancel) -> Result<(), AppError
     // but immutable configuration, so a stuck account cannot block another.
     let shared = Shared {
         paths: Arc::clone(&paths),
+        env: env.clone(),
         client: UsageClient::from_env(args.timeout),
         refresher: default_refresher()?,
         reader_factory: production_readers(),
@@ -385,6 +407,13 @@ pub fn production_readers() -> ReaderFactory {
 pub struct Shared {
     /// The store the pass reads and writes.
     pub paths: Arc<Paths>,
+    /// The environment view discovery derived its names from.
+    ///
+    /// Carried rather than re-read per worker so that everything one pass
+    /// decides about which item is which comes from a single reading of the
+    /// environment (risk R42): the lock protocol takes it too, and a second
+    /// view could in principle disagree with the one the row was built from.
+    pub env: EnvView,
     /// The usage endpoint client.
     pub client: UsageClient,
     /// What mints a new access token from a stored refresh token.
@@ -523,13 +552,49 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
     };
 
     let owns = matches!(record.kind, AccountKind::Owned { .. });
+
+    // Decision D-015: a namespace a Claude Code session has migrated into the
+    // keychain is no longer terminal (plan AC66). When the item found is the
+    // one the registry predicts, agentctl refreshes *that item* in place,
+    // through the same transport the session uses, so the row reports on the
+    // credential the session is actually holding rather than on the fact of
+    // the migration.
+    //
+    // An item under any other name stays terminal. The canonical spelling's
+    // variant is the case that matters: discovery looks for both spellings
+    // (plan AC20), and one that is *not* the registry's `export_sha8` is an
+    // item agentctl did not create a namespace for, so it can never be a
+    // write target (invariant I1′). The row says so rather than silently
+    // reporting `ok`.
+    let migrated_service = match &outcome.state {
+        AccountState::MigratedToKeychain { service } => Some(service.clone()),
+        _ => None,
+    };
+    let mut in_place: Option<MigratedItem> = None;
+    if let Some(service) = migrated_service {
+        match migrated_item(shared, &record, &service) {
+            Some(item) => {
+                outcome.state = AccountState::Ok;
+                outcome.note = Some(format!("keychain service `{service}`"));
+                in_place = Some(item);
+            }
+            None => {
+                outcome.note = Some(MIGRATED_NAME_MISMATCH.to_owned());
+                outcome.lock_state = "migrated";
+            }
+        }
+    }
+
     // Both questions are asked of the state *discovery* produced, before the
     // pending resolution below can change it. A discarded pending is not a
     // reason to stop fetching (plan AC33 (b) expects a POST after one), and
     // an unreadable row is not made readable by one.
     let mut network_allowed = outcome.state.allows_network();
     // Discovery has already looked for a session or a migration; a row it
-    // flagged is one agentctl must not write, whoever owns the record.
+    // flagged is one agentctl must not write, whoever owns the record. The
+    // one exception is the block above: a migrated namespace whose item the
+    // registry predicts has just had its state replaced by `Ok`, and it is
+    // refreshed through the keychain rather than through the file.
     let refreshable = owns
         && !matches!(
             outcome.state,
@@ -610,7 +675,10 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
 
     let expired = current.access_expired(now_ms, REFRESH_MARGIN_MS);
     if expired && refreshable {
-        let result = under_namespace_lock(ctx, shared, &record, &ns_dir, true);
+        let result = match in_place.as_ref() {
+            Some(item) => refresh_in_place(ctx, shared, item, current),
+            None => under_namespace_lock(ctx, shared, &record, &ns_dir, true),
+        };
         apply(&span, &mut outcome, &result);
         match result.credentials {
             Some(refreshed) => {
@@ -658,7 +726,10 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
                 // Routine: the two use different clocks.
                 span.record("http.status", 401);
                 refreshed_once = true;
-                let result = under_namespace_lock(ctx, shared, &record, &ns_dir, true);
+                let result = match in_place.as_ref() {
+                    Some(item) => refresh_in_place(ctx, shared, item, current),
+                    None => under_namespace_lock(ctx, shared, &record, &ns_dir, true),
+                };
                 apply(&span, &mut outcome, &result);
                 match result.credentials {
                     Some(refreshed) => current = refreshed,
@@ -1068,6 +1139,406 @@ fn write_failure_state(err: &FileStoreError) -> AccountState {
 /// A refusal carrying no credentials.
 fn refused(state: AccountState, lock_state: &'static str) -> LockedResult {
     LockedResult { state: Some(state), lock_state, ..LockedResult::default() }
+}
+
+// ---------------------------------------------------------------------------
+// D-015: refreshing a migrated namespace in place
+// ---------------------------------------------------------------------------
+
+/// The note a migrated row carries when the item found is not the item the
+/// registry predicts.
+///
+/// Its own sentence rather than a state, because the row is still perfectly
+/// readable — it is the *write* that is refused, and the reason is worth
+/// naming: an item agentctl cannot predict the name of is an item it did not
+/// create a namespace for (invariant I1′).
+const MIGRATED_NAME_MISMATCH: &str =
+    "item name does not match the recorded export spelling; refusing to refresh";
+
+/// The namespaced keychain item one row may refresh in place (decision D-015).
+///
+/// Constructed only through [`migrated_item`], which is what ties the three
+/// values together: the [`WriteTarget`] names the only item this row can
+/// write, `sha8` is how the audit log names the same item, and `account` is
+/// the attribute fact F42's `-U` matches on alongside the service.
+struct MigratedItem {
+    /// The item, and the store directory whose lock artefacts guard it.
+    target: WriteTarget,
+    /// The eight hex digits of the item's suffix, for the audit entry.
+    sha8: String,
+    /// The item's `acct` attribute.
+    account: String,
+}
+
+/// The migrated item this row may refresh in place, or `None` when the item a
+/// session migrated to is not the one the registry predicts.
+///
+/// [`WriteTarget::migrated`] derives the service name from the record's own
+/// `export_sha8`, so the comparison below is the whole of invariant I1′ for
+/// this path: an item under any other name — including the one the namespace's
+/// *canonical* spelling hashes to, which discovery also looks for — is never a
+/// write target, however plainly it belongs to this namespace.
+fn migrated_item(shared: &Shared, record: &AccountRecord, service: &str) -> Option<MigratedItem> {
+    let sha8 = OwnedSha8::from_record(&shared.paths, record)?;
+    let target = WriteTarget::migrated(sha8.clone());
+    if target.service() != service {
+        return None;
+    }
+    // The item's own account attribute rather than this process's user name.
+    // Fact F42's `-U` matches on the account *and* the service, so a write
+    // that named a different account would add a second item beside the one
+    // Claude Code reads instead of updating it. The pass's `dump-keychain`
+    // listing carries attributes only, and `current_account` is the fallback
+    // for an item the listing could not describe.
+    let account = shared
+        .listing
+        .iter()
+        .find(|entry| entry.service == service)
+        .and_then(|entry| entry.account.clone())
+        .unwrap_or_else(crate::secret::current_account);
+    Some(MigratedItem { target, sha8: sha8.sha8().to_owned(), account })
+}
+
+/// Refreshes a migrated namespace's own keychain item in place (D-015).
+///
+/// This is the first caller of [`claude_lock`] and [`keychain_write`], and it
+/// is plan section 3.4's Phase A/B/C shape against a target agentctl owns:
+///
+/// - **Phase A** happened already. The item was read once, during discovery,
+///   and [`migrated_item`] checked that its name is the one the registry
+///   predicts. `current` is what that read produced, and `before` below is its
+///   digest — the value invariant I2′ compares against under the lock.
+/// - **Phase B** is everything that can block or fail: the refresh POST, the
+///   line, and the audit entry's own precondition. Nothing Claude Code wants
+///   is held while any of it runs (invariant I17), and the two refusals that
+///   can only be decided after the POST — an over-long line (refusal D,
+///   invariant I15) and a credential with no usable digest — are both taken
+///   here rather than inside the hold.
+/// - **Phase C** is the hold: the three locks in the peer's own nesting, the
+///   drift check, the re-read, the write, the release. No network call, no
+///   prompt and no sampling wait happens inside it, and a write that cannot
+///   finish inside [`claude_lock::HOLD_BUDGET`] is not started at all.
+///
+/// The file store is **not** written (decision D-014, invariant I5′): the
+/// namespace stays migrated, and `.credentials.json` stays absent.
+///
+/// `current` arrives by value because [`Credentials::merge_refresh`] folds the
+/// response into it in place and `Credentials` is deliberately not `Clone`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "plan section 3.4's Phase A/B/C is one procedure and the order of \
+              its refusals is the invariant; splitting it would let a later \
+              edit move a refusal inside the hold without noticing"
+)]
+fn refresh_in_place(
+    ctx: &PassCtx,
+    shared: &Shared,
+    item: &MigratedItem,
+    mut current: Credentials,
+) -> LockedResult {
+    let ns_dir = item.target.store_dir();
+    let service = item.target.service();
+
+    // --- Phase B: the POST, holding nothing ------------------------------
+    let before = current.digests();
+    let token = match shared.refresher.refresh(&current, ctx.cancel()) {
+        Ok(token) => token,
+        Err(err) => {
+            return LockedResult {
+                state: Some(refresh_failure_state(&err)),
+                note: Some(err.to_string()),
+                lock_state: "none",
+                ..LockedResult::default()
+            };
+        }
+    };
+    if let Err(err) = current.merge_refresh(token, now_ms()) {
+        return refused(
+            AccountState::Error(format!("the refresh response was unusable: {err}")),
+            "none",
+        );
+    }
+    let after = current.digests();
+
+    // Refusal D, and the audit entry's precondition, both before anything is
+    // held: a line that cannot be written costs nothing to refuse here, and a
+    // write that could not be recorded must not happen at all (invariant I16).
+    let line = match current.to_keychain_stdin_line(&item.account, service) {
+        Ok(line) => line,
+        Err(KeychainWriteError::LineTooLong { .. }) => {
+            return refused(
+                AccountState::Error("blob exceeds the keychain stdin limit".to_owned()),
+                "none",
+            );
+        }
+        Err(err) => return refused(AccountState::Error(format!("refresh refused: {err}")), "none"),
+    };
+    let Some(to_digest8) = audit::digest8(&after.access_sha256) else {
+        return refused(
+            AccountState::Error("the refreshed credential has no usable digest".to_owned()),
+            "none",
+        );
+    };
+    let from_digest8 = audit::digest8(&before.access_sha256);
+
+    // The window a test occupies to change the item under us, which is
+    // otherwise microseconds wide. Deliberately outside the hold: a pause
+    // inside one would break invariant I17 even under a fault.
+    shared.fault.pause_point("before_migrated_write");
+
+    // `acquire` creates no directory and refuses a way to one that cannot be
+    // walked without following a symbolic link, so a namespace directory that
+    // is missing is `Unreachable` rather than a lock. Opening it the way the
+    // file writer does is what makes a first refresh in place work.
+    if let Err(err) = file_store::open_namespace_dir(&shared.paths, ns_dir) {
+        return refused(AccountState::Error(format!("refresh refused: {err}")), "unavailable");
+    }
+
+    // --- Phase C: under the three locks -----------------------------------
+    let clock = Clock::system();
+    let subject = LockSubject { store_dir: ns_dir, tree: Tree::Agentctl };
+    let acquisition =
+        match claude_lock::acquire(subject, &shared.paths, &shared.env, &clock, ctx, &shared.fault)
+        {
+            Ok(acquisition) => acquisition,
+            Err(claude_lock::LockError::Cancelled) => {
+                return refused(
+                    AccountState::Error("cancelled while taking the Claude Code locks".to_owned()),
+                    "unavailable",
+                );
+            }
+            Err(err) => {
+                // Fail closed, for the reason the namespace lock fails closed:
+                // a lock error that is not contention means the guarantee is
+                // gone, and writing without it could race a live session.
+                return LockedResult {
+                    state: Some(AccountState::LockUnavailable),
+                    note: Some(err.to_string()),
+                    lock_state: "unavailable",
+                    ..LockedResult::default()
+                };
+            }
+        };
+
+    // Invariant I16: the break the acquire may have performed is recorded
+    // whether it went on to hold anything or reported the store busy. The
+    // record is built by the rule and completed here, because the service name
+    // and which item the write is for are the caller's own knowledge.
+    if let Some(draft) = acquisition.break_record {
+        let record = draft.complete(service.to_owned(), Target::Namespace(item.sha8.clone()));
+        audit_append(&shared.paths, AuditEvent::LockBreak(record));
+    }
+
+    let hold = match acquisition.outcome {
+        AcquireOutcome::Held(hold) => hold,
+        AcquireOutcome::Busy { holder_alive, stopped_pids } => {
+            return LockedResult {
+                state: Some(AccountState::Busy),
+                note: Some(busy_note(holder_alive, &stopped_pids)),
+                lock_state: "busy",
+                ..LockedResult::default()
+            };
+        }
+    };
+
+    // Step 7: refusal A. A lock whose modification time moved under us means
+    // the protocol has already been violated, and nothing may be written.
+    if let Err(err) = hold.drift_check() {
+        return compromised(&err);
+    }
+
+    // Step 8: the item as it is *now*, compared with what the refresh was
+    // computed from. A difference is a peer that wrote while the POST was in
+    // flight, and their credential is newer than ours (invariant I2′).
+    let reader = (shared.reader_factory)(ctx);
+    let observed = match location::from_keychain(reader.as_ref(), service) {
+        Resolved::Credentials(credentials) => credentials.digests(),
+        Resolved::Absent => return discarded("the item is gone"),
+        Resolved::Locked => {
+            return LockedResult {
+                state: Some(AccountState::KeychainLocked { detail: String::new() }),
+                lock_state: "unavailable",
+                ..LockedResult::default()
+            };
+        }
+        Resolved::Transient(detail) => {
+            return LockedResult {
+                state: Some(AccountState::Stale),
+                note: Some(format!("refresh discarded: the item could not be re-read ({detail})")),
+                lock_state: "none",
+                ..LockedResult::default()
+            };
+        }
+    };
+    if observed != before {
+        return discarded("the item changed under us");
+    }
+
+    // The last moment at which abandoning still costs nothing, and the reason
+    // it is checked twice. The re-read above went through the ordinary reader,
+    // whose budget is `security_cli::READ_TIMEOUT` rather than the 800 ms
+    // `keychain_write::READ_TIMEOUT` section 3.4's table allots it — the
+    // reader trait takes no budget — so the guarantee that term bought is
+    // restored here instead: a write that cannot finish inside the hold's
+    // budget is not started, because a hold past fact F53's give-up floor
+    // makes the peer's own refresh throw rather than merely making ours late.
+    if let Err(err) = hold.drift_check() {
+        return compromised(&err);
+    }
+    if hold.hold_elapsed().saturating_add(keychain_write::WRITE_TIMEOUT) > claude_lock::HOLD_BUDGET
+    {
+        return discarded("the hold ran out of budget before the write");
+    }
+
+    // Step 9, then step 10: release, and say so when the hold overran.
+    let write = keychain_write::write_item(&item.target, &item.account, line, ctx);
+    let elapsed = hold.hold_elapsed();
+    drop(hold);
+    // Reported either way, because the number is the whole of invariant I17's
+    // observable half: a hold approaching the budget on a real machine is what
+    // would tell somebody the derivation needs revisiting, and only a line per
+    // hold makes that visible.
+    if elapsed > claude_lock::HOLD_BUDGET {
+        tracing::warn!(
+            hold_ms = millis(elapsed),
+            budget_ms = millis(claude_lock::HOLD_BUDGET),
+            "the credential-store hold outlasted its budget"
+        );
+    } else {
+        tracing::debug!(
+            hold_ms = millis(elapsed),
+            budget_ms = millis(claude_lock::HOLD_BUDGET),
+            "released the credential-store hold"
+        );
+    }
+
+    if let Err(err) = write {
+        audit_write(shared, item, from_digest8, &to_digest8, audit::WriteOutcome::Failed);
+        return LockedResult {
+            state: Some(write_refusal_state(&err)),
+            note: Some(err.to_string()),
+            lock_state: "none",
+            ..LockedResult::default()
+        };
+    }
+
+    // Step 11. The verifying read is deliberately *outside* the hold, so a
+    // legitimate peer write landing in the gap reports `unknown` for a write
+    // that did apply — which is why `unknown` means "re-run `status`" rather
+    // than "failed" (plan section 3.4 step 12).
+    let applied = match location::from_keychain(reader.as_ref(), service) {
+        Resolved::Credentials(credentials) => credentials.digests() == after,
+        _ => false,
+    };
+    let outcome = if applied { audit::WriteOutcome::Applied } else { audit::WriteOutcome::Unknown };
+    audit_write(shared, item, from_digest8, &to_digest8, outcome);
+
+    if applied {
+        return LockedResult {
+            credentials: Some(current),
+            lock_state: "migrated_refreshed",
+            ..LockedResult::default()
+        };
+    }
+    LockedResult {
+        credentials: Some(current),
+        state: Some(AccountState::Stale),
+        note: Some("the refreshed item could not be confirmed; re-run `status`".to_owned()),
+        lock_state: "migrated_refreshed",
+        ..LockedResult::default()
+    }
+}
+
+/// Refusal A, or a hold that outlasted its budget: release and write nothing.
+fn compromised(err: &claude_lock::LockError) -> LockedResult {
+    LockedResult {
+        state: Some(AccountState::Error(format!("refresh refused: {err}"))),
+        note: Some(err.to_string()),
+        lock_state: "unavailable",
+        ..LockedResult::default()
+    }
+}
+
+/// A refresh that completed and was thrown away rather than written.
+fn discarded(why: &str) -> LockedResult {
+    LockedResult {
+        state: Some(AccountState::Stale),
+        note: Some(format!("refresh discarded: {why}")),
+        lock_state: "none",
+        ..LockedResult::default()
+    }
+}
+
+/// Plan section 3.4's `busy` wording.
+///
+/// The stopped process ids are named because a bare `busy` is a dead end for a
+/// user whose `Ctrl-Z`'d pane is blocking every break, and the disclaimer is
+/// in the same breath because that is what makes naming them honest: a process
+/// id is not attribution to a store. Nothing here reaches the audit log, whose
+/// vocabulary names no pid at all (plan AC80).
+fn busy_note(holder_alive: bool, stopped_pids: &[u32]) -> String {
+    if !stopped_pids.is_empty() {
+        let pids: Vec<String> = stopped_pids.iter().map(u32::to_string).collect();
+        return format!(
+            "a stopped claude process is present (pid {}). agentctl will not break this lock \
+             while one is, because it cannot tell whether that process is the holder. Resume or \
+             end it, or run `agentctl claude doctor --remove-stale <path> --yes`",
+            pids.join(", ")
+        );
+    }
+    if holder_alive {
+        "another process is refreshing this store's credentials".to_owned()
+    } else {
+        "this store's refresh lock is held; agentctl did not break it".to_owned()
+    }
+}
+
+/// The row state a failed keychain write deserves.
+fn write_refusal_state(err: &KeychainWriteError) -> AccountState {
+    match err {
+        KeychainWriteError::Locked => {
+            AccountState::KeychainLocked { detail: "the write was refused".to_owned() }
+        }
+        KeychainWriteError::Timeout(_) => AccountState::KeychainTimeout,
+        _ => AccountState::Error(format!("the refresh could not be stored: {err}")),
+    }
+}
+
+/// Appends one audit entry, reporting a failure rather than failing the row.
+///
+/// Invariant I16 wants every write and every break recorded, and a log that
+/// cannot be written is a defect worth an error line. It is not a reason to
+/// discard a credential that is already in the keychain, though, so the row
+/// carries on.
+fn audit_append(paths: &Paths, event: AuditEvent) {
+    if let Err(err) = audit::append(paths, &AuditEntry::new(event)) {
+        tracing::error!(error = %err, "an audit entry could not be appended");
+    }
+}
+
+/// Appends the audit entry for one write of a namespaced item.
+fn audit_write(
+    shared: &Shared,
+    item: &MigratedItem,
+    from_digest8: Option<String>,
+    to_digest8: &str,
+    outcome: audit::WriteOutcome,
+) {
+    audit_append(
+        &shared.paths,
+        AuditEvent::Write {
+            target: Target::Namespace(item.sha8.clone()),
+            from_digest8,
+            to_digest8: to_digest8.to_owned(),
+            outcome,
+        },
+    );
+}
+
+/// A `Duration` in whole milliseconds, saturating rather than wrapping —
+/// overflow checks are compiled out in every profile (constraint C-006).
+fn millis(of: Duration) -> u64 {
+    u64::try_from(of.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// How long ago the current holder took the lock, when it recorded that.

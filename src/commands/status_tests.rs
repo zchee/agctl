@@ -152,6 +152,18 @@ fn migration_service(store: &Store) -> String {
     format!("{LIVE_SERVICE}-{}", sha8(&spelling))
 }
 
+/// The same, for the namespace's *canonical* spelling.
+///
+/// A second name for one directory, which is why discovery looks for both
+/// (plan AC20). Under `$TMPDIR` on macOS they always differ, because `/var` is
+/// a symbolic link to `/private/var`.
+fn canonical_migration_service(store: &Store) -> String {
+    let ns_dir = store.paths.namespace_dir(ACCT, ORG);
+    let canonical = crate::provider::claude::namespace::canonical(&ns_dir)
+        .unwrap_or_else(|err| panic!("`{}` should resolve: {err}", ns_dir.display()));
+    format!("{LIVE_SERVICE}-{}", sha8(&export_spelling(&canonical)))
+}
+
 /// A scripted keychain holding the given `(service, blob)` items.
 fn reader_with(items: &[(String, String)]) -> FakeReader {
     let mut reader = FakeReader::unlocked();
@@ -208,6 +220,7 @@ fn pass(
 ) -> Vec<RowOutcome> {
     let shared = Shared {
         paths: Arc::clone(&store.paths),
+        env: EnvView::with_home(store.home.clone()),
         client: UsageClient::new(&server.base_url(), "agentctl/test", setup.timeout),
         refresher: setup.refresher,
         reader_factory: setup.readers,
@@ -1202,6 +1215,93 @@ fn ac33h_a_migrated_namespace_takes_the_pending_over() {
 }
 
 // ---------------------------------------------------------------------------
+// AC66 — `migrated to keychain` is no longer terminal (decision D-015)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ac66_a_fresh_migrated_item_the_registry_predicts_reads_as_ok() {
+    // Decision D-015 makes a migrated namespace refreshable in place, so the
+    // row reports on the credential rather than on the fact of the migration.
+    // A *fresh* item needs no refresh, so this asserts the state change alone:
+    // no POST, no lock, no write, and a note that still says which keychain
+    // item the numbers came from.
+    let store = store();
+    let server = MockServer::start();
+    let usage = usage_ok(&server);
+    let token = token_ok(&server);
+
+    let service = migration_service(&store);
+    let items =
+        vec![(service.clone(), blob("sk-ant-oat01-migrated", "sk-ant-ort01-migrated", fresh_at()))];
+    let reader = reader_with(&items);
+    let config = owned_config(&store);
+    let found = discover_with(&store, &config, &reader);
+
+    let mut setup = Setup::new(&server);
+    setup.readers = readers(items);
+    let rows = pass(&store, &server, found, setup);
+
+    let row = owned_row(&rows);
+    assert_eq!(row.state, AccountState::Ok, "the migration is no longer the row's answer");
+    assert_eq!(row.lock_state, "none", "and no lock was taken for a credential already fresh");
+    assert_eq!(row.source, Source::Keychain);
+    assert_eq!(row.note.as_deref(), Some(format!("keychain service `{service}`").as_str()));
+    token.assert_calls(0);
+    assert!(usage.calls() >= 1, "the row was displayed, from the keychain");
+    assert!(namespace_entries(&store).is_empty(), "and no plaintext store was created");
+}
+
+#[test]
+fn ac66_an_item_under_the_canonical_spelling_stays_terminal() {
+    // Invariant I1′: only the item whose name the registry *predicts* can be
+    // a write target. The canonical spelling's item belongs to this directory
+    // just as plainly — discovery finds it under plan AC20's second spelling —
+    // and is still refused, with the reason in the row rather than left for
+    // the user to infer from a missing refresh.
+    let store = store();
+    let server = MockServer::start();
+    let usage = usage_ok(&server);
+    let token = token_ok(&server);
+
+    // The namespace has to exist for its canonical spelling to resolve.
+    fs::create_dir_all(store.paths.namespace_dir(ACCT, ORG))
+        .expect("the namespace directory should be creatable");
+    let canonical = canonical_migration_service(&store);
+    assert_ne!(
+        canonical,
+        migration_service(&store),
+        "the fixture needs the two spellings to differ, which under $TMPDIR they do"
+    );
+
+    let items = vec![(
+        canonical.clone(),
+        blob("sk-ant-oat01-canonical", "sk-ant-ort01-canonical", expired_at()),
+    )];
+    let reader = reader_with(&items);
+    let config = owned_config(&store);
+    let found = discover_with(&store, &config, &reader);
+
+    let mut setup = Setup::new(&server);
+    setup.readers = readers(items);
+    let rows = pass(&store, &server, found, setup);
+
+    let row = owned_row(&rows);
+    assert_eq!(
+        row.state,
+        AccountState::MigratedToKeychain { service: canonical },
+        "an item agentctl cannot predict the name of is not refreshed"
+    );
+    assert_eq!(row.lock_state, "migrated");
+    assert_eq!(
+        row.note.as_deref(),
+        Some("item name does not match the recorded export spelling; refusing to refresh")
+    );
+    token.assert_calls(0);
+    usage.assert_calls(0);
+    assert!(namespace_entries(&store).is_empty(), "and nothing was written into the namespace");
+}
+
+// ---------------------------------------------------------------------------
 // Selection, rendering and the exit status
 // ---------------------------------------------------------------------------
 
@@ -1527,6 +1627,7 @@ fn a_cancelled_pass_returns_without_fetching() {
 
     let shared = Shared {
         paths: Arc::clone(&store.paths),
+        env: EnvView::with_home(store.home.clone()),
         client: UsageClient::new(&server.base_url(), "agentctl/test", Duration::from_secs(5)),
         refresher: Arc::new(HttpRefresher::new(server.url(TOKEN_PATH))),
         reader_factory: readers(Vec::new()),

@@ -16,6 +16,7 @@
 //! | `rename_fail` | [`crate::secret::file_store::write_credentials`] takes the pending path |
 //! | `hold_lock` | [`crate::secret::namespace_lock::acquire`] holds the lock until cancel or deadline |
 //! | `pause_before_rename` | the credential writer waits at `before_rename` (see [`Fault::pause_point`]) |
+//! | `pause_before_migrated_write` | the refresh-in-place path waits after its POST and **before** it takes any lock |
 //! | `flock_enotsup` | the namespace lock reports `Unavailable` instead of locking |
 //! | `lock_contended` | [`crate::secret::claude_lock::acquire`] sees `EEXIST` on the primary lock |
 //! | `lock_stale` | every existing Claude Code lock is treated as stale, whatever its age |

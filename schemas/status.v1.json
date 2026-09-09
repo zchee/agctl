@@ -109,13 +109,14 @@
           "type": "string"
         },
         "lock_state": {
-          "description": "What the namespace lock did on this pass. `busy` means another process held it past this run's deadline; `adopted` means this run took the winner's freshly written credentials instead of refreshing again.",
+          "description": "What the namespace lock did on this pass. `busy` means another process held it past this run's deadline; `adopted` means this run took the winner's freshly written credentials instead of refreshing again; `migrated` means a Claude Code session has moved this namespace's credentials into the keychain and the item found is not one agentctl may write; `migrated_refreshed` means it is, and agentctl refreshed that keychain item in place under Claude Code's own lock protocol.",
           "enum": [
             "none",
             "busy",
             "adopted",
             "claude_detected",
             "migrated",
+            "migrated_refreshed",
             "unavailable"
           ]
         },
