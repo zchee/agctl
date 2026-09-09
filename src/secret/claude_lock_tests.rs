@@ -23,6 +23,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 use std::time::SystemTime;
 
+use crate::config::paths::FILE_MODE;
 use crate::secret::audit::AuditEntry;
 use crate::secret::audit::AuditEvent;
 
@@ -489,6 +490,12 @@ impl Fixture {
     /// The held-lock records this store currently has, through the one reader.
     fn records(&self) -> Vec<held_locks::HeldLockFile> {
         held_locks::read_all(&self.paths)
+    }
+
+    /// A path inside this fixture's temporary root but outside the store, for
+    /// the tests that need somewhere a redirected write would land.
+    fn scratch(&self, name: &str) -> PathBuf {
+        self._root.path().join(name)
     }
 }
 
@@ -1957,4 +1964,158 @@ fn samples(record: &LockBreakRecord) -> (Sample, Sample, Sample) {
 fn mode_of(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     fs::symlink_metadata(path).expect("readable").permissions().mode() & 0o777
+}
+
+// ---------------------------------------------------------------------------
+// The held-locks directory is reached by a walk
+// (`agentctl-p2-held-locks-dir-through-symlink-1yj`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_symlink_at_the_held_locks_directory_refuses_the_hold_before_anything_is_taken() {
+    // w2-rereview P2-a. The record used to be filed by path: `Path::is_dir`
+    // to decide whether the directory existed — which follows links — then a
+    // path-based `DirBuilder`, then a path-based create of the record itself.
+    // A link planted at that one leaf name sent the record, and every record
+    // after it, into a directory of somebody else's choosing. The record is
+    // what `doctor` and `--remove-stale` read to decide whether a lock
+    // *outside* the namespace root may be removed, so a record an attacker can
+    // place is a record that can name paths agentctl would then act on.
+    let fixture = Fixture::new();
+    let elsewhere = fixture.scratch("elsewhere");
+    fs::create_dir(&elsewhere).expect("the decoy should be creatable");
+
+    let held_dir = held_locks::dir(&fixture.paths);
+    assert!(!held_dir.exists(), "the first hold is what would create it");
+    std::os::unix::fs::symlink(&elsewhere, &held_dir).expect("the link should be plantable");
+    assert!(held_dir.is_dir(), "`is_dir` follows the link and says yes, which was the bug");
+
+    let clock = fixture.fake_clock();
+    let holders = FakeHolders::none_stopped();
+    let seams = fixture.seams(&clock, &holders);
+    let cancel = Cancel::new();
+    let err = fixture
+        .acquire(&seams, &cancel, &Fault::none())
+        .expect_err("a redirected held-locks directory refuses the hold");
+
+    // An existing variant, and the right one: `Unreachable` is already "the
+    // way from the permitted anchor down could not be walked without
+    // following a symbolic link". No new error family.
+    let LockError::Unreachable { path, message } = &err else {
+        panic!("expected `Unreachable`, got {err:?}")
+    };
+    assert_eq!(path, &held_dir, "the refusal names the directory it would not walk");
+    assert!(message.contains("symbolic link"), "and why: {message}");
+
+    // Nothing went through the link.
+    assert!(
+        fs::read_dir(&elsewhere).expect("readable").next().is_none(),
+        "no record was written through the link"
+    );
+    assert!(
+        fs::symlink_metadata(&held_dir).expect("still there").file_type().is_symlink(),
+        "and the link was neither followed nor replaced by a real directory"
+    );
+
+    // And the hold never started: the record is step 3, the three `mkdir`s are
+    // step 4, so a refusal here leaves the store exactly as it was.
+    assert_eq!(fixture.timeline.ops(), Vec::new(), "not one directory operation was attempted");
+    for path in fixture.all() {
+        assert!(!path.exists(), "no lock artefact was taken: `{}`", path.display());
+    }
+}
+
+#[test]
+fn a_symlink_at_the_record_file_name_is_refused_by_the_open_itself() {
+    // The directory can be honest and the leaf still be a trap: the record
+    // name is `<pid>-<monotonic ms>.json`, and the pid is not a secret. The
+    // create is `O_EXCL`, so a link there is `EEXIST` rather than a write
+    // through it — and the loop moves to the next name rather than failing,
+    // which is what it already did for a name that was simply taken.
+    let fixture = Fixture::new();
+    let elsewhere = fixture.scratch("target.json");
+    let held_dir = held_locks::dir(&fixture.paths);
+    fs::create_dir_all(&held_dir).expect("the held-locks directory should be creatable");
+
+    let clock = fixture.fake_clock();
+    let holders = FakeHolders::none_stopped();
+    let seams = fixture.seams(&clock, &holders);
+    let cancel = Cancel::new();
+
+    // The name this hold will try first. The fake clock's monotonic reading is
+    // frozen until something advances it, so this is the same stamp the
+    // acquire will compute — the link is on the candidate, not beside it, and
+    // the assertions below would be vacuous otherwise.
+    let stamp = monotonic_ms(&seams.clock);
+    let pid = std::process::id();
+    let first = held_dir.join(format!("{pid}-{stamp}.json"));
+    std::os::unix::fs::symlink(&elsewhere, &first).expect("the link should be plantable");
+
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("the hold proceeds");
+    let AcquireOutcome::Held(hold) = acquired.outcome else { panic!("expected a hold") };
+
+    assert!(!elsewhere.exists(), "nothing was written through the link");
+    assert_eq!(
+        hold.record_path(),
+        held_dir.join(format!("{pid}-{}.json", stamp + 1)),
+        "the taken name was skipped and the next one used, which is what proves the \
+         first was actually a candidate"
+    );
+    assert_eq!(fixture.records().len(), 1, "and there is exactly one real record");
+    assert!(
+        fs::symlink_metadata(&first).expect("still there").file_type().is_symlink(),
+        "the planted link is untouched"
+    );
+}
+
+#[test]
+fn a_real_held_locks_directory_behaves_exactly_as_before() {
+    // The other half of the claim: the fix refuses a link and changes nothing
+    // else. The record lands in the directory, at 0600, under the same
+    // `<pid>-<monotonic ms>.json` name, and its bytes are what the reader
+    // round-trips — which is what makes `doctor` and `--remove-stale`, who
+    // read this file and nothing else, unaffected by the change.
+    let fixture = Fixture::new();
+    let held_dir = held_locks::dir(&fixture.paths);
+    fs::create_dir_all(&held_dir).expect("the held-locks directory should be creatable");
+
+    let clock = fixture.fake_clock();
+    let holders = FakeHolders::none_stopped();
+    let seams = fixture.seams(&clock, &holders);
+    let cancel = Cancel::new();
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("an uncontended store");
+    let AcquireOutcome::Held(hold) = acquired.outcome else { panic!("expected a hold") };
+
+    let records = fixture.records();
+    assert_eq!(records.len(), 1, "one record per live hold");
+    let held = &records[0];
+    assert_eq!(held.file, hold.record_path());
+    assert_eq!(
+        held.file.parent(),
+        Some(held_dir.as_path()),
+        "in the directory, not through anything"
+    );
+    assert_eq!(mode_of(&held.file), FILE_MODE, "0600, as it always was");
+
+    // The name is still `<pid>-<monotonic ms>.json`.
+    let name = held.file.file_name().expect("a file name").to_string_lossy().into_owned();
+    let (pid, rest) = name.split_once('-').expect("`<pid>-<stamp>.json`");
+    assert_eq!(pid.parse::<u32>().ok(), Some(std::process::id()));
+    let stamp = rest.strip_suffix(".json").expect("the `.json` extension");
+    assert!(stamp.parse::<u64>().is_ok(), "a monotonic millisecond count: {stamp}");
+
+    // The bytes are exactly what serializing the parsed record produces, so
+    // nothing about the encoding moved: no pretty printing, no trailing
+    // newline, no reordered or renamed field.
+    let bytes = fs::read(&held.file).expect("the record should be readable");
+    let round_trip = serde_json::to_string(&held.record).expect("the record serializes");
+    assert_eq!(
+        String::from_utf8(bytes).expect("the record is UTF-8"),
+        round_trip,
+        "the record file is byte-for-byte the serialization of the record `doctor` reads"
+    );
+
+    drop(hold);
+    assert!(fixture.records().is_empty(), "and the record is cleared on release");
+    assert!(held_dir.is_dir(), "while the directory itself stays");
 }

@@ -905,3 +905,92 @@ fn remove_dir_under_refuses_a_symlinked_store_directory() {
     assert!(matches!(err, FileStoreError::RefusedSymlink(_)), "got {err:?}");
     assert!(elsewhere.join(".oauth_refresh.lock").exists(), "the target is untouched");
 }
+
+// ---------------------------------------------------------------------------
+// `create_dir_under` (`agentctl-p2-held-locks-dir-through-symlink-1yj`)
+// ---------------------------------------------------------------------------
+
+/// The mode bits of a path, without following links.
+fn lmode_of(path: &Path) -> u32 {
+    fs::symlink_metadata(path).expect("the path should exist").permissions().mode() & 0o777
+}
+
+#[test]
+fn create_dir_under_makes_a_missing_directory_at_0700_and_reopens_an_existing_one() {
+    let store = store();
+    let anchor = store.paths.namespace_root();
+    fs::create_dir_all(&anchor).expect("the anchor should be creatable");
+    let dir = anchor.join("held-locks");
+
+    let fd = create_dir_under(&anchor, &dir).expect("a missing directory is created");
+    assert!(dir.is_dir(), "it is there afterwards");
+    assert_eq!(lmode_of(&dir), 0o700, "0700, set on the descriptor rather than left to the umask");
+    // The descriptor addresses that directory, which is the whole point of
+    // returning one: a file made through it lands there.
+    create_new_file_at(fd.as_fd(), "probe", b"x").expect("the descriptor is writable");
+    assert!(dir.join("probe").is_file());
+    drop(fd);
+
+    // A second call finds it and opens it rather than failing on `EEXIST`.
+    let again = create_dir_under(&anchor, &dir).expect("an existing directory is reopened");
+    create_new_file_at(again.as_fd(), "probe-2", b"x").expect("still the same directory");
+    assert!(dir.join("probe-2").is_file());
+}
+
+#[test]
+fn create_dir_under_refuses_a_symlink_at_the_directory_it_would_create() {
+    // The finding this exists for: the old code asked `Path::is_dir`, which
+    // follows links, and then created and wrote by path.
+    let store = store();
+    let anchor = store.paths.namespace_root();
+    fs::create_dir_all(&anchor).expect("the anchor should be creatable");
+    let elsewhere = store._dir.path().join("elsewhere");
+    fs::create_dir(&elsewhere).expect("the decoy should be creatable");
+
+    let dir = anchor.join("held-locks");
+    std::os::unix::fs::symlink(&elsewhere, &dir).expect("the link should be plantable");
+    assert!(dir.is_dir(), "`is_dir` follows the link and says yes, which was the bug");
+
+    let err = create_dir_under(&anchor, &dir).expect_err("a link at the leaf is refused");
+    assert!(matches!(err, FileStoreError::RefusedSymlink(_)), "got {err:?}");
+    assert!(
+        fs::read_dir(&elsewhere).expect("readable").next().is_none(),
+        "nothing was created through the link"
+    );
+    assert!(
+        fs::symlink_metadata(&dir).expect("still there").file_type().is_symlink(),
+        "and the link itself was neither followed nor replaced"
+    );
+}
+
+#[test]
+fn create_dir_under_refuses_a_symlink_above_the_directory_and_a_missing_anchor() {
+    let store = store();
+    let anchor = store.paths.namespace_root();
+    fs::create_dir_all(&anchor).expect("the anchor should be creatable");
+    let elsewhere = store._dir.path().join("elsewhere");
+    fs::create_dir(&elsewhere).expect("the decoy should be creatable");
+
+    // A link one level up is refused too: the walk checks every component,
+    // not only the last.
+    let middle = anchor.join("middle");
+    std::os::unix::fs::symlink(&elsewhere, &middle).expect("the link should be plantable");
+    let err = create_dir_under(&anchor, &middle.join("held-locks"))
+        .expect_err("a link above the leaf is refused");
+    assert!(matches!(err, FileStoreError::RefusedSymlink(_)), "got {err:?}");
+    assert!(fs::read_dir(&elsewhere).expect("readable").next().is_none(), "nothing was created");
+
+    // A regular file where a directory belongs is not a link, and is refused
+    // as what it is.
+    let occupied = anchor.join("occupied");
+    fs::write(&occupied, b"not a directory").expect("the file should be writable");
+    let err = create_dir_under(&anchor, &occupied).expect_err("a file is not a directory");
+    assert!(matches!(err, FileStoreError::NotRegular(_)), "got {err:?}");
+
+    // The anchor is the caller's own root and is never created by this walk.
+    let absent = store._dir.path().join("no-such-root");
+    let err = create_dir_under(&absent, &absent.join("held-locks"))
+        .expect_err("a missing anchor is a failure, not something to create");
+    assert!(matches!(err, FileStoreError::Io { .. }), "got {err:?}");
+    assert!(!absent.exists(), "and nothing was made on the way to finding out");
+}

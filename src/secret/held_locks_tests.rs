@@ -285,3 +285,51 @@ fn the_anchor_is_the_store_directorys_parent() {
 
     assert_eq!(record.anchor(), Some(Path::new("/Users/someone")));
 }
+
+#[test]
+fn the_serialized_record_is_the_exact_document_doctor_and_remove_stale_read() {
+    // `agentctl-p2-held-locks-dir-through-symlink-1yj` changed **where** the
+    // record is written — through a walked descriptor rather than by path —
+    // and nothing about **what** is written. This pins the second half: the
+    // field names, their order, and the `tree` spelling, so a later change to
+    // the writer that moved any of them would fail here rather than in
+    // somebody's `doctor --remove-stale` months later.
+    let record = HeldLockRecord {
+        agentctl_pid: 4242,
+        agentctl_start_time: Some("1757400000".to_owned()),
+        tree: Tree::Live,
+        store_dir: PathBuf::from("/Users/someone/.claude"),
+        paths: vec![
+            PathBuf::from("/Users/someone/.claude/.oauth_refresh.lock"),
+            PathBuf::from("/Users/someone/.claude.lock"),
+        ],
+        taken_at: "2026-09-09T12:00:00Z".to_owned(),
+    };
+
+    assert_eq!(
+        serde_json::to_string(&record).expect("the record serializes"),
+        concat!(
+            r#"{"agentctl_pid":4242,"agentctl_start_time":"1757400000","tree":"live","#,
+            r#""store_dir":"/Users/someone/.claude","#,
+            r#""paths":["/Users/someone/.claude/.oauth_refresh.lock","/Users/someone/.claude.lock"],"#,
+            r#""taken_at":"2026-09-09T12:00:00Z"}"#,
+        ),
+        "the on-disk document, exactly"
+    );
+
+    // And it round-trips, which is what `read_all` does for a living.
+    let text = serde_json::to_string(&record).expect("the record serializes");
+    let parsed: HeldLockRecord = serde_json::from_str(&text).expect("the record parses");
+    assert_eq!(parsed, record);
+
+    // A record written by a build that predates the start time still parses,
+    // and still reads as "unknown" rather than as a mismatch.
+    let older: HeldLockRecord = serde_json::from_str(&record_json(
+        7,
+        "agentctl",
+        "/store",
+        &["/store/.oauth_refresh.lock"],
+    ))
+    .expect("a record without `agentctl_start_time` parses");
+    assert_eq!(older.agentctl_start_time, None);
+}

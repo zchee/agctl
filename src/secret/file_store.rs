@@ -998,6 +998,46 @@ pub fn open_dir_under(anchor: &Path, dir: &Path) -> Result<OwnedFd, FileStoreErr
         .ok_or_else(|| FileStoreError::OutsideNamespaceRoot(dir.to_path_buf()))
 }
 
+/// [`open_dir_under`], but creating the directory when it is not there.
+///
+/// The same walk, with [`Walk::Create`] instead of [`Walk::MustExist`], for a
+/// caller that owns a directory below `anchor` and may be the one to make it.
+/// [`claude_lock`](crate::secret::claude_lock) is that caller: it writes the
+/// held-lock record into `<namespace_root>/held-locks`, a directory that does
+/// not exist until the first hold, and the record is the only evidence a
+/// crashed hold leaves — so where it lands has to be decided by a walk that
+/// cannot be redirected, not by a path-based `is_dir` and `DirBuilder` that a
+/// symbolic link planted at the leaf would answer for.
+///
+/// **The anchor is not created.** Every component *below* it is, so a walk
+/// that still ends early can only mean the anchor itself is absent — and
+/// creating that by path is the step this function exists to replace. The
+/// anchor is the caller's own root, made by
+/// [`Paths::ensure_dirs`](crate::config::paths::Paths::ensure_dirs) before
+/// any of this runs.
+///
+/// # Errors
+///
+/// [`FileStoreError::RefusedSymlink`] for a link anywhere below `anchor` —
+/// including at `dir` itself, which is the case that matters here —
+/// [`FileStoreError::NotRegular`] for a component that exists and is not a
+/// directory, [`FileStoreError::OutsideNamespaceRoot`] when `dir` does not
+/// spell a location below `anchor`, and [`FileStoreError::Io`] when the
+/// anchor is missing or a `mkdirat` fails.
+pub fn create_dir_under(anchor: &Path, dir: &Path) -> Result<OwnedFd, FileStoreError> {
+    let Some(chain) = open_chain(anchor, dir, Walk::Create)? else {
+        return Err(FileStoreError::io(
+            format!("`{}` is not there", anchor.display()),
+            io::Error::from(io::ErrorKind::NotFound),
+        ));
+    };
+    chain
+        .into_iter()
+        .next_back()
+        .map(|step| step.fd)
+        .ok_or_else(|| FileStoreError::OutsideNamespaceRoot(dir.to_path_buf()))
+}
+
 /// Opens `ns_dir` for an operation that was not handed the [`Paths`] it came
 /// from.
 ///
@@ -1217,9 +1257,21 @@ fn create_dir_0700(dir: &Path) -> Result<(), FileStoreError> {
 /// writes it, and `fsync`s it.
 ///
 /// `openat`'s mode argument is masked by the process umask, so the mode is set
-/// again on the descriptor: this file holds a refresh token, and it is the
-/// inode the rename will carry into place.
-fn create_new_file_at(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> io::Result<()> {
+/// again on the descriptor: the first caller's file holds a refresh token and
+/// is the inode a rename will carry into place, and the second's is the only
+/// evidence a crashed hold leaves, which an `fsync` is what makes true.
+///
+/// `O_NOFOLLOW` here is about `name` alone; `dir` is a descriptor a walk
+/// already produced, so there is no path left to re-resolve and nothing
+/// between the two that could be swapped.
+///
+/// # Errors
+///
+/// The underlying [`io::Error`]. `EEXIST` arrives as
+/// [`io::ErrorKind::AlreadyExists`], which is how
+/// [`claude_lock`](crate::secret::claude_lock) tells "that name is taken" from
+/// a real failure while it looks for a free one.
+pub fn create_new_file_at(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> io::Result<()> {
     let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let fd = rustix::fs::openat(dir, name, flags, FILE_MODE_BITS).map_err(as_io_error)?;
     rustix::fs::fchmod(&fd, FILE_MODE_BITS).map_err(as_io_error)?;

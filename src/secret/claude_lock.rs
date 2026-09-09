@@ -92,8 +92,6 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
-use crate::config::paths::DIR_MODE;
-use crate::config::paths::FILE_MODE;
 use crate::config::paths::Paths;
 use crate::provider::claude::namespace;
 use crate::provider::claude::namespace::EnvView;
@@ -669,8 +667,8 @@ impl std::fmt::Debug for LockAnchor {
 /// The mode every lock directory is created with: 0700, spelled the way
 /// `file_store` spells 0600, so no numeric conversion is needed.
 ///
-/// A test pins it against [`DIR_MODE`], which is the crate's one spelling of
-/// the same number.
+/// A test pins it against [`crate::config::paths::DIR_MODE`], which is the
+/// crate's one spelling of the same number.
 const LOCK_DIR_MODE: rustix::fs::Mode = rustix::fs::Mode::RWXU;
 
 /// Whether any same-user `claude` process is stopped.
@@ -1616,24 +1614,43 @@ const RECORD_NAME_ATTEMPTS: u32 = 8;
 /// The record is [`held_locks::HeldLockRecord`] — the reader's own type, not a
 /// second declaration of the same fields — so `doctor` and this writer cannot
 /// disagree about a name or a `tree` spelling.
+///
+/// # Where the record lands is decided by a walk, not by a path
+///
+/// The directory is `<namespace_root>/held-locks`, and it does not exist until
+/// the first hold, so this function may be the one to make it. It used to
+/// answer "is it there?" with `Path::is_dir` — which **follows** symbolic
+/// links — and make it with a path-based `DirBuilder`, after which the record
+/// was created by path as well. A symbolic link planted at that one leaf name
+/// therefore sent the record, and every later record, into a directory of
+/// somebody else's choosing: the file itself was still `create_new`, so this
+/// was integrity and not disclosure, but the record is what `doctor` and
+/// `--remove-stale` read to decide whether a lock outside the namespace root
+/// may be removed, and a record an attacker can place is a record that can
+/// name paths agentctl would then act on.
+///
+/// So the directory is resolved once, from [`Paths::namespace_root`] down,
+/// one `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` component at a time
+/// ([`file_store::create_dir_under`]), and the record is created relative to
+/// the descriptor that walk produced — `O_WRONLY | O_CREAT | O_EXCL |
+/// O_NOFOLLOW | O_CLOEXEC` at 0600. A link at `held-locks` is refused before
+/// anything is written; a link left at the record's own name is refused by
+/// `O_NOFOLLOW` on that name. Nothing is resolved by path twice, so there is
+/// no window between the check and the write for a name to change in.
+///
+/// The record's **bytes and file name are unchanged**: the same
+/// `serde_json::to_string` of the same [`HeldLockRecord`], under the same
+/// `<pid>-<monotonic ms>.json`. `doctor` and `--remove-stale` read what they
+/// always did.
 fn write_held_record(
     paths: &Paths,
     anchor: &LockAnchor,
     plans: &[LockPlan; 3],
     clock: &Clock,
 ) -> Result<PathBuf, LockError> {
-    use std::os::unix::fs::DirBuilderExt;
-    use std::os::unix::fs::OpenOptionsExt;
-
     let dir = held_locks::dir(paths);
-    if !dir.is_dir() {
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true).mode(DIR_MODE);
-        builder.create(&dir).map_err(|err| LockError::Io {
-            context: format!("could not create `{}`", dir.display()),
-            message: err.to_string(),
-        })?;
-    }
+    let dir_fd = file_store::create_dir_under(&paths.namespace_root(), &dir)
+        .map_err(|err| LockError::Unreachable { path: dir.clone(), message: err.to_string() })?;
 
     let record = HeldLockRecord {
         agentctl_pid: std::process::id(),
@@ -1657,17 +1674,15 @@ fn write_held_record(
     let base = monotonic_ms(clock);
     for attempt in 0..RECORD_NAME_ATTEMPTS {
         let stamp = base.saturating_add(u64::from(attempt));
-        let path = dir.join(format!("{pid}-{stamp}.json"));
-        match std::fs::OpenOptions::new().write(true).create_new(true).mode(FILE_MODE).open(&path) {
-            Ok(mut file) => {
-                return match std::io::Write::write_all(&mut file, json.as_bytes()) {
-                    Ok(()) => Ok(path),
-                    Err(err) => Err(LockError::Io {
-                        context: format!("could not write `{}`", path.display()),
-                        message: err.to_string(),
-                    }),
-                };
-            }
+        let name = format!("{pid}-{stamp}.json");
+        // The path is built only to name the file in the returned value and in
+        // an error; every syscall below goes through `dir_fd`.
+        let path = dir.join(&name);
+        match file_store::create_new_file_at(dir_fd.as_fd(), &name, json.as_bytes()) {
+            Ok(()) => return Ok(path),
+            // That name is taken — by an earlier record, or by whatever else
+            // is sitting there. Either way this hold needs a different one,
+            // and `O_EXCL` means nothing was disturbed.
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(err) => {
                 return Err(LockError::Io {
