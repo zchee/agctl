@@ -348,6 +348,7 @@ fn ac45_doctor_reports_every_part_of_the_store() {
         .stdout(contains("stray tmp"))
         .stdout(contains("no Claude Code lock artefacts"))
         .stdout(contains("namespace locks"))
+        .stdout(contains("held locks"))
         .stdout(contains(format!("{ACCT}/{}", common::UNKNOWN_ORG)))
         .stdout(contains("accounts relocate"));
 
@@ -398,10 +399,25 @@ fn ac45_doctor_remove_stale_refuses_everything_it_should() {
         .code(1)
         .stderr(contains("not a Claude Code lock artefact"));
 
-    // A real artefact, but younger than the staleness threshold: a session
-    // that is starting up looks exactly like this.
+    // A regular file at an artefact's name. Claude Code makes its locks with
+    // `mkdir` (fact F45), so this was written by something else: it is
+    // reported as anomalous and never removed (`agentctl-nz5`, AC73).
+    let anomalous = ns_dir.join(".storage-write");
+    fs::write(&anomalous, "{}").expect("writable");
+    age(&anomalous);
+    fixture
+        .cmd()
+        .args(["claude", "doctor", "--remove-stale", &anomalous.to_string_lossy(), "--yes"])
+        .assert()
+        .code(1)
+        .stderr(contains("anomalous (regular file; Claude Code makes lock directories)"));
+    assert!(anomalous.exists());
+
+    // A real artefact — a directory, as Claude Code makes it — but younger
+    // than the staleness threshold: a session that is starting up looks
+    // exactly like this.
     let fresh = ns_dir.join(".oauth_refresh.lock");
-    fs::write(&fresh, "{}").expect("writable");
+    fs::create_dir(&fresh).expect("the lock directory should be creatable");
     fixture
         .cmd()
         .args(["claude", "doctor", "--remove-stale", &fresh.to_string_lossy(), "--yes"])
@@ -432,7 +448,11 @@ fn ac45_doctor_remove_stale_removes_a_lapsed_artefact_after_two_samples() {
     // safety property, not an implementation detail to be stubbed out.
     let fixture = owned_store();
     let artefact = fixture.ns_dir(ACCT, ORG).join(".oauth_refresh.lock");
-    fs::write(&artefact, "{}").expect("writable");
+    // A directory, because that is what Claude Code's `mkdir` leaves (fact
+    // F45). Phase 1's fixture wrote a regular file here, which is the whole of
+    // why AC45 passed against a command that could not remove a real artefact
+    // (`agentctl-nz5`, AC73).
+    fs::create_dir(&artefact).expect("the lock directory should be creatable");
     age(&artefact);
 
     let started = Instant::now();

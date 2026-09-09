@@ -756,3 +756,152 @@ fn a_cancelled_pass_unlinks_the_temporary_file_and_leaves_the_old_one() {
     );
     assert!(!store.ns_dir.join(PENDING_FILE).exists(), "and it was not parked as pending either");
 }
+
+// ---------------------------------------------------------------------------
+// remove_dir_under_root — the artefacts Claude Code actually leaves (AC73)
+// ---------------------------------------------------------------------------
+
+/// Creates one lock *directory* in the namespace, the way Claude Code does.
+fn plant_lock_dir(store: &Store, name: &str) -> PathBuf {
+    std::fs::create_dir_all(&store.ns_dir).expect("directories should be creatable");
+    let path = store.ns_dir.join(name);
+    std::fs::create_dir(&path).expect("the lock directory should be creatable");
+    path
+}
+
+#[test]
+fn remove_dir_under_root_removes_an_empty_lock_directory() {
+    // Fact F45: acquire is `mkdir` and release is `rmdir`, so an empty
+    // directory is the whole shape of a lapsed lock.
+    let store = store();
+    let lock = plant_lock_dir(&store, ".oauth_refresh.lock");
+
+    remove_dir_under_root(&store.paths, &lock).expect("an empty lock directory is removable");
+
+    assert!(!lock.exists(), "the lock directory is gone");
+    assert!(store.ns_dir.exists(), "and the namespace around it survives");
+}
+
+#[test]
+fn remove_dir_under_root_refuses_a_non_empty_directory() {
+    // Never a recursive delete: a lock directory with something in it is not
+    // a lapsed lock, so `ENOTEMPTY` is reported rather than worked around.
+    let store = store();
+    let lock = plant_lock_dir(&store, ".storage-write");
+    std::fs::write(lock.join("holder.json"), b"{}").expect("writable");
+
+    let err = remove_dir_under_root(&store.paths, &lock)
+        .expect_err("a non-empty directory must be refused");
+
+    assert!(matches!(err, FileStoreError::NotEmpty(_)), "got {err:?}");
+    assert!(lock.join("holder.json").exists(), "and its contents are untouched");
+}
+
+#[test]
+fn remove_dir_under_root_refuses_a_regular_file() {
+    // `AT_REMOVEDIR` refuses anything that is not a directory, which is what
+    // keeps the anomalous case — a regular file at an artefact's name — away
+    // from the code that removes the real thing.
+    let store = store();
+    std::fs::create_dir_all(&store.ns_dir).expect("directories should be creatable");
+    let file = store.ns_dir.join(".oauth_refresh.lock");
+    std::fs::write(&file, b"{}").expect("writable");
+
+    let err =
+        remove_dir_under_root(&store.paths, &file).expect_err("a regular file must be refused");
+
+    assert!(matches!(err, FileStoreError::NotRegular(_)), "got {err:?}");
+    assert!(file.exists(), "the file is still there");
+}
+
+#[test]
+fn remove_dir_under_root_refuses_a_symlink_at_the_artefact() {
+    // A link is not a directory, so `AT_REMOVEDIR` will not unlink it — and,
+    // more to the point, cannot delete what it points at.
+    let store = store();
+    let target = plant_lock_dir(&store, "target.lock");
+    let link = store.ns_dir.join(".oauth_refresh.lock");
+    std::os::unix::fs::symlink(&target, &link).expect("the symlink should be creatable");
+
+    let err = remove_dir_under_root(&store.paths, &link).expect_err("a symlink must be refused");
+
+    assert!(matches!(err, FileStoreError::NotRegular(_)), "got {err:?}");
+    assert!(std::fs::symlink_metadata(&link).is_ok(), "the link is still there");
+    assert!(target.exists(), "and so is what it pointed at");
+}
+
+#[test]
+fn remove_dir_under_root_refuses_a_symlinked_component() {
+    // The escape the walk exists to close: the path spells a location under
+    // the root while `<org>` is a link into somebody else's store.
+    let store = store();
+    let elsewhere = plant_directory_link(&store._dir, &store.ns_dir);
+    std::fs::create_dir(elsewhere.join(".oauth_refresh.lock"))
+        .expect("the victim's lock directory should be creatable");
+
+    let err = remove_dir_under_root(&store.paths, &store.ns_dir.join(".oauth_refresh.lock"))
+        .expect_err("a symlinked component must be refused");
+
+    assert!(matches!(err, FileStoreError::RefusedSymlink(_)), "got {err:?}");
+    assert!(
+        elsewhere.join(".oauth_refresh.lock").exists(),
+        "the other store's lock directory is untouched"
+    );
+}
+
+#[test]
+fn remove_dir_under_root_refuses_a_path_outside_the_root() {
+    let store = store();
+    let outside = store._dir.path().join("elsewhere");
+    std::fs::create_dir_all(&outside).expect("directories should be creatable");
+    let lock = outside.join(".oauth_refresh.lock");
+    std::fs::create_dir(&lock).expect("the lock directory should be creatable");
+
+    let err = remove_dir_under_root(&store.paths, &lock)
+        .expect_err("a path outside the namespace root must be refused");
+
+    assert!(matches!(err, FileStoreError::OutsideNamespaceRoot(_)), "got {err:?}");
+    assert!(lock.exists(), "nothing outside the root was removed");
+}
+
+#[test]
+fn remove_dir_under_removes_below_the_anchor_it_is_given() {
+    // The attested outside-root removal (plan section 3.9): the anchor is the
+    // record's store directory's parent, and the store directory itself stays
+    // a walked component — which is why a link there is still refused.
+    let store = store();
+    let home = store._dir.path().join("home");
+    let live = home.join(".claude");
+    std::fs::create_dir_all(&live).expect("directories should be creatable");
+    let lock = live.join(".oauth_refresh.lock");
+    std::fs::create_dir(&lock).expect("the lock directory should be creatable");
+
+    remove_dir_under(&home, &lock).expect("a lock directory below the anchor is removable");
+    assert!(!lock.exists(), "the leaked lock directory is gone");
+    assert!(live.exists(), "and the store around it survives");
+
+    // The legacy lock sits *beside* the store directory (fact F17), which is
+    // why the anchor is the parent rather than the store itself.
+    let legacy = home.join(".claude.lock");
+    std::fs::create_dir(&legacy).expect("the legacy lock directory should be creatable");
+    remove_dir_under(&home, &legacy).expect("the legacy lock is below the same anchor");
+    assert!(!legacy.exists());
+}
+
+#[test]
+fn remove_dir_under_refuses_a_symlinked_store_directory() {
+    let store = store();
+    let home = store._dir.path().join("home");
+    std::fs::create_dir_all(&home).expect("directories should be creatable");
+    let elsewhere = store._dir.path().join("someone-elses-claude");
+    std::fs::create_dir_all(elsewhere.join(".oauth_refresh.lock"))
+        .expect("directories should be creatable");
+    std::os::unix::fs::symlink(&elsewhere, home.join(".claude"))
+        .expect("the symlink should be creatable");
+
+    let err = remove_dir_under(&home, &home.join(".claude").join(".oauth_refresh.lock"))
+        .expect_err("a symlinked store directory must be refused");
+
+    assert!(matches!(err, FileStoreError::RefusedSymlink(_)), "got {err:?}");
+    assert!(elsewhere.join(".oauth_refresh.lock").exists(), "the target is untouched");
+}

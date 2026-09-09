@@ -188,8 +188,32 @@ fn backdate(path: &Path, age: Duration) {
     .expect("the fixture's timestamp should be settable");
 }
 
-/// Plants a Claude Code refresh lock in a namespace, aged `age`.
+/// Moves a modification time to *now*, which is what a heartbeat looks like.
+fn beat(path: &Path) {
+    backdate(path, Duration::ZERO);
+}
+
+/// Plants a Claude Code lock artefact in a namespace, aged `age`.
+///
+/// A **directory**, because that is what Claude Code makes: every one of its
+/// lock artefacts is acquired with `mkdir` and released with `rmdir` (fact
+/// F45). Phase 1's fixture wrote a regular file, which is why AC45 passed
+/// against a `doctor` that could not have removed a real artefact at all
+/// (`agentctl-nz5`, premortem PM13′).
 fn plant_artefact(store: &Store, org: &str, name: &str, age: Duration) -> PathBuf {
+    let ns_dir = store.ns_dir(org);
+    fs::create_dir_all(&ns_dir).expect("the namespace directory should be creatable");
+    let path = ns_dir.join(name);
+    fs::create_dir(&path).expect("the artefact directory should be creatable");
+    backdate(&path, age);
+    path
+}
+
+/// Plants a *regular file* at an artefact's name, aged `age`.
+///
+/// Nothing in Claude Code creates this, which is exactly why it is worth a
+/// fixture: `doctor` reports it as anomalous and never removes it.
+fn plant_file_artefact(store: &Store, org: &str, name: &str, age: Duration) -> PathBuf {
     let ns_dir = store.ns_dir(org);
     fs::create_dir_all(&ns_dir).expect("the namespace directory should be creatable");
     let path = ns_dir.join(name);
@@ -418,7 +442,7 @@ fn remove_stale_accepts_the_storage_write_guard_and_the_legacy_lock() {
     // The legacy lock sits beside the namespace, named after it (fact F17).
     let legacy = store.paths.namespace_dir(ACCT, "").parent().map(|dir| dir.join("org.lock"));
     let legacy = legacy.expect("the namespace has a parent inside the store");
-    fs::write(&legacy, "{}").expect("the legacy lock should be writable");
+    fs::create_dir(&legacy).expect("the legacy lock directory should be creatable");
     backdate(&legacy, Duration::from_secs(120));
     let mut io = Recorder::default();
     remove_stale(&store.doctor(), &legacy, true, &mut io).expect("a legacy `.lock` is an artefact");
@@ -455,8 +479,10 @@ fn remove_stale_refuses_an_artefact_whose_holder_is_still_beating() {
     std::thread::scope(|scope| {
         scope.spawn(move || {
             std::thread::sleep(TEST_INTERVAL / 3);
-            fs::write(&beating, "{\"pid\":424242,\"beat\":2}")
-                .expect("the heartbeat should be writable");
+            // Claude Code's heartbeat is `utimes` on the lock directory (fact
+            // F45), so the fixture beats the same way rather than writing a
+            // file into it.
+            beat(&beating);
         });
         let mut io = Recorder::default();
         let err = remove_stale(&store.doctor(), &artefact, true, &mut io)
@@ -489,8 +515,7 @@ fn remove_stale_refuses_without_yes() {
 fn remove_stale_refuses_a_path_outside_the_namespace_root() {
     let store = store();
     let outside = store.home.join(".claude").join(REFRESH_LOCK);
-    fs::create_dir_all(store.home.join(".claude")).expect("creatable");
-    fs::write(&outside, "{}").expect("writable");
+    fs::create_dir_all(&outside).expect("creatable");
     backdate(&outside, Duration::from_secs(120));
 
     let mut io = Recorder::default();
@@ -563,17 +588,274 @@ fn remove_stale_refuses_a_symbolic_link() {
 }
 
 #[test]
-fn remove_stale_refuses_a_directory() {
+fn remove_stale_removes_the_directory_claude_code_actually_makes() {
+    // `agentctl-nz5`, the first half of AC73. This test asserted the opposite
+    // in phase 1 — a directory refused as "not a regular file" — which is how
+    // a shipped `--remove-stale` that could never remove anything real passed
+    // its own suite. Every Claude Code lock artefact is a directory (fact F45).
     let store = store();
     record_owned(&store, ORG, None);
     let dir = store.ns_dir(ORG).join(REFRESH_LOCK);
     fs::create_dir_all(&dir).expect("a directory should be creatable");
+    backdate(&dir, Duration::from_secs(120));
 
     let mut io = Recorder::default();
-    let err =
-        remove_stale(&store.doctor(), &dir, true, &mut io).expect_err("a directory is refused");
-    assert!(err.to_string().contains("not a regular file"), "{err}");
-    assert!(dir.exists());
+    remove_stale(&store.doctor(), &dir, true, &mut io)
+        .expect("the directory Claude Code makes is the thing this command removes");
+
+    assert!(!dir.exists(), "the lock directory is gone");
+    assert!(io.text().contains("Removed `"), "{}", io.text());
+}
+
+#[test]
+fn remove_stale_refuses_a_regular_file_at_an_artefact_name() {
+    // Claude Code never writes a file at one of those names, so a file there
+    // was made by something else and is not agentctl's to delete — reported,
+    // never removed.
+    let store = store();
+    record_owned(&store, ORG, None);
+    let file = plant_file_artefact(&store, ORG, REFRESH_LOCK, Duration::from_secs(120));
+
+    let mut io = Recorder::default();
+    let err = remove_stale(&store.doctor(), &file, true, &mut io)
+        .expect_err("a regular file at an artefact name is anomalous, not removable");
+
+    assert!(err.to_string().contains(ANOMALOUS_REGULAR_FILE), "{err}");
+    assert!(err.to_string().contains("`mkdir`"), "and it says what makes a real one:\n{err}");
+    assert!(file.exists(), "the file is still there");
+}
+
+#[test]
+fn remove_stale_refuses_an_artefact_directory_with_something_in_it() {
+    // A lapsed lock is an empty directory; one holding a file is either in use
+    // or not a lock at all. Either way this command removes a directory and
+    // never a tree.
+    let store = store();
+    record_owned(&store, ORG, None);
+    let dir = plant_artefact(&store, ORG, REFRESH_LOCK, Duration::from_secs(120));
+    fs::write(dir.join("holder.json"), "{}").expect("writable");
+    backdate(&dir, Duration::from_secs(120));
+
+    let mut io = Recorder::default();
+    let err = remove_stale(&store.doctor(), &dir, true, &mut io)
+        .expect_err("a non-empty lock directory is refused");
+
+    assert!(err.to_string().contains("never a tree"), "{err}");
+    assert!(dir.join("holder.json").exists(), "and its contents are untouched");
+}
+
+// ---------------------------------------------------------------------------
+// --remove-stale outside the namespace root (plan section 3.9 row 2, N-2/M1)
+// ---------------------------------------------------------------------------
+
+/// A process id that is certainly gone: a child that has run and been reaped.
+fn dead_pid() -> u32 {
+    let mut child =
+        std::process::Command::new("/usr/bin/true").spawn().expect("`true` should be runnable");
+    let pid = child.id();
+    child.wait().expect("the child should be waitable");
+    pid
+}
+
+/// Writes a held-lock record naming `held`, in the shape `claude_lock` writes.
+fn plant_record(store: &Store, pid: u32, store_dir: &Path, held: &[&Path]) -> PathBuf {
+    let dir = held_locks::dir(&store.paths);
+    fs::create_dir_all(&dir).expect("the held-locks directory should be creatable");
+    let record = held_locks::HeldLockRecord {
+        agentctl_pid: pid,
+        tree: held_locks::Tree::Live,
+        store_dir: store_dir.to_path_buf(),
+        paths: held.iter().map(|path| path.to_path_buf()).collect(),
+        taken_at: "2026-09-09T12:00:00Z".to_owned(),
+    };
+    let file = dir.join(format!("{pid}.json"));
+    fs::write(&file, serde_json::to_string(&record).expect("the record serializes"))
+        .expect("the record should be writable");
+    file
+}
+
+/// A lock directory in a store agentctl does not own, aged past the threshold.
+fn plant_leak(store: &Store) -> (PathBuf, PathBuf) {
+    let live = store.home.join(".claude");
+    let leaked = live.join(REFRESH_LOCK);
+    fs::create_dir_all(&leaked).expect("the leaked lock directory should be creatable");
+    backdate(&leaked, Duration::from_secs(120));
+    (live, leaked)
+}
+
+#[test]
+fn remove_stale_removes_an_outside_path_a_dead_record_names() {
+    // The second half of AC73, and the only recovery command premortem PM9
+    // has: a `--live` swap's leaked locks are in `~/.claude` by construction,
+    // so refusing every outside path would leave nothing to run.
+    let store = store();
+    let (live, leaked) = plant_leak(&store);
+    let record = plant_record(&store, dead_pid(), &live, &[leaked.as_path()]);
+
+    let mut io = Recorder::default();
+    remove_stale(&store.doctor(), &leaked, true, &mut io)
+        .expect("a record with a dead pid is what makes this removable");
+
+    assert!(!leaked.exists(), "the leaked lock directory is gone");
+    assert!(live.exists(), "and the store around it is untouched");
+    let text = io.text();
+    assert!(
+        text.contains(&record.display().to_string()),
+        "the evidence is named, so the user can check it:\n{text}"
+    );
+    assert!(text.contains("is outside"), "{text}");
+}
+
+#[test]
+fn remove_stale_refuses_an_outside_path_whose_record_is_still_held() {
+    // A live pid means the lock is held, not leaked. This process is the
+    // liveliest pid available.
+    let store = store();
+    let (live, leaked) = plant_leak(&store);
+    plant_record(&store, std::process::id(), &live, &[leaked.as_path()]);
+
+    let mut io = Recorder::default();
+    let err = remove_stale(&store.doctor(), &leaked, true, &mut io)
+        .expect_err("a lock a live agentctl holds is not stale");
+
+    assert!(err.to_string().contains("is being held, not leaked"), "{err}");
+    assert!(leaked.exists(), "the lock directory survives");
+}
+
+#[test]
+fn remove_stale_refuses_an_outside_path_no_record_names() {
+    // The record vouches for the paths it lists and for nothing else: a
+    // sibling artefact in the same store is still outside the root.
+    let store = store();
+    let (live, leaked) = plant_leak(&store);
+    let sibling = live.join(STORAGE_WRITE_LOCK);
+    fs::create_dir(&sibling).expect("the sibling artefact should be creatable");
+    backdate(&sibling, Duration::from_secs(120));
+    plant_record(&store, dead_pid(), &live, &[leaked.as_path()]);
+
+    let mut io = Recorder::default();
+    let err = remove_stale(&store.doctor(), &sibling, true, &mut io)
+        .expect_err("a path the record does not name is refused");
+
+    assert!(err.to_string().contains("is not inside"), "phase 1's sentence, unchanged:\n{err}");
+    assert!(sibling.exists(), "and nothing outside the root was removed");
+}
+
+#[test]
+fn remove_stale_refuses_an_outside_path_with_no_records_at_all() {
+    // The default on every machine that has never held a Claude Code lock.
+    let store = store();
+    let (_live, leaked) = plant_leak(&store);
+
+    let mut io = Recorder::default();
+    let err = remove_stale(&store.doctor(), &leaked, true, &mut io)
+        .expect_err("no record means no exception");
+
+    assert!(err.to_string().contains("is not inside"), "{err}");
+    assert!(leaked.exists());
+}
+
+#[test]
+fn remove_stale_refuses_an_attested_path_reached_through_a_symbolic_link() {
+    // The record vouches for a path, not for the way the filesystem resolves
+    // it now: the store directory is still walked with `O_NOFOLLOW`.
+    let store = store();
+    let elsewhere = store.home.join("someone-elses-claude");
+    let victim = elsewhere.join(REFRESH_LOCK);
+    fs::create_dir_all(&victim).expect("the victim's lock directory should be creatable");
+    backdate(&victim, Duration::from_secs(120));
+    let live = store.home.join(".claude");
+    symlink(&elsewhere, &live);
+    let attested = live.join(REFRESH_LOCK);
+    plant_record(&store, dead_pid(), &live, &[attested.as_path()]);
+
+    let mut io = Recorder::default();
+    let err = remove_stale(&store.doctor(), &attested, true, &mut io)
+        .expect_err("a symlinked store directory is refused even when a record names the path");
+
+    assert!(err.to_string().contains("symbolic link"), "{err}");
+    assert!(victim.exists(), "the other store's lock directory is untouched");
+}
+
+// ---------------------------------------------------------------------------
+// The report's held-locks and anomalous-artefact rows
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_report_calls_a_regular_file_at_an_artefact_name_anomalous() {
+    let store = store();
+    record_owned(&store, ORG, None);
+    let file = plant_file_artefact(&store, ORG, REFRESH_LOCK, Duration::from_secs(120));
+    // And a link at the second artefact's name, which is refused everywhere.
+    symlink(&file, &store.ns_dir(ORG).join(STORAGE_WRITE_LOCK));
+
+    let mut io = Recorder::default();
+    report(&store.doctor(), &FakeReader::unlocked(), &store.ctx(), &mut io)
+        .expect("the report should succeed");
+    let text = io.text();
+
+    assert!(text.contains(ANOMALOUS_REGULAR_FILE), "{text}");
+    assert!(text.contains("anomalous (a symbolic link — refused)"), "{text}");
+    assert!(text.contains("will not remove it"), "{text}");
+    assert!(
+        !text.contains(&format!("--remove-stale {} --yes", file.display())),
+        "no removal is offered for something that is not removable:\n{text}"
+    );
+    assert!(
+        !text.contains("sampling again"),
+        "and nothing is sampled, because nothing here can be beating:\n{text}"
+    );
+}
+
+#[test]
+fn the_report_names_a_leaked_held_lock_and_the_command_that_clears_it() {
+    // Plan section 3.9 row 2, the `doctor` half: the record is the only
+    // evidence a crash leaves, so the report is where a user finds out that
+    // anything is being held at all.
+    let store = store();
+    let (live, leaked) = plant_leak(&store);
+    let record = plant_record(&store, dead_pid(), &live, &[leaked.as_path()]);
+
+    let mut io = Recorder::default();
+    report(&store.doctor(), &FakeReader::unlocked(), &store.ctx(), &mut io)
+        .expect("the report should succeed");
+    let text = io.text();
+
+    assert!(text.contains("held locks"), "{text}");
+    assert!(text.contains(&record.display().to_string()), "{text}");
+    assert!(text.contains("the live store"), "the tree is named (I11′ containment):\n{text}");
+    assert!(text.contains("(dead)"), "{text}");
+    assert!(
+        text.contains(&format!("--remove-stale {} --yes", leaked.display())),
+        "the report names the exact command:\n{text}"
+    );
+}
+
+#[test]
+fn the_report_calls_a_record_with_no_directories_a_stale_record() {
+    // Plan section 3.9 row 1: the directories are gone, so nothing is held
+    // and there is nothing to remove — only a record to clear.
+    let store = store();
+    let live = store.home.join(".claude");
+    let record = plant_record(&store, dead_pid(), &live, &[live.join(REFRESH_LOCK).as_path()]);
+
+    let mut io = Recorder::default();
+    report(&store.doctor(), &FakeReader::unlocked(), &store.ctx(), &mut io)
+        .expect("the report should succeed");
+    let text = io.text();
+
+    assert!(text.contains(&record.display().to_string()), "{text}");
+    assert!(text.contains("a stale record, holding nothing"), "{text}");
+    assert!(!text.contains("--remove-stale"), "and no removal is offered:\n{text}");
+}
+
+#[test]
+fn the_report_says_none_when_nothing_is_held() {
+    let store = store();
+    let mut io = Recorder::default();
+    report(&store.doctor(), &FakeReader::unlocked(), &store.ctx(), &mut io)
+        .expect("the report should succeed");
+    assert!(io.text().contains("held locks\n  none"), "{}", io.text());
 }
 
 #[test]
@@ -662,7 +944,7 @@ fn the_foreign_section_says_none_when_there_is_nothing_foreign() {
 fn plant_outside(at: &Path) -> PathBuf {
     fs::create_dir_all(at).expect("the outside directory should be creatable");
     let path = at.join(REFRESH_LOCK);
-    fs::write(&path, "{\"pid\":424242}").expect("the artefact should be writable");
+    fs::create_dir(&path).expect("the artefact directory should be creatable");
     backdate(&path, Duration::from_secs(120));
     path
 }
@@ -748,7 +1030,7 @@ fn the_report_prints_a_legacy_lock_command_that_remove_stale_accepts() {
     let mut legacy = canonical.clone().into_os_string();
     legacy.push(LEGACY_LOCK_SUFFIX);
     let legacy = PathBuf::from(legacy);
-    fs::write(&legacy, "{\"pid\":424242}").expect("writable");
+    fs::create_dir(&legacy).expect("the legacy lock directory should be creatable");
     backdate(&legacy, Duration::from_secs(120));
     assert_ne!(canonical, ns_dir, "the fixture is only meaningful if the spellings differ");
 

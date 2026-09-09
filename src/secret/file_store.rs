@@ -170,6 +170,10 @@ pub enum FileStoreError {
     /// The path is not inside this store's namespace root (invariant I1).
     #[error("`{0}` is outside the agentctl namespace root; refusing to write")]
     OutsideNamespaceRoot(PathBuf),
+    /// A directory that had to be empty was not. Reported rather than
+    /// recursed: see [`remove_dir_under`].
+    #[error("`{0}` is not empty")]
+    NotEmpty(PathBuf),
     /// The pass was cancelled, or ran out of deadline, while the replacement
     /// was staged but not yet renamed into place.
     #[error("cancelled before `{0}` could be replaced")]
@@ -876,36 +880,72 @@ pub fn open_namespace_dir(paths: &Paths, ns_dir: &Path) -> Result<OwnedFd, FileS
     Ok(leaf.fd)
 }
 
-/// Removes one name from a directory under the namespace root, resolving that
-/// directory without ever following a symbolic link.
+/// Removes one empty *directory* under the namespace root, resolving the way
+/// to it without ever following a symbolic link.
 ///
 /// `doctor --remove-stale` is the only caller, and it is the only thing in
-/// agentctl that deletes a lock artefact at all. Its own path check is
+/// agentctl that removes a lock artefact at all. Its own path check is
 /// lexical — it compares spellings — and a lexical check cannot see a
 /// symbolic link planted at `<acct>` or `<org>`:
 /// `<root>/<acct>/<org>/.oauth_refresh.lock` spells a location under the root
-/// while naming Claude Code's live lock in the user's home directory, which
-/// is exactly the file invariant I11 exists to protect. So the directory is
-/// walked down from the root one `O_NOFOLLOW` component at a time and the
-/// file is unlinked relative to the descriptor that walk produced — a
-/// directory nothing could have redirected between the check and the unlink.
+/// while naming Claude Code's live lock in the user's home directory, which is
+/// exactly what invariant I11′ exists to protect. So the parent is walked down
+/// from the root one `O_NOFOLLOW` component at a time and the artefact is
+/// removed relative to the descriptor that walk produced — a directory nothing
+/// could have redirected between the check and the removal.
 ///
-/// `unlinkat` without `AT_REMOVEDIR` never removes a directory, and removes a
-/// symbolic link rather than what it points at, so the final component needs
-/// no separate guard.
+/// This replaced a phase-1 `remove_file_under_root` that unlinked *without*
+/// `AT_REMOVEDIR`, which could not remove a lock artefact at all: every one of
+/// them is a directory (`agentctl-nz5`, fact F45). Nothing else in the crate
+/// needed the file version, so it is gone rather than left as a second, wrong
+/// way to do this.
+///
+/// # Errors
+///
+/// [`FileStoreError::OutsideNamespaceRoot`] when the path does not spell a
+/// location under
+/// [`Paths::namespace_root`](crate::config::paths::Paths::namespace_root), and
+/// otherwise as [`remove_dir_under`] anchored there.
+pub fn remove_dir_under_root(paths: &Paths, path: &Path) -> Result<(), FileStoreError> {
+    // Stated here rather than left to the walk's `strip_prefix`, which cannot
+    // answer until the root itself exists — and "is this mine to remove?" is
+    // not a question whose answer should depend on that.
+    if !paths.is_under_namespace_root(path) {
+        return Err(FileStoreError::OutsideNamespaceRoot(path.to_path_buf()));
+    }
+    remove_dir_under(&paths.namespace_root(), path)
+}
+
+/// [`remove_dir_under_root`] with the `O_NOFOLLOW` walk anchored elsewhere.
+///
+/// `doctor --remove-stale` uses the other anchor for the single path outside
+/// the namespace root it will act on: a lock directory a crashed agentctl left
+/// in the store it was holding, named by a held-lock record whose process is
+/// dead (plan section 3.9). That anchor is the record's store directory's
+/// *parent*, which leaves both components the record cannot vouch for — the
+/// store directory and the artefact name — to be walked and refused here.
+///
+/// Nothing recurses. `AT_REMOVEDIR` fails with `ENOTEMPTY` on a directory with
+/// anything inside it, and that is reported: a lock directory holding a file
+/// is not the empty artefact a lapsed lock leaves, and removing a tree is not
+/// something this command may do. `AT_REMOVEDIR` also refuses anything that is
+/// not a directory, so a regular file or a symbolic link at the final
+/// component arrives as [`FileStoreError::NotRegular`] rather than being
+/// deleted.
 ///
 /// # Errors
 ///
 /// [`FileStoreError::RefusedSymlink`] for a link anywhere along the chain,
 /// [`FileStoreError::OutsideNamespaceRoot`] when the path does not spell a
-/// location below the root, and [`FileStoreError::Io`] when the directory is
-/// not there or the unlink itself fails.
-pub fn remove_file_under_root(paths: &Paths, path: &Path) -> Result<(), FileStoreError> {
+/// location below `anchor`, [`FileStoreError::NotEmpty`] for a directory with
+/// anything in it, [`FileStoreError::NotRegular`] when the final component is
+/// not a directory, and [`FileStoreError::Io`] when the parent is not there or
+/// the removal itself fails.
+pub fn remove_dir_under(anchor: &Path, path: &Path) -> Result<(), FileStoreError> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(FileStoreError::OutsideNamespaceRoot(path.to_path_buf()));
     };
-    let root = paths.namespace_root();
-    let Some(chain) = open_chain(&root, parent, Walk::MustExist)? else {
+    let Some(chain) = open_chain(anchor, parent, Walk::MustExist)? else {
         return Err(FileStoreError::io(
             format!("`{}` is not there", parent.display()),
             io::Error::from(io::ErrorKind::NotFound),
@@ -915,8 +955,14 @@ pub fn remove_file_under_root(paths: &Paths, path: &Path) -> Result<(), FileStor
         .into_iter()
         .next_back()
         .ok_or_else(|| FileStoreError::OutsideNamespaceRoot(path.to_path_buf()))?;
-    rustix::fs::unlinkat(&leaf.fd, name, AtFlags::empty()).map_err(|errno| {
-        FileStoreError::errno(format!("could not remove `{}`", path.display()), errno)
+    rustix::fs::unlinkat(&leaf.fd, name, AtFlags::REMOVEDIR).map_err(|errno| match errno {
+        Errno::NOTEMPTY => FileStoreError::NotEmpty(path.to_path_buf()),
+        // Every parent was opened with `O_DIRECTORY`, so at this point
+        // `ENOTDIR` can only be about `name` itself: a regular file, a socket,
+        // or a symbolic link, none of which `AT_REMOVEDIR` will touch.
+        // `EISDIR` is the same refusal on the platforms that spell it that way.
+        Errno::NOTDIR | Errno::ISDIR => FileStoreError::NotRegular(path.to_path_buf()),
+        other => FileStoreError::errno(format!("could not remove `{}`", path.display()), other),
     })
 }
 

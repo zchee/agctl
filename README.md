@@ -157,19 +157,24 @@ agentctl claude doctor --remove-stale ~/.config/agentctl/claude/<acct>/<org>/.oa
 
 The report covers the keychain preflight, every discovered row with its token expiries,
 credentials on this machine that belong to something else and are never read, the
-namespace locks and who holds them, the artefacts a Claude Code session leaves behind, the
-files a failed write leaves behind, and the four situations that are not failures but are
-worth knowing about: a stale sibling, a forgotten service, two rows holding the same
-credential, and a namespace still called `_unknown-org`.
+namespace locks and who holds them, the Claude Code locks agentctl is holding itself, the
+artefacts a Claude Code session leaves behind, the files a failed write leaves behind, and
+the four situations that are not failures but are worth knowing about: a stale sibling, a
+forgotten service, two rows holding the same credential, and a namespace still called
+`_unknown-org`.
 
 **`--remove-stale` is the only thing in agentctl that deletes anything Claude Code
 created, and deleting a lock that is not actually stale can corrupt a running Claude Code
 session's credential store.** It is fenced accordingly. The path must:
 
-1. spell a location under `<config-dir>/claude/`;
+1. spell a location under `<config-dir>/claude/`, or be named by a held-lock record whose
+   process is gone — see below;
 2. not be in `.locks/` — those are agentctl's own locks, which nothing ever unlinks;
 3. be named `.oauth_refresh.lock`, `.storage-write`, or a legacy `<namespace>.lock`;
-4. be a regular file, reached without following a symbolic link;
+4. be a **directory**, reached without following a symbolic link: Claude Code takes every
+   one of its locks with `mkdir` and releases it with `rmdir`, so a directory is the only
+   shape a lapsed lock has. A regular file at one of those names was written by something
+   else; the report calls it anomalous and nothing removes it;
 5. be older than 60 s;
 6. show the **same modification time in two samples 12 s apart** — Claude Code's lock
    holders heartbeat every five seconds and derive "the holder is alive" from exactly that
@@ -179,6 +184,15 @@ session's credential store.** It is fenced accordingly. The path must:
 
 Anything else is refused, including a path that satisfies six of the seven. The command
 takes about twelve seconds because of step 6.
+
+Step 1 has one exception, and it is the only way `--remove-stale` reaches outside
+`<config-dir>/claude/`. When agentctl takes Claude Code's locks itself it records what it
+took before taking it, and a crash leaves that record naming directories nothing else will
+ever remove. So a path outside the store is accepted when a record in
+`<config-dir>/claude/held-locks/` names **that exact path** and the process that wrote it
+is gone. A live process, a record naming some other path, and no record at all are each
+refused. `doctor` lists those records, and prints the removal command for the ones that
+leaked.
 
 ## How accounts are discovered
 
@@ -232,7 +246,8 @@ counted; `--all` shows them.
 - **A row agentctl does not own is never refreshed and, when expired, is not even
   fetched.** Its owner refreshes it; agentctl reports.
 - `doctor --remove-stale` is the single exception to "agentctl removes nothing", and it is
-  fenced by the seven conditions listed under
+  fenced by the seven conditions — and the one record-attested exception to the first of
+  them — listed under
   [`doctor`](#doctor--what-is-actually-on-this-machine).
 
 ## The usage endpoint

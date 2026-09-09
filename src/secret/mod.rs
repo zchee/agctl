@@ -14,6 +14,8 @@
 //! - [`file_store`] is agentctl's own credential file, in Claude Code's
 //!   on-disk shape (fact F40).
 //! - [`namespace_lock`] is the `flock` that makes a namespace single-writer.
+//! - [`held_locks`] reads the records agentctl writes while it holds a Claude
+//!   Code lock, which is how `doctor` finds a leaked one.
 //! - [`foreign_activity`] answers "is somebody else using this namespace?".
 //! - [`location`] picks between the keychain and the file for one account.
 
@@ -27,6 +29,7 @@
 
 pub mod file_store;
 pub mod foreign_activity;
+pub mod held_locks;
 pub mod location;
 pub mod namespace_lock;
 pub mod security_cli;
