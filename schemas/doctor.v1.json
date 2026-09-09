@@ -32,6 +32,7 @@
         "unexposed",
         "mcp",
         "drift",
+        "migrated",
         "forget_command"
       ],
       "properties": {
@@ -65,6 +66,10 @@
         },
         "mcp": { "$ref": "#/$defs/mcp" },
         "drift": { "$ref": "#/$defs/drift" },
+        "migrated": {
+          "description": "Whether a Claude Code session has migrated this namespace's credentials into the keychain. False for an unregistered or non-owned session.",
+          "type": "boolean"
+        },
         "forget_command": {
           "description": "The exact command that tears this session down.",
           "type": "string"
@@ -91,13 +96,14 @@
       }
     },
     "link": {
+      "description": "One allowlisted entry's state. The `seed` tier (the seeded `.claude.json`) is never a symlink, so it carries its own disjoint state vocabulary (`seeded`/`occupied`/`absent`) and always carries a null target.",
       "type": "object",
       "additionalProperties": false,
       "required": ["name", "tier", "state", "target"],
       "properties": {
         "name": { "type": "string" },
-        "tier": { "enum": ["tier1", "tier2", "mcp"] },
-        "state": { "enum": ["linked", "missing-target", "occupied", "absent"] },
+        "tier": { "enum": ["tier1", "tier2", "mcp", "seed"] },
+        "state": { "enum": ["linked", "missing-target", "occupied", "absent", "seeded"] },
         "target": { "type": ["string", "null"] }
       }
     },

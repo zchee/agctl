@@ -895,6 +895,22 @@ fn link_entry_reports_every_state() {
         link_entry(&session_dir, "shell-snapshots", "tier2", &live.join("shell-snapshots"));
     assert_eq!(snapshots.state, "occupied");
     assert!(snapshots.target.is_some(), "a symlink to the wrong place still reports its target");
+
+    // The seed row (`.claude.json`) carries its own, disjoint vocabulary:
+    // `seeded` | `occupied` | `absent` — never the symlink states above.
+    let seed_absent = seed_link_entry(&session_dir);
+    assert_eq!(seed_absent.state, "absent");
+    assert_eq!(seed_absent.tier, "seed");
+    assert!(seed_absent.target.is_none());
+
+    fs::write(session_dir.join(".claude.json"), "{}").expect("the seed file should be writable");
+    let seed_seeded = seed_link_entry(&session_dir);
+    assert_eq!(seed_seeded.state, "seeded");
+
+    fs::remove_file(session_dir.join(".claude.json")).expect("the seed file should be removable");
+    symlink(&live_settings, &session_dir.join(".claude.json"));
+    let seed_occupied = seed_link_entry(&session_dir);
+    assert_eq!(seed_occupied.state, "occupied", "a symlink at the seed path is never `seeded`");
 }
 
 #[test]
@@ -989,7 +1005,7 @@ fn mcp_credential_entries_counts_only_servers_carrying_env_or_headers() {
         ACCT,
         ORG,
         &session_dir,
-        &[],
+        &IsolationContext { unexposed: &[], listing: &[] },
     );
     assert!(row.mcp.linked);
     assert_eq!(row.mcp.credential_entries, Some(3));
@@ -1027,7 +1043,7 @@ fn mcp_credential_entries_is_unreadable_on_a_parse_failure() {
         ACCT,
         ORG,
         &session_dir,
-        &[],
+        &IsolationContext { unexposed: &[], listing: &[] },
     );
     assert!(row.mcp.linked, "it is still a symlink, just not a readable one");
     assert_eq!(row.mcp.credential_entries, None);
@@ -1035,6 +1051,58 @@ fn mcp_credential_entries_is_unreadable_on_a_parse_failure() {
     let data = IsolationData { rows: vec![row], policy: isolation_policy(&store.env) };
     let text = isolation_section(&data, &store.paths.session_root()).join("\n");
     assert!(text.contains("credential_entries=unreadable"), "{text}");
+}
+
+#[test]
+fn isolation_row_reports_migrated_when_a_keychain_item_exists_for_the_namespace() {
+    // Plan AC58's "migration state" clause: the same probe
+    // `the_report_flags_a_namespace_a_session_has_migrated` exercises for
+    // `attention_section`, reused here for the isolation row.
+    let store = store();
+    record_owned(&store, ORG, None);
+    let session_dir = store.session_dir(ORG);
+    fs::create_dir_all(&session_dir).expect("the session directory should be creatable");
+
+    let config = AgentctlConfig::load(&store.paths).expect("the registry should load");
+    let record = config.get(ACCT, ORG).expect("record_owned just recorded this account");
+    let AccountKind::Owned { export_sha8, .. } = &record.kind else {
+        panic!("record_owned always creates an Owned account");
+    };
+    let listing = vec![ServiceEntry {
+        service: format!("{LIVE_SERVICE}-{export_sha8}"),
+        account: None,
+        cdat: None,
+        mdat: None,
+    }];
+
+    let migrated_row = isolation_row(
+        &store.paths,
+        &config,
+        &store.env,
+        ACCT,
+        ORG,
+        &session_dir,
+        &IsolationContext { unexposed: &[], listing: &listing },
+    );
+    assert!(migrated_row.migrated, "a keychain item for this namespace means it has migrated");
+
+    let absent_row = isolation_row(
+        &store.paths,
+        &config,
+        &store.env,
+        ACCT,
+        ORG,
+        &session_dir,
+        &IsolationContext { unexposed: &[], listing: &[] },
+    );
+    assert!(!absent_row.migrated, "no matching keychain item means it has not migrated");
+
+    let text = isolation_section(
+        &IsolationData { rows: vec![migrated_row], policy: isolation_policy(&store.env) },
+        &store.paths.session_root(),
+    )
+    .join("\n");
+    assert!(text.contains("migrated=true"), "{text}");
 }
 
 #[test]
@@ -1061,7 +1129,7 @@ fn disable_sideload_flags_reports_true_false_or_not_set() {
 #[test]
 fn the_isolation_section_says_the_root_is_empty_when_there_are_no_sessions() {
     let store = store();
-    let data = collect_isolation(&store.doctor(), &AgentctlConfig::default());
+    let data = collect_isolation(&store.doctor(), &AgentctlConfig::default(), &[]);
     assert!(data.rows.is_empty());
 
     let text = isolation_section(&data, &store.paths.session_root()).join("\n");

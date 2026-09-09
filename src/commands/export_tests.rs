@@ -27,7 +27,7 @@ fn session(path: &str, mcp: Option<&str>) -> SessionDir {
         mcp_config: mcp.map(PathBuf::from),
         linked: Vec::new(),
         missing: Vec::new(),
-        occupied: Vec::new(),
+        already_linked: Vec::new(),
     }
 }
 
@@ -115,7 +115,7 @@ fn render_env_zsh_and_bash_match_the_golden_string() {
                      export CLAUDE_CONFIG_DIR='/session/dir'\n\
                      # CLAUDE_CODE_OAUTH_TOKEN would bypass this session's stored credential (fact F19)\n\
                      unset CLAUDE_CODE_OAUTH_TOKEN\n\
-                     alias claude='claude --mcp-config \"/session/dir/mcp.json\"'\n\
+                     alias claude='claude --mcp-config '\\''/session/dir/mcp.json'\\'''\n\
                      # an alias only reaches an interactive shell; a script started from one \
                      will not inherit it";
     assert_eq!(render_env(&spec_with_mcp(), Shell::Zsh), expected);
@@ -128,7 +128,7 @@ fn render_env_fish_matches_the_golden_string() {
                      set -gx CLAUDE_CONFIG_DIR '/session/dir'\n\
                      # CLAUDE_CODE_OAUTH_TOKEN would bypass this session's stored credential (fact F19)\n\
                      set -e CLAUDE_CODE_OAUTH_TOKEN\n\
-                     function claude\n    command claude --mcp-config \"/session/dir/mcp.json\" $argv\nend\n\
+                     function claude\n    command claude --mcp-config '/session/dir/mcp.json' $argv\nend\n\
                      # a fish function only reaches an interactive shell; a script started from \
                      one will not inherit it";
     assert_eq!(render_env(&spec_with_mcp(), Shell::Fish), expected);
@@ -158,6 +158,63 @@ fn render_env_single_quotes_survive_an_embedded_quote() {
     assert_eq!(
         render_env(&spec, Shell::Fish).lines().next().unwrap(),
         "set -gx CLAUDE_SECURESTORAGE_CONFIG_DIR '/it\\'s/here'"
+    );
+}
+
+/// P1-2: an `mcp.json` path carrying both a `'` and a `$(id)` must never let
+/// a re-parse of the alias/function body execute anything. AC51's
+/// "single-quoted" clause is proved two ways: an exact-string assertion on
+/// the whole rendering (all three shells), and a real shell actually
+/// expanding the alias and observing the literal path arrive at the child
+/// — never the output of `id`.
+#[test]
+fn render_env_single_quotes_survive_an_embedded_quote_and_a_command_substitution() {
+    let mcp_path = "/it's/$(id)/mcp.json";
+    let spec = ExportSpec {
+        securestorage_dir: "/ns/spelling".to_owned(),
+        config_dir: PathBuf::from("/session/dir"),
+        mcp_config: Some(PathBuf::from(mcp_path)),
+    };
+
+    let expected_inner = format!("claude --mcp-config {}", quote_posix(mcp_path));
+    let expected_alias = format!("alias claude={}", quote_posix(&expected_inner));
+    let zsh = render_env(&spec, Shell::Zsh);
+    let alias_line =
+        zsh.lines().find(|line| line.starts_with("alias claude=")).expect("alias present");
+    assert_eq!(alias_line, expected_alias, "the whole alias body must be single-quoted");
+    assert!(!alias_line.contains("\"$("), "no path segment may sit in re-parsable double quotes");
+    assert_eq!(render_env(&spec, Shell::Bash), zsh, "zsh and bash share the same rendering");
+
+    let fish = render_env(&spec, Shell::Fish);
+    let expected_function_line =
+        format!("    command claude --mcp-config {} $argv", quote_fish(mcp_path));
+    assert!(
+        fish.lines().any(|line| line == expected_function_line),
+        "fish's function body must single-quote the path: {fish}"
+    );
+
+    // The real-shell proof: a fake `claude` on `PATH` records its own argv;
+    // `bash` sources the rendered environment with alias expansion turned
+    // on (as an interactive shell has it by default) and then types
+    // `claude`, exactly as a user would.
+    let dir = TempDir::new().expect("a temporary directory should be available");
+    let argv_log = dir.path().join("argv.log");
+    write_argv_capture_script(dir.path(), "claude", &argv_log);
+
+    let script = format!("shopt -s expand_aliases\n{zsh}\nclaude\n");
+    let output = std::process::Command::new("/bin/bash")
+        .env(
+            "PATH",
+            format!("{}:{}", dir.path().display(), std::env::var("PATH").unwrap_or_default()),
+        )
+        .args(["-c", &script])
+        .output()
+        .expect("`/bin/bash` should be runnable");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        std::fs::read_to_string(&argv_log).expect("the argv log should exist"),
+        format!("--mcp-config\n{mcp_path}\n"),
+        "the alias must expand to the literal path, never execute the embedded $(id)"
     );
 }
 

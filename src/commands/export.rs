@@ -124,6 +124,18 @@ pub fn spec_for(
 /// [`ExportSpec::mcp_config`] is `Some` — is followed by a one-line caveat
 /// that an alias (or fish function) reaches only interactive shells (fact
 /// F59: `--mcp-config` has no environment-variable form).
+///
+/// The alias/function's *whole body* is quoted, not just the path inside
+/// it: an `alias` is a textual macro that the shell re-parses from scratch
+/// when it is expanded, so a path sitting in double quotes inside a
+/// single-quoted alias body still undergoes `$()`/`` ` ` ``/`$var`
+/// expansion at that second parse, even though the definition line looked
+/// safely quoted. Quoting the path once for its own position and once more
+/// for the body it sits inside — `quote_posix(inner)` where `inner` already
+/// contains a `quote_posix`-quoted path — means the stored macro text is
+/// single-quoted at the position that matters, so the second parse expands
+/// nothing (plan AC51's "single-quoted" clause, invariant-equivalent to
+/// I19's "never re-interpret what agentctl places").
 #[must_use]
 pub fn render_env(spec: &ExportSpec, shell: Shell) -> String {
     let mut lines = Vec::new();
@@ -148,9 +160,9 @@ pub fn render_env(spec: &ExportSpec, shell: Shell) -> String {
                 lines.push(format!("set -e {var}"));
             }
             if let Some(mcp) = &spec.mcp_config {
-                let path = mcp.display();
+                let path = quote_fish(&mcp.display().to_string());
                 lines.push(format!(
-                    "function claude\n    command claude --mcp-config \"{path}\" $argv\nend"
+                    "function claude\n    command claude --mcp-config {path} $argv\nend"
                 ));
                 lines.push(
                     "# a fish function only reaches an interactive shell; a script started from \
@@ -177,8 +189,9 @@ pub fn render_env(spec: &ExportSpec, shell: Shell) -> String {
                 lines.push(format!("unset {var}"));
             }
             if let Some(mcp) = &spec.mcp_config {
-                let path = mcp.display();
-                lines.push(format!("alias claude='claude --mcp-config \"{path}\"'"));
+                let inner =
+                    format!("claude --mcp-config {}", quote_posix(&mcp.display().to_string()));
+                lines.push(format!("alias claude={}", quote_posix(&inner)));
                 lines.push(
                     "# an alias only reaches an interactive shell; a script started from one \
                      will not inherit it"

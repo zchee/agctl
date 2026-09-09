@@ -64,6 +64,7 @@ use crate::runtime::coordinator::PassCtx;
 use crate::runtime::proc;
 use crate::secret::KeychainReader;
 use crate::secret::KeychainStatus;
+use crate::secret::ServiceEntry;
 use crate::secret::file_store;
 use crate::secret::foreign_activity::REFRESH_LOCK;
 use crate::secret::foreign_activity::STORAGE_WRITE_LOCK;
@@ -214,7 +215,7 @@ pub fn report(
     out.extend(attention_section(doctor, &config, &found));
 
     out.push(String::new());
-    let isolation = collect_isolation(doctor, &config);
+    let isolation = collect_isolation(doctor, &config, &found.listing);
     out.extend(isolation_section(&isolation, &doctor.paths.session_root()));
 
     io.tell(&out.join("\n"));
@@ -814,18 +815,36 @@ struct IsolationData {
     policy: json::IsolationPolicy,
 }
 
+/// The two facts about the wider store every session's row needs beyond its
+/// own identity, grouped so [`isolation_row`] stays under clippy's
+/// argument-count limit.
+struct IsolationContext<'a> {
+    /// Top-level entries of the live config directory that are on neither
+    /// allowlist, sorted.
+    unexposed: &'a [String],
+    /// This pass's keychain listing, for the migration probe — the same one
+    /// `attention_section` already has from discovery, passed in rather
+    /// than re-fetched.
+    listing: &'a [ServiceEntry],
+}
+
 /// Builds [`IsolationData`] for every session directory under
 /// `session_root()`.
-fn collect_isolation(doctor: &Doctor<'_>, config: &AgentctlConfig) -> IsolationData {
+fn collect_isolation(
+    doctor: &Doctor<'_>,
+    config: &AgentctlConfig,
+    listing: &[ServiceEntry],
+) -> IsolationData {
     let paths = doctor.paths;
     let env = doctor.env;
 
     let live_dir = namespace::live_store_dir(env);
     let unexposed = unexposed_entries(&live_dir);
+    let ctx = IsolationContext { unexposed: &unexposed, listing };
 
     let rows = discover_sessions(&paths.session_root())
         .into_iter()
-        .map(|(acct, org, dir)| isolation_row(paths, config, env, &acct, &org, &dir, &unexposed))
+        .map(|(acct, org, dir)| isolation_row(paths, config, env, &acct, &org, &dir, &ctx))
         .collect();
 
     let policy = isolation_policy(env);
@@ -876,7 +895,7 @@ fn isolation_row(
     acct: &str,
     org: &str,
     session_dir: &Path,
-    unexposed: &[String],
+    ctx: &IsolationContext<'_>,
 ) -> json::IsolationRow {
     let registered = config.get(acct, org);
     let id = registered
@@ -885,17 +904,27 @@ fn isolation_row(
     let forget_target =
         if registered.is_some() { id.clone() } else { session_dir.display().to_string() };
 
-    let (securestorage_dir, sha8_match) = match registered.map(|rec| &rec.kind) {
+    // Plan AC58's "migration state" clause: the same probe
+    // `attention_section` runs for a registered `Owned` account — a
+    // `claude-code-<sha8>` keychain item existing for the namespace means a
+    // session has migrated it — computed alongside `sha8_match` since both
+    // read the same `export_sha8`.
+    let (securestorage_dir, sha8_match, migrated) = match registered.map(|rec| &rec.kind) {
         Some(AccountKind::Owned { export_spelling, export_sha8 }) => {
-            (export_spelling.clone(), &namespace::sha8(export_spelling) == export_sha8)
+            let migrated_service = format!("{}-{export_sha8}", namespace::LIVE_SERVICE);
+            (
+                export_spelling.clone(),
+                &namespace::sha8(export_spelling) == export_sha8,
+                ctx.listing.iter().any(|entry| entry.service == migrated_service),
+            )
         }
-        _ => (namespace::export_spelling(&paths.namespace_dir(acct, org)), false),
+        _ => (namespace::export_spelling(&paths.namespace_dir(acct, org)), false, false),
     };
 
     let live_dir = namespace::live_store_dir(env);
     let live_claude_json = namespace::claude_json_path(env);
 
-    let mut links = Vec::with_capacity(isolate::TIER1.len() + isolate::TIER2_DIRS.len() + 1);
+    let mut links = Vec::with_capacity(isolate::TIER1.len() + isolate::TIER2_DIRS.len() + 2);
     for name in isolate::TIER1 {
         links.push(link_entry(session_dir, name, "tier1", &live_dir.join(name)));
     }
@@ -905,6 +934,7 @@ fn isolation_row(
     let mcp_link = link_entry(session_dir, isolate::MCP_LINK, "mcp", &live_claude_json);
     let mcp = mcp_details(session_dir, &mcp_link);
     links.push(mcp_link);
+    links.push(seed_link_entry(session_dir));
 
     let (seeded_keys, leaked_keys) = seed_keys(session_dir);
     let drift = drift_of(&live_claude_json, session_dir);
@@ -920,9 +950,10 @@ fn isolation_row(
         links,
         seeded_keys,
         leaked_keys,
-        unexposed: unexposed.to_vec(),
+        unexposed: ctx.unexposed.to_vec(),
         mcp,
         drift,
+        migrated,
         forget_command: format!("agentctl claude use --forget {forget_target}"),
     }
 }
@@ -958,6 +989,22 @@ fn link_entry(
     };
 
     json::IsolationLink { name: name.to_owned(), tier, state, target }
+}
+
+/// The seeded `.claude.json`'s own row: `seeded` | `occupied` | `absent`.
+///
+/// A sibling of [`link_entry`] rather than a call to it: the seed is never
+/// expected to be a symlink at all (invariant I18, and P1-1's tightening of
+/// `write_seed_file`), so this reports whether a plain file is there rather
+/// than whether a symlink resolves correctly. `target` is always `None`.
+fn seed_link_entry(session_dir: &Path) -> json::IsolationLink {
+    let seed_path = session_dir.join(isolate::SEED_FILE);
+    let state = match fs::symlink_metadata(&seed_path) {
+        Err(_) => "absent",
+        Ok(meta) if meta.is_file() => "seeded",
+        Ok(_) => "occupied",
+    };
+    json::IsolationLink { name: isolate::SEED_FILE.to_owned(), tier: "seed", state, target: None }
 }
 
 /// The D-019 MCP symlink's credential count, reusing the state
@@ -1111,8 +1158,11 @@ fn isolation_section(data: &IsolationData, session_root: &Path) -> Vec<String> {
         out.push(format!("  {}  id={}", row.path, row.id));
         out.push(format!(
             "    exports          CLAUDE_SECURESTORAGE_CONFIG_DIR={} CLAUDE_CONFIG_DIR={} \
-             sha8_match={}",
-            row.exports.securestorage_dir, row.exports.config_dir, row.exports.sha8_match
+             sha8_match={} migrated={}",
+            row.exports.securestorage_dir,
+            row.exports.config_dir,
+            row.exports.sha8_match,
+            row.migrated
         ));
         for link in &row.links {
             match &link.target {

@@ -98,17 +98,48 @@ fn ac52_exec_delivers_exactly_the_expected_environment_delta() {
 // AC51 — env's golden strings, one per shell
 // ---------------------------------------------------------------------------
 
+/// A POSIX single-quoted encoding of `value`, mirroring the production
+/// `quote_posix` in `src/commands/export.rs`. Duplicated here rather than
+/// exposed from the binary — as `common::sha8`/`common::export_spelling`
+/// already duplicate other production logic — so the golden strings are
+/// computed independently of the code this e2e suite exercises.
+fn quote_posix(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' { out.push_str("'\\''") } else { out.push(ch) }
+    }
+    out.push('\'');
+    out
+}
+
+/// The `fish` equivalent of [`quote_posix`], mirroring `quote_fish`.
+fn quote_fish(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        match ch {
+            '\'' => out.push_str("\\'"),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('\'');
+    out
+}
+
 fn expected_zsh_bash_env(securestorage: &str, config_dir: &Path, mcp: &Path) -> String {
+    let inner = format!("claude --mcp-config {}", quote_posix(&mcp.display().to_string()));
     format!(
         "export CLAUDE_SECURESTORAGE_CONFIG_DIR='{securestorage}'\n\
          export CLAUDE_CONFIG_DIR='{config}'\n\
          # CLAUDE_CODE_OAUTH_TOKEN would bypass this session's stored credential (fact F19)\n\
          unset CLAUDE_CODE_OAUTH_TOKEN\n\
-         alias claude='claude --mcp-config \"{mcp}\"'\n\
+         alias claude={alias}\n\
          # an alias only reaches an interactive shell; a script started from one will not \
          inherit it\n",
         config = config_dir.display(),
-        mcp = mcp.display(),
+        alias = quote_posix(&inner),
     )
 }
 
@@ -118,11 +149,11 @@ fn expected_fish_env(securestorage: &str, config_dir: &Path, mcp: &Path) -> Stri
          set -gx CLAUDE_CONFIG_DIR '{config}'\n\
          # CLAUDE_CODE_OAUTH_TOKEN would bypass this session's stored credential (fact F19)\n\
          set -e CLAUDE_CODE_OAUTH_TOKEN\n\
-         function claude\n    command claude --mcp-config \"{mcp}\" $argv\nend\n\
+         function claude\n    command claude --mcp-config {mcp} $argv\nend\n\
          # a fish function only reaches an interactive shell; a script started from one will \
          not inherit it\n",
         config = config_dir.display(),
-        mcp = mcp.display(),
+        mcp = quote_fish(&mcp.display().to_string()),
     )
 }
 
@@ -437,6 +468,35 @@ fn ac56_refuses_a_foreign_occupant_at_a_tier_1_path_naming_it() {
         fs::read_to_string(session_dir.join("settings.json")).expect("readable"),
         "not a symlink",
         "the foreign occupant is left untouched"
+    );
+}
+
+#[test]
+fn ac56_refuses_a_symlinked_session_directory_and_leaves_its_target_untouched() {
+    // P1-1 scenario A: the session directory itself, not just what lives
+    // under it, is a placed path invariant I19 must cover.
+    let fixture = isolated_store();
+    let live_elsewhere = fixture.scratch("live-elsewhere");
+    fs::create_dir_all(&live_elsewhere).expect("the decoy live directory should be creatable");
+
+    let session_dir = fixture.session_dir(ACCT, ORG);
+    fs::create_dir_all(session_dir.parent().expect("the session dir has a parent"))
+        .expect("the session directory's parent should be creatable");
+    std::os::unix::fs::symlink(&live_elsewhere, &session_dir)
+        .expect("the decoy symlink should be creatable");
+
+    fixture
+        .cmd()
+        .args(["claude", "env", ACCT])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicates::str::contains(session_dir.to_string_lossy().into_owned()));
+
+    assert_eq!(
+        fs::read_dir(&live_elsewhere).expect("readable").count(),
+        0,
+        "nothing was created inside the symlink's target"
     );
 }
 

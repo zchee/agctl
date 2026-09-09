@@ -364,6 +364,12 @@ pub struct IsolationRow {
     /// How the live `.claude.json` compares with the seed, by modification
     /// time.
     pub drift: IsolationDrift,
+    /// Whether a Claude Code session has migrated this namespace's
+    /// credentials into the keychain — the same probe `attention_section`
+    /// runs for AC58's "migration state" clause, reused rather than
+    /// duplicated. `false` for an unregistered or non-`Owned` session, which
+    /// has no namespace to migrate.
+    pub migrated: bool,
     /// The exact command that tears this session down.
     pub forget_command: String,
 }
@@ -382,15 +388,24 @@ pub struct IsolationExports {
 }
 
 /// One allowlisted entry's symlink state.
+///
+/// The seeded `.claude.json` gets a row too (`name: ".claude.json"`,
+/// `tier: "seed"`), but it is never expected to be a symlink (invariant
+/// I18), so it carries its own, disjoint state vocabulary: `seeded`
+/// (a plain file is there), `occupied` (something else is — a symlink or a
+/// directory), or `absent`. `target` is always `None` for that row.
 #[derive(Debug, Clone, Serialize)]
 pub struct IsolationLink {
-    /// The file or directory name, e.g. `settings.json` or `mcp.json`.
+    /// The file or directory name, e.g. `settings.json`, `mcp.json`, or
+    /// `.claude.json`.
     pub name: String,
-    /// `tier1`, `tier2`, or `mcp`.
+    /// `tier1`, `tier2`, `mcp`, or `seed`.
     pub tier: &'static str,
-    /// `linked`, `missing-target`, `occupied`, or `absent`.
+    /// `linked`, `missing-target`, `occupied`, or `absent` for a symlinked
+    /// entry; `seeded`, `occupied`, or `absent` for the `seed` tier.
     pub state: &'static str,
-    /// The symlink's raw target, when the entry is a symlink at all.
+    /// The symlink's raw target, when the entry is a symlink at all. Always
+    /// `None` for the `seed` tier.
     pub target: Option<String>,
 }
 

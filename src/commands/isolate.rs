@@ -137,8 +137,10 @@ pub struct SessionDir {
     pub missing: Vec<String>,
     /// Session-directory paths whose tier 1/tier 2 symlink already pointed
     /// at the live entry before this call — left untouched (I19's "leaves
-    /// correct ones alone").
-    pub occupied: Vec<PathBuf>,
+    /// correct ones alone"). Named `already_linked` rather than `occupied`
+    /// so it cannot be confused with `doctor`'s `occupied` state, which means
+    /// the opposite: something foreign sits at that path.
+    pub already_linked: Vec<PathBuf>,
 }
 
 /// Prepares one isolated session directory (plan section 3.3).
@@ -157,9 +159,9 @@ pub struct SessionDir {
 /// Only an [`AccountKind::Owned`] account has a namespace to isolate:
 /// `Live` and `ConfigDirReadOnly` are refused, naming the kind.
 ///
-/// `ctx`'s cancellation flag bounds the seed's read-twice-and-compare retry
-/// loop (M6): a cancelled run gives up between retries rather than running
-/// out the whole retry budget.
+/// `ctx` bounds the seed's read-twice-and-compare retry loop (M6): a run
+/// that is cancelled or past its deadline gives up between retries rather
+/// than running out the whole retry budget.
 ///
 /// # Errors
 ///
@@ -188,26 +190,68 @@ pub fn ensure_session(
     };
 
     let path = match &opts.claude_config_dir {
-        Some(dir) if dir.is_absolute() => dir.clone(),
+        Some(dir) if dir.is_absolute() => {
+            if is_live_store_dir(dir, env) {
+                return Err(AppError::Config(format!(
+                    "--claude-config-dir `{}` is the live Claude Code configuration directory; \
+                     an isolated session cannot be the very thing it isolates from",
+                    dir.display()
+                )));
+            }
+            dir.clone()
+        }
         Some(dir) => {
             return Err(AppError::Config(format!(
                 "--claude-config-dir must be an absolute path; `{}` is not",
                 dir.display()
             )));
         }
-        None => paths.session_dir(account_uuid, organization_uuid),
+        None => {
+            let dir = paths.session_dir(account_uuid, organization_uuid);
+            // Defense in depth, matching `forget_session`'s own check: this
+            // cannot fail through the normal call path, since `session_dir`
+            // always composes a path under `session_root()` from validated
+            // segments (`new_record` runs `validate_segment` on both, the
+            // same convention `namespace_dir` relies on).
+            if !paths.is_under_session_root(&dir) {
+                return Err(AppError::Config(format!(
+                    "`{}` is not under `{}`; refusing to use it as a session directory",
+                    dir.display(),
+                    paths.session_root().display()
+                )));
+            }
+            dir
+        }
     };
 
     create_session_dir(&path)?;
 
     let live_dir = namespace::live_store_dir(env);
-    let (linked, missing, occupied) = link_tiers(&path, &live_dir, opts.fresh_context)?;
+    let (linked, missing, already_linked) = link_tiers(&path, &live_dir, opts.fresh_context)?;
 
     let mcp_config = if opts.no_mcp { None } else { Some(link_mcp_config(&path, env)?) };
 
     seed_claude_json(&path, env, ctx)?;
 
-    Ok(SessionDir { path, mcp_config, linked, missing, occupied })
+    Ok(SessionDir { path, mcp_config, linked, missing, already_linked })
+}
+
+/// Whether `dir` is the live Claude Code configuration directory itself
+/// (plan section 3.3; a `--claude-config-dir` override equal to it would
+/// symlink and seed on top of the very store a session exists to isolate
+/// from).
+///
+/// Compares canonicalized paths so a symlinked spelling of the same
+/// directory is still caught; when either side cannot be canonicalized (the
+/// override does not exist yet, most commonly — it is about to be created)
+/// falls back to comparing the normalized spelling instead of skipping the
+/// check.
+fn is_live_store_dir(dir: &Path, env: &EnvView) -> bool {
+    let live = namespace::live_store_dir(env);
+    match (namespace::canonical(dir), namespace::canonical(&live)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => namespace::export_spelling(dir) == namespace::export_spelling(&live),
+    }
 }
 
 /// Creates one session directory at [`DIR_MODE`], parents included,
@@ -216,9 +260,30 @@ pub fn ensure_session(
 /// Mirrors [`crate::config::paths`]'s own `create_dir_mode` rather than
 /// calling it: that helper is private to its module, and duplicating four
 /// lines here is cheaper than widening its visibility for one caller.
+///
+/// Uses [`std::fs::symlink_metadata`] rather than [`Path::is_dir`], which
+/// follows a symlink: a symlink at `path` — left by an earlier experiment or
+/// any same-user actor — would otherwise silently redirect every placement
+/// this call makes into whatever the link points at (invariant I19, plan
+/// AC56). Anything at `path` that is not a plain directory is refused,
+/// naming the path, and nothing is created inside the link's target.
 fn create_session_dir(path: &Path) -> Result<(), AppError> {
-    if path.is_dir() {
-        return Ok(());
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(AppError::Config(format!(
+                "`{}` already exists and is not the plain directory agentctl would create \
+                 there; move or remove it before starting this session",
+                path.display()
+            )));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(AppError::Io {
+                context: format!("could not inspect `{}`", path.display()),
+                source: err,
+            });
+        }
     }
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true).mode(DIR_MODE);
@@ -228,8 +293,8 @@ fn create_session_dir(path: &Path) -> Result<(), AppError> {
     })
 }
 
-/// `(linked, missing, occupied)`, [`link_tiers`]'s report — factored out so
-/// its signature stays under clippy's type-complexity threshold.
+/// `(linked, missing, already_linked)`, [`link_tiers`]'s report — factored
+/// out so its signature stays under clippy's type-complexity threshold.
 type TierLinkReport = (Vec<String>, Vec<String>, Vec<PathBuf>);
 
 /// Symlinks every present tier 1/tier 2 entry from `live_dir` into
@@ -238,12 +303,14 @@ type TierLinkReport = (Vec<String>, Vec<String>, Vec<PathBuf>);
 /// `fresh_context` omits tier 2 entirely: those names are neither linked nor
 /// reported as missing, since their absence here was requested rather than
 /// discovered. An entry `live_dir` does not have is reported in `missing`
-/// and nothing is created for it. An entry whose session-dir symlink already
-/// points at the live target is left alone and reported in `occupied`.
-/// Anything else already at that path is invariant I19's refusal, naming the
-/// path — the check runs before any placement for that entry, so a refusal
-/// midway through the list leaves every entry already handled exactly as it
-/// was and touches nothing after it.
+/// and nothing is created for it; so is a tier 2 name that resolves to a
+/// file rather than a directory (AC53: tier 2 is directories only). An entry
+/// whose session-dir symlink already points at the live target is left
+/// alone and reported in `already_linked`. Anything else already at that
+/// path is invariant I19's refusal, naming the path — the check runs before
+/// any placement for that entry, so a refusal midway through the list
+/// leaves every entry already handled exactly as it was and touches nothing
+/// after it.
 fn link_tiers(
     session_dir: &Path,
     live_dir: &Path,
@@ -253,7 +320,7 @@ fn link_tiers(
 
     let mut linked = Vec::new();
     let mut missing = Vec::new();
-    let mut occupied = Vec::new();
+    let mut already_linked = Vec::new();
 
     for name in TIER1.iter().copied().chain(tier2.iter().copied()) {
         let live_path = live_dir.join(name);
@@ -273,6 +340,14 @@ fn link_tiers(
             }
         };
 
+        if TIER2_DIRS.contains(&name) {
+            let is_dir = std::fs::metadata(&target).map(|meta| meta.is_dir()).unwrap_or(false);
+            if !is_dir {
+                missing.push(name.to_owned());
+                continue;
+            }
+        }
+
         match std::fs::symlink_metadata(&link) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 let existing = std::fs::read_link(&link).map_err(|err| AppError::Io {
@@ -280,7 +355,7 @@ fn link_tiers(
                     source: err,
                 })?;
                 if existing == target {
-                    occupied.push(link);
+                    already_linked.push(link);
                     continue;
                 }
                 return Err(AppError::Config(format!(
@@ -314,7 +389,7 @@ fn link_tiers(
         }
     }
 
-    Ok((linked, missing, occupied))
+    Ok((linked, missing, already_linked))
 }
 
 /// Places (or verifies) the D-019 `mcp.json` symlink inside `session_dir`.
@@ -370,16 +445,36 @@ fn link_mcp_config(session_dir: &Path, env: &EnvView) -> Result<PathBuf, AppErro
 
 /// Seeds `<session_dir>/.claude.json` from the live file, once (plan AC54).
 ///
-/// Skips entirely when the seed already exists: this never rewrites it after
-/// the first run (invariant I18). Copies [`SEED_KEYS`] verbatim from the
-/// live file, present-only, then fills any [`seed_floor`] entry the live
-/// file lacked. Serialised as 2-space pretty JSON in [`SEED_KEYS`]'s own
-/// order — deterministic and stable across releases, which matters more
-/// here than matching the live file's own key order — at mode [`FILE_MODE`].
+/// Skips entirely when the seed already exists as a plain file: this never
+/// rewrites it after the first run (invariant I18). Uses
+/// [`std::fs::symlink_metadata`] rather than [`Path::exists`], which follows
+/// a symlink — a symlink at the seed path, dangling or not, would otherwise
+/// point Claude Code's first config write at whatever it targets instead of
+/// being refused (invariant I19, plan AC56); anything at that path other
+/// than a plain file is refused, naming the path. Copies [`SEED_KEYS`]
+/// verbatim from the live file, present-only, then fills any [`seed_floor`]
+/// entry the live file lacked. Serialised as 2-space pretty JSON in
+/// [`SEED_KEYS`]'s own order — deterministic and stable across releases,
+/// which matters more here than matching the live file's own key order — at
+/// mode [`FILE_MODE`].
 fn seed_claude_json(session_dir: &Path, env: &EnvView, ctx: &PassCtx) -> Result<(), AppError> {
     let seed_path = session_dir.join(SEED_FILE);
-    if seed_path.exists() {
-        return Ok(());
+    match std::fs::symlink_metadata(&seed_path) {
+        Ok(meta) if meta.is_file() => return Ok(()),
+        Ok(_) => {
+            return Err(AppError::Config(format!(
+                "`{}` already exists and is not the plain file agentctl would seed there; move \
+                 or remove it before starting this session",
+                seed_path.display()
+            )));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(AppError::Io {
+                context: format!("could not inspect `{}`", seed_path.display()),
+                source: err,
+            });
+        }
     }
 
     let live_path = namespace::claude_json_path(env);
@@ -433,11 +528,33 @@ fn seed_claude_json(session_dir: &Path, env: &EnvView, ctx: &PassCtx) -> Result<
 
 /// Writes `text` to `path` at [`FILE_MODE`], tolerating a concurrent seed
 /// that won the race to create it first.
+///
+/// `create_new`'s `AlreadyExists` also fires for a *dangling* symlink at
+/// `path` (the create fails because the target does not exist, not because a
+/// regular file is there) — the quietest form of the P1-1/I19 hazard, since
+/// nothing about the error alone distinguishes it from the benign race this
+/// tolerance exists for. So the arm looks again with
+/// [`std::fs::symlink_metadata`]: only a regular file — the winning racer's
+/// own seed — is treated as already seeded; a symlink or anything else is
+/// invariant I19's refusal, naming the path.
 fn write_seed_file(path: &Path, text: &str) -> Result<(), AppError> {
     let mut file =
         match std::fs::OpenOptions::new().write(true).create_new(true).mode(FILE_MODE).open(path) {
             Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                return match std::fs::symlink_metadata(path) {
+                    Ok(meta) if meta.is_file() => Ok(()),
+                    Ok(_) => Err(AppError::Config(format!(
+                        "`{}` already exists and is not the plain file agentctl would seed \
+                         there; move or remove it before starting this session",
+                        path.display()
+                    ))),
+                    Err(err) => Err(AppError::Io {
+                        context: format!("could not inspect `{}`", path.display()),
+                        source: err,
+                    }),
+                };
+            }
             Err(err) => {
                 return Err(AppError::Io {
                     context: format!("could not create `{}`", path.display()),
@@ -453,7 +570,8 @@ fn write_seed_file(path: &Path, text: &str) -> Result<(), AppError> {
 
 /// Reads `path` through `read` twice and compares the results, retrying up
 /// to [`LIVE_READ_ATTEMPTS`] times when a live writer tears the read (M6),
-/// and giving up early when `ctx` is cancelled between retries.
+/// and giving up early when `ctx` should stop — cancelled, or past its
+/// deadline — between retries.
 ///
 /// `read` is a seam rather than a direct filesystem call so the retry loop
 /// is testable without racing a real writer thread: a test's `read` can
@@ -463,8 +581,8 @@ fn write_seed_file(path: &Path, text: &str) -> Result<(), AppError> {
 /// # Errors
 ///
 /// Propagates whatever `read` returns; returns [`AppError::Refused`] when
-/// `ctx` is cancelled before a retry, and [`AppError::Config`] naming `path`
-/// when every attempt disagreed with itself.
+/// `ctx` signals it should stop before a retry, and [`AppError::Config`]
+/// naming `path` when every attempt disagreed with itself.
 fn read_twice_and_compare<R>(
     path: &Path,
     ctx: &PassCtx,
@@ -474,7 +592,7 @@ where
     R: FnMut(&Path) -> Result<Option<Vec<u8>>, AppError>,
 {
     for attempt in 0..LIVE_READ_ATTEMPTS {
-        if attempt > 0 && ctx.cancel().is_cancelled() {
+        if attempt > 0 && ctx.should_stop() {
             return Err(AppError::Refused {
                 reason: "cancelled while re-reading the live `.claude.json` to seed a session"
                     .to_owned(),

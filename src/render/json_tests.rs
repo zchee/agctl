@@ -516,6 +516,7 @@ fn isolation_row() -> IsolationRow {
             seed_mtime_ms: Some(1_000),
             changed_since_seed: true,
         },
+        migrated: false,
         forget_command: "agentctl claude use --forget acct-1".to_owned(),
     }
 }
@@ -550,6 +551,25 @@ fn a_doctor_report_with_a_leaked_key_and_a_readable_mcp_count_validates() {
     let report = DoctorReport::new(
         vec![row],
         IsolationPolicy { disable_sideload_flags: Some(false), backend_observable: false },
+    );
+    assert_valid_doctor(&report);
+}
+
+#[test]
+fn a_doctor_report_with_a_migrated_namespace_and_a_seed_link_validates() {
+    // Plan AC58's "migration state" clause, and the `seed` tier / `seeded`
+    // state P1-1 added to the `link` vocabulary.
+    let mut row = isolation_row();
+    row.migrated = true;
+    row.links.push(IsolationLink {
+        name: ".claude.json".to_owned(),
+        tier: "seed",
+        state: "seeded",
+        target: None,
+    });
+    let report = DoctorReport::new(
+        vec![row],
+        IsolationPolicy { disable_sideload_flags: None, backend_observable: false },
     );
     assert_valid_doctor(&report);
 }

@@ -2,6 +2,7 @@
 //! symlink, idempotence and the I19 refusal.
 
 use std::os::unix::fs::PermissionsExt;
+use std::time::Duration;
 use std::time::Instant;
 
 use tempfile::TempDir;
@@ -44,6 +45,15 @@ fn owned_record() -> AccountRecord {
 
 fn ctx() -> PassCtx {
     PassCtx::standalone(Cancel::new(), Instant::now())
+}
+
+/// A [`PassCtx`] with a deadline far enough in the future that
+/// [`PassCtx::should_stop`] answers only to cancellation, never to the
+/// deadline — for the M6 retry tests, which need more than one attempt to
+/// run before the loop returns and would otherwise see [`ctx`]'s
+/// already-past deadline as a spurious stop request.
+fn ctx_with_deadline() -> PassCtx {
+    PassCtx::standalone(Cancel::new(), Instant::now() + Duration::from_secs(60))
 }
 
 #[test]
@@ -208,6 +218,42 @@ fn honours_an_absolute_claude_config_dir_override() {
     assert_eq!(session.path, overridden);
 }
 
+#[test]
+fn refuses_a_claude_config_dir_override_equal_to_the_live_store_dir() {
+    // A `--claude-config-dir` naming the live directory would symlink and
+    // seed on top of the very store a session exists to isolate from.
+    let fx = fixture();
+    let live = live_dir(&fx);
+    std::fs::create_dir_all(&live).expect("the live config dir should be creatable");
+
+    let opts =
+        SessionOptions { claude_config_dir: Some(live.clone()), ..SessionOptions::default() };
+    let err = ensure_session(&fx.paths, &owned_record(), &opts, &fx.env, &ctx())
+        .expect_err("the live store dir cannot be the isolated one");
+    assert!(err.to_string().contains("live Claude Code configuration directory"), "{err}");
+    assert!(
+        std::fs::read_dir(&live).expect("readable").next().is_none(),
+        "nothing was created inside the live directory"
+    );
+}
+
+#[test]
+fn refuses_a_claude_config_dir_override_reaching_the_live_store_dir_through_a_symlink() {
+    // The same refusal, spelled differently: a symlink resolving to the live
+    // directory is caught by the canonicalized comparison.
+    let fx = fixture();
+    let live = live_dir(&fx);
+    std::fs::create_dir_all(&live).expect("the live config dir should be creatable");
+    let via_link = fx.root.path().join("live-via-link");
+    std::os::unix::fs::symlink(&live, &via_link).expect("the symlink should be creatable");
+
+    let opts =
+        SessionOptions { claude_config_dir: Some(via_link.clone()), ..SessionOptions::default() };
+    let err = ensure_session(&fx.paths, &owned_record(), &opts, &fx.env, &ctx())
+        .expect_err("a symlinked spelling of the live store dir is still refused");
+    assert!(err.to_string().contains("live Claude Code configuration directory"), "{err}");
+}
+
 // ---------------------------------------------------------------------------
 // Tier 1 / tier 2 symlinks (AC53)
 // ---------------------------------------------------------------------------
@@ -244,7 +290,7 @@ fn links_every_tier_1_and_tier_2_entry_the_live_dir_has_and_reports_the_rest_mis
             "session-env".to_owned(),
         ]
     );
-    assert!(session.occupied.is_empty());
+    assert!(session.already_linked.is_empty());
 
     for name in ["settings.json", "projects"] {
         let link = session.path.join(name);
@@ -281,6 +327,28 @@ fn fresh_context_omits_tier_2_entirely_even_when_the_live_dir_has_it() {
 }
 
 #[test]
+fn a_tier_2_name_that_resolves_to_a_file_is_reported_missing_not_symlinked() {
+    // AC53: tier 2 is directories only. A file living under a tier-2 name in
+    // the live config directory must not be symlinked in.
+    let fx = fixture();
+    let live = live_dir(&fx);
+    std::fs::create_dir_all(&live).expect("writable");
+    std::fs::write(live.join("projects"), "not a directory").expect("writable");
+
+    let opts = SessionOptions::default();
+    let session =
+        ensure_session(&fx.paths, &owned_record(), &opts, &fx.env, &ctx()).expect("should succeed");
+
+    assert!(
+        session.missing.contains(&"projects".to_owned()),
+        "a tier-2 file is reported missing: {:?}",
+        session.missing
+    );
+    assert!(!session.linked.contains(&"projects".to_owned()));
+    assert!(!session.path.join("projects").exists(), "a tier-2 file must not be symlinked");
+}
+
+#[test]
 fn idempotent_repair_links_a_missing_symlink_and_leaves_correct_ones_alone() {
     let fx = fixture();
     let live = live_dir(&fx);
@@ -292,7 +360,7 @@ fn idempotent_repair_links_a_missing_symlink_and_leaves_correct_ones_alone() {
     let first =
         ensure_session(&fx.paths, &owned_record(), &opts, &fx.env, &ctx()).expect("first run");
     assert_eq!(first.linked, vec!["settings.json".to_owned(), "CLAUDE.md".to_owned()]);
-    assert!(first.occupied.is_empty());
+    assert!(first.already_linked.is_empty());
 
     // Simulate the symlink going missing between runs.
     std::fs::remove_file(first.path.join("CLAUDE.md")).expect("the symlink should be removable");
@@ -301,7 +369,7 @@ fn idempotent_repair_links_a_missing_symlink_and_leaves_correct_ones_alone() {
         ensure_session(&fx.paths, &owned_record(), &opts, &fx.env, &ctx()).expect("second run");
     assert_eq!(second.linked, vec!["CLAUDE.md".to_owned()], "only the missing one is repaired");
     assert_eq!(
-        second.occupied,
+        second.already_linked,
         vec![second.path.join("settings.json")],
         "the correct one is left alone"
     );
@@ -368,6 +436,73 @@ fn refuses_when_a_tier_1_path_is_occupied_by_a_directory() {
     let err = ensure_session(&fx.paths, &owned_record(), &opts, &fx.env, &ctx())
         .expect_err("an occupying directory should be refused");
     assert!(err.to_string().contains("skills"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// Symlink hazards at the session directory itself, and at the seed path
+// (P1-1 / invariant I19, plan AC56)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_when_the_session_directory_itself_is_a_symlink_to_a_live_directory() {
+    // Scenario A: `<session_root>/<acct>/<org>` is a symlink to some other
+    // "live" directory left by an earlier experiment or any same-user
+    // actor. Before this fix `is_dir()` follows the link and every
+    // placement this call makes lands inside the link's target instead of
+    // being refused.
+    let fx = fixture();
+    let live_elsewhere = fx.root.path().join("live-elsewhere");
+    std::fs::create_dir_all(&live_elsewhere).expect("the decoy live directory should be creatable");
+
+    let session_dir = fx.paths.session_dir(ACCT, ORG);
+    std::fs::create_dir_all(session_dir.parent().expect("the session dir has a parent"))
+        .expect("the session directory's parent should be creatable");
+    std::os::unix::fs::symlink(&live_elsewhere, &session_dir)
+        .expect("the decoy symlink should be creatable");
+
+    let opts = SessionOptions::default();
+    let err = ensure_session(&fx.paths, &owned_record(), &opts, &fx.env, &ctx())
+        .expect_err("a symlinked session directory should be refused");
+    assert!(err.to_string().contains(&session_dir.display().to_string()), "{err}");
+    assert_eq!(
+        std::fs::read_dir(&live_elsewhere).expect("readable").count(),
+        0,
+        "nothing was created inside the symlink's target"
+    );
+    assert!(
+        std::fs::symlink_metadata(&session_dir)
+            .expect("the symlink itself is untouched")
+            .file_type()
+            .is_symlink(),
+        "the decoy symlink itself is left exactly as it was"
+    );
+}
+
+#[test]
+fn refuses_when_the_seed_path_is_a_dangling_symlink() {
+    // Scenario B: `<session>/.claude.json` is a dangling symlink. Before
+    // this fix `exists()` is false, `create_new` then fails with
+    // `AlreadyExists` (the entry itself is there, even though its target is
+    // not), and the old `write_seed_file` mapped that straight to `Ok(())`
+    // — no seed, no error, no report.
+    let fx = fixture();
+    let opts = SessionOptions::default();
+    let session_dir = fx.paths.session_dir(ACCT, ORG);
+    std::fs::create_dir_all(&session_dir).expect("the session directory should be creatable");
+    let nowhere = fx.root.path().join("nowhere.json");
+    std::os::unix::fs::symlink(&nowhere, session_dir.join(SEED_FILE))
+        .expect("the dangling symlink should be creatable");
+
+    let err = ensure_session(&fx.paths, &owned_record(), &opts, &fx.env, &ctx())
+        .expect_err("a dangling symlink at the seed path should be refused, not silently skipped");
+    assert!(err.to_string().contains(SEED_FILE), "{err}");
+    assert!(
+        std::fs::symlink_metadata(session_dir.join(SEED_FILE))
+            .expect("the symlink itself is untouched")
+            .file_type()
+            .is_symlink(),
+        "the dangling symlink itself is left exactly as it was"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -486,13 +621,16 @@ fn read_twice_and_compare_returns_immediately_when_the_first_pair_agrees() {
 #[test]
 fn read_twice_and_compare_retries_and_succeeds_once_the_writer_settles() {
     let mut calls = 0u32;
-    let result =
-        read_twice_and_compare(std::path::Path::new("/fixture/.claude.json"), &ctx(), |_| {
+    let result = read_twice_and_compare(
+        std::path::Path::new("/fixture/.claude.json"),
+        &ctx_with_deadline(),
+        |_| {
             calls += 1;
             // Tears on the first attempt's pair, then settles.
             if calls <= 2 { Ok(Some(vec![calls as u8])) } else { Ok(Some(vec![9])) }
-        })
-        .expect("a writer that settles within the retry budget should succeed");
+        },
+    )
+    .expect("a writer that settles within the retry budget should succeed");
     assert_eq!(result, Some(vec![9]));
     assert_eq!(calls, 4, "one torn attempt plus one settled attempt, two reads each");
 }
@@ -500,11 +638,15 @@ fn read_twice_and_compare_retries_and_succeeds_once_the_writer_settles() {
 #[test]
 fn read_twice_and_compare_refuses_after_persistent_tearing() {
     let mut calls = 0u32;
-    let err = read_twice_and_compare(std::path::Path::new("/fixture/.claude.json"), &ctx(), |_| {
-        calls += 1;
-        // Alternates every single call, so no pair ever agrees.
-        Ok(Some(vec![u8::try_from(calls % 2).unwrap_or(0)]))
-    })
+    let err = read_twice_and_compare(
+        std::path::Path::new("/fixture/.claude.json"),
+        &ctx_with_deadline(),
+        |_| {
+            calls += 1;
+            // Alternates every single call, so no pair ever agrees.
+            Ok(Some(vec![u8::try_from(calls % 2).unwrap_or(0)]))
+        },
+    )
     .expect_err("persistent tearing across every attempt should refuse rather than seed it");
     assert!(err.to_string().contains(".claude.json"), "{err}");
     assert_eq!(calls, LIVE_READ_ATTEMPTS * 2);
