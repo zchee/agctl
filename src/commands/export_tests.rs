@@ -22,7 +22,13 @@ fn owned(spelling: &str, sha8: &str) -> AccountRecord {
 }
 
 fn session(path: &str, mcp: Option<&str>) -> SessionDir {
-    SessionDir { path: PathBuf::from(path), mcp_config: mcp.map(PathBuf::from) }
+    SessionDir {
+        path: PathBuf::from(path),
+        mcp_config: mcp.map(PathBuf::from),
+        linked: Vec::new(),
+        missing: Vec::new(),
+        occupied: Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------

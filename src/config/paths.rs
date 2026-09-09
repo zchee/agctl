@@ -247,10 +247,6 @@ impl Paths {
     /// Lexical, exactly as [`Paths::is_under_namespace_root`] is: it answers
     /// what the path says, not what it resolves to. `use --forget <id>` uses
     /// this to refuse a path outside `claude-sessions/` (plan AC79).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "S16's `use --forget` is the first production caller")
-    )]
     pub fn is_under_session_root(&self, p: &Path) -> bool {
         let root = lexical_normalize(&self.session_root());
         let target = lexical_normalize(p);

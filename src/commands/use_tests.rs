@@ -1,9 +1,19 @@
-//! Tests for the `use` dispatch: the S22/S16 refusals and the id
-//! requirement. The successful launch path is exercised at the `export`
-//! unit-test and e2e layers, which is where a controllable `PATH` lives —
-//! `run` resolves `claude` through the *process's own* `PATH`, which a unit
-//! test cannot safely override (`std::env::set_var` is `unsafe` in this
-//! edition and would race every other test in the binary).
+//! Tests for the `use` dispatch: the S22 refusals and the id requirement.
+//! The successful launch path is exercised at the `export` unit-test and
+//! e2e layers, which is where a controllable `PATH` lives — `run` resolves
+//! `claude` through the *process's own* `PATH`, which a unit test cannot
+//! safely override (`std::env::set_var` is `unsafe` in this edition and
+//! would race every other test in the binary).
+//!
+//! `--forget` is not exercised here for the same reason `run_forget` is not:
+//! it calls [`crate::config::paths::Paths::resolve`] with no override, which
+//! in this in-process unit-test binary would resolve to whatever
+//! `AGENTCTL_CONFIG_DIR`/XDG names on the machine actually running the
+//! tests — never a directory a test controls. `isolate::forget_session`
+//! itself is exercised directly, with a `Paths::with_config_dir` fixture, in
+//! `isolate_tests.rs`; the dispatch wiring is exercised end-to-end, with the
+//! `Fixture` harness's `--config-dir` isolation, in
+//! `tests/e2e_isolate.rs`'s `ac79_*` tests.
 
 use super::*;
 use crate::runtime::coordinator::Cancel;
@@ -37,14 +47,6 @@ fn refuses_undo_as_not_implemented() {
     a.undo = true;
     let err = run(None, &a, &Cancel::new()).expect_err("--undo is not implemented yet");
     assert!(err.to_string().contains("--undo"), "{err}");
-}
-
-#[test]
-fn refuses_forget_as_not_implemented() {
-    let mut a = args(None);
-    a.forget = Some("someone".to_owned());
-    let err = run(None, &a, &Cancel::new()).expect_err("--forget is not implemented yet");
-    assert!(err.to_string().contains("--forget"), "{err}");
 }
 
 #[test]

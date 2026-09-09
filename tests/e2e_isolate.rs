@@ -1,12 +1,12 @@
 #![cfg(feature = "testing")]
 
-//! `claude exec` and `claude env`, driven through the real binary (plan
-//! AC50–AC52, and the `exec`/`env` halves of AC55).
+//! `claude exec`/`env`/`use --forget`, driven through the real binary (plan
+//! AC50–AC57, AC79, and the `exec`/`env` halves of AC55).
 //!
 //! Every test here sets `HOME` to a temporary directory (through
 //! [`Fixture::cmd`]) and never touches the real `~/.claude`. No keychain is
-//! ever involved: `exec`/`env` read no credential and write none, so none of
-//! these tests installs the fake `security(1)` at all.
+//! ever involved: none of these commands read a credential or write one, so
+//! none of these tests installs the fake `security(1)` at all.
 
 mod common;
 
@@ -257,7 +257,7 @@ fn mcp_config_is_appended_to_argv_only_when_the_command_is_named_claude() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ac55_the_symlink_target_is_exact_and_nothing_else_is_created() {
+fn ac55_the_symlink_target_is_exact_and_nothing_unexpected_is_created() {
     let fixture = isolated_store();
 
     fixture.cmd().args(["claude", "exec", ACCT, "--", "/usr/bin/true"]).assert().success();
@@ -272,14 +272,274 @@ fn ac55_the_symlink_target_is_exact_and_nothing_else_is_created() {
         .expect("the live `.claude.json` fixture should canonicalize");
     assert_eq!(target, expected);
 
-    let entries: Vec<String> = fs::read_dir(&session_dir)
+    let mut entries: Vec<String> = fs::read_dir(&session_dir)
         .expect("the session directory should exist")
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
+    entries.sort();
     assert_eq!(
         entries,
-        vec!["mcp.json".to_owned()],
-        "S15's skeleton creates nothing else under the session directory"
+        vec![".claude.json".to_owned(), "mcp.json".to_owned()],
+        "the fixture's empty live config dir has no tier 1/tier 2 entries, so the D-019 \
+         symlink and the AC54 seed are the only two things created under the session directory"
     );
+}
+
+// ---------------------------------------------------------------------------
+// AC53 — tier 1/tier 2 symlinks, tier 3 absent, `--fresh-context`
+// ---------------------------------------------------------------------------
+
+/// Every tier 1/tier 2 name this module's tests populate, so the assertions
+/// below do not have to repeat the allowlists by hand.
+const TIER1_NAMES: [&str; 3] = ["settings.json", "CLAUDE.md", "skills"];
+const TIER2_NAMES: [&str; 5] =
+    ["projects", "shell-snapshots", "file-history", "sessions", "session-env"];
+
+#[test]
+fn ac53_symlinks_every_tier_1_and_tier_2_entry_and_leaves_tier_3_alone() {
+    let fixture = isolated_store();
+    let live_dir = fixture.live_store_dir();
+    fs::create_dir_all(&live_dir).expect("the live config dir should be creatable");
+
+    fs::write(live_dir.join("settings.json"), "{}").expect("writable");
+    fs::write(live_dir.join("CLAUDE.md"), "# hi").expect("writable");
+    fs::create_dir_all(live_dir.join("skills")).expect("writable");
+    for name in TIER2_NAMES {
+        fs::create_dir_all(live_dir.join(name)).expect("writable");
+    }
+    // Tier 3: present in the live dir, on neither list.
+    fs::create_dir_all(live_dir.join("backups")).expect("writable");
+
+    fixture.cmd().args(["claude", "exec", ACCT, "--", "/usr/bin/true"]).assert().success();
+
+    let session_dir = fixture.session_dir(ACCT, ORG);
+    let meta = fs::metadata(&session_dir).expect("the session directory should exist");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+    assert!(
+        !session_dir.starts_with(fixture.config_dir().join("claude")),
+        "the session directory must be outside `namespace_root()`"
+    );
+
+    for name in TIER1_NAMES.into_iter().chain(TIER2_NAMES) {
+        let link = session_dir.join(name);
+        let link_meta = fs::symlink_metadata(&link)
+            .unwrap_or_else(|err| panic!("`{name}` should be a symlink: {err}"));
+        assert!(link_meta.file_type().is_symlink(), "`{name}` should be a symlink");
+        let target = fs::read_link(&link).expect("readable");
+        let expected = fs::canonicalize(live_dir.join(name)).expect("canonicalizable");
+        assert_eq!(target, expected, "`{name}`'s target");
+    }
+
+    assert!(!session_dir.join("backups").exists(), "tier 3 is never exposed");
+}
+
+#[test]
+fn ac53_fresh_context_omits_tier_2_but_keeps_tier_1() {
+    let fixture = isolated_store();
+    let live_dir = fixture.live_store_dir();
+    fs::create_dir_all(&live_dir).expect("writable");
+    fs::write(live_dir.join("settings.json"), "{}").expect("writable");
+    fs::create_dir_all(live_dir.join("projects")).expect("writable");
+
+    fixture
+        .cmd()
+        .args(["claude", "exec", ACCT, "--fresh-context", "--", "/usr/bin/true"])
+        .assert()
+        .success();
+
+    let session_dir = fixture.session_dir(ACCT, ORG);
+    assert!(
+        fs::symlink_metadata(session_dir.join("settings.json")).is_ok(),
+        "tier 1 still links under --fresh-context"
+    );
+    assert!(!session_dir.join("projects").exists(), "--fresh-context omits tier 2");
+}
+
+// ---------------------------------------------------------------------------
+// AC54/AC55 — seeding: no regular file leaks `mcpServers`, the mcp.json
+// symlink target is exact
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ac55_no_regular_file_under_the_session_directory_contains_mcp_servers_or_oauth_account() {
+    let fixture = isolated_store();
+    fs::write(
+        fixture.home().join(".claude.json"),
+        json!({
+            "oauthAccount": {"uuid": "should-not-leak"},
+            "mcpServers": {"server-a": {"command": "foo"}},
+            "hasCompletedOnboarding": true,
+            "theme": "dark",
+        })
+        .to_string(),
+    )
+    .expect("writable");
+
+    fixture.cmd().args(["claude", "exec", ACCT, "--", "/usr/bin/true"]).assert().success();
+
+    let session_dir = fixture.session_dir(ACCT, ORG);
+    for entry in fs::read_dir(&session_dir).expect("readable") {
+        let entry = entry.expect("readable");
+        // `DirEntry::metadata` uses `lstat` on Unix: it does not follow a
+        // symlink entry, which is exactly "walked without following
+        // symlinks" (critic MAJOR 4 / AC55).
+        let meta = entry.metadata().expect("lstat should succeed");
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        assert!(meta.is_file(), "unexpected non-file, non-symlink entry: {:?}", entry.path());
+        let contents = fs::read_to_string(entry.path()).expect("readable");
+        assert!(
+            !contents.contains("mcpServers"),
+            "`{}` is a regular file and must not contain `mcpServers`: {contents}",
+            entry.path().display()
+        );
+        assert!(
+            !contents.contains("should-not-leak"),
+            "`{}` must not leak `oauthAccount`: {contents}",
+            entry.path().display()
+        );
+    }
+
+    let mcp_link = session_dir.join("mcp.json");
+    let link_meta = fs::symlink_metadata(&mcp_link).expect("mcp.json should exist");
+    assert!(link_meta.file_type().is_symlink());
+    let target = fs::read_link(&mcp_link).expect("readable");
+    let expected = fs::canonicalize(fixture.home().join(".claude.json")).expect("canonicalizable");
+    assert_eq!(target, expected, "mcp.json's target must be the exact canonical live file");
+}
+
+// ---------------------------------------------------------------------------
+// AC56 — I19 refusal names the path
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ac56_refuses_a_foreign_occupant_at_a_tier_1_path_naming_it() {
+    let fixture = isolated_store();
+    let live_dir = fixture.live_store_dir();
+    fs::create_dir_all(&live_dir).expect("writable");
+    fs::write(live_dir.join("settings.json"), "{}").expect("writable");
+
+    let session_dir = fixture.session_dir(ACCT, ORG);
+    fs::create_dir_all(&session_dir).expect("writable");
+    fs::write(session_dir.join("settings.json"), "not a symlink").expect("writable");
+
+    fixture
+        .cmd()
+        .args(["claude", "env", ACCT])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicates::str::contains("settings.json"));
+
+    assert_eq!(
+        fs::read_to_string(session_dir.join("settings.json")).expect("readable"),
+        "not a symlink",
+        "the foreign occupant is left untouched"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC57 — never rewrites the seed after seeding it once
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ac57_never_rewrites_the_seed_once_claude_code_has_extended_it() {
+    let fixture = isolated_store();
+    fs::write(
+        fixture.home().join(".claude.json"),
+        json!({"hasCompletedOnboarding": true, "theme": "dark"}).to_string(),
+    )
+    .expect("writable");
+
+    fixture.cmd().args(["claude", "exec", ACCT, "--", "/usr/bin/true"]).assert().success();
+
+    let seed_path = fixture.session_dir(ACCT, ORG).join(".claude.json");
+    let seeded: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&seed_path).expect("readable"))
+            .expect("valid JSON");
+    let seeded_keys: std::collections::BTreeSet<String> =
+        seeded.as_object().expect("an object").keys().cloned().collect();
+    assert!(seeded_keys.contains("hasCompletedOnboarding"));
+    assert!(seeded_keys.contains("theme"));
+
+    let seeded_mtime = fs::metadata(&seed_path).expect("readable").modified().expect("mtime");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Simulate Claude Code's own first run: it treats the session's
+    // `.claude.json` as its own and extends it with a key agentctl never
+    // wrote.
+    let mut extended = seeded.clone();
+    extended["lastOnboardingVersion"] = json!("9.9.9");
+    fs::write(&seed_path, serde_json::to_string_pretty(&extended).expect("serializable"))
+        .expect("writable");
+    let extended_mtime = fs::metadata(&seed_path).expect("readable").modified().expect("mtime");
+    assert!(extended_mtime > seeded_mtime, "the simulated write should move the mtime");
+
+    fixture.cmd().args(["claude", "exec", ACCT, "--", "/usr/bin/true"]).assert().success();
+
+    let after_rerun_mtime = fs::metadata(&seed_path).expect("readable").modified().expect("mtime");
+    assert_eq!(after_rerun_mtime, extended_mtime, "the re-run must not rewrite the seed");
+
+    let after: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&seed_path).expect("readable"))
+            .expect("valid JSON");
+    let after_keys: std::collections::BTreeSet<String> =
+        after.as_object().expect("an object").keys().cloned().collect();
+    assert!(seeded_keys.is_subset(&after_keys), "the seeded key set must survive: {after_keys:?}");
+    assert!(after_keys.contains("lastOnboardingVersion"), "the simulated addition must survive");
+}
+
+// ---------------------------------------------------------------------------
+// AC79 — `use --forget`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ac79_forget_removes_the_session_and_leaves_the_namespace_and_lock_untouched() {
+    let fixture = isolated_store();
+    fixture.cmd().args(["claude", "exec", ACCT, "--", "/usr/bin/true"]).assert().success();
+
+    let session_dir = fixture.session_dir(ACCT, ORG);
+    assert!(session_dir.exists(), "the fixture should have created a session first");
+
+    fixture.write_credentials(ACCT, ORG, &common::blob("access", "refresh", common::fresh_at()));
+    let lock_path = fixture.lock_path(ACCT, ORG);
+    fs::create_dir_all(lock_path.parent().expect("has a parent")).expect("writable");
+    fs::write(&lock_path, "{}").expect("writable");
+
+    fixture.cmd().args(["claude", "use", "--forget", ACCT, "--yes"]).assert().success();
+
+    assert!(!session_dir.exists(), "the session directory is gone");
+    assert!(fixture.credentials_path(ACCT, ORG).exists(), "the namespace is untouched");
+    assert!(lock_path.exists(), "the lock file is untouched");
+}
+
+#[test]
+fn ac79_forget_without_yes_and_no_terminal_removes_nothing() {
+    let fixture = isolated_store();
+    fixture.cmd().args(["claude", "exec", ACCT, "--", "/usr/bin/true"]).assert().success();
+    let session_dir = fixture.session_dir(ACCT, ORG);
+    assert!(session_dir.exists());
+
+    fixture
+        .cmd()
+        .args(["claude", "use", "--forget", ACCT])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--yes"));
+
+    assert!(session_dir.exists(), "nothing was removed without confirmation");
+}
+
+#[test]
+fn ac79_forget_an_account_with_no_session_is_a_no_op() {
+    let fixture = isolated_store();
+
+    fixture
+        .cmd()
+        .args(["claude", "use", "--forget", ACCT, "--yes"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("nothing to forget"));
 }

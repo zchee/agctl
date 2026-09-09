@@ -19,8 +19,9 @@ use common::ORG;
 use serde_json::json;
 
 /// An isolated store with one owned account, a live `.claude.json`, and the
-/// session directory S15's `env` creates (the directory itself plus the
-/// D-019 `mcp.json` symlink — nothing seeded).
+/// session directory `env` creates: the directory, the D-019 `mcp.json`
+/// symlink, and a seed carrying only the floor key, because the live file
+/// here has no tier-1 entries and none of the seed keys.
 fn store_with_session() -> Fixture {
     let fixture = Fixture::new();
     fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
@@ -44,7 +45,11 @@ fn ac58_the_isolation_section_reports_a_minimal_session() {
     assert!(stdout.contains("sha8_match=true"), "{stdout}");
     assert!(stdout.contains("mcp.json"), "{stdout}");
     assert!(stdout.contains("linked"), "the D-019 symlink S15 placed is reported:\n{stdout}");
-    assert!(stdout.contains("not seeded"), "no seed file exists in S15's skeleton:\n{stdout}");
+    assert!(
+        stdout.contains("hasCompletedOnboarding"),
+        "the seed carries only the floor key when the live file has none:\n{stdout}"
+    );
+    assert!(stdout.contains("leaked keys      none"), "{stdout}");
     assert!(stdout.contains("agentctl claude use --forget"), "{stdout}");
     assert!(stdout.contains("policySettings.disableSideloadFlags"), "{stdout}");
     assert!(stdout.contains("secure-storage backend"), "{stdout}");
