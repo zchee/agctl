@@ -17,6 +17,20 @@
 //! | `hold_lock` | [`crate::secret::namespace_lock::acquire`] holds the lock until cancel or deadline |
 //! | `pause_before_rename` | the credential writer waits at `before_rename` (see [`Fault::pause_point`]) |
 //! | `flock_enotsup` | the namespace lock reports `Unavailable` instead of locking |
+//! | `lock_contended` | [`crate::secret::claude_lock::acquire`] sees `EEXIST` on the primary lock |
+//! | `lock_stale` | every existing Claude Code lock is treated as stale, whatever its age |
+//! | `lock_resume_after_sample_b` | a wedged holder heartbeats between Sample B and Sample C |
+//! | `swap_lock_leak` | a [`crate::secret::claude_lock::HeldLocks`] leaves its directories and its record behind |
+//! | `swap_pause_in_locks` | (W4a) the swap waits inside the hold |
+//! | `swap_write_fail` | (W4a) the keychain write fails after adoption |
+//! | `keychain_write_hang` | (W4a) the `security` write child never answers |
+//!
+//! The last three are **declared here and implemented by their own step**:
+//! W2 lands the lock protocol and the keychain transport with no caller, so
+//! there is nothing yet for a swap-shaped injection to act on, and adding a
+//! sleep-inside-the-hold branch to unreachable code would be exactly the
+//! kind of dangerous dead weight section 3.8 exists to keep out. Declaring
+//! the names now means W4a does not have to come back and edit this file.
 //!
 //! Without the `testing` feature [`Fault::from_env`] does not exist, the set
 //! is always empty, [`Fault::is`] is always false and [`Fault::pause_point`]

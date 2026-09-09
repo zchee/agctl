@@ -23,6 +23,7 @@ dependencies = [
  "insta",
  "jiff",
  "jsonschema",
+ "libc",
  "open",
  "predicates",
  "rand 0.10.2",

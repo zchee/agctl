@@ -16,6 +16,8 @@
 //! - [`namespace_lock`] is the `flock` that makes a namespace single-writer.
 //! - [`held_locks`] reads the records agentctl writes while it holds a Claude
 //!   Code lock, which is how `doctor` finds a leaked one.
+//! - [`claude_lock`] is Claude Code's own `mkdir` lock protocol, implemented
+//!   as a peer. Landed with no caller in W2; a swap wires it up in W4a.
 //! - [`foreign_activity`] answers "is somebody else using this namespace?".
 //! - [`location`] picks between the keychain and the file for one account.
 
@@ -28,6 +30,7 @@
 )]
 
 pub mod audit;
+pub mod claude_lock;
 pub mod file_store;
 pub mod foreign_activity;
 pub mod held_locks;
