@@ -17,6 +17,7 @@
 //! modules that own them, never by this one: a production-visible token-URL
 //! override would be an exfiltration vector (plan section 3.9, AC37).
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -174,6 +175,12 @@ pub enum ClaudeCommand {
     Import(ImportArgs),
     /// Report on store health, locks, and stray files.
     Doctor(DoctorArgs),
+    /// Start (or manage) an isolated Claude Code session for one account.
+    Use(UseArgs),
+    /// Run one command with an account's credentials, without a shell.
+    Exec(ExecArgs),
+    /// Print shell commands that put an account's credentials in your environment.
+    Env(EnvArgs),
 }
 
 /// Arguments for `agentctl claude status`.
@@ -312,6 +319,118 @@ pub struct DoctorArgs {
     /// Do not prompt for confirmation.
     #[arg(long)]
     pub yes: bool,
+}
+
+/// Which login shell [`EnvArgs`] should print for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Shell {
+    /// `export VAR=value`, `unset VAR`, `alias`.
+    Zsh,
+    /// Identical to [`Shell::Zsh`]: both read the same `export`/`unset`/`alias` syntax.
+    Bash,
+    /// `set -gx VAR value`, `set -e VAR`, a `function`.
+    Fish,
+}
+
+/// Arguments for `agentctl claude use`.
+///
+/// Three shapes share this struct, distinguished by which fields are set:
+/// `use [<id>] [--live] [--claude-config-dir <PATH>] [--fresh-context]
+/// [--no-mcp] [--yes] [--json]`, `use --undo [--yes]`, and `use --forget <id>
+/// [--yes]`.
+#[derive(Debug, Args)]
+pub struct UseArgs {
+    /// Account selector: the same syntax `accounts remove` accepts.
+    #[arg(value_name = "ID", conflicts_with_all = ["undo", "forget"])]
+    pub id: Option<String>,
+
+    /// Hot-swap the live Claude Code credential instead of starting an
+    /// isolated session (decision D-018).
+    #[arg(long, conflicts_with_all = ["new_only", "undo", "forget"])]
+    pub live: bool,
+
+    /// Accepted as a synonym for the default (isolated-session) behaviour.
+    #[arg(long)]
+    pub new_only: bool,
+
+    /// Undo the most recent `--live` swap.
+    #[arg(long, conflicts_with = "forget")]
+    pub undo: bool,
+
+    /// Remove the session directory created by an earlier `use <id>`.
+    #[arg(long, value_name = "ID")]
+    pub forget: Option<String>,
+
+    /// Use this directory as the session's Claude Code config directory
+    /// instead of a generated one. Must be an absolute path.
+    #[arg(long, value_name = "PATH")]
+    pub claude_config_dir: Option<PathBuf>,
+
+    /// Do not symlink the directories that hold resumable work (tier 2).
+    #[arg(long)]
+    pub fresh_context: bool,
+
+    /// Omit the MCP symlink, the `--mcp-config` flag and the shell alias
+    /// together.
+    #[arg(long)]
+    pub no_mcp: bool,
+
+    /// Do not prompt for confirmation.
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Print the session's details as JSON before launching.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `agentctl claude exec <id> -- <command> [args...]`.
+#[derive(Debug, Args)]
+pub struct ExecArgs {
+    /// Account selector: the same syntax `accounts remove` accepts.
+    pub id: String,
+
+    /// Use this directory as the session's Claude Code config directory
+    /// instead of a generated one. Must be an absolute path.
+    #[arg(long, value_name = "PATH")]
+    pub claude_config_dir: Option<PathBuf>,
+
+    /// Do not symlink the directories that hold resumable work (tier 2).
+    #[arg(long)]
+    pub fresh_context: bool,
+
+    /// Omit the MCP symlink and the `--mcp-config` flag together.
+    #[arg(long)]
+    pub no_mcp: bool,
+
+    /// The command to run, and any arguments to give it.
+    #[arg(last = true, required = true, value_name = "COMMAND")]
+    pub command: Vec<OsString>,
+}
+
+/// Arguments for `agentctl claude env <id>`.
+#[derive(Debug, Args)]
+pub struct EnvArgs {
+    /// Account selector: the same syntax `accounts remove` accepts.
+    pub id: String,
+
+    /// Use this directory as the session's Claude Code config directory
+    /// instead of a generated one. Must be an absolute path.
+    #[arg(long, value_name = "PATH")]
+    pub claude_config_dir: Option<PathBuf>,
+
+    /// Do not symlink the directories that hold resumable work (tier 2).
+    #[arg(long)]
+    pub fresh_context: bool,
+
+    /// Omit the MCP symlink, the `--mcp-config` flag and the shell alias
+    /// together.
+    #[arg(long)]
+    pub no_mcp: bool,
+
+    /// Which shell's syntax to print.
+    #[arg(long, value_enum, default_value_t = Shell::Zsh)]
+    pub shell: Shell,
 }
 
 #[cfg(test)]

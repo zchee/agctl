@@ -368,6 +368,157 @@ fn doctor_parses_its_flags() {
 }
 
 #[test]
+fn use_bare_id_parses_with_every_default_off() {
+    let cli = parse(&["agentctl", "claude", "use", "acct-1"]);
+    match claude_of(&cli) {
+        ClaudeCommand::Use(args) => {
+            assert_eq!(args.id.as_deref(), Some("acct-1"));
+            assert!(!args.live && !args.new_only && !args.undo && !args.yes && !args.json);
+            assert_eq!(args.forget, None);
+            assert_eq!(args.claude_config_dir, None);
+            assert!(!args.fresh_context);
+            assert!(!args.no_mcp);
+        }
+        other => panic!("expected `use`, got {other:?}"),
+    }
+}
+
+#[test]
+fn use_accepts_every_flag_together_with_an_id() {
+    let cli = parse(&[
+        "agentctl",
+        "claude",
+        "use",
+        "acct-1",
+        "--claude-config-dir",
+        "/tmp/session",
+        "--fresh-context",
+        "--no-mcp",
+        "--yes",
+        "--json",
+    ]);
+    match claude_of(&cli) {
+        ClaudeCommand::Use(args) => {
+            assert_eq!(args.id.as_deref(), Some("acct-1"));
+            assert_eq!(args.claude_config_dir, Some(PathBuf::from("/tmp/session")));
+            assert!(args.fresh_context && args.no_mcp && args.yes && args.json);
+        }
+        other => panic!("expected `use`, got {other:?}"),
+    }
+}
+
+#[test]
+fn use_undo_and_forget_parse_without_an_id() {
+    let undo = parse(&["agentctl", "claude", "use", "--undo", "--yes"]);
+    match claude_of(&undo) {
+        ClaudeCommand::Use(args) => {
+            assert_eq!(args.id, None);
+            assert!(args.undo);
+            assert!(args.yes);
+        }
+        other => panic!("expected `use`, got {other:?}"),
+    }
+
+    let forget = parse(&["agentctl", "claude", "use", "--forget", "acct-1"]);
+    match claude_of(&forget) {
+        ClaudeCommand::Use(args) => {
+            assert_eq!(args.id, None);
+            assert_eq!(args.forget.as_deref(), Some("acct-1"));
+        }
+        other => panic!("expected `use`, got {other:?}"),
+    }
+}
+
+#[test]
+fn use_live_conflicts_with_new_only_undo_and_forget() {
+    for argv in [
+        vec!["agentctl", "claude", "use", "acct-1", "--live", "--new-only"],
+        vec!["agentctl", "claude", "use", "--live", "--undo"],
+        vec!["agentctl", "claude", "use", "--live", "--forget", "acct-1"],
+    ] {
+        let message = parse_err(&argv);
+        assert!(!message.is_empty(), "`{}` should be rejected", argv.join(" "));
+    }
+}
+
+#[test]
+fn use_undo_and_forget_conflict_with_an_id_and_with_each_other() {
+    for argv in [
+        vec!["agentctl", "claude", "use", "acct-1", "--undo"],
+        vec!["agentctl", "claude", "use", "acct-1", "--forget", "acct-1"],
+        vec!["agentctl", "claude", "use", "--undo", "--forget", "acct-1"],
+    ] {
+        let message = parse_err(&argv);
+        assert!(!message.is_empty(), "`{}` should be rejected", argv.join(" "));
+    }
+}
+
+#[test]
+fn exec_requires_a_trailing_command() {
+    let message = parse_err(&["agentctl", "claude", "exec", "acct-1"]);
+    assert!(!message.is_empty(), "a missing `-- <command>` should be rejected");
+}
+
+#[test]
+fn exec_parses_the_id_and_the_trailing_command() {
+    let cli = parse(&[
+        "agentctl",
+        "claude",
+        "exec",
+        "acct-1",
+        "--claude-config-dir",
+        "/tmp/session",
+        "--fresh-context",
+        "--no-mcp",
+        "--",
+        "claude",
+        "--resume",
+    ]);
+    match claude_of(&cli) {
+        ClaudeCommand::Exec(args) => {
+            assert_eq!(args.id, "acct-1");
+            assert_eq!(args.claude_config_dir, Some(PathBuf::from("/tmp/session")));
+            assert!(args.fresh_context && args.no_mcp);
+            assert_eq!(
+                args.command,
+                vec![std::ffi::OsString::from("claude"), std::ffi::OsString::from("--resume")]
+            );
+        }
+        other => panic!("expected `exec`, got {other:?}"),
+    }
+}
+
+#[test]
+fn env_defaults_to_zsh() {
+    let cli = parse(&["agentctl", "claude", "env", "acct-1"]);
+    match claude_of(&cli) {
+        ClaudeCommand::Env(args) => {
+            assert_eq!(args.id, "acct-1");
+            assert_eq!(args.shell, Shell::Zsh);
+            assert!(!args.fresh_context && !args.no_mcp);
+        }
+        other => panic!("expected `env`, got {other:?}"),
+    }
+}
+
+#[test]
+fn env_accepts_every_documented_shell() {
+    for (flag, expected) in [("zsh", Shell::Zsh), ("bash", Shell::Bash), ("fish", Shell::Fish)] {
+        let cli = parse(&["agentctl", "claude", "env", "acct-1", "--shell", flag]);
+        match claude_of(&cli) {
+            ClaudeCommand::Env(args) => assert_eq!(args.shell, expected, "--shell {flag}"),
+            other => panic!("expected `env`, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn env_rejects_an_unknown_shell() {
+    let message = parse_err(&["agentctl", "claude", "env", "acct-1", "--shell", "powershell"]);
+    assert!(!message.is_empty(), "clap should explain the rejection");
+}
+
+#[test]
 fn top_level_config_dir_is_accepted_before_the_subcommand() {
     let cli = parse(&["agentctl", "--config-dir", "/custom/store", "claude", "status"]);
     assert_eq!(cli.config_dir, Some(PathBuf::from("/custom/store")));

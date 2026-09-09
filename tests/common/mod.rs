@@ -166,6 +166,12 @@ impl Fixture {
         self.config_dir().join("claude").join(acct).join(org)
     }
 
+    /// One account's isolated session directory (plan section 3.3).
+    #[must_use]
+    pub fn session_dir(&self, acct: &str, org: &str) -> PathBuf {
+        self.config_dir().join("claude-sessions").join(acct).join(org)
+    }
+
     /// One account's credential file.
     #[must_use]
     pub fn credentials_path(&self, acct: &str, org: &str) -> PathBuf {

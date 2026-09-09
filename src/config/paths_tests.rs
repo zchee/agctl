@@ -101,6 +101,49 @@ fn ensure_dirs_is_idempotent() {
 }
 
 #[test]
+fn session_paths_follow_the_documented_layout() {
+    let paths = Paths::with_config_dir(PathBuf::from("/store"));
+    assert_eq!(paths.session_root(), Path::new("/store/claude-sessions"));
+    assert_eq!(paths.session_dir("acct", "org"), Path::new("/store/claude-sessions/acct/org"));
+}
+
+#[test]
+fn session_root_is_outside_namespace_root() {
+    let paths = Paths::with_config_dir(PathBuf::from("/store"));
+    assert!(!paths.session_root().starts_with(paths.namespace_root()));
+    assert!(!paths.namespace_root().starts_with(paths.session_root()));
+}
+
+#[test]
+fn is_under_session_root_rejects_escapes() {
+    let paths = Paths::with_config_dir(PathBuf::from("/store"));
+    let root = paths.session_root();
+
+    let accepted = [
+        root.join("acct").join("org").join("mcp.json"),
+        root.join("acct"),
+        PathBuf::from("/store/claude-sessions/./acct/../acct/org/mcp.json"),
+    ];
+    for path in accepted {
+        assert!(paths.is_under_session_root(&path), "{} should be accepted", path.display());
+    }
+
+    let refused = [
+        root.clone(),
+        PathBuf::from("/store/config.json"),
+        PathBuf::from("/store/claude-sessions/../config.json"),
+        PathBuf::from("/store/claude-sessions/acct/../../../etc/passwd"),
+        PathBuf::from("/etc/passwd"),
+        paths.namespace_root().join("acct").join("org"),
+        PathBuf::from("claude-sessions/acct/org/mcp.json"),
+        PathBuf::from("/store/claude-sessionsx/acct"),
+    ];
+    for path in refused {
+        assert!(!paths.is_under_session_root(&path), "{} should be refused", path.display());
+    }
+}
+
+#[test]
 fn is_under_namespace_root_rejects_escapes() {
     let paths = Paths::with_config_dir(PathBuf::from("/store"));
     let root = paths.namespace_root();

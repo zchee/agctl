@@ -47,7 +47,7 @@ fn main() {
     }
 
     match dispatch(&cli, &cancel) {
-        Ok(()) => process::exit(EXIT_OK),
+        Ok(code) => process::exit(code),
         Err(err) => {
             eprintln!("agentctl: {err}");
             process::exit(err.exit_code());
@@ -76,27 +76,39 @@ fn init_tracing() {
         .try_init();
 }
 
-/// Routes a parsed command line to its implementation.
+/// Routes a parsed command line to its implementation, returning the process
+/// exit code.
 ///
-/// Every arm is one line, and every one of them is built: W3 replaced the last
-/// [`AppError::not_implemented`] placeholder with `watch`. The constructor
-/// stays for the next command that is parsed before it is implemented, so such
-/// an arm fails loudly with exit status 1 rather than exiting 0 having done
-/// nothing.
-fn dispatch(cli: &Cli, cancel: &Cancel) -> Result<(), AppError> {
+/// Every arm is one line. Most commands follow agentctl's own 0/1/2 contract
+/// ([`error`]), so they are mapped to [`EXIT_OK`] on success; `use` and
+/// `exec` instead launch a child the user is meant to interact with, so
+/// their success value is that child's own exit code (plan AC52) rather than
+/// a fixed one. The constructor stays for the next command that is parsed
+/// before it is implemented, so such an arm fails loudly with exit status 1
+/// rather than exiting 0 having done nothing.
+fn dispatch(cli: &Cli, cancel: &Cancel) -> Result<i32, AppError> {
     let Command::Claude { command } = &cli.command;
     match command {
-        ClaudeCommand::Status(args) => status::run(cli, args, cancel),
-        ClaudeCommand::Watch(args) => commands::watch::run(cli, args, cancel),
-        ClaudeCommand::Login(args) => commands::login::run(cli.config_dir.as_deref(), args, cancel),
+        ClaudeCommand::Status(args) => status::run(cli, args, cancel).map(|()| EXIT_OK),
+        ClaudeCommand::Watch(args) => commands::watch::run(cli, args, cancel).map(|()| EXIT_OK),
+        ClaudeCommand::Login(args) => {
+            commands::login::run(cli.config_dir.as_deref(), args, cancel).map(|()| EXIT_OK)
+        }
         ClaudeCommand::Import(args) => {
-            commands::import::run(cli.config_dir.as_deref(), args, cancel)
+            commands::import::run(cli.config_dir.as_deref(), args, cancel).map(|()| EXIT_OK)
         }
         ClaudeCommand::Doctor(args) => {
-            commands::doctor::run(cli.config_dir.as_deref(), args, cancel)
+            commands::doctor::run(cli.config_dir.as_deref(), args, cancel).map(|()| EXIT_OK)
         }
         ClaudeCommand::Accounts { command } => {
-            commands::accounts::run(cli.config_dir.as_deref(), command, cancel)
+            commands::accounts::run(cli.config_dir.as_deref(), command, cancel).map(|()| EXIT_OK)
+        }
+        ClaudeCommand::Use(args) => commands::r#use::run(cli.config_dir.as_deref(), args, cancel),
+        ClaudeCommand::Exec(args) => {
+            commands::export::run_exec(cli.config_dir.as_deref(), args, cancel)
+        }
+        ClaudeCommand::Env(args) => {
+            commands::export::run_env(cli.config_dir.as_deref(), args, cancel).map(|()| EXIT_OK)
         }
     }
 }

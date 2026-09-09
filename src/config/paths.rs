@@ -37,6 +37,10 @@ use crate::error::AppError;
 /// (decision D-008). `accounts relocate` moves such a namespace afterwards.
 pub const UNKNOWN_ORG: &str = "_unknown-org";
 
+/// Where isolated `claude use`/`exec`/`env` sessions live (plan section 3.3,
+/// decision D-011).
+pub const SESSION_ROOT: &str = "claude-sessions";
+
 /// The directory mode for everything agentctl creates.
 pub const DIR_MODE: u32 = 0o700;
 
@@ -212,6 +216,43 @@ impl Paths {
     /// other.
     pub fn is_under_namespace_root(&self, p: &Path) -> bool {
         let root = lexical_normalize(&self.namespace_root());
+        let target = lexical_normalize(p);
+        target != root && target.starts_with(&root)
+    }
+
+    /// The root of every isolated session directory.
+    ///
+    /// Deliberately outside [`Paths::namespace_root`] (plan section 3.3):
+    /// [`crate::secret::file_store::remove_namespace`] unlinks a fixed name
+    /// list under a namespace directory and then climbs it with
+    /// `AT_REMOVEDIR`, so a session's copied `mcpServers` symlink and seeded
+    /// `.claude.json` sitting inside a namespace would make that climb fail
+    /// silently. `use --forget <id>` is this tree's own teardown instead.
+    pub fn session_root(&self) -> PathBuf {
+        self.config_dir.join(SESSION_ROOT)
+    }
+
+    /// The isolated session directory for one `(account, organization)` pair.
+    ///
+    /// Callers pass identifiers that have already gone through
+    /// [`validate_segment`] — every [`crate::config::AccountRecord`] does, at
+    /// [`crate::config::new_record`] time — exactly as
+    /// [`Paths::namespace_dir`] assumes of its own arguments.
+    pub fn session_dir(&self, acct: &str, org: &str) -> PathBuf {
+        self.session_root().join(acct).join(org)
+    }
+
+    /// Whether `p` *spells* a path strictly below [`Paths::session_root`].
+    ///
+    /// Lexical, exactly as [`Paths::is_under_namespace_root`] is: it answers
+    /// what the path says, not what it resolves to. `use --forget <id>` uses
+    /// this to refuse a path outside `claude-sessions/` (plan AC79).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "S16's `use --forget` is the first production caller")
+    )]
+    pub fn is_under_session_root(&self, p: &Path) -> bool {
+        let root = lexical_normalize(&self.session_root());
         let target = lexical_normalize(p);
         target != root && target.starts_with(&root)
     }

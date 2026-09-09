@@ -8,9 +8,12 @@
 
 pub mod accounts;
 pub mod doctor;
+pub mod export;
 pub mod import;
+pub mod isolate;
 pub mod login;
 pub mod status;
+pub mod r#use;
 pub mod watch;
 
 use std::io::IsTerminal;
