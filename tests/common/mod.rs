@@ -352,8 +352,80 @@ impl Fixture {
 
     /// Where the fake keychain items live.
     #[must_use]
-    fn items_dir(&self) -> PathBuf {
+    pub fn items_dir(&self) -> PathBuf {
         self.root.path().join("keychain-items")
+    }
+
+    /// The file one item's password is stored in.
+    #[must_use]
+    pub fn keychain_item_path(&self, service: &str) -> PathBuf {
+        self.items_dir().join(item_file_name(service))
+    }
+
+    /// The fake `security(1)` this fixture installed.
+    #[must_use]
+    pub fn security_bin(&self) -> PathBuf {
+        self.root.path().join("bin").join("security")
+    }
+
+    /// Registers `service` as a service the fake will let a write reach.
+    ///
+    /// The stand-in refuses any other service (see `src/secret/fake_security.rs`):
+    /// a write is the one operation where "the test forgot to say which item"
+    /// must not silently succeed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the list cannot be written.
+    pub fn allow_write(&self, service: &str) -> &Self {
+        let path = self.items_dir().join(".allowed-services");
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .expect("the allowlist should be creatable");
+        writeln!(file, "{service}").expect("the allowlist should be writable");
+        self
+    }
+
+    /// Runs the fake `security` the way the write transport does: argv `-i`,
+    /// with one command line on standard input (fact F42).
+    ///
+    /// This is how the end-to-end suite reaches the write path in W2, and the
+    /// reason it has to: `keychain_write::write_item` has **no caller** in the
+    /// shipped binary yet — that is the whole point of landing the dangerous
+    /// module on its own — and `agentctl` is a binary crate, so `tests/` has
+    /// no library to call it through. What is exercised here is therefore the
+    /// far side of the transport: the argv, the line on stdin, the stand-in's
+    /// parsing, its redaction, its allowlist and the item it stores. The near
+    /// side — that `write_item` produces exactly this argv and exactly this
+    /// line — is asserted in `src/secret/keychain_write_tests.rs`, against the
+    /// same script.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stand-in cannot be started or the line cannot be sent.
+    #[must_use]
+    pub fn security_write(&self, line: &str) -> Output {
+        let mut command = StdCommand::new(self.security_bin());
+        command.arg("-i");
+        command.env("HOME", self.home());
+        for key in REMOVED_ENV {
+            command.env_remove(key);
+        }
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let mut child = command.spawn().expect("the stand-in should be runnable");
+        {
+            let stdin = child.stdin.as_mut().expect("stdin was piped");
+            stdin.write_all(line.as_bytes()).expect("the line should reach the stand-in");
+            stdin.flush().expect("the line should reach the stand-in");
+        }
+        drop(child.stdin.take());
+        finish(child)
     }
 
     /// Where the fake `dump-keychain` output lives.
@@ -495,7 +567,7 @@ impl Default for Fixture {
 /// scripting variables. Removed *before* the fixture's own settings are
 /// applied, so an inherited value loses to the fixture rather than to the
 /// list.
-const REMOVED_ENV: [&str; 17] = [
+const REMOVED_ENV: [&str; 18] = [
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -509,6 +581,7 @@ const REMOVED_ENV: [&str; 17] = [
     "AGENTCTL_FAKE_SECURITY_SLEEP",
     "AGENTCTL_FAKE_SECURITY_PREFLIGHT_EXIT",
     "AGENTCTL_FAKE_SECURITY_FIND_EXIT",
+    "AGENTCTL_FAKE_SECURITY_WRITE_EXIT",
     "AGENTCTL_FAKE_SECURITY_DUMP_EXIT",
     "AGENTCTL_FAKE_SECURITY_STDERR",
     "AGENTCTL_FAKE_SECURITY_PREFLIGHT_STDERR",
@@ -792,8 +865,50 @@ pub fn finish(child: Child) -> Output {
 }
 
 // ---------------------------------------------------------------------------
-// The suite-wide keychain log (plan AC25)
+// The suite-wide keychain log (plan AC25, AC61)
 // ---------------------------------------------------------------------------
+
+/// The end-to-end tests that put a write on the fake `security`'s stdin.
+///
+/// Plan AC61 counts `add-generic-password` lines in the suite-wide log against
+/// this list, so it has to be exactly the tests that write — one line each. In
+/// W2 that is the three S18 tests below, all in `tests/e2e_keychain.rs`; W3
+/// and W4 add the refresh-in-place and swap tests as they land.
+///
+/// The count is asserted **positively**: a list this long and a log with no
+/// write lines in it is a failure, not a pass, because "the write path did
+/// nothing" is exactly the way this criterion could otherwise be satisfied
+/// (critic M8).
+pub const KEYCHAIN_WRITE_TESTS: [&str; 3] = [
+    "ac59_the_write_transport_reads_one_line_from_stdin_and_redacts_the_hex",
+    "ac60_a_service_no_test_registered_is_refused_and_stores_nothing",
+    "ac61_what_the_write_path_stores_is_what_the_binary_reads",
+];
+
+/// Fact F42's keychain update line, for a test that means to write one.
+///
+/// Spelled out here rather than reached through the crate, for the reason
+/// [`Fixture::security_write`] gives: `agentctl` has no library target. A
+/// divergence from the line the crate builds would fail
+/// `src/secret/keychain_write_tests.rs`, which asserts the same text against
+/// the transport's own output.
+#[must_use]
+pub fn keychain_write_line(account: &str, service: &str, blob: &str) -> String {
+    format!(
+        "add-generic-password -U -a \"{account}\" -s \"{service}\" -X \"{}\"\n",
+        hex::encode(blob)
+    )
+}
+
+/// Adds this test's keychain calls to the suite-wide log without asserting
+/// that they were read-only.
+///
+/// For the write tests, which by construction are not. Everything else uses
+/// [`Fixture::assert_keychain_read_only`], which still holds for every
+/// *command* in the suite: nothing in `commands/` calls the write path in W2.
+pub fn record_keychain_calls(lines: &[String]) {
+    append_to_aggregate_log(lines);
+}
 
 /// Where every test's keychain calls are accumulated.
 ///

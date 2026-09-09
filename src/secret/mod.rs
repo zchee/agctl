@@ -27,9 +27,11 @@
     )
 )]
 
+pub mod audit;
 pub mod file_store;
 pub mod foreign_activity;
 pub mod held_locks;
+pub mod keychain_write;
 pub mod location;
 pub mod namespace_lock;
 pub mod security_cli;

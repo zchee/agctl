@@ -55,9 +55,11 @@ scripts/release-gate.sh
 
 It builds `cargo build --release` (default features, no `--config`, into a scratch
 `--target-dir` that is never `./target` and never the shared `/Volumes/tmpfs/target`) and
-greps the artifact for two lists. The nine seam names are one representative name per
+greps the artifact for two lists. The ten seam names are one representative name per
 seam-owning module, not the whole test-only surface — `fixtures/fake-security.sh` alone
-defines nine `AGENTCTL_FAKE_SECURITY_*` names on its own. **Nine seam names, every one of
+defines ten `AGENTCTL_FAKE_SECURITY_*` names on its own. The fake's **write** knob is the
+one exception to "one per owner": the keychain write path is the only seam that can change
+a keychain, so it is gated by name rather than by family. **Ten seam names, every one of
 which must be absent:**
 
 | name | owner |
@@ -70,6 +72,7 @@ which must be absent:**
 | `AGENTCTL_CLAUDE_TOKEN_URL` | `src/provider/claude/oauth.rs` |
 | `AGENTCTL_CLAUDE_AUTHORIZE_URL` | `src/provider/claude/oauth.rs` |
 | `AGENTCTL_FAKE_SECURITY_LOG` | `fixtures/fake-security.sh` |
+| `AGENTCTL_FAKE_SECURITY_WRITE_EXIT` | `fixtures/fake-security.sh` (the `-i` write path) |
 | `AGENTCTL_NO_BROWSER` | `src/commands/login.rs` |
 
 **Three production names, every one of which must be present:** `AGENTCTL_CONFIG_DIR`,

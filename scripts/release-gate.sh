@@ -4,14 +4,17 @@
 # Builds agentctl the way a release is built (default features, release profile)
 # into a scratch target directory, then proves two things about the artifact:
 #
-#   1. none of the nine test-seam environment-variable names appear in it, and
+#   1. none of the ten test-seam environment-variable names appear in it, and
 #   2. the three production-visible names do.
 #
-# The nine are one representative name per seam-owning module, not the whole
-# test-only surface — fixtures/fake-security.sh alone defines nine
-# AGENTCTL_FAKE_SECURITY_* names on its own. A new seam-owning module adds its
-# representative to the `seams` array below and to the table in
-# .claude/skills/check/SKILL.md, in the same change that introduces it.
+# The ten are one representative name per seam-owning module, not the whole
+# test-only surface — fixtures/fake-security.sh alone defines ten
+# AGENTCTL_FAKE_SECURITY_* names on its own. The fake's write knob is the one
+# exception to "one per owner": the keychain *write* path is the only seam that
+# can change a keychain, so it is gated by name rather than by family. A new
+# seam-owning module adds its representative to the `seams` array below and to
+# the table in .claude/skills/check/SKILL.md, in the same change that
+# introduces it.
 #
 # The first is the one that matters. The `testing` feature compiles overrides for
 # the OAuth token endpoint, the authorize endpoint and the usage endpoint; a
@@ -82,6 +85,7 @@ seams=(
 	AGENTCTL_CLAUDE_TOKEN_URL
 	AGENTCTL_CLAUDE_AUTHORIZE_URL
 	AGENTCTL_FAKE_SECURITY_LOG
+	AGENTCTL_FAKE_SECURITY_WRITE_EXIT
 	AGENTCTL_NO_BROWSER
 )
 

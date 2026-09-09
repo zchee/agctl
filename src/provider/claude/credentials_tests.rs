@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 
 use super::*;
+use crate::provider::claude::namespace::LIVE_SERVICE;
+use crate::secret::keychain_write::SECURITY_STDIN_LIMIT;
 
 /// A fixture blob, read from `fixtures/claude/`.
 fn fixture(name: &str) -> Vec<u8> {
@@ -265,4 +267,104 @@ fn a_wrong_typed_expiry_keeps_its_place_too() {
 
     let keys: Vec<&str> = credentials.extra.keys().map(String::as_str).collect();
     assert_eq!(keys, ["alpha", "refreshTokenExpiresAt", "omega"], "the key moved");
+}
+
+// ---------------------------------------------------------------------------
+// The keychain line (fact F42, plan AC59)
+// ---------------------------------------------------------------------------
+
+/// A credential whose serialized blob is exactly `blob_len` bytes.
+///
+/// The padding goes in `extra`, one byte per character, so the length is
+/// reachable exactly rather than approximately — which is the whole point of
+/// the 4 031 / 4 032 / 4 033 cases.
+fn credentials_of_blob_len(blob_len: usize) -> Credentials {
+    let minimal = br#"{"claudeAiOauth":{"accessToken":"a","expiresAt":0,"scopes":[]}}"#;
+    let mut credentials = Credentials::parse_blob(minimal).expect("the minimal blob parses");
+    credentials.extra.insert("pad".to_owned(), Value::String(String::new()));
+    let base = credentials.to_blob_json().len();
+    let padding = blob_len.checked_sub(base).expect("the requested blob is at least the base size");
+    // An index-backed map keeps the key where it is, so this replaces the
+    // value without moving it and the length arithmetic holds.
+    credentials.extra.insert("pad".to_owned(), Value::String("p".repeat(padding)));
+    assert_eq!(credentials.to_blob_json().len(), blob_len);
+    credentials
+}
+
+/// A line of exactly `len` bytes, trailing newline included.
+///
+/// The blob contributes two bytes per byte (it is hex-encoded), so the parity
+/// of the length is fixed by the account and service names; one of the two
+/// account lengths below always lands on the requested number.
+fn line_of_exactly(len: usize) -> Result<KeychainStdinLine, KeychainWriteError> {
+    // 28 through the opening quote, 6 for `" -s "`, 6 for `" -X "`, 1 for the
+    // closing quote, 1 for the newline.
+    const FIXED: usize = 42;
+    for account_len in [1_usize, 2] {
+        let overhead = FIXED + account_len + LIVE_SERVICE.len();
+        if len < overhead || !(len - overhead).is_multiple_of(2) {
+            continue;
+        }
+        let credentials = credentials_of_blob_len((len - overhead) / 2);
+        return credentials.to_keychain_stdin_line(&"u".repeat(account_len), LIVE_SERVICE);
+    }
+    panic!("no account length makes a line of exactly {len} bytes");
+}
+
+/// The bytes a line puts on a pipe.
+fn line_bytes(line: &KeychainStdinLine) -> Vec<u8> {
+    let mut sink = Vec::new();
+    line.write_to(&mut sink).expect("a vector accepts a write");
+    sink
+}
+
+#[test]
+fn the_keychain_line_is_fact_f42s_shape() {
+    let credentials = parse("credentials-new-blob.json");
+    let line = credentials
+        .to_keychain_stdin_line("example", LIVE_SERVICE)
+        .expect("the fixture blob is well under the limit");
+
+    let expected = format!(
+        "add-generic-password -U -a \"example\" -s \"{LIVE_SERVICE}\" -X \"{}\"\n",
+        hex::encode(credentials.to_blob_json())
+    );
+    assert_eq!(String::from_utf8_lossy(&line_bytes(&line)), expected);
+    assert_eq!(line.len(), expected.len());
+    assert!(!line.is_empty());
+    assert_eq!(line.account(), "example");
+    assert_eq!(line.service(), LIVE_SERVICE);
+}
+
+#[test]
+fn the_lines_length_is_fixed_overhead_plus_twice_the_blob() {
+    let credentials = credentials_of_blob_len(100);
+    let line = credentials.to_keychain_stdin_line("u", LIVE_SERVICE).expect("well under");
+    assert_eq!(line.len(), 42 + 1 + LIVE_SERVICE.len() + 200);
+}
+
+#[test]
+fn the_limit_counts_the_trailing_newline() {
+    // Plan AC59: 4 032 is accepted and 4 033 is refused, both measured with
+    // the newline fact F42 counts.
+    assert_eq!(line_of_exactly(4031).expect("under the limit").len(), 4031);
+    assert_eq!(line_of_exactly(SECURITY_STDIN_LIMIT).expect("at the limit").len(), 4032);
+
+    let refused = line_of_exactly(4033).expect_err("one byte over the limit is refused");
+    assert_eq!(
+        refused,
+        KeychainWriteError::LineTooLong { len: 4033, limit: SECURITY_STDIN_LIMIT },
+        "refusal D: agentctl has no argv fallback (invariant I15)"
+    );
+}
+
+#[test]
+fn the_line_never_prints_its_payload() {
+    let credentials = parse("credentials-new-blob.json");
+    let line = credentials.to_keychain_stdin_line("example", LIVE_SERVICE).expect("well under");
+    let rendered = format!("{line:?}");
+    assert!(!rendered.contains("sk-ant-"), "Debug leaked a token: {rendered}");
+    assert!(!rendered.contains(&hex::encode(credentials.to_blob_json())), "{rendered}");
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+    assert!(rendered.contains(LIVE_SERVICE), "the item it names is not a secret: {rendered}");
 }

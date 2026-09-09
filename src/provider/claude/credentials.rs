@@ -13,12 +13,19 @@
 //!
 //! # The one place a token is exposed
 //!
-//! Invariant I6 allows exactly two sites in the whole crate where a token's
-//! plaintext is taken out of its `SecretString`. This module owns the first,
-//! inside [`Credentials::with_exposed`],
-//! and everything that needs the plaintext — serializing the blob, hashing
-//! the digests, building the refresh POST body — goes through it. The second
-//! is the HTTP `Authorization` header builder, which lane C owns.
+//! Invariant I6 allows exactly one line in the whole crate where a token's
+//! plaintext is taken out of its `SecretString`, and it is the body of the
+//! private [`exposed`] helper in this module. Everything that needs the
+//! plaintext goes through it: serializing the blob, hashing the digests,
+//! building the refresh POST body, the `Authorization` header, and — since
+//! phase 2 — handing the keychain line to a child's standard input
+//! ([`KeychainStdinLine::write_to`]).
+//!
+//! The helper exists *because* of that second-to-last item. [`Credentials`]
+//! needs two secrets exposed at once, which is what [`Credentials::with_exposed`]
+//! arranges by nesting the helper; [`KeychainStdinLine`] needs one. Written
+//! independently they would be two exposure sites and the gate's grep would
+//! find two lines.
 //!
 //! [`Credentials`] therefore has a hand-written [`fmt::Debug`] that prints
 //! digests instead of tokens; deriving it would have put access tokens in
@@ -33,6 +40,8 @@
 )]
 
 use std::fmt;
+use std::io;
+use std::io::Write;
 
 use secrecy::ExposeSecret;
 use secrecy::SecretString;
@@ -44,6 +53,8 @@ use sha2::Digest;
 use sha2::Sha256;
 
 use crate::provider::claude::oauth::TokenResponse;
+use crate::secret::keychain_write;
+use crate::secret::keychain_write::KeychainWriteError;
 
 /// The key the blob object hangs under, in both the keychain item and the
 /// file (fact F4).
@@ -259,6 +270,43 @@ impl Credentials {
         Value::Object(root).to_string()
     }
 
+    /// Fact F42's keychain update line for this credential, ready for
+    /// `security -i`'s standard input.
+    ///
+    /// The line itself is assembled by
+    /// [`keychain_write::line_text`](crate::secret::keychain_write::line_text),
+    /// which owns the wire shape and the length rule; this method owns the
+    /// secret half — the blob, hex-encoded — and the wrapper that keeps the
+    /// finished line out of every `Debug` render and every log line on its way
+    /// to the child.
+    ///
+    /// `account` is the item's `acct` attribute (`$USER`, fact F14) and
+    /// `service` is the target item's service name. Both are recorded in the
+    /// returned value so
+    /// [`write_item`](crate::secret::keychain_write::write_item) can refuse a
+    /// line built for a different item than the one it was asked to write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeychainWriteError::LineTooLong`] when the finished line —
+    /// trailing newline included — is over
+    /// [`SECURITY_STDIN_LIMIT`](crate::secret::keychain_write::SECURITY_STDIN_LIMIT),
+    /// which is refusal **D**: agentctl has no argv fallback, because that
+    /// fallback is what would put a refresh token in `ps` (invariant I15).
+    pub fn to_keychain_stdin_line(
+        &self,
+        account: &str,
+        service: &str,
+    ) -> Result<KeychainStdinLine, KeychainWriteError> {
+        let hex = hex::encode(self.to_blob_json());
+        let line = keychain_write::line_text(account, service, &hex)?;
+        Ok(KeychainStdinLine {
+            line: SecretString::from(line),
+            account: account.to_owned(),
+            service: service.to_owned(),
+        })
+    }
+
     /// The `Authorization` header value for a request made as this account.
     ///
     /// Built here, beside [`Credentials::to_blob_json`], for the same reason
@@ -366,15 +414,119 @@ impl Credentials {
         })
     }
 
-    /// The crate's first and only credential exposure site (invariant I6).
+    /// Both of this credential's secrets, exposed for the duration of `f`.
     ///
-    /// Everything that needs plaintext token material calls through here, so
-    /// there is exactly one line to audit — and exactly one line for the
-    /// gate's audit grep to find, which is why the name of the call does not
-    /// appear anywhere else in this file.
+    /// Everything that needs plaintext token material calls through here, and
+    /// here calls [`exposed`] — twice, nested, because the callers want the
+    /// access token and the refresh token at the same time and the helper
+    /// hands out one at a time.
     fn with_exposed<R>(&self, f: impl FnOnce(&str, Option<&str>) -> R) -> R {
-        let refresh = self.refresh_token.as_ref();
-        f(self.access_token.expose_secret(), refresh.map(|t| t.expose_secret()))
+        exposed(&self.access_token, |access| match self.refresh_token.as_ref() {
+            Some(refresh) => exposed(refresh, |refresh| f(access, Some(refresh))),
+            None => f(access, None),
+        })
+    }
+}
+
+/// The crate's one and only secret exposure site (invariant I6).
+///
+/// One function, one line, so there is exactly one line to audit — and exactly
+/// one line for the gate's grep to find, which is why the name of the call
+/// appears nowhere else in the crate.
+fn exposed<R>(secret: &SecretString, f: impl FnOnce(&str) -> R) -> R {
+    f(secret.expose_secret())
+}
+
+/// One keychain update line, built and ready for `security -i`.
+///
+/// Three things make this a type rather than a `SecretString`:
+///
+/// - **It can only be built by [`Credentials::to_keychain_stdin_line`].** The
+///   field is private and there is no other constructor, so the transport
+///   cannot be handed a bare token, or a line somebody assembled by hand, in
+///   place of a line that went through fact F42's shape and length rules.
+/// - **It records who it was built for.** `account` and `service` are not
+///   secrets; carrying them is what lets
+///   [`write_item`](crate::secret::keychain_write::write_item) refuse a line
+///   built for a different item than the target it was asked to write (risk
+///   R42).
+/// - **It is written without being read.** [`KeychainStdinLine::write_to`]
+///   hands the bytes to a pipe inside [`exposed`], so the transport module
+///   never holds the plaintext and the crate keeps its single exposure site.
+pub struct KeychainStdinLine {
+    line: SecretString,
+    account: String,
+    service: String,
+}
+
+impl KeychainStdinLine {
+    /// The item's `acct` attribute this line was built for.
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+
+    /// The keychain service name this line was built for.
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+
+    /// The line's length in bytes, trailing newline included.
+    ///
+    /// What fact F42's 4 032-byte rule is measured against, and what
+    /// [`write_item`](crate::secret::keychain_write::write_item) re-checks
+    /// before it spawns anything.
+    pub fn len(&self) -> usize {
+        exposed(&self.line, str::len)
+    }
+
+    /// Whether the line is empty, which a built line never is.
+    ///
+    /// Present because a type with `len` and no `is_empty` is a clippy lint
+    /// and, more to the point, because a caller reading `len` should have the
+    /// obvious companion available rather than comparing to zero.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Writes the line to `sink` and keeps no copy.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the [`io::Error`] from the write, which for the transport's
+    /// pipe means the child died before it could be handed its input.
+    pub fn write_to<W: Write>(&self, sink: &mut W) -> io::Result<()> {
+        exposed(&self.line, |line| sink.write_all(line.as_bytes()))
+    }
+
+    /// Builds a line from raw text, for tests only.
+    ///
+    /// The transport's own length re-check is otherwise unreachable — the
+    /// builder refuses an over-long line first — and a guarantee nothing can
+    /// exercise is a guarantee nobody should trust (plan AC59 asks for "no
+    /// child spawned", which is a statement about the transport).
+    #[cfg(test)]
+    pub fn from_raw_for_test(line: String, account: &str, service: &str) -> Self {
+        Self {
+            line: SecretString::from(line),
+            account: account.to_owned(),
+            service: service.to_owned(),
+        }
+    }
+}
+
+impl fmt::Debug for KeychainStdinLine {
+    /// Prints the item it names and the length, never the line.
+    ///
+    /// Hand-written for the reason [`Credentials`]'s is: a derived `Debug`
+    /// would put a hex-encoded credential into any `tracing` line that
+    /// formatted one.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeychainStdinLine")
+            .field("account", &self.account)
+            .field("service", &self.service)
+            .field("len", &self.len())
+            .field("line", &"<redacted>")
+            .finish()
     }
 }
 
