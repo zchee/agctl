@@ -85,7 +85,7 @@ an undocumented endpoint faster than that. Keys: `q`, `Esc`, `Ctrl-C` or `Ctrl-D
 `r` refreshes now; arrows or `j`/`k` move the selection. (`Ctrl-C` is bound explicitly
 because raw mode swallows the terminal's own interrupt.)
 
-Two things about `watch` that are not visible from the flags:
+Three things about `watch` that are not visible from the flags:
 
 - A **scheduled** pass may be served from the 300 s usage cache and make no request at
   all. `r` always goes to the wire.
@@ -287,9 +287,21 @@ the same credentials.
 | `AGENTCTL_CLAUDE_OAUTH_SCOPES` | replaces the space-separated scope set requested at login. A diagnostic: the server grants the same five scopes whatever is asked for |
 | `RUST_LOG` | tracing filter for the diagnostics on stderr. Unset or unparseable means `warn`. `RUST_LOG=agentctl=trace` is the useful setting; no token material is ever logged at any level |
 
-Those four are the whole production surface. Every other `AGENTCTL_*` name you may find in
-the source is a test seam compiled only under the `testing` feature and absent from a
-release build — see [Build](#build) and `scripts/release-gate.sh`.
+Those four are the whole `AGENTCTL_*` surface agentctl defines. Every other `AGENTCTL_*`
+name you may find in the source is a test seam compiled only under the `testing` feature
+and absent from a release build — see [Build](#build) and `scripts/release-gate.sh`.
+
+### Read, but owned by Claude Code
+
+agentctl also reads a handful of variables it does not define, because they decide what
+Claude Code itself would do:
+
+| variable | meaning |
+|----------|---------|
+| `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR` | read on every run by `EnvView::from_process` in `src/provider/claude/namespace.rs`; together they decide which keychain service name agentctl rebuilds — see [docs/re-verify.md](docs/re-verify.md) section 1 |
+| `CLAUDE_CODE_OAUTH_TOKEN` | short-circuits Claude Code's own credential lookup; agentctl reports that row read-only and never refreshes it |
+| `HOME` | locates the live store |
+| `USER`, `LOGNAME` | the `acct` attribute every `find-generic-password` is keyed on (`src/secret/mod.rs`); an unexpected value finds nothing rather than erroring |
 
 ## Exit codes
 

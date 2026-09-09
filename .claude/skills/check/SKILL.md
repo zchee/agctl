@@ -55,7 +55,10 @@ scripts/release-gate.sh
 
 It builds `cargo build --release` (default features, no `--config`, into a scratch
 `--target-dir` that is never `./target` and never the shared `/Volumes/tmpfs/target`) and
-greps the artifact for two lists. **Nine seam names, every one of which must be absent:**
+greps the artifact for two lists. The nine seam names are one representative name per
+seam-owning module, not the whole test-only surface — `fixtures/fake-security.sh` alone
+defines nine `AGENTCTL_FAKE_SECURITY_*` names on its own. **Nine seam names, every one of
+which must be absent:**
 
 | name | owner |
 |------|-------|
@@ -66,7 +69,7 @@ greps the artifact for two lists. **Nine seam names, every one of which must be 
 | `AGENTCTL_CLAUDE_USAGE_URL` | `src/provider/claude/usage.rs` |
 | `AGENTCTL_CLAUDE_TOKEN_URL` | `src/provider/claude/oauth.rs` |
 | `AGENTCTL_CLAUDE_AUTHORIZE_URL` | `src/provider/claude/oauth.rs` |
-| `AGENTCTL_FAKE_SECURITY_LOG` | `src/secret/fake_security.rs` |
+| `AGENTCTL_FAKE_SECURITY_LOG` | `fixtures/fake-security.sh` |
 | `AGENTCTL_NO_BROWSER` | `src/commands/login.rs` |
 
 **Three production names, every one of which must be present:** `AGENTCTL_CONFIG_DIR`,
@@ -78,8 +81,9 @@ production binary means a refresh token goes wherever an environment variable po
 If the gate fails, the build enabled `testing` — never `cargo build --release
 --all-features`, never `cargo install --all-features`.
 
-Adding a new test seam means adding its name to the `seams` array in
-`scripts/release-gate.sh` **and** to the table above, in the same change that introduces it.
+One representative name per seam-owning module: a new seam-owning module adds its
+representative to the `seams` array in `scripts/release-gate.sh` **and** to the table
+above, in the same change that introduces it.
 
 Benchmarks are not part of this gate. When you do run them, run them **bare** — `cargo bench`
 with no direnv — because `layout rust_stable` pins `-C target-cpu` to the host CPU.

@@ -7,6 +7,12 @@
 #   1. none of the nine test-seam environment-variable names appear in it, and
 #   2. the three production-visible names do.
 #
+# The nine are one representative name per seam-owning module, not the whole
+# test-only surface — fixtures/fake-security.sh alone defines nine
+# AGENTCTL_FAKE_SECURITY_* names on its own. A new seam-owning module adds its
+# representative to the `seams` array below and to the table in
+# .claude/skills/check/SKILL.md, in the same change that introduces it.
+#
 # The first is the one that matters. The `testing` feature compiles overrides for
 # the OAuth token endpoint, the authorize endpoint and the usage endpoint; a
 # release binary that honoured AGENTCTL_CLAUDE_TOKEN_URL would send a refresh
@@ -20,6 +26,14 @@
 # No dev-profile cargo config is passed: this is a release build with its own
 # --target-dir.
 #
+# The build is a plain `cargo build --release`, exactly the command README
+# documents, run in whatever environment the caller has (a developer shell
+# that loads a project .envrc includes its RUSTFLAGS; a fresh clone has none).
+# The seam detection below does not depend on RUSTFLAGS either way: the seam
+# constants either do not exist at all (feature off) or are live and
+# referenced (feature on), so a dead-strip flag cannot remove them in either
+# case.
+#
 # Usage: scripts/release-gate.sh
 # Exit:  0 every check passed; 1 a check failed or the build did not produce a
 #        binary.
@@ -29,6 +43,34 @@ set -euo pipefail
 unset CDPATH
 repo_root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
+
+# Resolves $1 to an absolute, symlink-free path, without requiring that it
+# exist yet. Relative spellings, `.` and `..` components, and a target that
+# does not exist must all still land on the physical path the shared-dir
+# refusal below compares against — otherwise "target", "./target" or
+# ".../target/../target" walk past a check written against the canonical
+# spelling. The nearest existing ancestor is resolved with `cd` + `pwd -P`;
+# any path segments below that ancestor are appended back on literally.
+canonicalize() {
+	local target=$1
+	local remainder=
+	local parent
+	local resolved
+	while [ ! -d "$target" ]; do
+		remainder=$(basename -- "$target")${remainder:+/}$remainder
+		parent=$(dirname -- "$target")
+		if [ "$parent" = "$target" ]; then
+			break
+		fi
+		target=$parent
+	done
+	resolved=$(cd -- "$target" && pwd -P)
+	if [ -n "$remainder" ]; then
+		printf '%s/%s\n' "$resolved" "$remainder"
+	else
+		printf '%s\n' "$resolved"
+	fi
+}
 
 # The test-only seams. Every one of these must be ABSENT from the artifact.
 seams=(
@@ -57,6 +99,8 @@ elif [ -d /Volumes/tmpfs ]; then
 else
 	target_dir=${TMPDIR:-/tmp}/agentctl-release-gate
 fi
+
+target_dir=$(canonicalize "$target_dir")
 
 case "$target_dir" in
 "$repo_root"/target | "$repo_root"/target/* | /Volumes/tmpfs/target | /Volumes/tmpfs/target/*)
