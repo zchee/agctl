@@ -30,6 +30,13 @@ use crate::usage::model::UsageSnapshot;
 /// the reason the same address appears twice.
 pub const SAME_IDENTITY_NOTE: &str = "same identity as live";
 
+/// The `Kind` cell of a row `--by-identity` folded two rows into.
+///
+/// A composition of two [`AccountKind::name`](crate::config::AccountKind::name)
+/// values, in the order the reader meets them: the live credential first,
+/// because that is the one already in use, then the store agentctl owns.
+pub const LIVE_AND_OWNED_KIND: &str = "live+owned";
+
 /// One account, ready to render.
 #[derive(Debug, Clone)]
 pub struct StatusRow {
@@ -53,6 +60,18 @@ pub struct StatusRow {
     /// credential's, which is what puts [`SAME_IDENTITY_NOTE`] in the state
     /// cell.
     pub same_identity_as_live: bool,
+    /// The `Kind` cell: an
+    /// [`AccountKind::name`](crate::config::AccountKind::name), or
+    /// [`LIVE_AND_OWNED_KIND`] for a row two were folded into.
+    ///
+    /// Carried on every row but printed only under `--by-identity`, so the
+    /// default table keeps the ten columns plan section 3.1 fixed. `Kind` and
+    /// not `Source`: the vocabulary here is `owned`/`live`/`config_dir`/
+    /// `foreign`, which is what `accounts list`'s `Kind` column and the JSON
+    /// report's `kind` member already spell, while `source` in both of those
+    /// means `keychain`/`file`/`env`/`none` — where the bytes were read from,
+    /// a different question with a different answer.
+    pub kind: &'static str,
 }
 
 impl StatusRow {
@@ -93,6 +112,14 @@ pub struct Report {
     pub tz: TimeZone,
     /// Whether `--all` was given.
     pub show_all: bool,
+    /// Whether `--by-identity` was given, which is the only thing that puts
+    /// the `Kind` column on the table.
+    ///
+    /// The folding itself has already happened by the time a report exists —
+    /// which rows survive is a decision about accounts, and
+    /// `commands::status` makes it (see this module's opening note on why a
+    /// renderer is given no room to decide what to hide).
+    pub by_identity: bool,
 }
 
 impl Report {

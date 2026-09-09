@@ -1501,6 +1501,7 @@ fn document(outcomes: &[RowOutcome], show_all: bool, raw: bool) -> serde_json::V
         // `TZ` would only be able to fail somewhere else.
         tz: TimeZone::UTC,
         show_all,
+        by_identity: false,
     };
     let document = json_report(outcomes, &report, raw);
     crate::render::json::assert_valid(&document);
@@ -1678,6 +1679,7 @@ fn the_rendered_table_carries_the_row_the_pass_produced() {
         now: Timestamp::now(),
         tz: TimeZone::UTC,
         show_all: false,
+        by_identity: false,
     };
     let rendered = table::render(&report);
 
@@ -1727,6 +1729,7 @@ fn credits_ride_on_the_same_response_the_windows_came_from() {
         now: Timestamp::now(),
         tz: TimeZone::UTC,
         show_all: false,
+        by_identity: false,
     };
     let rendered = table::render(&report);
     assert!(rendered.contains("$219.56 / $5000.00 (4%)"), "got:\n{rendered}");
@@ -1954,6 +1957,7 @@ fn b90_the_owned_twin_of_the_live_account_is_marked_and_nothing_else_is() {
         now: Timestamp::now(),
         tz: TimeZone::UTC,
         show_all: false,
+        by_identity: false,
     };
     let rendered = table::render(&report);
     assert_eq!(
@@ -2008,4 +2012,103 @@ fn b90_a_live_row_with_no_identity_marks_nothing() {
     for row in value["rows"].as_array().expect("rows is an array") {
         assert_eq!(row["same_identity_as"], json!(null), "nothing is marked: {row:#}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// `--by-identity` (`agentctl-xq8`)
+// ---------------------------------------------------------------------------
+
+/// The `Kind` cell of each rendered row, in order.
+fn kinds(rows: &[StatusRow]) -> Vec<&'static str> {
+    rows.iter().map(|row| row.kind).collect()
+}
+
+#[test]
+fn xq8_by_identity_folds_the_live_row_into_the_owned_one_and_leaves_json_alone() {
+    // `agentctl-xq8`: one account with a live credential and a store agentctl
+    // owns renders once under the flag. The owned row is the survivor because
+    // it is the one anything can be done to — refreshed, relocated, forgotten
+    // — while the live row is read-only.
+    let store = store();
+    let server = MockServer::start();
+    usage_ok(&server);
+
+    write_credential_file(&store, &blob("sk-ant-oat01-owned", "sk-ant-ort01-owned", fresh_at()));
+    let config = owned_config_with_stranger(&store);
+    let live_blob = blob("sk-ant-oat01-live", "sk-ant-ort01-live", fresh_at());
+    let reader = reader_with(&[(LIVE_SERVICE.to_owned(), live_blob)]);
+    let found = discover_with(&store, &config, &reader);
+    let outcomes = pass(&store, &server, found, Setup::new(&server));
+
+    let plain = status_rows(&outcomes, false);
+    let folded = status_rows(&outcomes, true);
+    assert_eq!(plain.len(), outcomes.len(), "without the flag, one row per credential source");
+    assert_eq!(folded.len(), plain.len() - 1, "with it, the live row is gone");
+    assert_eq!(kinds(&plain), ["live", "owned", "owned"], "discovery order: live first");
+    assert_eq!(
+        kinds(&folded),
+        ["live+owned", "owned"],
+        "the twin absorbed it; the stranger did not"
+    );
+
+    // The `Kind` cell now says what the note said, so the note is dropped
+    // rather than repeating it in the next column but one.
+    let twin = &folded[0];
+    assert!(!twin.same_identity_as_live, "no duplicate marker under the flag");
+    assert!(
+        !twin.state_cell().contains(crate::render::SAME_IDENTITY_NOTE),
+        "got: {}",
+        twin.state_cell()
+    );
+    assert!(
+        plain.iter().any(|row| row.state_cell().contains(crate::render::SAME_IDENTITY_NOTE)),
+        "and the default table still carries it"
+    );
+
+    // The document is untouched: one object per credential source either way.
+    let value = document(&outcomes, false, false);
+    assert_eq!(
+        value["rows"].as_array().expect("rows is an array").len(),
+        plain.len(),
+        "`--json` does not fold; it says the same thing with `same_identity_as`"
+    );
+}
+
+#[test]
+fn xq8_a_failing_live_row_is_never_folded_away() {
+    // The exit status is computed from the outcomes, not from the rendered
+    // rows, so folding a failing live row would leave `status` exiting 2 with
+    // nothing on screen to explain it.
+    let store = store();
+    let server = MockServer::start();
+    usage_ok(&server);
+
+    // The keychain is locked, so the live row has no credential and fails —
+    // but `.claude.json` still names the account (fact F33), so the owned row
+    // is marked and the fold would otherwise apply.
+    fs::write(
+        store.home.join(".claude.json"),
+        json!({
+            "oauthAccount": {
+                "accountUuid": ACCT,
+                "emailAddress": "owner@example.com",
+                "organizationUuid": ORG,
+            }
+        })
+        .to_string(),
+    )
+    .expect("`.claude.json` should be writable");
+
+    write_credential_file(&store, &blob("sk-ant-oat01-owned", "sk-ant-ort01-owned", fresh_at()));
+    let config = owned_config(&store);
+    let reader = FakeReader::unlocked().with_preflight(KeychainStatus::Locked);
+    let found = discover_with(&store, &config, &reader);
+    let outcomes = pass(&store, &server, found, Setup::new(&server));
+
+    let live = row_for(&outcomes, "live", ACCT);
+    assert!(live.state.is_failure(), "the live row failed: {:?}", live.state);
+    assert!(row_for(&outcomes, "owned", ACCT).same_identity_as_live, "and it is still the twin");
+
+    let folded = status_rows(&outcomes, true);
+    assert_eq!(kinds(&folded), ["live", "live+owned"], "the failing live row is still rendered");
 }

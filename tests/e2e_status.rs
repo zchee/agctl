@@ -941,3 +941,105 @@ fn b90_the_json_report_names_the_live_twin_and_leaves_every_other_row_null() {
     }
     fixture.assert_keychain_read_only();
 }
+
+// ---------------------------------------------------------------------------
+// `--by-identity` (`agentctl-xq8`)
+// ---------------------------------------------------------------------------
+
+/// The live keychain item and exactly one owned namespace, the same account.
+///
+/// One owned account rather than two, deliberately: `Fixture::owned_record`
+/// gives every owned account the same email address (`agentctl-p95`), so a
+/// second one could not be told from the first in rendered table text. With
+/// one, the claim is a row *count* — two rows without the flag, one with it —
+/// which needs no per-row identification at all.
+fn one_identity_fixture(server: &MockServer) -> Fixture {
+    usage_ok(server);
+
+    let mut fixture = Fixture::new();
+    fixture.with_keychain().endpoints(&server.base_url());
+    fixture.dump(&[LIVE_SERVICE]);
+    fixture.keychain_item(
+        LIVE_SERVICE,
+        &common::blob("sk-ant-oat01-live", "sk-ant-ort01-live", common::fresh_at()),
+    );
+    fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
+    fixture.write_credentials(
+        ACCT,
+        ORG,
+        &common::blob("sk-ant-oat01-owned", "sk-ant-ort01-owned", common::fresh_at()),
+    );
+    fixture
+}
+
+/// The rendered rows naming `EMAIL`, which under this fixture is every data
+/// row and no heading or rule.
+fn account_lines(stdout: &str) -> Vec<&str> {
+    stdout.lines().filter(|line| line.contains(EMAIL)).collect()
+}
+
+#[test]
+fn xq8_by_identity_renders_one_row_where_the_default_table_renders_two() {
+    // `agentctl-xq8`: the symptom is one address on two rows. Without the
+    // flag both are shown, which is the default this does not change; with
+    // it, the live credential is folded into the row of the account that owns
+    // it and the `Kind` column says `live+owned`.
+    let server = MockServer::start();
+    let fixture = one_identity_fixture(&server);
+
+    let plain = fixture.cmd().args(["claude", "status"]).assert().success();
+    let plain = String::from_utf8(plain.get_output().stdout.clone()).expect("stdout is UTF-8");
+    assert_eq!(account_lines(&plain).len(), 2, "the live row and the owned row:\n{plain}");
+    assert!(!plain.contains("| Kind"), "the default table has ten columns:\n{plain}");
+    assert!(!plain.contains("live+owned"), "and no folded cell:\n{plain}");
+
+    let folded = fixture.cmd().args(["claude", "status", "--by-identity"]).assert().success();
+    let folded = String::from_utf8(folded.get_output().stdout.clone()).expect("stdout is UTF-8");
+    assert_eq!(account_lines(&folded).len(), 1, "one row per identity:\n{folded}");
+    assert!(folded.contains("Kind"), "the eleventh column is there:\n{folded}");
+    let row = account_lines(&folded)[0];
+    assert!(row.contains("live+owned"), "and the folded row says so: {row}");
+    assert!(
+        !row.contains("same identity as live"),
+        "the note would only repeat the Kind cell: {row}"
+    );
+    assert!(!row.contains("sk-ant"), "no token material reaches the table: {row}");
+    fixture.assert_keychain_read_only();
+}
+
+#[test]
+fn xq8_the_flag_does_not_change_the_json_report_at_all() {
+    // The document keeps one object per credential source under the flag as
+    // without it — a consumer reads `same_identity_as` instead. Table and
+    // JSON row counts therefore differ under the flag, which is the tradeoff
+    // the bead records.
+    let server = MockServer::start();
+    let fixture = one_identity_fixture(&server);
+
+    let plain = fixture.cmd().args(["claude", "status", "--json"]).assert().success();
+    let plain: Value =
+        serde_json::from_slice(&plain.get_output().stdout).expect("the report is JSON");
+
+    let folded =
+        fixture.cmd().args(["claude", "status", "--json", "--by-identity"]).assert().success();
+    let mut folded: Value =
+        serde_json::from_slice(&folded.get_output().stdout).expect("the report is JSON");
+
+    assert_eq!(
+        folded["rows"].as_array().expect("rows is an array").len(),
+        2,
+        "still one object per credential source:\n{folded:#}"
+    );
+    // Byte-for-byte the same document, once the two timestamps that cannot
+    // agree between two runs are set aside.
+    let mut plain = plain;
+    for document in [&mut plain, &mut folded] {
+        document["generated_at"] = json!("");
+        for row in document["rows"].as_array_mut().expect("rows is an array") {
+            row["next_reset"] = json!("");
+            row["session_reset"] = json!("");
+            row["weekly_reset"] = json!("");
+        }
+    }
+    assert_eq!(plain, folded, "`--by-identity` is a table flag and nothing else");
+}

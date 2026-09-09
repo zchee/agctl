@@ -186,10 +186,11 @@ pub fn run(cli: &Cli, args: &StatusArgs, cancel: &Cancel) -> Result<(), AppError
     // environment, not another process's — and falls back to UTC rather than
     // failing when neither says anything.
     let report = Report {
-        rows: outcomes.iter().map(RowOutcome::to_status_row).collect(),
+        rows: status_rows(&outcomes, args.by_identity),
         now: Timestamp::now(),
         tz: TimeZone::system(),
         show_all: args.all,
+        by_identity: args.by_identity,
     };
 
     // `--json` replaces the table rather than accompanying it: the document is
@@ -287,6 +288,61 @@ fn mark_same_identity(outcomes: &mut [RowOutcome]) {
         let key = (outcome.record.account_uuid.clone(), outcome.record.organization_uuid.clone());
         outcome.same_identity_as_live = live.contains(&key);
     }
+}
+
+/// The rows the table renders, with `--by-identity` applied.
+///
+/// Without the flag this is one row per credential source, unchanged. With
+/// it, an identity that has both a live credential and a store agentctl owns
+/// renders once: the owned row survives, its `Kind` cell reads `live+owned`,
+/// and the live row is dropped.
+///
+/// **The owned row is the one that survives** because it is the one anything
+/// can be done to — refreshed, relocated, forgotten — while the live row is
+/// read-only. The tradeoff is real and worth stating: under this flag the
+/// table shows the owned credential's state and figures, and the live row's
+/// own state is not rendered at all. `status` without the flag still shows
+/// both, which is why this is opt-in.
+///
+/// **A live row in a failing state is never folded away.** The exit status is
+/// computed from the outcomes, not from these rows, so hiding a failing row
+/// would leave `status` exiting 2 with nothing on screen to explain it.
+///
+/// `--json` does not come through here: the document keeps one object per
+/// credential source under the flag as without it, and says the same thing
+/// through `same_identity_as` instead (which is also what pairs the two rows
+/// up here).
+fn status_rows(outcomes: &[RowOutcome], by_identity: bool) -> Vec<StatusRow> {
+    if !by_identity {
+        return outcomes.iter().map(RowOutcome::to_status_row).collect();
+    }
+
+    let folded: Vec<(&str, &str)> =
+        outcomes.iter().filter(|outcome| outcome.same_identity_as_live).map(identity_of).collect();
+
+    outcomes
+        .iter()
+        .filter(|outcome| {
+            !(matches!(outcome.record.kind, AccountKind::Live)
+                && !outcome.state.is_failure()
+                && folded.contains(&identity_of(outcome)))
+        })
+        .map(|outcome| {
+            let mut row = outcome.to_status_row();
+            if outcome.same_identity_as_live {
+                row.kind = crate::render::LIVE_AND_OWNED_KIND;
+                // The `Kind` cell now says what the note said, so the note
+                // would only repeat it in the next column but one.
+                row.same_identity_as_live = false;
+            }
+            row
+        })
+        .collect()
+}
+
+/// A row's `(account, organization)` pair, borrowed.
+fn identity_of(outcome: &RowOutcome) -> (&str, &str) {
+    (outcome.record.account_uuid.as_str(), outcome.record.organization_uuid.as_str())
 }
 
 /// Builds the `StatusReport v1` document from a finished pass.
@@ -515,6 +571,7 @@ impl RowOutcome {
             usage: self.usage.clone(),
             visible_by_default: self.visible_by_default,
             same_identity_as_live: self.same_identity_as_live,
+            kind: self.record.kind.name(),
         }
     }
 

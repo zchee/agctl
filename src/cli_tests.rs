@@ -177,6 +177,7 @@ fn status_defaults_are_the_documented_ones() {
             assert!(!args.refresh, "refresh defaults off");
             assert!(!args.no_cache, "no_cache defaults off");
             assert!(!args.all, "all defaults off");
+            assert!(!args.by_identity, "by_identity defaults off");
             assert!(args.account.is_empty(), "account defaults empty");
             assert_eq!(args.timeout, Duration::from_secs(10), "timeout defaults to 10s");
         }
@@ -195,6 +196,7 @@ fn status_accepts_every_flag_and_repeats_account() {
         "--refresh",
         "--no-cache",
         "--all",
+        "--by-identity",
         "--account",
         "acct-a",
         "--account",
@@ -205,6 +207,7 @@ fn status_accepts_every_flag_and_repeats_account() {
     match claude_of(&cli) {
         ClaudeCommand::Status(args) => {
             assert!(args.json && args.raw && args.refresh && args.no_cache && args.all);
+            assert!(args.by_identity, "`--by-identity` is spelled with a hyphen");
             assert_eq!(args.account, vec!["acct-a".to_owned(), "acct-b/org-1".to_owned()]);
             assert_eq!(args.timeout, Duration::from_secs(300));
         }

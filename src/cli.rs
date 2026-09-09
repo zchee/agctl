@@ -216,6 +216,11 @@ pub struct StatusArgs {
     #[arg(long)]
     pub all: bool,
 
+    /// Fold the live credential into the row of the account that owns it, and
+    /// add a Kind column saying so. Table only; --json is unaffected.
+    #[arg(long)]
+    pub by_identity: bool,
+
     /// Limit the report to this account; repeat to name several.
     #[arg(long = "account", value_name = "ID")]
     pub account: Vec<String>,

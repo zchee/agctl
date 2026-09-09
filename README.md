@@ -96,6 +96,7 @@ agentctl claude status --all --refresh --timeout 30s
 | `--refresh` | refresh expired credentials agentctl owns, and bypass the usage cache |
 | `--no-cache` | bypass the usage cache without forcing a token refresh |
 | `--all` | also show the rows hidden by default (stale siblings, foreign items, forgotten services) |
+| `--by-identity` | fold the live credential into the row of the account that owns it, and add a `Kind` column; table only |
 | `--account <ID>` | limit the report to one account; repeat for several |
 | `--timeout <DUR>` | per-HTTP-request timeout, default `10s` (`10s`, `5m`, `2h`, or a bare number of seconds) |
 
@@ -108,6 +109,12 @@ Claude Code is signed in as can be the same account with two independent token p
 owned row says so, with `same identity as live` in its `State` column and
 `"same_identity_as": "live"` in `--json`; the rows stay separate, because each pair
 expires, refreshes and can be revoked on its own.
+
+`--by-identity` collapses that pair into one table row instead, with a `Kind` column
+reading `live+owned`. The owned row is the one that survives, because it is the one
+agentctl can refresh, relocate or forget. It is a table flag: `--json` still emits one
+object per credential source, so the two row counts differ under it, and a live row in a
+failing state is never folded away.
 
 ### `watch` — the same table, live
 

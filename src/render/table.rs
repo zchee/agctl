@@ -15,6 +15,16 @@
 //! untouched by that change: it is a published interface, and the soonest
 //! reset across every window is still a fact a consumer may be reading.
 //!
+//! # The eleventh column
+//!
+//! `status --by-identity` folds the live credential's row into the row of the
+//! account that owns it and adds a `Kind` column after `Plan`, where the
+//! folded row reads `live+owned`. The column exists **only** under that flag:
+//! plan section 3.1 fixed ten columns for the default table, and an opt-in
+//! view is not a reason to widen what everyone else sees. Which rows survive
+//! the fold is decided in `commands::status` — see [`crate::render`] on why a
+//! renderer is given no room to decide what to hide.
+//!
 //! # Continuation rows
 //!
 //! An account can have windows that no column names — a weekly scope other
@@ -67,6 +77,25 @@ pub const HEADINGS: [&str; 10] = [
     "State",
 ];
 
+/// The heading of the column `--by-identity` adds.
+pub const KIND_HEADING: &str = "Kind";
+
+/// Where that column goes: after `Plan`, with the other three columns that
+/// say *which account this is* rather than what it is using.
+pub const KIND_INDEX: usize = 3;
+
+/// [`HEADINGS`], plus [`KIND_HEADING`] when `by_identity`.
+///
+/// A function rather than a second constant so the ten headings stay written
+/// down exactly once: a column added to `HEADINGS` cannot be forgotten here.
+pub fn headings(by_identity: bool) -> Vec<&'static str> {
+    let mut headings = HEADINGS.to_vec();
+    if by_identity {
+        headings.insert(KIND_INDEX, KIND_HEADING);
+    }
+    headings
+}
+
 /// Renders a whole report: the table, then the hidden-row footer.
 ///
 /// A report with no shown rows still prints its headings and its footer, so
@@ -74,13 +103,17 @@ pub const HEADINGS: [&str; 10] = [
 /// itself rather than printing nothing.
 pub fn render(report: &Report) -> String {
     let mut builder = Builder::default();
-    builder.push_record(HEADINGS);
+    builder.push_record(headings(report.by_identity));
 
     for row in report.shown() {
-        builder.push_record(account_record(row, report));
+        builder.push_record(with_kind(account_record(row, report), report, row.kind));
         if let Some(usage) = &row.usage {
             for window in usage.extra_windows(HEADLINE_SCOPE) {
-                builder.push_record(continuation_record(window, report));
+                // A continuation row's kind cell is blank for the same reason
+                // its `Org` and `Plan` cells are: the window belongs to the
+                // account named above it, and repeating the account's
+                // attributes on it would read as a second account.
+                builder.push_record(with_kind(continuation_record(window, report), report, ""));
             }
         }
     }
@@ -101,6 +134,16 @@ pub fn render(report: &Report) -> String {
 pub fn footer(hidden: usize) -> String {
     let noun = if hidden == 1 { "entry" } else { "entries" };
     format!("{hidden} {noun} hidden (--all)")
+}
+
+/// A ten-cell record, with `kind` spliced in at [`KIND_INDEX`] under
+/// `--by-identity` and left out entirely otherwise.
+fn with_kind(cells: [String; 10], report: &Report, kind: &str) -> Vec<String> {
+    let mut cells = cells.to_vec();
+    if report.by_identity {
+        cells.insert(KIND_INDEX, kind.to_owned());
+    }
+    cells
 }
 
 /// One account's own row.

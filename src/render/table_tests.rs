@@ -70,6 +70,7 @@ fn healthy_row(account: &str) -> StatusRow {
         usage: Some(usage(healthy_windows(), CreditsState::Unavailable)),
         visible_by_default: true,
         same_identity_as_live: false,
+        kind: "owned",
     }
 }
 
@@ -84,11 +85,17 @@ fn empty_row(account: &str, state: &str) -> StatusRow {
         usage: None,
         visible_by_default: true,
         same_identity_as_live: false,
+        kind: "owned",
     }
 }
 
 fn report(rows: Vec<StatusRow>, show_all: bool) -> Report {
-    Report { rows, now: ts(NOW), tz: tz(), show_all }
+    Report { rows, now: ts(NOW), tz: tz(), show_all, by_identity: false }
+}
+
+/// The same report, rendered the way `--by-identity` renders it.
+fn by_identity(rows: Vec<StatusRow>) -> Report {
+    Report { rows, now: ts(NOW), tz: tz(), show_all: false, by_identity: true }
 }
 
 /// The cells of the rendered row whose first column contains `needle`.
@@ -203,6 +210,7 @@ fn degraded_states_render_with_their_notes() {
         usage: Some(usage(Vec::new(), CreditsState::Unavailable)),
         visible_by_default: true,
         same_identity_as_live: false,
+        kind: "owned",
     };
 
     insta::assert_snapshot!(
@@ -276,6 +284,7 @@ fn the_credits_cell_covers_every_state_the_column_can_reach() {
         usage: Some(usage(healthy_windows(), credits)),
         visible_by_default: true,
         same_identity_as_live: false,
+        kind: "owned",
     })
     .collect();
 
@@ -408,4 +417,79 @@ fn a_continuation_rows_reset_sits_in_the_weekly_column() {
     // Twenty-three days out: past a week, so the date names the day rather
     // than a weekday that would come round again first.
     assert_eq!(cells[column("Weekly reset")], "Oct 1 9:00 AM (23d0h)", "got:\n{rendered}");
+}
+
+// ---------------------------------------------------------------------------
+// `--by-identity` (`agentctl-xq8`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn by_identity_adds_a_kind_column_after_plan_and_the_default_table_has_none() {
+    // `agentctl-xq8`: the eleventh column is opt-in. Plan section 3.1 fixed
+    // ten columns for the default table, and an opt-in view is not a reason
+    // to widen what everyone else sees.
+    assert_eq!(headings(false), HEADINGS.to_vec(), "the default table is untouched");
+    assert!(!HEADINGS.contains(&KIND_HEADING), "`Kind` is not one of the ten");
+
+    let with = headings(true);
+    assert_eq!(with.len(), HEADINGS.len() + 1);
+    assert_eq!(with[KIND_INDEX], KIND_HEADING);
+    assert_eq!(with[KIND_INDEX - 1], "Plan", "it sits with the identification columns");
+    assert_eq!(with[KIND_INDEX + 1], "5h", "and before the first figure");
+    // Removing it again gives back exactly the ten, in order: the flag adds a
+    // column, it never reorders or renames one.
+    let mut without = with.clone();
+    without.remove(KIND_INDEX);
+    assert_eq!(without, HEADINGS.to_vec());
+}
+
+#[test]
+fn the_kind_cell_reads_live_and_owned_for_a_folded_row_and_the_plain_kind_otherwise() {
+    let mut folded = healthy_row("alice@example.com");
+    folded.kind = crate::render::LIVE_AND_OWNED_KIND;
+    let mut plain = healthy_row("bob@example.com");
+    plain.kind = "owned";
+    let rendered = render(&by_identity(vec![folded, plain]));
+
+    insta::assert_snapshot!("by_identity_kind_column", rendered);
+
+    // Asserted by column position, not by `contains`, so a cell landing in the
+    // wrong column fails here rather than passing on a substring match.
+    let heading_at = |name: &str| {
+        headings(true)
+            .iter()
+            .position(|candidate| *candidate == name)
+            .unwrap_or_else(|| panic!("`{name}` should be a heading"))
+    };
+    let kind = heading_at(KIND_HEADING);
+    assert_eq!(cells_of(&rendered, "alice@example.com")[kind], "live+owned");
+    assert_eq!(cells_of(&rendered, "bob@example.com")[kind], "owned");
+    // The figures did not shift: the column was inserted, not overlaid.
+    assert_eq!(cells_of(&rendered, "alice@example.com")[heading_at("5h")], "21%");
+}
+
+#[test]
+fn a_continuation_row_leaves_the_kind_cell_blank() {
+    // The window belongs to the account named above it, so repeating that
+    // account's kind on it would read as a second account.
+    let mut windows = healthy_windows();
+    windows.push(window(WindowKind::WeeklyScoped("opus".to_owned()), 12.0, None));
+    let mut row = healthy_row("alice@example.com");
+    row.kind = crate::render::LIVE_AND_OWNED_KIND;
+    row.usage = Some(usage(windows, CreditsState::Unavailable));
+    let rendered = render(&by_identity(vec![row]));
+
+    let continuation = rendered
+        .lines()
+        .find(|line| line.contains(CONTINUATION_MARKER))
+        .unwrap_or_else(|| panic!("a continuation row should be rendered:\n{rendered}"));
+    assert!(
+        !continuation.contains("live+owned") && !continuation.contains("owned"),
+        "the continuation row carries no kind: {continuation}"
+    );
+    assert_eq!(
+        continuation.split('|').count(),
+        headings(true).len(),
+        "and it still has one cell per column: {continuation}"
+    );
 }

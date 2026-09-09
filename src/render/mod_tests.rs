@@ -14,6 +14,7 @@ fn row(account: &str, visible: bool) -> StatusRow {
         usage: None,
         visible_by_default: visible,
         same_identity_as_live: false,
+        kind: "owned",
     }
 }
 
@@ -28,6 +29,7 @@ fn empty_row(account: &str, state: &str) -> StatusRow {
         usage: None,
         visible_by_default: true,
         same_identity_as_live: false,
+        kind: "owned",
     }
 }
 
@@ -38,6 +40,7 @@ fn hidden_rows_are_counted_but_not_shown_by_default() {
         now: ts(),
         tz: TimeZone::UTC,
         show_all: false,
+        by_identity: false,
     };
 
     let shown: Vec<&str> = report.shown().iter().map(|row| row.account.as_str()).collect();
@@ -54,6 +57,7 @@ fn all_shows_every_row_and_reports_nothing_hidden() {
         now: ts(),
         tz: TimeZone::UTC,
         show_all: true,
+        by_identity: false,
     };
 
     assert_eq!(report.shown().len(), 2);
