@@ -425,7 +425,15 @@ struct Fixture {
     /// `Tree::Live` is checked against.
     env: EnvView,
     tree: Tree,
+    /// The spelling handed to [`LockSubject`], as production hands it.
     store: PathBuf,
+    /// Where the artefacts actually land — the store as the anchor reached it.
+    ///
+    /// The two differ in the live tree, and only there: [`LockAnchor::open`]
+    /// resolves the store the environment names before it walks to it, and on
+    /// macOS `tempfile`'s spelling is never the resolved one (`$TMPDIR` lives
+    /// under `/var`, a link to `/private/var`).
+    resolved: PathBuf,
     primary: PathBuf,
     legacy: PathBuf,
     storage: PathBuf,
@@ -450,7 +458,20 @@ impl Fixture {
         Self::in_tree(Tree::Live)
     }
 
+    /// The live store reached through a symbolic link, which is what a normal
+    /// machine looks like: `$HOME/.claude` is a link to a directory elsewhere
+    /// (fact F41, `agentctl-p1-live-tree-symlinked-store-anchor-ory`).
+    fn live_through_link() -> Self {
+        Self::build(Tree::Live, true)
+    }
+
     fn in_tree(tree: Tree) -> Self {
+        Self::build(tree, false)
+    }
+
+    /// `through_link`: plant the store as a symbolic link to a directory
+    /// elsewhere under the temporary root instead of creating it in place.
+    fn build(tree: Tree, through_link: bool) -> Self {
         let root = tempfile::tempdir().expect("a temporary directory");
         let paths = Paths::with_config_dir(root.path().join("config"));
         paths.ensure_dirs().expect("the agentctl store should be creatable");
@@ -459,11 +480,28 @@ impl Fixture {
             Tree::Agentctl => paths.namespace_dir("acct", "org"),
             Tree::Live => namespace::live_store_dir(&env),
         };
-        fs::create_dir_all(&store).expect("the store directory should be creatable");
+        if through_link {
+            let target = root.path().join("elsewhere").join("claude");
+            fs::create_dir_all(&target).expect("the link target should be creatable");
+            if let Some(parent) = store.parent() {
+                fs::create_dir_all(parent).expect("the store's parent should be creatable");
+            }
+            std::os::unix::fs::symlink(&target, &store)
+                .expect("the store link should be plantable");
+        } else {
+            fs::create_dir_all(&store).expect("the store directory should be creatable");
+        }
+        // `Tree::Agentctl` resolves nothing — a link below its own root is an
+        // attack, not a configuration — so there the artefacts land under the
+        // spelling the caller handed in.
+        let resolved = match tree {
+            Tree::Agentctl => store.clone(),
+            Tree::Live => namespace::canonical(&store).expect("the live store resolves"),
+        };
 
         let timeline = Shared::default();
         let fs_spy = Arc::new(SpyFs::new(timeline.clone()));
-        let [primary, legacy, storage] = lock_paths(&store);
+        let [primary, legacy, storage] = lock_paths(&resolved);
 
         Self {
             _root: root,
@@ -471,6 +509,7 @@ impl Fixture {
             env,
             tree,
             store,
+            resolved,
             primary,
             legacy,
             storage,
@@ -2115,6 +2154,173 @@ fn a_store_that_is_not_the_live_one_cannot_claim_the_live_tree() {
     let live = Fixture::live();
     LockAnchor::open(live.subject(), &live.paths, &live.env)
         .expect("the live store is the live store");
+}
+
+// ---------------------------------------------------------------------------
+// The live store through a symbolic link
+// (`agentctl-p1-live-tree-symlinked-store-anchor-ory`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_symlinked_live_store_is_locked_where_it_resolves_to() {
+    // The default configuration on a real machine: `$HOME/.claude` is a link
+    // to a directory elsewhere (fact F41). Before this, `Tree::Live` anchored
+    // at the *lexical* parent and walked `.claude` with `O_NOFOLLOW`, so every
+    // acquire returned `Unreachable` — the live tree could not be locked at
+    // all. The naive repair, following the link but keeping `$HOME` as the
+    // anchor, is worse than the defect: the legacy artefact would be
+    // `$HOME/.claude.lock` while the peer holds `realpath(dir) + ".lock"`
+    // (fact F17), and the F54/F55 race would be lost silently.
+    let fixture = Fixture::live_through_link();
+    let clock = fixture.fake_clock();
+    let holders = FakeHolders::none_stopped();
+    let seams = fixture.seams(&clock, &holders);
+    let cancel = Cancel::new();
+
+    assert!(
+        fs::symlink_metadata(&fixture.store).expect("planted").file_type().is_symlink(),
+        "the fixture really does reach the live store through a link"
+    );
+    assert_ne!(fixture.resolved, fixture.store, "and the two spellings differ");
+
+    let acquired = fixture.acquire(&seams, &cancel, &Fault::none()).expect("an uncontended store");
+    let AcquireOutcome::Held(hold) = acquired.outcome else { panic!("expected a hold") };
+    assert_eq!(hold.tree(), Tree::Live);
+    assert_eq!(hold.store_dir(), fixture.resolved, "the hold is about the resolved store");
+
+    // The load-bearing assertion: the legacy artefact is the entry the peer
+    // names, and *not* the one beside the link.
+    let peers_spelling =
+        PathBuf::from(format!("{}{LEGACY_LOCK_SUFFIX}", fixture.resolved.display()));
+    assert_eq!(fixture.legacy, peers_spelling);
+    assert!(peers_spelling.is_dir(), "`{}` is agentctl's", peers_spelling.display());
+    let beside_the_link = PathBuf::from(format!("{}{LEGACY_LOCK_SUFFIX}", fixture.store.display()));
+    assert!(
+        !beside_the_link.exists(),
+        "and nothing was created at `{}`, which is a different entry",
+        beside_the_link.display()
+    );
+
+    for path in fixture.all() {
+        assert!(path.is_dir(), "all three are taken: `{}`", path.display());
+    }
+    let held = fixture.records().pop().expect("a held-lock record");
+    assert_eq!(held.record.store_dir, fixture.resolved);
+    assert_eq!(held.record.paths, fixture.all().to_vec());
+    // `HeldLockRecord::anchor()` is `store_dir.parent()`, and `doctor
+    // --remove-stale` walks from it with `O_NOFOLLOW`. Recording the lexical
+    // spelling would name `$HOME`, whose next component is the link — so a
+    // leaked lock could never be removed by the tool that exists to remove it.
+    assert_eq!(held.record.anchor(), fixture.resolved.parent());
+
+    drop(hold);
+    for path in fixture.all() {
+        assert!(!path.exists(), "released on drop: `{}`", path.display());
+    }
+}
+
+#[test]
+fn the_live_store_is_matched_by_identity_and_not_by_spelling() {
+    // Two spellings of one directory are one store. The environment names the
+    // link; a caller that spells the resolved target is asking about the same
+    // directory and is accepted, and both anchor at the same resolved parent.
+    let fixture = Fixture::live_through_link();
+    let by_target = LockSubject { store_dir: fixture.resolved.as_path(), tree: Tree::Live };
+    let anchor = LockAnchor::open(by_target, &fixture.paths, &fixture.env)
+        .expect("the resolved spelling names the live store");
+    assert_eq!(anchor.store_dir(), fixture.resolved);
+
+    // A sibling of the *resolved* store is not the live store, so the
+    // resolution has not turned the check into containment.
+    let sibling = fixture.resolved.with_file_name("not-claude");
+    fs::create_dir(&sibling).expect("creatable");
+    let refused = LockAnchor::open(
+        LockSubject { store_dir: &sibling, tree: Tree::Live },
+        &fixture.paths,
+        &fixture.env,
+    )
+    .expect_err("a store beside the live one is not the live one");
+    assert_eq!(refused, LockError::WrongTree { store_dir: sibling, tree: Tree::Live });
+}
+
+#[test]
+fn a_live_store_that_does_not_resolve_is_refused_before_anything_is_created() {
+    // A dangling link is not a store. The refusal is `Unreachable` rather than
+    // `WrongTree`, because the environment does name this path — it is the
+    // path that is not there.
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let paths = Paths::with_config_dir(root.path().join("config"));
+    paths.ensure_dirs().expect("the agentctl store should be creatable");
+    let env = EnvView::with_home(root.path().to_path_buf());
+    let store = namespace::live_store_dir(&env);
+    std::os::unix::fs::symlink(root.path().join("gone"), &store).expect("plantable");
+
+    let refused =
+        LockAnchor::open(LockSubject { store_dir: &store, tree: Tree::Live }, &paths, &env)
+            .expect_err("a dangling live store cannot be locked");
+    let LockError::Unreachable { path, message } = &refused else {
+        panic!("expected `Unreachable`, got {refused:?}")
+    };
+    assert_eq!(path, &store, "named by the spelling the caller used");
+    assert!(message.contains("could not be resolved"), "and why: {message}");
+    assert!(!root.path().join("gone").exists(), "and nothing was created at the target");
+}
+
+#[test]
+fn a_live_store_link_to_something_that_is_not_a_directory_is_refused() {
+    // The walk still runs after the resolution, and it still refuses. The
+    // resolved last component exists here, so this is the walk's own refusal
+    // below the resolved anchor rather than the resolution's.
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let paths = Paths::with_config_dir(root.path().join("config"));
+    paths.ensure_dirs().expect("the agentctl store should be creatable");
+    let env = EnvView::with_home(root.path().to_path_buf());
+    let target = root.path().join("a-file");
+    fs::write(&target, b"not a directory").expect("writable");
+    let store = namespace::live_store_dir(&env);
+    std::os::unix::fs::symlink(&target, &store).expect("plantable");
+
+    let refused =
+        LockAnchor::open(LockSubject { store_dir: &store, tree: Tree::Live }, &paths, &env)
+            .expect_err("a live store that resolves to a file cannot be locked");
+    assert!(matches!(refused, LockError::Unreachable { .. }), "{refused:?}");
+    assert_eq!(
+        fs::read(&target).expect("still readable"),
+        b"not a directory",
+        "and the target was left alone"
+    );
+}
+
+#[test]
+fn a_symlinked_agentctl_store_is_still_refused() {
+    // `Tree::Agentctl` is deliberately not relaxed. agentctl owns every
+    // component below its own root, so a link planted at the store is an
+    // attack rather than a configuration, and following it would put a lock
+    // wherever the attacker pointed.
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let paths = Paths::with_config_dir(root.path().join("config"));
+    paths.ensure_dirs().expect("the agentctl store should be creatable");
+    let env = EnvView::with_home(root.path().to_path_buf());
+
+    let elsewhere = root.path().join("elsewhere");
+    fs::create_dir(&elsewhere).expect("creatable");
+    let store = paths.namespace_dir("acct", "org");
+    fs::create_dir_all(store.parent().expect("a parent")).expect("creatable");
+    std::os::unix::fs::symlink(&elsewhere, &store).expect("the store link should be plantable");
+
+    let refused =
+        LockAnchor::open(LockSubject { store_dir: &store, tree: Tree::Agentctl }, &paths, &env)
+            .expect_err("a symbolic link at agentctl's own store is refused");
+    let LockError::Unreachable { path, message } = &refused else {
+        panic!("expected `Unreachable`, got {refused:?}")
+    };
+    assert_eq!(path, &store);
+    assert!(message.contains("symbolic link"), "and why: {message}");
+    assert_eq!(
+        fs::read_dir(&elsewhere).expect("readable").count(),
+        0,
+        "and nothing was created in what it pointed at"
+    );
 }
 
 // ---------------------------------------------------------------------------

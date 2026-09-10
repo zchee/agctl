@@ -534,9 +534,9 @@ struct Artefact {
 /// The two directory descriptors every lock of one hold is addressed through.
 ///
 /// Opened by a single `O_NOFOLLOW` component walk from the anchor the *tree*
-/// permits — [`Paths::namespace_root`] for [`Tree::Agentctl`], the live store's
-/// parent for [`Tree::Live`] — and kept for the life of the hold. Two
-/// consequences, and both are the point:
+/// permits — [`Paths::namespace_root`] for [`Tree::Agentctl`], the *resolved*
+/// live store's parent for [`Tree::Live`] — and kept for the life of the hold.
+/// Two consequences, and both are the point:
 ///
 /// - a symbolic link anywhere below the anchor is refused **before** the first
 ///   `mkdir`, so nothing is created in whatever it pointed at;
@@ -551,7 +551,14 @@ pub struct LockAnchor {
     /// The store directory's own name inside `parent` — the spelling the walk
     /// accepted, which is what the legacy lock's name is built from.
     store_name: OsString,
-    /// The store directory as the caller spelled it, for records and messages.
+    /// The store directory the walk actually reached, for records and messages.
+    ///
+    /// For [`Tree::Agentctl`] that is the caller's own spelling, which is
+    /// already a path below [`Paths::namespace_root`] with no link in it. For
+    /// [`Tree::Live`] it is the *resolved* store (see [`LockAnchor::open`]),
+    /// because the live store is reached through a symbolic link on a normal
+    /// machine and the caller's spelling would then name neither the directory
+    /// the artefacts are in nor the entry the legacy lock is.
     store_dir: PathBuf,
     /// Which tree the walk proved it is in.
     tree: Tree,
@@ -567,7 +574,8 @@ impl LockAnchor {
     /// [`LockError::WrongTree`] when the store directory is neither under
     /// [`Paths::namespace_root`] (for [`Tree::Agentctl`]) nor the live store
     /// itself (for [`Tree::Live`]), and [`LockError::Unreachable`] when the
-    /// walk refuses a component or cannot find one.
+    /// walk refuses a component, cannot find one, or — for [`Tree::Live`] —
+    /// when the store this environment names cannot be resolved at all.
     pub fn open(subject: LockSubject<'_>, paths: &Paths, env: &EnvView) -> Result<Self, LockError> {
         let store_dir = subject.store_dir;
         let wrong_tree =
@@ -577,31 +585,83 @@ impl LockAnchor {
         // the choice binding: a store that is not below the anchor cannot be
         // reached from it at all (`strip_prefix` fails inside the walk), and one
         // that is below it is reached one `O_NOFOLLOW` component at a time.
-        let anchor = match subject.tree {
+        let (anchor, store_path) = match subject.tree {
             Tree::Agentctl => {
                 if !paths.is_under_namespace_root(store_dir) {
                     return Err(wrong_tree());
                 }
-                paths.namespace_root()
+                // Nothing is resolved here, and that is the difference between
+                // the two trees: agentctl owns every component below its own
+                // root, so a symbolic link at one of them is an attack rather
+                // than a configuration, and the walk below refuses it.
+                (paths.namespace_root(), store_dir.to_path_buf())
             }
             Tree::Live => {
-                // Equality, not containment: `live` means *the* live store, the
-                // one this environment names, and nothing else. W4b is the
-                // increment that lets a break reach it, and a store that merely
-                // sits beside it is not it.
-                if store_dir != namespace::live_store_dir(env) {
+                // The live store is *the* store this environment names — and on
+                // a normal machine it names it through a symbolic link:
+                // `~/.claude` pointing somewhere else is the configuration this
+                // was developed against (fact F41). So the store is resolved
+                // once, here, and everything downstream is derived from the
+                // resolved path:
+                //
+                // - the walk below starts at the **resolved parent** and has one
+                //   component left to open, which by construction is not a link,
+                //   so `Tree::Live` is reachable at all rather than permanently
+                //   `Unreachable`;
+                // - `store_name` — and therefore the legacy lock — is the
+                //   resolved last component, which is the entry the peer creates
+                //   (`realpath(dir) + ".lock"`, fact F17). Following the link but
+                //   keeping the caller's lexical parent would put agentctl's
+                //   legacy lock at `$HOME/.claude.lock` while a Claude Code
+                //   session held `<target>.lock`: two different entries, and the
+                //   F54/F55 race the legacy lock exists to lose would be back.
+                //
+                // Resolving does not weaken the walk. A link swapped in at the
+                // resolved location after this line is still refused by the
+                // `O_NOFOLLOW` open, and every artefact is then addressed
+                // through the descriptor rather than through a path.
+                let named = namespace::live_store_dir(env);
+                let live = namespace::canonical(&named);
+                // Identity, not spelling — but the tree check first, and in that
+                // order for a reason. A store that is not the live one is
+                // `WrongTree` whether or not a live store exists at all, so the
+                // resolution failure is held rather than raised until the caller
+                // has been shown to be asking about the live store. Accepted:
+                // the characters the environment names, and any spelling that
+                // resolves to the same directory. Refused: a spelling that
+                // resolves elsewhere, and one that does not resolve — a path
+                // that is not there is not this directory.
+                //
+                // Only the *acceptance* consults the caller's spelling. What is
+                // walked and locked below is derived from `named` alone, so no
+                // swap between these two resolutions can point the hold at a
+                // directory the environment does not name.
+                let is_live = store_dir == named
+                    || match (&live, namespace::canonical(store_dir)) {
+                        (Ok(resolved), Ok(given)) => *resolved == given,
+                        _ => false,
+                    };
+                if !is_live {
                     return Err(wrong_tree());
                 }
+                let resolved = live.map_err(|err| LockError::Unreachable {
+                    path: store_dir.to_path_buf(),
+                    message: format!(
+                        "the live store `{}` could not be resolved: {err}",
+                        named.display()
+                    ),
+                })?;
                 // The legacy lock is the store's sibling, so the anchor has to
                 // be the parent — and the store's own component is still walked
                 // `O_NOFOLLOW` below it.
-                store_dir.parent().ok_or_else(wrong_tree)?.to_path_buf()
+                let parent = resolved.parent().ok_or_else(wrong_tree)?.to_path_buf();
+                (parent, resolved)
             }
         };
 
-        let store_name = store_dir.file_name().ok_or_else(wrong_tree)?.to_os_string();
-        let store = file_store::open_dir_under(&anchor, store_dir).map_err(|err| {
-            LockError::Unreachable { path: store_dir.to_path_buf(), message: err.to_string() }
+        let store_name = store_path.file_name().ok_or_else(wrong_tree)?.to_os_string();
+        let store = file_store::open_dir_under(&anchor, &store_path).map_err(|err| {
+            LockError::Unreachable { path: store_path.clone(), message: err.to_string() }
         })?;
 
         // The parent by descriptor rather than by a second walk: `..` inside an
@@ -615,18 +675,12 @@ impl LockAnchor {
             | rustix::fs::OFlags::CLOEXEC;
         let parent = rustix::fs::openat(&store, "..", flags, rustix::fs::Mode::empty()).map_err(
             |errno| LockError::Unreachable {
-                path: store_dir.to_path_buf(),
+                path: store_path.clone(),
                 message: format!("its parent directory could not be opened: {errno}"),
             },
         )?;
 
-        Ok(Self {
-            store,
-            parent,
-            store_name,
-            store_dir: store_dir.to_path_buf(),
-            tree: subject.tree,
-        })
+        Ok(Self { store, parent, store_name, store_dir: store_path, tree: subject.tree })
     }
 
     /// The store directory this hold is about.
@@ -1073,16 +1127,23 @@ struct LockPlan {
 ///
 /// The legacy lock's name comes from the **opened chain** — the store
 /// directory's own component as the `O_NOFOLLOW` walk accepted it, placed in
-/// the parent that walk reached — and not from `realpath`. Fact F17 says the
-/// peer names it after the resolved directory, and this produces exactly that
-/// directory entry, because a walk that refused every symbolic link below the
-/// anchor has already resolved everything `realpath` would have: the parent
-/// descriptor is the resolved parent's inode. Calling `canonicalize` instead
-/// would ask the kernel to *follow* a link planted at the store, which is
-/// precisely the redirection this hold must not accept — the lexical and
-/// resolved spellings of the path differ on macOS in the common case
-/// (`$TMPDIR` lives under `/var`, a link to `/private/var`), and both name the
-/// same entry in the same directory.
+/// the parent that walk reached. Fact F17 says the peer names it after the
+/// resolved directory, and this produces exactly that directory entry, because
+/// a walk that refused every symbolic link below the anchor has already
+/// resolved everything `realpath` would have: the parent descriptor is the
+/// resolved parent's inode. That is why the lexical and resolved spellings of
+/// the *path* may differ — on macOS they do in the common case, `$TMPDIR`
+/// living under `/var`, a link to `/private/var` — while still naming the same
+/// entry in the same directory.
+///
+/// [`Tree::Live`] is the one tree whose store is resolved before the walk, and
+/// the two rules meet rather than conflict: [`LockAnchor::open`] resolves the
+/// store *the environment names* once, so what this function is handed is
+/// already the resolved path, and the component it names the legacy lock after
+/// is the resolved last component. Nothing here calls `canonicalize` on a
+/// directory the walk has opened, which would be asking the kernel to follow a
+/// link planted at the store between the two — the redirection this hold must
+/// not accept.
 fn plan(anchor: &LockAnchor) -> [LockPlan; 3] {
     let mut legacy_name = anchor.store_name.clone();
     legacy_name.push(LEGACY_LOCK_SUFFIX);
