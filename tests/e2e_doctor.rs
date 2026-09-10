@@ -1,6 +1,7 @@
 #![cfg(feature = "testing")]
 
-//! `doctor`'s isolation section, driven through the real binary (plan AC58).
+//! `doctor`'s isolation section, driven through the real binary (plan AC58),
+//! and the store block's own audit-log row (`agctl-9je`).
 //!
 //! Like `tests/e2e_isolate.rs`, these only exercise the session-directory
 //! half of the store: no test here installs the fake `security(1)`, and every
@@ -104,4 +105,48 @@ fn ac58_the_isolation_section_says_the_root_is_empty_with_no_sessions() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(stdout.contains("has no isolated sessions"), "{stdout}");
+}
+
+/// The audit log's own row in the store block: `doctor` names a mode `append`
+/// refuses, and repairs nothing (`agctl-9je`).
+///
+/// The log lives in the same directory as the held-lock records, so the
+/// attacker who could plant one name could plant the other — and this file is
+/// the only durable evidence a broken lock leaves. A wrong mode is therefore a
+/// state to report, not one to quietly fix: a `chmod` here would erase the
+/// evidence that somebody else can read this machine's swap history.
+#[test]
+fn the_store_block_names_an_audit_log_agctl_refuses_and_leaves_its_mode_alone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
+    let log = fixture.audit_log_path();
+    fs::create_dir_all(log.parent().expect("the log path has a parent"))
+        .expect("the namespace root should be creatable");
+    fs::write(&log, "").expect("the log fixture should be writable");
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o644))
+        .expect("the mode should be settable");
+
+    let output =
+        fixture.cmd().args(["claude", "doctor"]).output().expect("`claude doctor` should run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("audit log"), "{stdout}");
+    assert!(stdout.contains(&log.display().to_string()), "the row names the file:\n{stdout}");
+    assert!(
+        stdout.contains("its mode is 0644 and not 0600"),
+        "the row names the mode it found:\n{stdout}"
+    );
+    assert!(stdout.contains("will not change it"), "and says it will not repair it:\n{stdout}");
+
+    let mode = fs::symlink_metadata(&log).expect("stat-able").permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o644, "reported, never repaired");
+
+    // The same row tracks the fix: nothing else about the store changed.
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o600)).expect("the mode is settable");
+    let second =
+        fixture.cmd().args(["claude", "doctor"]).output().expect("`claude doctor` should run");
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(stdout.contains("audit log"), "{stdout}");
+    assert!(!stdout.contains("its mode is"), "a 0600 log is reported as present:\n{stdout}");
 }

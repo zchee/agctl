@@ -21,8 +21,14 @@
 //!
 //! One JSON object per line, `O_APPEND`, mode 0600, `fsync` per entry, at
 //! `<config_dir>/claude/keychain-writes.jsonl`. One `write` syscall per entry
-//! keeps two agctl processes from interleaving half-lines. The
-//! provenance fields — `ts`, `monotonic_ms`, `agctl_pid` — come first and
+//! keeps two agctl processes from interleaving half-lines. The log is
+//! reached through the same `O_NOFOLLOW` walk the held-lock records are
+//! ([`open_log_dir`], `agctl-9je`): it sits in `held-locks`' own directory, so
+//! whoever could plant that name could otherwise redirect the record of the
+//! break — and a mode that is not 0600 is refused rather than repaired, and
+//! named by `doctor` through [`log_state`].
+//!
+//! The provenance fields — `ts`, `monotonic_ms`, `agctl_pid` — come first and
 //! belong to *this* process; the plan moved `agctl_pid` up here precisely
 //! so it cannot be read as the pid of somebody else's lock holder (ledger
 //! #70), which the vocabulary in [`HolderEvidence`] never names.
@@ -36,14 +42,24 @@
 )]
 
 use std::fmt;
-use std::fs;
+use std::fs::File;
+use std::io;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::AsFd;
+use std::os::fd::BorrowedFd;
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Instant;
 
 use jiff::Timestamp;
+use rustix::fs::AtFlags;
+use rustix::fs::FileType;
+use rustix::fs::Mode;
+use rustix::fs::OFlags;
+use rustix::io::Errno;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
@@ -52,12 +68,21 @@ use serde::Serializer;
 use crate::config::paths::FILE_MODE;
 use crate::config::paths::Paths;
 use crate::error::AppError;
+use crate::secret::file_store;
+use crate::secret::file_store::FileStoreError;
 
 /// The log's file name, under [`Paths::namespace_root`].
 pub const LOG_FILE: &str = "keychain-writes.jsonl";
 
 /// How many hex digits of a digest an entry may carry (risk R34).
 pub const DIGEST_PREFIX_LEN: usize = 8;
+
+/// The permission bits [`append`] creates the log with, and the only ones it
+/// will write through.
+///
+/// The same 0600 [`FILE_MODE`] spells for the rest of the store, in the form
+/// `openat` takes.
+const LOG_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
 
 /// When this process started, for [`AuditEntry::monotonic_ms`].
 ///
@@ -377,16 +402,28 @@ impl fmt::Display for AuditId {
 
 /// Appends one entry and returns its identity.
 ///
-/// The file is created 0600 if it is absent, opened `O_APPEND`, written with a
-/// single `write` and `fsync`ed before this returns — because the whole point
-/// of the record is to survive the crash that happens next.
+/// The file is created 0600 if it is absent, opened `O_APPEND` through
+/// [`open_log`]'s walk, written with a single `write` and `fsync`ed before
+/// this returns — because the whole point of the record is to survive the
+/// crash that happens next.
 ///
 /// # Errors
 ///
 /// Returns [`AppError::Config`] when the entry carries a digest field that is
 /// not exactly [`DIGEST_PREFIX_LEN`] lowercase hex digits — the guard that
-/// keeps risk R34 from arriving through a caller — or when the entry cannot be
-/// serialized, and [`AppError::Io`] when the log cannot be created or written.
+/// keeps risk R34 from arriving through a caller — when the entry cannot be
+/// serialized, and when the log itself is refused: a symbolic link at its
+/// name, a link on the way to it, something that is not a regular file, or a
+/// mode that is not 0600 ([`LogState`]). [`AppError::Io`] is the remaining
+/// arm, for a log that cannot be written or flushed.
+///
+/// Both arms are the ones this function already had, and both callers —
+/// `commands::use`'s `audit_append` and
+/// [`status`](crate::commands::status)'s — treat any `Err` the same way: the
+/// entry is not written, the failure is logged, and the swap or the row
+/// carries on. A refused log therefore means the `broken` line
+/// [`AuditEvent::LockBreak`] exists to produce is absent — fail-closed, and
+/// the same shape as every other unwritable log.
 pub fn append(paths: &Paths, entry: &AuditEntry) -> Result<AuditId, AppError> {
     if let AuditEvent::Write { from_digest8, to_digest8, .. } = &entry.event {
         if let Some(from) = from_digest8 {
@@ -402,13 +439,7 @@ pub fn append(paths: &Paths, entry: &AuditEntry) -> Result<AuditId, AppError> {
 
     paths.ensure_dirs()?;
     let path = log_path(paths);
-    let mut file =
-        fs::OpenOptions::new().append(true).create(true).mode(FILE_MODE).open(&path).map_err(
-            |err| AppError::Io {
-                context: format!("could not open the audit log `{}`", path.display()),
-                source: err,
-            },
-        )?;
+    let mut file = open_log(paths, &path)?;
     file.write_all(line.as_bytes()).map_err(|err| AppError::Io {
         context: format!("could not append to the audit log `{}`", path.display()),
         source: err,
@@ -419,6 +450,202 @@ pub fn append(paths: &Paths, entry: &AuditEntry) -> Result<AuditId, AppError> {
     })?;
 
     Ok(entry.id())
+}
+
+// ---------------------------------------------------------------------------
+// Reaching the log: one walk, and no name resolved by path
+// ---------------------------------------------------------------------------
+
+/// What is at the log's name, seen through the same walk [`append`] writes
+/// through.
+///
+/// The vocabulary exists so the refusal and the report cannot drift: `append`
+/// hands [`LogState::note`]'s sentence to its caller, and `doctor` prints the
+/// same sentence in its `audit log` row. A wrong mode is a *state*, never a
+/// repair — the file belongs to whoever set it that way, and agctl saying so
+/// is worth more than agctl quietly making it look right.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogState {
+    /// Nothing is there: a store that has never appended.
+    Absent,
+    /// A regular file at mode 0600 — the one shape [`append`] writes to.
+    Present,
+    /// A regular file whose permission bits are something else, carrying them.
+    WrongMode(u32),
+    /// A symbolic link at the log's name, a link on the way to it, or
+    /// something that is not a regular file at all.
+    Refused(String),
+}
+
+impl LogState {
+    /// The sentence `doctor` prints, and the reason [`append`]'s refusal
+    /// carries.
+    pub fn note(&self) -> String {
+        match self {
+            Self::Absent => "absent".to_owned(),
+            Self::Present => "present".to_owned(),
+            Self::WrongMode(mode) => format!(
+                "present, but its mode is {mode:04o} and not {FILE_MODE:04o}: agctl refuses \
+                 the log and will not change it"
+            ),
+            Self::Refused(why) => why.clone(),
+        }
+    }
+
+    /// Whether [`append`] will write to what is at that name.
+    pub fn is_appendable(&self) -> bool {
+        matches!(self, Self::Absent | Self::Present)
+    }
+}
+
+/// What is at the audit log's name, for `doctor`'s report.
+///
+/// Reads through [`open_log_dir`]'s walk, so what it reports is what [`append`]
+/// would meet rather than what a second path resolution would find. A store
+/// with no namespace root at all reads as [`LogState::Absent`]: it has never
+/// appended.
+pub fn log_state(paths: &Paths) -> LogState {
+    match open_log_dir(paths) {
+        Ok(dir) => state_at(dir.as_fd()),
+        Err(err) if is_absent(&err) => LogState::Absent,
+        Err(err) => LogState::Refused(format!("unreachable: {err}")),
+    }
+}
+
+/// Opens the log for one append, refusing a link at its name and a mode that
+/// is not 0600.
+///
+/// The log lives in [`Paths::namespace_root`], the directory
+/// [`held_locks`](crate::secret::held_locks) keeps its records in, so the
+/// attacker who could plant `held-locks` as a symbolic link could plant this
+/// name too — and this file is the only durable evidence a broken lock leaves
+/// (`agctl-9je`, from the T6 security review). The directory is therefore
+/// resolved once, one `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` component at a
+/// time from [`Paths::config_dir`] down, and the log is opened relative to the
+/// descriptor that walk produced with `O_NOFOLLOW` on its own name. Nothing is
+/// resolved by path twice.
+///
+/// The mode is checked on the open descriptor, not on the name, so there is no
+/// window between the check and the write. It is **refused, never repaired**:
+/// a `chmod` here would erase the evidence that somebody else can read this
+/// machine's swap history.
+fn open_log(paths: &Paths, path: &Path) -> Result<File, AppError> {
+    let dir = open_log_dir(paths)
+        .map_err(|err| refused(path, &format!("its directory is unreachable: {err}")))?;
+
+    // `O_NONBLOCK` is not decoration: without it a FIFO planted at this name
+    // — one `mkfifo`, the same precondition as the symbolic link — blocks the
+    // `openat` until a reader arrives, and `append` runs with the namespace
+    // lock held, so the whole store wedges instead of one entry failing. With
+    // it the open returns `ENXIO` at once and the FIFO is refused as what it
+    // is. It changes nothing for a regular file, which is why `read_file_at`
+    // has carried it all along.
+    let flags = OFlags::WRONLY
+        | OFlags::APPEND
+        | OFlags::CREATE
+        | OFlags::NOFOLLOW
+        | OFlags::NONBLOCK
+        | OFlags::CLOEXEC;
+    let fd = match rustix::fs::openat(&dir, LOG_FILE, flags, LOG_MODE) {
+        Ok(fd) => fd,
+        // The open has already refused: `O_NOFOLLOW` followed nothing and
+        // `O_CREAT` without `O_TRUNC` wrote nothing. All this second look
+        // decides is which sentence the caller is handed — the reasoning
+        // `file_store::open_dir_at` gives for its own `lstat`.
+        Err(errno) => return Err(refused(path, &why_open_failed(dir.as_fd(), errno))),
+    };
+
+    let file = File::from(fd);
+    let meta = file.metadata().map_err(|err| AppError::Io {
+        context: format!("could not stat the audit log `{}`", path.display()),
+        source: err,
+    })?;
+    if !meta.is_file() {
+        return Err(refused(path, "it is not a regular file"));
+    }
+    let mode = meta.mode() & 0o7777;
+    if mode != FILE_MODE {
+        return Err(refused(path, &LogState::WrongMode(mode).note()));
+    }
+    Ok(file)
+}
+
+/// The log's whole text, or `None` when there is nothing there to read.
+///
+/// [`tail`]'s half of the same walk. The reader must refuse what the writer
+/// refuses — `use --undo` acts on what this returns, so a log somebody else
+/// could redirect would be an undo somebody else could direct — but it does
+/// **not** apply the mode rule: a log at 0644 is one `doctor` must still be
+/// able to report, and reading it discloses nothing that its mode has not
+/// already disclosed.
+fn read_log(paths: &Paths, path: &Path) -> Result<Option<String>, AppError> {
+    let dir = match open_log_dir(paths) {
+        Ok(dir) => dir,
+        // A store with no namespace root has never appended.
+        Err(err) if is_absent(&err) => return Ok(None),
+        Err(err) => return Err(refused(path, &format!("its directory is unreachable: {err}"))),
+    };
+
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = match rustix::fs::openat(&dir, LOG_FILE, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(errno) if errno == Errno::NOENT => return Ok(None),
+        Err(errno) => return Err(refused(path, &why_open_failed(dir.as_fd(), errno))),
+    };
+
+    let mut file = File::from(fd);
+    io::read_to_string(&mut file).map(Some).map_err(|err| AppError::Io {
+        context: format!("could not read the audit log `{}`", path.display()),
+        source: err,
+    })
+}
+
+/// The directory the log lives in, opened without following a link.
+///
+/// Anchored at [`Paths::config_dir`] and walked down to
+/// [`Paths::namespace_root`], so the `claude` component itself — the one a
+/// planter would swap — is opened `O_NOFOLLOW` like every other.
+fn open_log_dir(paths: &Paths) -> Result<OwnedFd, FileStoreError> {
+    file_store::open_dir_under(paths.config_dir(), &paths.namespace_root())
+}
+
+/// What is at [`LOG_FILE`] inside an already-opened directory.
+fn state_at(dir: BorrowedFd<'_>) -> LogState {
+    match rustix::fs::statat(dir, LOG_FILE, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Symlink => {
+                LogState::Refused("a symbolic link, which agctl will not append through".to_owned())
+            }
+            FileType::RegularFile => match u32::from(stat.st_mode) & 0o7777 {
+                FILE_MODE => LogState::Present,
+                other => LogState::WrongMode(other),
+            },
+            _ => LogState::Refused("not a regular file".to_owned()),
+        },
+        Err(errno) if errno == Errno::NOENT => LogState::Absent,
+        Err(errno) => LogState::Refused(format!("could not be examined: {errno}")),
+    }
+}
+
+/// Why an open of the log failed, in the user's terms.
+///
+/// [`state_at`] first, because "a symbolic link" is a better answer than
+/// `ELOOP`; the errno when the name says nothing useful — the open failed for
+/// a reason that is not about the shape of what is there, or lost a race with
+/// somebody changing it.
+fn why_open_failed(dir: BorrowedFd<'_>, errno: Errno) -> String {
+    let state = state_at(dir);
+    if state.is_appendable() { format!("it could not be opened: {errno}") } else { state.note() }
+}
+
+/// Whether a walk failed because the directory is simply not there.
+fn is_absent(err: &FileStoreError) -> bool {
+    matches!(err, FileStoreError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound)
+}
+
+/// The refusal both halves of this module hand back.
+fn refused(path: &Path, why: &str) -> AppError {
+    AppError::Config(format!("the audit log `{}` is refused: {why}", path.display()))
 }
 
 /// What one [`tail`] read found: the entries it could parse, and the lines it
@@ -449,23 +676,18 @@ pub struct Tail {
 /// members* is not unreadable either — serde ignores them, so a log written by
 /// a later agctl still reads here (principle P3).
 ///
+/// The read goes through [`read_log`]'s `O_NOFOLLOW` walk, the same one
+/// [`append`] writes through.
+///
 /// # Errors
 ///
-/// Returns [`AppError::Io`] when the log exists but cannot be opened or read at
-/// all. That is a different failure from a line this build cannot parse, and it
-/// is the only one that leaves the caller with nothing to report.
+/// Returns [`AppError::Config`] when the log is refused — a symbolic link at
+/// its name or on the way to it — and [`AppError::Io`] when it exists but
+/// cannot be opened or read at all. Both are a different failure from a line
+/// this build cannot parse, and both leave the caller with nothing to report.
 pub fn tail(paths: &Paths, n: usize) -> Result<Tail, AppError> {
     let path = log_path(paths);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Tail::default()),
-        Err(err) => {
-            return Err(AppError::Io {
-                context: format!("could not read the audit log `{}`", path.display()),
-                source: err,
-            });
-        }
-    };
+    let Some(text) = read_log(paths, &path)? else { return Ok(Tail::default()) };
 
     let numbered: Vec<(usize, &str)> = text
         .lines()

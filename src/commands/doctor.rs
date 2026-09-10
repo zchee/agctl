@@ -89,6 +89,7 @@ use crate::runtime::proc;
 use crate::secret::KeychainReader;
 use crate::secret::KeychainStatus;
 use crate::secret::ServiceEntry;
+use crate::secret::audit;
 use crate::secret::file_store;
 use crate::secret::foreign_activity::REFRESH_LOCK;
 use crate::secret::foreign_activity::STORAGE_WRITE_LOCK;
@@ -188,6 +189,15 @@ pub fn report(
     out.push(format!("  config dir       {}", doctor.paths.config_dir().display()));
     out.push(format!("  namespace root   {}", doctor.paths.namespace_root().display()));
     out.push(format!("  registry         {}", state_of(&doctor.paths.config_file())));
+    // Always a row, not only when something is wrong: the log is the only
+    // durable evidence a crashed swap or a broken lock leaves (invariant I16),
+    // and a mode `append` refuses is a state this report exists to name —
+    // `agctl` refuses such a log and never repairs it (`agctl-9je`).
+    out.push(format!(
+        "  audit log        {} ({})",
+        audit::log_path(doctor.paths).display(),
+        audit::log_state(doctor.paths).note()
+    ));
     out.push(format!("  accounts         {} recorded", config.accounts.len()));
 
     out.push(String::new());

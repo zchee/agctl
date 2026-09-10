@@ -434,3 +434,261 @@ fn the_log_lives_beside_the_namespaces() {
     let (_dir, paths) = store();
     assert_eq!(log_path(&paths), paths.namespace_root().join("keychain-writes.jsonl"));
 }
+
+// ---------------------------------------------------------------------------
+// The log is reached through a walk (`agctl-9je`)
+// ---------------------------------------------------------------------------
+
+/// A store whose namespace root exists, ready for something to be planted at
+/// the log's name.
+///
+/// `ensure_dirs` rather than `create_dir_all`, because that is what `append`
+/// itself runs first: a test that set the directory up differently would be
+/// testing a store `append` never meets.
+fn store_with_root() -> (TempDir, Paths) {
+    let (dir, paths) = store();
+    paths.ensure_dirs().expect("the store directories should be creatable");
+    (dir, paths)
+}
+
+/// One way of planting something at the log's name: what to call it in a
+/// failure, and what to leave there. Spelled like `held_locks_tests`' own,
+/// because it is the same guard for the neighbouring file.
+type Plant = (&'static str, fn(&std::path::Path));
+
+/// Every name directly inside one directory, sorted.
+fn entries_of(dir: &std::path::Path) -> Vec<std::ffi::OsString> {
+    let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(dir)
+        .expect("the directory should be readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    names.sort();
+    names
+}
+
+fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::symlink_metadata(path).expect("stat-able").permissions().mode() & 0o7777
+}
+
+#[test]
+fn append_refuses_a_symlink_planted_at_the_log() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, paths) = store_with_root();
+
+    // Whoever can plant `<namespace_root>/held-locks` can plant this name,
+    // one directory entry over — the T6 review's precondition, and the whole
+    // reason this is a P2 rather than the P3 it was filed as.
+    let elsewhere = dir.path().join("somebody-elses.jsonl");
+    std::fs::write(&elsewhere, "planted\n").expect("the target should be writable");
+    // 0600, deliberately: at the umask's 0644 the mode check would refuse a
+    // followed link too, and this test would pass while `O_NOFOLLOW` was
+    // gone. At 0600 the only thing standing between `append` and the target
+    // is the flag, so removing it makes the append *succeed* and this test
+    // fail on the two assertions that matter.
+    std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o600))
+        .expect("the target's mode should be settable");
+    std::os::unix::fs::symlink(&elsewhere, log_path(&paths)).expect("the link should be plantable");
+
+    let entry = AuditEntry::new(write_event("aabbccdd", None));
+    let err = append(&paths, &entry).expect_err("a symbolic link at the log is refused");
+
+    assert!(err.to_string().contains("symbolic link"), "{err}");
+    assert!(!err.to_string().contains("mode"), "refused as a link, not for its mode: {err}");
+    assert_eq!(
+        std::fs::read_to_string(&elsewhere).expect("readable"),
+        "planted\n",
+        "the link's target is not appended to, which is the whole point"
+    );
+    assert!(
+        std::fs::symlink_metadata(log_path(&paths)).expect("stat-able").is_symlink(),
+        "what agctl refuses it also leaves alone: nothing is repaired or replaced"
+    );
+}
+
+#[test]
+fn append_refuses_a_fifo_planted_at_the_log() {
+    // The other one-command plant (`mkfifo <namespace_root>/keychain-writes.jsonl`),
+    // and the one that is worse than a redirect: an `openat` for writing
+    // blocks on a FIFO until a reader arrives, and `append` runs with the
+    // namespace lock held, so without `O_NONBLOCK` the store wedges rather
+    // than the entry failing. Made with `mkfifo(1)` because rustix's
+    // `mkfifoat` is not compiled on Apple platforms and `libc::mkfifo` would
+    // need an `unsafe` block outside `runtime/proc.rs`.
+    let (_dir, paths) = store_with_root();
+    let path = log_path(&paths);
+    let made = std::process::Command::new("/usr/bin/mkfifo")
+        .arg(&path)
+        .status()
+        .expect("`mkfifo` should be runnable");
+    assert!(made.success(), "the FIFO should be plantable");
+
+    // On a helper thread with a deadline, so a regression to the blocking
+    // flag set reads as a failed test rather than as a suite that never
+    // finishes. The thread is left blocked in that case; the test binary
+    // exits and takes it with it.
+    let before = entries_of(&paths.namespace_root());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let store = paths.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(append(&store, &AuditEntry::new(write_event("aabbccdd", None))).is_ok());
+    });
+    let appended = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("`append` must return rather than block on the FIFO: `O_NONBLOCK` is missing");
+    assert!(!appended, "a FIFO at the log's name is refused");
+
+    let kind = std::fs::symlink_metadata(&path).expect("stat-able").file_type();
+    assert!(
+        std::os::unix::fs::FileTypeExt::is_fifo(&kind),
+        "what agctl refuses it leaves alone: still a FIFO, neither unlinked nor replaced"
+    );
+    assert_eq!(
+        entries_of(&paths.namespace_root()),
+        before,
+        "and the refusal created nothing beside it"
+    );
+}
+
+#[test]
+fn append_refuses_a_log_whose_mode_is_not_0600_and_does_not_repair_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, paths) = store_with_root();
+    let path = log_path(&paths);
+    std::fs::write(&path, "{\"already\":\"here\"}\n").expect("the log should be writable");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        .expect("the mode should be settable");
+
+    let err = append(&paths, &AuditEntry::new(write_event("aabbccdd", None)))
+        .expect_err("a world-readable log is refused");
+
+    assert!(err.to_string().contains("0644"), "the refusal names the mode it found: {err}");
+    assert_eq!(mode_of(&path), 0o644, "refused, never repaired: agctl does not chmod evidence");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("readable"),
+        "{\"already\":\"here\"}\n",
+        "and nothing was appended to it"
+    );
+}
+
+#[test]
+fn append_refuses_a_symlink_planted_at_the_namespace_root() {
+    let (dir, paths) = store_with_root();
+
+    // The directory itself swapped, rather than the file: `append` walks to
+    // it from the config dir one `O_NOFOLLOW` component at a time, so the
+    // link is refused before the log's own name is ever opened.
+    let elsewhere = dir.path().join("somebody-elses-store");
+    std::fs::create_dir(&elsewhere).expect("the target should be creatable");
+    std::fs::remove_dir_all(paths.namespace_root()).expect("the root should be removable");
+    std::os::unix::fs::symlink(&elsewhere, paths.namespace_root())
+        .expect("the link should be plantable");
+
+    let err = append(&paths, &AuditEntry::new(write_event("aabbccdd", None)))
+        .expect_err("a symlinked namespace root is refused");
+    assert!(err.to_string().contains("symbolic link"), "{err}");
+    assert!(
+        !elsewhere.join(LOG_FILE).exists(),
+        "no log was created in the directory the link pointed at"
+    );
+
+    let read = tail(&paths, 10).expect_err("and the reader refuses the same store");
+    assert!(read.to_string().contains("symbolic link"), "{read}");
+}
+
+#[test]
+fn tail_refuses_a_symlink_planted_at_the_log() {
+    let (dir, paths) = store_with_root();
+
+    // `use --undo` acts on what `tail` returns, so a log somebody else can
+    // redirect is an undo somebody else can direct. The reader refuses what
+    // the writer refuses.
+    let elsewhere = dir.path().join("somebody-elses.jsonl");
+    let entry = AuditEntry::new(write_event("aabbccdd", None));
+    let mut line = serde_json::to_string(&entry).expect("serializable");
+    line.push('\n');
+    std::fs::write(&elsewhere, &line).expect("the target should be writable");
+    std::os::unix::fs::symlink(&elsewhere, log_path(&paths)).expect("the link should be plantable");
+
+    let err = tail(&paths, 10).expect_err("a symbolic link at the log is refused");
+    assert!(err.to_string().contains("symbolic link"), "{err}");
+}
+
+#[test]
+fn the_state_doctor_prints_is_the_one_append_acts_on() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The drift guard: `doctor`'s row and `append`'s decision come from one
+    // walk and one vocabulary, so a later edit that taught only one of them
+    // about a shape fails here. Both sides are asked about the same store,
+    // in the same process, with nothing between them.
+    let plants: [Plant; 5] = [
+        ("nothing at all", |_| {}),
+        ("a plain 0600 log", |path| {
+            std::fs::write(path, "").expect("writable");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("settable");
+        }),
+        ("a world-readable log", |path| {
+            std::fs::write(path, "").expect("writable");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+                .expect("settable");
+        }),
+        ("a symbolic link", |path| {
+            let target = path.with_file_name("somebody-elses.jsonl");
+            std::fs::write(&target, "").expect("writable");
+            std::os::unix::fs::symlink(&target, path).expect("plantable");
+        }),
+        ("a directory", |path| {
+            std::fs::create_dir(path).expect("creatable");
+        }),
+    ];
+
+    let mut appendable = 0usize;
+    let mut refused = 0usize;
+    for (name, plant) in plants {
+        let (_dir, paths) = store_with_root();
+        let path = log_path(&paths);
+        plant(&path);
+
+        let state = log_state(&paths);
+        let wrote = append(&paths, &AuditEntry::new(write_event("aabbccdd", None)));
+        assert_eq!(
+            state.is_appendable(),
+            wrote.is_ok(),
+            "{name}: `doctor` says `{}` and `append` {}",
+            state.note(),
+            if wrote.is_ok() { "wrote" } else { "refused" }
+        );
+        if state.is_appendable() {
+            appendable = appendable.saturating_add(1);
+        } else {
+            refused = refused.saturating_add(1);
+            assert!(
+                wrote.expect_err("refused").to_string().contains(&state.note()),
+                "{name}: the refusal carries the sentence `doctor` prints"
+            );
+        }
+    }
+    assert_eq!(appendable, 2, "both appendable shapes were exercised");
+    assert_eq!(refused, 3, "and all three refused ones");
+}
+
+#[test]
+fn the_bytes_on_disk_are_the_entry_and_one_newline() {
+    // The happy path, pinned on the bytes rather than on the round trip:
+    // reaching the log through a walk changed how it is opened and must not
+    // have changed a byte of what lands in it.
+    let (_dir, paths) = store_with_root();
+    let entry = AuditEntry::new(write_event("aabbccdd", Some("11223344")));
+    append(&paths, &entry).expect("appendable");
+
+    let expected = format!("{}\n", serde_json::to_string(&entry).expect("serializable"));
+    assert_eq!(std::fs::read_to_string(log_path(&paths)).expect("readable"), expected);
+    assert_eq!(mode_of(&log_path(&paths)), 0o600);
+    assert_eq!(log_state(&paths), LogState::Present);
+}
