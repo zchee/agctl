@@ -354,8 +354,15 @@ pub fn read_file(path: &Path, limit: u64) -> Result<ReadOutcome, FileStoreError>
     read_opened(File::from(fd), path, limit)
 }
 
-/// [`read_file`], relative to an already-opened namespace directory.
-fn read_file_at(
+/// [`read_file`], relative to an already-opened directory.
+///
+/// The counterpart of [`open_dir_under`] for a caller that has walked to a
+/// directory and must not resolve a path again to read what is inside it:
+/// [`held_locks`](crate::secret::held_locks) enumerates through that
+/// descriptor and reads every record with this, so the directory a record
+/// comes from is decided by the walk rather than by the name a second
+/// resolution would find.
+pub fn read_file_at(
     dir: BorrowedFd<'_>,
     name: &str,
     limit: u64,

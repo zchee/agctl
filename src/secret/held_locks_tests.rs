@@ -329,3 +329,94 @@ fn the_serialized_record_is_the_exact_document_doctor_and_remove_stale_read() {
             .expect("a record without `agctl_start_time` parses");
     assert_eq!(older.agctl_start_time, None);
 }
+
+/// A store whose namespace root exists and whose held-locks directory does
+/// not, so a test can plant something at that one name.
+fn bare_store() -> Store {
+    let dir = TempDir::new().expect("a temporary directory should be available");
+    let paths = Paths::with_config_dir(dir.path().join("agctl"));
+    fs::create_dir_all(paths.namespace_root()).expect("the namespace root should be creatable");
+    Store { _dir: dir, paths }
+}
+
+/// One way of planting something at the `held-locks` name: what to call it in
+/// a failure, and what to leave there.
+type Plant = (&'static str, fn(&Path));
+
+/// How a [`file_store::FileStoreError`] refused, as a word two call sites can
+/// be compared on.
+fn refusal(error: &file_store::FileStoreError) -> &'static str {
+    match error {
+        file_store::FileStoreError::RefusedSymlink(_) => "refused a symbolic link",
+        file_store::FileStoreError::NotRegular(_) => "refused something that is not a directory",
+        file_store::FileStoreError::OutsideNamespaceRoot(_) => "refused a path outside the root",
+        _ => "failed",
+    }
+}
+
+#[test]
+fn read_all_refuses_a_planted_held_locks_directory() {
+    // `agctl-dit`: `1yj` gave the *writer* an `O_NOFOLLOW` walk down to
+    // `held-locks` and left this reader listing that same directory by path.
+    // The record below is well-formed and would be returned by any reader that
+    // followed the link — and a returned record is what lets `--remove-stale`
+    // act on a path outside the namespace root.
+    let store = bare_store();
+    let elsewhere = store._dir.path().join("planted-held-locks");
+    fs::create_dir(&elsewhere).expect("the planted directory should be creatable");
+    fs::write(
+        elsewhere.join("4242.json"),
+        record_json(4242, "live", "/Users/someone/.claude", &["/Users/someone/.claude.lock"]),
+    )
+    .expect("the planted record should be writable");
+    std::os::unix::fs::symlink(&elsewhere, dir_of(&store.paths))
+        .expect("the symlink should be creatable");
+
+    assert!(read_all(&store.paths).is_empty(), "nothing is read through the planted link");
+    assert!(elsewhere.join("4242.json").is_file(), "and the planted record is left where it is");
+}
+
+#[test]
+fn the_reader_refuses_every_environment_the_writer_refuses() {
+    // The drift guard for `agctl-dit`. The reader now reaches `held-locks`
+    // through `open_dir_under` and the writer through `create_dir_under` —
+    // the same walk from the same anchor, differing only in whether a missing
+    // component is created. So for every way of planting something at that
+    // name the two must refuse alike, and this fails the moment one of them
+    // starts resolving the path a second time.
+    let cases: [Plant; 3] = [
+        ("a symbolic link to a directory", |at| {
+            let target = at.with_file_name("planted-dir");
+            fs::create_dir(&target).expect("the planted directory should be creatable");
+            // A record any reader that followed the link would return, so the
+            // `read_all` assertion below is about the walk and not about an
+            // empty directory.
+            fs::write(target.join("1.json"), record_json(1, "live", "/store", &["/store/x.lock"]))
+                .expect("the planted record should be writable");
+            std::os::unix::fs::symlink(&target, at).expect("the symlink should be creatable");
+        }),
+        ("a symbolic link to nothing", |at| {
+            std::os::unix::fs::symlink(at.with_file_name("gone"), at)
+                .expect("the symlink should be creatable");
+        }),
+        ("a regular file", |at| {
+            fs::write(at, "not a directory").expect("the file should be writable");
+        }),
+    ];
+
+    for (what, plant) in cases {
+        let store = bare_store();
+        let dir = dir_of(&store.paths);
+        let root = store.paths.namespace_root();
+        plant(&dir);
+
+        let writer = file_store::create_dir_under(&root, &dir).err();
+        let reader = file_store::open_dir_under(&root, &dir).err();
+        let writer = writer.as_ref().map(refusal);
+        let reader = reader.as_ref().map(refusal);
+
+        assert!(writer.is_some(), "the writer must refuse {what}");
+        assert_eq!(reader, writer, "the reader and the writer disagree about {what}");
+        assert!(read_all(&store.paths).is_empty(), "and `read_all` reads nothing through {what}");
+    }
+}

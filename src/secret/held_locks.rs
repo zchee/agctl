@@ -22,10 +22,15 @@
 //! fields — two types that were wire-compatible only by inspection is how a
 //! reader and a writer in different lanes end up disagreeing about a spelling.
 
-use std::fs;
+use std::ffi::CStr;
+use std::ffi::OsStr;
+use std::os::fd::AsFd;
+use std::os::fd::BorrowedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 
+use rustix::fs::Dir;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -153,29 +158,65 @@ pub struct HeldLockFile {
 /// because one file in a directory is malformed is a `doctor` that cannot
 /// diagnose the machine it was run on. The read itself refuses symbolic links
 /// and stops at [`MAX_RECORD_BYTES`].
+///
+/// **Which directory the records come from is decided by a walk, not by a
+/// path** (`agctl-dit`). [`file_store::open_dir_under`] descends from
+/// [`Paths::namespace_root`] one `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`
+/// component at a time — the writer's walk
+/// ([`file_store::create_dir_under`]) with `Walk::MustExist` in place of
+/// `Walk::Create` — and the enumeration and every record read go through the
+/// descriptor it produced. A symbolic link planted at `held-locks` is
+/// therefore refused on this side exactly as it is on the writer's, which
+/// matters because these records are the only thing that lets
+/// `doctor --remove-stale` act on a path *outside* the namespace root: a
+/// listing somebody else could redirect would be a permit somebody else could
+/// redirect.
+///
+/// A directory that is simply not there is not a refusal — it is every
+/// machine that has never held a Claude Code lock, and it reads as no records.
 pub fn read_all(paths: &Paths) -> Vec<HeldLockFile> {
     let dir = dir(paths);
-    let Ok(entries) = fs::read_dir(&dir) else { return Vec::new() };
+    let Ok(dir_fd) = file_store::open_dir_under(&paths.namespace_root(), &dir) else {
+        return Vec::new();
+    };
+    let Ok(entries) = Dir::read_from(&dir_fd) else { return Vec::new() };
 
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == RECORD_EXTENSION))
-        .collect();
-    files.sort();
+    let mut names: Vec<String> =
+        entries.filter_map(Result::ok).filter_map(|entry| record_name(entry.file_name())).collect();
+    names.sort();
 
-    files
+    names
         .into_iter()
-        .filter_map(|file| {
-            let record = read_one(&file)?;
+        .filter_map(|name| {
+            // Built for the report and for `--remove-stale`'s refusals, which
+            // name the record they read; every syscall goes through `dir_fd`.
+            let file = dir.join(&name);
+            let record = read_one(dir_fd.as_fd(), &name, &file)?;
             Some(HeldLockFile { file, record })
         })
         .collect()
 }
 
+/// The name of one record, or nothing when this entry is not one.
+///
+/// `.`, `..` and anything without the [`RECORD_EXTENSION`] extension are not
+/// records. Neither is a name that is not UTF-8: every record agctl writes is
+/// `<pid>-<monotonic ms>.json`, and on the filesystems this runs on (APFS and
+/// HFS+ both reject a non-UTF-8 name with `EILSEQ`) nothing can put one here
+/// to begin with. Skipping is the same answer this module gives a truncated
+/// record, and it is the conservative one: a record that is not returned
+/// cannot authorise a removal.
+fn record_name(raw: &CStr) -> Option<String> {
+    let name = OsStr::from_bytes(raw.to_bytes()).to_str()?;
+    Path::new(name).extension().is_some_and(|ext| ext == RECORD_EXTENSION).then(|| name.to_owned())
+}
+
 /// One record, or nothing if it cannot be read or parsed.
-fn read_one(file: &Path) -> Option<HeldLockRecord> {
-    match file_store::read_file(file, MAX_RECORD_BYTES) {
+///
+/// `display` is the path the record would be named by, used for messages only;
+/// the read itself is `name` relative to `dir`.
+fn read_one(dir: BorrowedFd<'_>, name: &str, display: &Path) -> Option<HeldLockRecord> {
+    match file_store::read_file_at(dir, name, MAX_RECORD_BYTES, display) {
         Ok(ReadOutcome::Present { bytes, .. }) => serde_json::from_slice(&bytes).ok(),
         _ => None,
     }

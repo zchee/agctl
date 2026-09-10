@@ -51,8 +51,16 @@ fn dead_pid() -> u32 {
 
 /// Writes one held-lock record, in the shape `claude_lock` writes.
 fn write_record(fixture: &Fixture, pid: u32, store_dir: &Path, held: &[&Path]) -> PathBuf {
-    let dir = fixture.config_dir().join("claude").join("held-locks");
-    fs::create_dir_all(&dir).expect("the held-locks directory should be creatable");
+    write_record_in(&fixture.held_locks_dir(), pid, store_dir, held)
+}
+
+/// [`write_record`], into a directory the caller names.
+///
+/// The planted-directory test needs a record that is *not* under the namespace
+/// root, and a second spelling of the record's JSON is how a reader and a
+/// writer end up disagreeing about a field name.
+fn write_record_in(dir: &Path, pid: u32, store_dir: &Path, held: &[&Path]) -> PathBuf {
+    fs::create_dir_all(dir).expect("the held-locks directory should be creatable");
     let held: Vec<String> = held.iter().map(|path| path.to_string_lossy().into_owned()).collect();
     let record = json!({
         "agctl_pid": pid,
@@ -149,6 +157,64 @@ fn ac73_remove_stale_refuses_an_outside_path_without_a_dead_record() {
         .stderr(contains("is not inside"));
     assert!(leaked.exists(), "the path no record names is still there");
     assert!(sibling.exists(), "and so is the one that was never asked about");
+}
+
+#[test]
+fn a_symlinked_held_locks_directory_authorises_no_removal() {
+    // `agctl-dit`. After `1yj` the *writer* reaches `<namespace_root>/held-locks`
+    // through an `O_NOFOLLOW` walk, and the reader still listed it by path — so
+    // a same-uid planter chose the directory every record `doctor` reports came
+    // from, and `Permit::Attested` is the only thing in agctl that lets a
+    // removal leave the namespace root.
+    //
+    // Everything the permit asks for is true here: the record is in the shape
+    // `claude_lock` writes, it names a real lock directory in the live store,
+    // that directory is empty and aged past the threshold, and the process that
+    // "wrote" the record is really dead. The one thing that is false is where
+    // the directory holding it was found — which is now what decides it.
+    let fixture = owned_store();
+    let leaked = leak(&fixture);
+    let pid = dead_pid();
+
+    let planted = fixture.scratch("planted-held-locks");
+    let record = write_record_in(&planted, pid, &fixture.live_store_dir(), &[leaked.as_path()]);
+    std::os::unix::fs::symlink(&planted, fixture.held_locks_dir())
+        .expect("the symlink should be creatable");
+
+    // Nothing behind the link is reported. Pre-fix this section listed the
+    // record under the name it would have had inside the root
+    // (`held-locks/<pid>.json`) and offered the removal command for the leak.
+    let output =
+        fixture.cmd().args(["claude", "doctor"]).output().expect("`claude doctor` should run");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("held locks"), "the section is still reported:\n{stdout}");
+    assert!(
+        !stdout.contains(&format!("{pid}.json")),
+        "no record is read through the planted link:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(&format!("--remove-stale {} --yes", leaked.display())),
+        "and no removal outside the root is offered:\n{stdout}"
+    );
+
+    // And nothing behind it authorises one. The refusal is phase 1's sentence
+    // for a path no record vouches for, which is what an unreadable
+    // `held-locks` leaves true: it arrives before anything is sampled, so this
+    // does not spend the two heartbeat intervals a permitted removal does.
+    fixture
+        .cmd()
+        .args(["claude", "doctor", "--remove-stale", &leaked.to_string_lossy(), "--yes"])
+        .assert()
+        .code(1)
+        .stderr(contains("is not inside"));
+
+    assert!(leaked.exists(), "the leak the planted record named is still there");
+    assert!(record.exists(), "and the planted record was neither read nor removed");
+    assert!(
+        fixture.held_locks_dir().symlink_metadata().is_ok_and(|meta| meta.is_symlink()),
+        "the link itself is left exactly as it was found: agctl repairs nothing here"
+    );
 }
 
 /// Backdates a path past the staleness threshold.
