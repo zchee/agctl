@@ -107,6 +107,12 @@ fn usage_body_resetting_at(session_at: Timestamp, weekly_at: Timestamp) -> Strin
 /// not the implementation restated. The prefix rule is only half-applied: both
 /// instants are inside a week of each other by construction, so the date form
 /// cannot arise here (the unit tests in `src/render/reset_tests.rs` cover it).
+///
+/// The countdown leads and the absolute time follows in parentheses (user
+/// request of 2026-09-11); the hour is zero-padded once the weekday joins it,
+/// but not in the bare today shape — also `src/render/reset_tests.rs`'s
+/// territory, restated here only so this second derivation stays honest about
+/// what it is asserting.
 fn expected_cell(now: Timestamp, at: Timestamp, tz: &TimeZone, countdown: &str) -> String {
     let now_local = now.to_zoned(tz.clone());
     let at_local = at.to_zoned(tz.clone());
@@ -115,12 +121,27 @@ fn expected_cell(now: Timestamp, at: Timestamp, tz: &TimeZone, countdown: &str) 
         hour => hour,
     };
     let meridiem = if at_local.hour() < 12 { "AM" } else { "PM" };
-    let clock = format!("{hour}:{:02} {meridiem}", at_local.minute());
-    if now_local.date() == at_local.date() {
-        format!("{clock} ({countdown})")
+    let minute = at_local.minute();
+    let clock = if now_local.date() == at_local.date() {
+        format!("{hour}:{minute:02} {meridiem}")
     } else {
-        format!("{} {clock} ({countdown})", weekday(at_local.weekday()))
-    }
+        format!("{} {hour:02}:{minute:02} {meridiem}", weekday(at_local.weekday()))
+    };
+    format!("{countdown} ({clock})")
+}
+
+/// The trimmed cells of the line containing `needle`, split on the table's
+/// own column separator.
+///
+/// Mirrors `src/render/table_tests.rs`'s helper of the same job: this binary
+/// carries no library target, so a test crate cannot import that one's
+/// private helper and must restate the small split-and-trim itself.
+fn cells_of(rendered: &str, needle: &str) -> Vec<String> {
+    let line = rendered
+        .lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no row contains `{needle}`:\n{rendered}"));
+    line.split('|').map(|cell| cell.trim().to_owned()).collect()
 }
 
 /// The abbreviation `%a` produces, spelled out rather than borrowed.
@@ -194,6 +215,24 @@ fn the_reset_columns_are_printed_in_the_zone_tz_selects() {
         !stdout.contains(&utc_session),
         "the `TZ=Asia/Tokyo` run printed a UTC clock time:\n{stdout}"
     );
+
+    // Pin the requirement that the countdown sits flush left and the
+    // absolute time flush right (user request of 2026-09-11): each cell,
+    // read by its own column, is exactly the countdown-first form computed
+    // above, and its closing paren is the cell's last character rather than
+    // trailing space left over from some other padding. With only this one
+    // account fetched, the column's width is this row's own natural length —
+    // `src/render/table_tests.rs` proves the deeper case where several rows
+    // of differing countdown length share a column.
+    let headings = cells_of(&stdout, "5h reset");
+    let five_h = headings.iter().position(|h| h == "5h reset").expect("`5h reset` is a heading");
+    let weekly =
+        headings.iter().position(|h| h == "Weekly reset").expect("`Weekly reset` is a heading");
+    let row = cells_of(&stdout, EMAIL);
+    assert_eq!(row[five_h], tokyo_session, "got:\n{stdout}");
+    assert_eq!(row[weekly], tokyo_weekly, "got:\n{stdout}");
+    assert!(row[five_h].ends_with(')'), "the paren should be flush right:\n{stdout}");
+    assert!(row[weekly].ends_with(')'), "the paren should be flush right:\n{stdout}");
 
     // The same fixture, the other zone. Nothing about the fetch changed, so
     // this run may well be served from the 300 s cache — which is the point:

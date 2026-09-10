@@ -355,12 +355,14 @@ fn both_reset_columns_carry_a_local_time_and_a_countdown() {
     // The healthy windows reset at 02:13:40Z and 20:00:00Z, which in +09:00
     // are 11:13 the same local morning and 05:00 on Friday the 11th. The
     // weekly cell is the point of the whole column: `2d20h` alone never said
-    // which morning.
+    // which morning. The countdown leads and the absolute time follows in
+    // parentheses (user request of 2026-09-11); with only one row in each
+    // column, the gap is the guaranteed single space.
     let rendered = render(&report(vec![healthy_row("alice@example.com")], false));
     let cells = cells_of(&rendered, "alice@example.com");
 
-    assert_eq!(cells[column("5h reset")], "11:13 AM (2h13m)", "got:\n{rendered}");
-    assert_eq!(cells[column("Weekly reset")], "Fri 5:00 AM (2d20h)", "got:\n{rendered}");
+    assert_eq!(cells[column("5h reset")], "2h13m (11:13 AM)", "got:\n{rendered}");
+    assert_eq!(cells[column("Weekly reset")], "2d20h (Fri 05:00 AM)", "got:\n{rendered}");
 }
 
 #[test]
@@ -375,7 +377,7 @@ fn a_row_with_only_a_weekly_window_leaves_the_five_hour_reset_an_em_dash() {
     let cells = cells_of(&rendered, "alice@example.com");
 
     assert_eq!(cells[column("5h reset")], EMPTY_CELL, "got:\n{rendered}");
-    assert_eq!(cells[column("Weekly reset")], "Fri 5:00 AM (2d20h)", "got:\n{rendered}");
+    assert_eq!(cells[column("Weekly reset")], "2d20h (Fri 05:00 AM)", "got:\n{rendered}");
 }
 
 #[test]
@@ -415,8 +417,39 @@ fn a_continuation_rows_reset_sits_in_the_weekly_column() {
 
     assert_eq!(cells[column("5h reset")], "", "got:\n{rendered}");
     // Twenty-three days out: past a week, so the date names the day rather
-    // than a weekday that would come round again first.
-    assert_eq!(cells[column("Weekly reset")], "Oct 1 9:00 AM (23d0h)", "got:\n{rendered}");
+    // than a weekday that would come round again first, and the hour is
+    // zero-padded (`09`, not `9`) for that shape's constant width.
+    assert_eq!(cells[column("Weekly reset")], "23d0h (Oct 1 09:00 AM)", "got:\n{rendered}");
+}
+
+#[test]
+fn the_weekly_reset_column_right_aligns_its_closing_paren_across_rows() {
+    // Two rows whose weekly countdowns differ in length (`6d5h` vs `19h32m`)
+    // so the column's width comes from the longer one, and the shorter row's
+    // parenthesis must still land on the same right edge (user request of
+    // 2026-09-11): `6d5h` gets three extra spaces where `19h32m` gets one.
+    let mut short = healthy_row("alice@example.com");
+    short.usage = Some(usage(
+        vec![window(WindowKind::WeeklyAll, 35.0, Some("2026-09-14T05:00:00Z"))],
+        CreditsState::Unavailable,
+    ));
+    let mut long = healthy_row("bob@example.com");
+    long.usage = Some(usage(
+        vec![window(WindowKind::WeeklyAll, 35.0, Some("2026-09-08T19:32:00Z"))],
+        CreditsState::Unavailable,
+    ));
+
+    let rendered = render(&report(vec![short, long], false));
+    let alice = cells_of(&rendered, "alice@example.com");
+    let bob = cells_of(&rendered, "bob@example.com");
+
+    assert_eq!(alice[column("Weekly reset")], "6d5h   (Mon 02:00 PM)", "got:\n{rendered}");
+    assert_eq!(bob[column("Weekly reset")], "19h32m (Wed 04:32 AM)", "got:\n{rendered}");
+    assert_eq!(
+        alice[column("Weekly reset")].len(),
+        bob[column("Weekly reset")].len(),
+        "both rows should reach the same column width:\n{rendered}"
+    );
 }
 
 // ---------------------------------------------------------------------------

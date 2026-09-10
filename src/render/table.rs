@@ -10,10 +10,15 @@
 //! Account | Org | Plan | 5h | Weekly | Fable (weekly) | Credits | 5h reset | Weekly reset | State
 //! ```
 //!
-//! Each reset cell is [`crate::render::reset::render_reset`] — an absolute
-//! local time and a countdown. The JSON report's `next_reset` member is
-//! untouched by that change: it is a published interface, and the soonest
-//! reset across every window is still a fact a consumer may be reading.
+//! Each reset cell carries a countdown and the absolute local time it names
+//! (user request of 2026-09-09), the countdown flush left and the
+//! parenthesised absolute time flush right within the column (user request
+//! of 2026-09-11) — see [`crate::render::reset::justify`] for why `tabled`
+//! cannot do that per cell on its own, which is why this module builds each
+//! reset column in two passes rather than one cell at a time. The JSON
+//! report's `next_reset` member is untouched by either change: it is a
+//! published interface, and the soonest reset across every window is still a
+//! fact a consumer may be reading.
 //!
 //! # The eleventh column
 //!
@@ -84,6 +89,13 @@ pub const KIND_HEADING: &str = "Kind";
 /// say *which account this is* rather than what it is using.
 pub const KIND_INDEX: usize = 3;
 
+/// Where `5h reset` sits in a ten-cell record, before `--by-identity` splices
+/// `Kind` in.
+const SESSION_RESET_INDEX: usize = 7;
+
+/// Where `Weekly reset` sits, before `--by-identity` splices `Kind` in.
+const WEEKLY_RESET_INDEX: usize = 8;
+
 /// [`HEADINGS`], plus [`KIND_HEADING`] when `by_identity`.
 ///
 /// A function rather than a second constant so the ten headings stay written
@@ -105,17 +117,54 @@ pub fn render(report: &Report) -> String {
     let mut builder = Builder::default();
     builder.push_record(headings(report.by_identity));
 
+    // Two passes, because a justified cell's padding depends on every other
+    // row in its column (the countdown flush left, the absolute time flush
+    // right — `crate::render::reset::justify`), and that width is only known
+    // once every row has been seen. The first pass builds each row's other
+    // nine (or ten, under `--by-identity`) cells directly and sets the two
+    // reset cells aside as raw data; the second computes each reset column's
+    // width and fills the justified text in before any record reaches the
+    // builder.
+    let mut records: Vec<Vec<String>> = Vec::new();
+    let mut session_column: Vec<ResetSlot> = Vec::new();
+    let mut weekly_column: Vec<ResetSlot> = Vec::new();
+
     for row in report.shown() {
-        builder.push_record(with_kind(account_record(row, report), report, row.kind));
+        let usage = row.usage.as_ref();
+        session_column.push(reset_slot(usage.and_then(|u| u.window(&WindowKind::Session)), report));
+        weekly_column
+            .push(reset_slot(usage.and_then(|u| u.window(&WindowKind::WeeklyAll)), report));
+        // A continuation row's kind cell is blank for the same reason its
+        // `Org` and `Plan` cells are: the window belongs to the account named
+        // above it, and repeating the account's attributes on it would read
+        // as a second account.
+        records.push(with_kind(account_record(row), report, row.kind));
+
         if let Some(usage) = &row.usage {
             for window in usage.extra_windows(HEADLINE_SCOPE) {
-                // A continuation row's kind cell is blank for the same reason
-                // its `Org` and `Plan` cells are: the window belongs to the
-                // account named above it, and repeating the account's
-                // attributes on it would read as a second account.
-                builder.push_record(with_kind(continuation_record(window, report), report, ""));
+                // Never the five-hour window, so that cell is left blank
+                // rather than justified — see `continuation_record`.
+                session_column.push(ResetSlot::Final(String::new()));
+                weekly_column.push(reset_slot(Some(window), report));
+                records.push(with_kind(continuation_record(window), report, ""));
             }
         }
+    }
+
+    let session_width = column_width(&session_column);
+    let weekly_width = column_width(&weekly_column);
+    let session_index = reset_index(SESSION_RESET_INDEX, report);
+    let weekly_index = reset_index(WEEKLY_RESET_INDEX, report);
+
+    for ((record, session), weekly) in
+        records.iter_mut().zip(session_column.iter()).zip(weekly_column.iter())
+    {
+        record[session_index] = session.finalize(session_width);
+        record[weekly_index] = weekly.finalize(weekly_width);
+    }
+
+    for record in records {
+        builder.push_record(record);
     }
 
     let mut table = builder.build();
@@ -147,7 +196,11 @@ fn with_kind(cells: [String; 10], report: &Report, kind: &str) -> Vec<String> {
 }
 
 /// One account's own row.
-fn account_record(row: &StatusRow, report: &Report) -> [String; 10] {
+///
+/// The two reset cells are left blank here: `render`'s second pass fills
+/// them in once every row's [`ResetSlot`] has been collected and each
+/// column's width is known.
+fn account_record(row: &StatusRow) -> [String; 10] {
     let usage = row.usage.as_ref();
     [
         row.account.clone(),
@@ -157,14 +210,19 @@ fn account_record(row: &StatusRow, report: &Report) -> [String; 10] {
         usage.map_or_else(empty, |u| percent_cell(u.window(&WindowKind::WeeklyAll))),
         usage.map_or_else(empty, |u| percent_cell(u.scoped_window(HEADLINE_SCOPE))),
         usage.map_or_else(empty, |u| credits_cell(&u.credits)),
-        reset_cell(usage.and_then(|u| u.window(&WindowKind::Session)), report),
-        reset_cell(usage.and_then(|u| u.window(&WindowKind::WeeklyAll)), report),
+        String::new(),
+        String::new(),
         row.state_cell(),
     ]
 }
 
 /// One window that has no column of its own.
-fn continuation_record(window: &LimitWindow, report: &Report) -> [String; 10] {
+///
+/// Its `Weekly reset` cell is left blank for the same reason as
+/// [`account_record`]'s; its `5h reset` cell is left blank for good, because
+/// such a window is never the five-hour one (see `render`, which gives it
+/// [`ResetSlot::Final`] rather than a pair to justify).
+fn continuation_record(window: &LimitWindow) -> [String; 10] {
     [
         format!("  {CONTINUATION_MARKER} {}", window.label()),
         String::new(),
@@ -177,7 +235,7 @@ fn continuation_record(window: &LimitWindow, report: &Report) -> [String; 10] {
         // never reaches here — so the cell is left blank rather than being
         // given an em dash, which would claim a figure was unavailable.
         String::new(),
-        reset_cell(Some(window), report),
+        String::new(),
         String::new(),
     ]
 }
@@ -218,18 +276,71 @@ fn credits_cell(credits: &CreditsState) -> String {
     }
 }
 
-/// One reset column's cell: when that window rolls over, locally, and how
-/// long that is.
+/// One reset column's cell, before its column's width is known: either a
+/// countdown/absolute pair to [justify](reset::justify), or text that is
+/// already final and must not be touched by justification.
 ///
-/// An em dash covers both ways of having nothing to say — the response
-/// described no such window, or described one with no `resets_at` — because
-/// the reader's question is about the figure, not about which of the two
-/// happened.
-fn reset_cell(window: Option<&LimitWindow>, report: &Report) -> String {
-    match window.and_then(|window| window.resets_at) {
-        Some(resets_at) => reset::render_reset(report.now, resets_at, &report.tz),
-        None => empty(),
+/// An em dash covers both ways of a real window having nothing to say — the
+/// response described no such window, or described one with no `resets_at`
+/// — because the reader's question is about the figure, not about which of
+/// the two happened. `Final` also carries the blank a continuation row's
+/// `5h reset` cell always is (`account_record`, `continuation_record`).
+enum ResetSlot {
+    Pair(String, String),
+    Final(String),
+}
+
+impl ResetSlot {
+    /// This slot's own contribution to its column's width.
+    ///
+    /// A pair's is its natural minimum — `len(countdown) + 1 +
+    /// len("(absolute)")`, [`reset::justify`]'s own floor — and `Final`'s is
+    /// simply its length: the rule that a `—` or a blank cell counts toward
+    /// the column's width the same as any other row (see
+    /// [`reset::justify`]'s doc), which in practice never matters, since
+    /// neither is ever the widest cell in a column that also holds a pair.
+    fn natural_width(&self) -> usize {
+        match self {
+            ResetSlot::Pair(countdown, absolute) => {
+                countdown.chars().count() + 1 + absolute.chars().count() + 2
+            }
+            ResetSlot::Final(text) => text.chars().count(),
+        }
     }
+
+    /// This slot's finished cell text, once the column's width is known.
+    fn finalize(&self, width: usize) -> String {
+        match self {
+            ResetSlot::Pair(countdown, absolute) => reset::justify(countdown, absolute, width),
+            ResetSlot::Final(text) => text.clone(),
+        }
+    }
+}
+
+/// The reset slot for one window: a pair to justify when it has a
+/// `resets_at`, an em dash otherwise.
+fn reset_slot(window: Option<&LimitWindow>, report: &Report) -> ResetSlot {
+    match window.and_then(|window| window.resets_at) {
+        Some(resets_at) => {
+            let (countdown, absolute) = reset::parts(report.now, resets_at, &report.tz);
+            ResetSlot::Pair(countdown, absolute)
+        }
+        None => ResetSlot::Final(empty()),
+    }
+}
+
+/// The width a reset column's cells should be justified to: the widest
+/// [`ResetSlot::natural_width`] among every row sharing the column, or zero
+/// for a column with no rows (an empty report still prints its headings).
+fn column_width(column: &[ResetSlot]) -> usize {
+    column.iter().map(ResetSlot::natural_width).max().unwrap_or(0)
+}
+
+/// `index`, shifted by one when `--by-identity` spliced `Kind` in before it
+/// (`with_kind`) — both reset columns sit after [`KIND_INDEX`], so both shift
+/// together.
+fn reset_index(index: usize, report: &Report) -> usize {
+    if report.by_identity && index >= KIND_INDEX { index + 1 } else { index }
 }
 
 /// The em dash, as an owned string.

@@ -9,22 +9,28 @@ Phase 1 is **Claude only**. Later phases add other providers and account switchi
 [Scope](#scope).
 
 ```
- Account           | Org  | Plan | 5h  | Weekly | Fable (weekly) | Credits                 | 5h reset        | Weekly reset        | State
--------------------+------+------+-----+--------+----------------+-------------------------+-----------------+---------------------+-------
- alice@example.com | Acme | max  | 21% | 35%    | 56%            | n/a                     | 4:15 PM (1h12m) | Sun 2:00 PM (2d22h) | ok
- bob@example.com   | Acme | max  | 4%  | 12%    | 30%            | $219.56 / $5000.00 (4%) | 5:16 PM (2h13m) | Sun 2:00 PM (2d22h) | ok
+ Account           | Org  | Plan | 5h  | Weekly | Fable (weekly) | Credits                 | 5h reset        | Weekly reset         | State
+-------------------+------+------+-----+--------+----------------+-------------------------+-----------------+----------------------+-------
+ alice@example.com | Acme | max  | 21% | 35%    | 56%            | n/a                     | 1h12m (4:15 PM) | 2d22h (Sun 02:00 PM) | ok
+ bob@example.com   | Acme | max  | 4%  | 12%    | 30%            | $219.56 / $5000.00 (4%) | 2h13m (5:16 PM) | 2d22h (Sun 02:00 PM) | ok
 ```
 
 The `Credits` cell reads `n/a` when the account has no usage credits, `off` when they are
 disabled, `<used> / <limit> (<pct>%)` when capped, and `<used> / Unlimited` when not.
 
 The two reset columns say **when** each window rolls over as well as how long is left: the
-5-hour window in `5h reset`, the seven-day all-models window in `Weekly reset`. The time is
-local, and carries as much of the date as it takes to name the day — nothing for a reset
-later today, the weekday for another day this week (`Sun 2:00 PM`), the date from a week out
-(`Sep 16 2:00 PM`). A reset that has already passed reads `(now)`, and a window agctl has
-no reset for is an em dash. A per-model weekly window other than Fable gets a continuation
-row of its own, and its reset appears in `Weekly reset`.
+5-hour window in `5h reset`, the seven-day all-models window in `Weekly reset`. Each cell
+leads with the countdown and follows it with the absolute local time in parentheses, and
+within a column every countdown lines up flush left and every closing parenthesis lines up
+flush right, so `2d22h` and a shorter countdown in the same column still end at the same
+right edge. The absolute time carries as much of the date as it takes to name the day —
+nothing for a reset later today (`4:15 PM`), the weekday for another day this week
+(`Sun 02:00 PM`), the date from a week out (`Sep 16 02:00 PM`) — and the hour is zero-padded
+once a weekday or a date joins it, so every absolute time inside one of those two shapes is
+the same width; today's bare clock time keeps the un-padded hour. A reset that has already
+passed reads `now (11:59 PM)`, and a window agctl has no reset for is an em dash. A per-model
+weekly window other than Fable gets a continuation row of its own, and its reset appears in
+`Weekly reset`.
 
 ## Build
 
