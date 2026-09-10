@@ -17,6 +17,12 @@ const HOUR: i64 = 3_600_000;
 /// The displaced credential in every case below expires at `NOW + HOUR`.
 fn input(existing: Existing) -> Input {
     Input {
+        displaced_is_incoming: false,
+        // Only the `displaced_is_incoming` row reads these two; the value is
+        // the displaced credential's own, so nothing is "newer" by default.
+        incoming_expires_at_ms: NOW + HOUR,
+        displaced_is_duplicate: false,
+        existing_is_another_account: false,
         same_namespace: false,
         identity_matches: true,
         pending_present: false,
@@ -52,6 +58,132 @@ fn the_five_matrix_rows_of_decision_d_017() {
     for (name, input, expected) in cases {
         assert_eq!(decide(&input), expected, "matrix row: {name}");
     }
+}
+
+#[test]
+fn the_incoming_accounts_own_copy_is_dropped_only_when_it_is_a_duplicate_or_older() {
+    // `agctl-5gs`'s row, split by `agctl-r3h` and guarded by review F1/F3.
+    // The question is not "what is at the target" but "is this copy of that
+    // account's grant worth keeping": a proven duplicate or a strictly older
+    // copy is not, and everything else is. Equal expiries with **different**
+    // digests are kept, because two credentials of one account can share an
+    // `expiresAt` and differ in their refresh token, and dropping the live
+    // one costs that account a `login`.
+    let row = |stored: i64, duplicate: bool| Input {
+        displaced_is_incoming: true,
+        incoming_expires_at_ms: stored,
+        displaced_is_duplicate: duplicate,
+        ..input(Existing::Absent)
+    };
+
+    // The displaced copy expires at NOW + HOUR throughout.
+    let cases: Vec<(&str, Input, Adoption)> = vec![
+        ("newer than the store's copy: keep it", row(NOW, false), Adoption::ToAdoptedCopy),
+        (
+            "the same expiry but a different credential: keep it",
+            row(NOW + HOUR, false),
+            Adoption::ToAdoptedCopy,
+        ),
+        ("the same credential: drop it", row(NOW + HOUR, true), Adoption::Discarded),
+        ("older than the store's copy: drop it", row(NOW + 2 * HOUR, false), Adoption::Discarded),
+    ];
+    for (name, input, expected) in cases {
+        assert_eq!(decide(&input), expected, "{name}");
+        assert_eq!(decide(&input).writes(), expected == Adoption::ToAdoptedCopy, "{name}");
+    }
+}
+
+#[test]
+fn the_kept_half_of_the_row_takes_the_adopted_copys_own_guards() {
+    // Review F1/F2: keeping writes `<D>/.credentials.adopted.json`, which
+    // `write_adopted` renames over blind. Every condition the
+    // `same_namespace` row puts on that file applies here too, or the row
+    // destroys whatever the previous swap adopted there — a credential whose
+    // store has migrated and whose item this swap is overwriting has no other
+    // home.
+    let keep = |existing: Existing| Input {
+        displaced_is_incoming: true,
+        incoming_expires_at_ms: NOW,
+        displaced_is_duplicate: false,
+        ..input(existing)
+    };
+
+    assert_eq!(decide(&keep(Existing::Absent)), Adoption::ToAdoptedCopy, "nothing there: write it");
+    assert_eq!(
+        decide(&keep(Existing::Same)),
+        Adoption::AlreadyPresent,
+        "already the same credential: nothing to do"
+    );
+    assert_eq!(
+        decide(&keep(Existing::Different { expires_at_ms: NOW - HOUR })),
+        Adoption::ToAdoptedCopy,
+        "strictly older: worth replacing"
+    );
+    assert_eq!(
+        decide(&keep(Existing::Different { expires_at_ms: NOW + 2 * HOUR })),
+        Adoption::Refused(Refusal::NewerCopy),
+        "a newer copy is refused, not overwritten and not silently dropped"
+    );
+    assert_eq!(
+        decide(&keep(Existing::Unreadable)),
+        Adoption::Refused(Refusal::Unreadable),
+        "what cannot be read cannot be confirmed worthless"
+    );
+    assert_eq!(
+        decide(&Input { pending_present: true, ..keep(Existing::Absent) }),
+        Adoption::Refused(Refusal::PendingPresent),
+        "condition (b) applies to the file this row writes"
+    );
+
+    // Condition (a) for that file, and it outranks the expiry comparison: an
+    // **older** credential of another account is not a worse copy of this one,
+    // it is somebody else's only one. Without this the sibling is renamed
+    // over and that account owes an interactive `login`.
+    assert_eq!(
+        decide(&Input {
+            existing_is_another_account: true,
+            ..keep(Existing::Different { expires_at_ms: NOW - HOUR })
+        }),
+        Adoption::Refused(Refusal::OccupiedByAnother),
+        "another account's copy is refused whatever its expiry says"
+    );
+    assert_eq!(
+        decide(&Input { existing_is_another_account: true, ..keep(Existing::Absent) }),
+        Adoption::Refused(Refusal::OccupiedByAnother),
+        "and the flag decides on its own"
+    );
+}
+
+#[test]
+fn the_row_changes_nothing_when_the_displaced_credential_is_a_third_partys() {
+    // The other half of the same claim: the flag is the whole of the new
+    // row's reach, so with it clear every case above answers exactly as it
+    // did before it existed.
+    assert_eq!(decide(&input(Existing::Absent)), Adoption::ToStore);
+    assert_eq!(decide(&input(Existing::Same)), Adoption::AlreadyPresent);
+    assert_eq!(
+        decide(&input(Existing::Different { expires_at_ms: NOW + 2 * HOUR })),
+        Adoption::Refused(Refusal::NewerCopy)
+    );
+    assert_eq!(
+        decide(&Input { pending_present: true, ..input(Existing::Absent) }),
+        Adoption::Refused(Refusal::PendingPresent)
+    );
+}
+
+#[test]
+fn a_reversal_ignores_the_row_because_it_has_a_target_of_its_own() {
+    // The `--undo` direction parks the occupant in the store's own adopted
+    // copy whoever it belongs to, which is a target that always exists — so
+    // `decide_undo` never consults the flag, and a reversal of a swap whose
+    // occupant happens to be the incoming account's is still a staged copy
+    // rather than a discard.
+    let row = Input { displaced_is_incoming: true, ..input(Existing::Absent) };
+    assert_eq!(decide_undo(&row), Adoption::ToAdoptedCopy);
+    assert_eq!(
+        decide_undo(&Input { displaced_is_incoming: true, ..input(Existing::Same) }),
+        Adoption::AlreadyPresent
+    );
 }
 
 #[test]
@@ -176,6 +308,7 @@ fn only_the_two_writing_decisions_write() {
     assert!(Adoption::ToStore.writes());
     assert!(Adoption::ToAdoptedCopy.writes());
     assert!(!Adoption::AlreadyPresent.writes());
+    assert!(!Adoption::Discarded.writes(), "the row that has no target writes nothing");
     for refusal in every_refusal() {
         assert!(!Adoption::Refused(refusal).writes(), "{refusal:?} must not write");
     }
@@ -196,7 +329,7 @@ fn every_refusal_has_a_distinct_token_and_a_message_that_names_refusal_f() {
         );
         assert!(!message.is_empty());
     }
-    assert_eq!(seen.len(), 6, "every variant is covered by this test");
+    assert_eq!(seen.len(), 7, "every variant is covered by this test");
 }
 
 fn every_refusal() -> Vec<Refusal> {
@@ -207,6 +340,7 @@ fn every_refusal() -> Vec<Refusal> {
         Refusal::IdentityMismatch,
         Refusal::Unreadable,
         Refusal::Changed,
+        Refusal::OccupiedByAnother,
     ]
 }
 

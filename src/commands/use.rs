@@ -596,7 +596,9 @@ fn swap_phases(
     // this store's own adopted copy whoever it belongs to, so there is no
     // third namespace to write and none to lock.
     let third = match direction {
-        Direction::Forward => displaced.as_ref().and_then(|p| third_namespace(config, store, p)),
+        Direction::Forward => {
+            displaced.as_ref().and_then(|p| third_namespace(config, store, incoming.record, p))
+        }
         Direction::Reverse => None,
     };
 
@@ -639,15 +641,14 @@ fn swap_phases(
     // not a swap worth asking about; only the write moves.
     let plan = match displaced.as_ref() {
         Some(displaced) => {
-            match decide_adoption(
-                paths,
+            let parties = Parties {
                 store,
-                &store_dir,
-                displaced,
-                third.as_ref(),
-                ctx,
-                direction,
-            ) {
+                store_dir: &store_dir,
+                incoming: incoming.record,
+                incoming_credentials: &incoming_credentials,
+                third: third.as_ref(),
+            };
+            match decide_adoption(paths, &parties, displaced, ctx, direction) {
                 Ok(plan) => plan,
                 Err(reason) => return Report::cannot_adopt(reason, &service),
             }
@@ -841,19 +842,33 @@ fn swap_phases(
 }
 
 /// The registry record the displaced credential belongs to, when that is
-/// somebody other than the store's own account.
+/// somebody other than the store's own account **and** other than the account
+/// being swapped in.
 ///
 /// `None` when the credential is the store's own — including the case where
 /// it names no identity at all, which fact F4 says is an older blob rather
-/// than a different account — and `None` when it names one agctl has no
-/// record for, which [`adopt_displaced`] turns into a refusal rather than
-/// manufacturing a namespace for it.
+/// than a different account — `None` when it belongs to the incoming account
+/// (see below), and `None` when it names one agctl has no record for, which
+/// [`decide_adoption`] turns into a refusal rather than manufacturing a
+/// namespace for it.
+///
+/// **The incoming exclusion is not a special case; it is the absence of a
+/// third party** (`agctl-5gs`, review4 N-14). A displaced credential that
+/// belongs to the account being swapped *in* is an older copy of the very
+/// grant this pass is about to write into the item — and, when it refreshed,
+/// into that account's own store. Resolving it here made the "third"
+/// namespace the incoming one, so step 13's write-back mutated the file step
+/// 15's compare-and-swap had been taken from: run 1 refused `Changed` against
+/// agctl's own write, blaming a concurrent writer that did not exist, and
+/// every later run refused `NewerCopy`, wedging the store. What becomes of
+/// that copy is [`adopt::Adoption::Discarded`]'s row, not this function's.
 fn third_namespace(
     config: &AgctlConfig,
     store: &AccountRecord,
+    incoming: &AccountRecord,
     displaced: &Credentials,
 ) -> Option<AccountRecord> {
-    if swap::same_identity(displaced, store) {
+    if swap::same_identity(displaced, store) || swap::same_identity(displaced, incoming) {
         return None;
     }
     displaced
@@ -1755,15 +1770,41 @@ enum AdoptionPlan {
 /// under the namespace lock (ruling OQ2, condition (c)) and **before** the
 /// confirmation prompt, so refusal **F** keeps the position plan section
 /// 3.4 gives it: a swap that cannot adopt is refused without asking about it.
+/// Who one adoption is between, and where the store it displaces from is.
+///
+/// Grouped rather than passed one by one because the three records have to
+/// describe **one** swap: the account that owns the store being written, the
+/// account being swapped in, and — when the displaced credential belongs to
+/// neither of them — the third account whose namespace lock step 10 took for
+/// it. Since `agctl-5gs` the second of those is not decoration: whose the
+/// displaced credential is decides whether there is an adoption target at all.
+struct Parties<'a> {
+    /// The account that owns the store being swapped.
+    store: &'a AccountRecord,
+    /// That store's namespace directory.
+    store_dir: &'a Path,
+    /// The account being swapped in.
+    incoming: &'a AccountRecord,
+    /// The credential this pass read from that account's own store in Phase A
+    /// and is about to install. Carried rather than re-read: a second read of
+    /// the same file can see a different credential (a concurrent `login`,
+    /// `import` or `status` that ignores the namespace lock), and the row's
+    /// question is about the credential actually being written
+    /// (`agctl-5gs` review F4).
+    incoming_credentials: &'a Credentials,
+    /// The account the displaced credential belongs to, when it is neither of
+    /// the two above and agctl has a record for it — see [`third_namespace`].
+    third: Option<&'a AccountRecord>,
+}
+
 fn decide_adoption(
     paths: &Paths,
-    store: &AccountRecord,
-    store_dir: &Path,
+    parties: &Parties<'_>,
     displaced: &Credentials,
-    third: Option<&AccountRecord>,
     ctx: &PassCtx,
     direction: Direction,
 ) -> Result<AdoptionPlan, adopt::Refusal> {
+    let Parties { store, store_dir, incoming, incoming_credentials, third } = *parties;
     // A reversal parks the occupant in the store's own adopted copy, whoever
     // it belongs to: see `adopt::decide_undo` for why the identity condition
     // and the matrix's namespace choice both fall away in that direction.
@@ -1779,6 +1820,13 @@ fn decide_adoption(
     if direction == Direction::Reverse {
         let existing = classify(location::from_adopted(store_dir), displaced);
         let decision = adopt::decide_undo(&adopt::Input {
+            // A reversal reads the store's own adopted copy, never the
+            // incoming account's namespace, so the row these fields select
+            // cannot arise here — and `decide_undo` does not consult them.
+            displaced_is_incoming: false,
+            incoming_expires_at_ms: displaced.expires_at_ms,
+            displaced_is_duplicate: false,
+            existing_is_another_account: false,
             same_namespace: true,
             identity_matches: true,
             pending_present: pending_present(store_dir),
@@ -1799,8 +1847,33 @@ fn decide_adoption(
     // belongs to the store it was found in, which is the same conclusion.
     let identity_matches = swap::same_identity(displaced, store);
     let same_namespace = identity_matches;
+    // `agctl-5gs`: whose the displaced credential is, asked of the incoming
+    // record as well as of the store's. It selects the row that decides
+    // whether that copy is worth keeping at all — see [`third_namespace`] for
+    // what the third-namespace row did with it instead.
+    let displaced_is_incoming = !same_namespace && swap::same_identity(displaced, incoming);
+    let mut occupied_by_another = false;
 
-    let (ns_dir, existing, prior) = if same_namespace {
+    let (ns_dir, existing, prior) = if displaced_is_incoming {
+        // When this row keeps the copy it writes the **store's** D-024
+        // sibling — the file `use --undo` reads back, and never the incoming
+        // namespace, which is what the write-back writes. So it is read like
+        // the sibling it is: a blind rename over that name destroys whatever
+        // the previous swap adopted there (review F1). No keychain probe: the
+        // row's own question is answered from Phase A's credential.
+        let read = location::from_adopted(store_dir);
+        // Condition (a) for that file: whose credential is already there. The
+        // crate's one identity predicate, against the incoming record —
+        // which is the displaced credential's own account by this row's
+        // construction, so this is "the sibling's occupant against the
+        // credential being adopted" (review F1's residual). Fact F4's
+        // identity-less blob passes, as it does everywhere else.
+        occupied_by_another = match &read {
+            Resolved::Credentials(found) => !swap::same_identity(found, incoming),
+            _ => false,
+        };
+        (store_dir.to_path_buf(), classify(read, displaced), None)
+    } else if same_namespace {
         // Decision D-024: the adopted copy, never `.credentials.json`.
         let read = location::from_adopted(store_dir);
         (store_dir.to_path_buf(), classify(read, displaced), None)
@@ -1826,9 +1899,13 @@ fn decide_adoption(
     // migrated by construction (that is *why* there is a swap) and ruling
     // OQ2's carve-out is the exception that covers it, so `adopt::decide`
     // does not consult this flag there and nothing is read.
-    let target_migrated = !same_namespace && migrated(paths, third, ctx);
+    let target_migrated = !same_namespace && !displaced_is_incoming && migrated(paths, third, ctx);
 
     let decision = adopt::decide(&adopt::Input {
+        displaced_is_incoming,
+        incoming_expires_at_ms: incoming_credentials.expires_at_ms,
+        displaced_is_duplicate: displaced.digests() == incoming_credentials.digests(),
+        existing_is_another_account: occupied_by_another,
         same_namespace,
         identity_matches,
         pending_present: pending_present(&ns_dir),
@@ -1838,7 +1915,10 @@ fn decide_adoption(
     });
 
     match decision {
-        adopt::Adoption::AlreadyPresent => Ok(AdoptionPlan::Nothing),
+        // Both write nothing, and the difference between them is what they
+        // say about *why*: the target already held it, or the credential was
+        // a duplicate of — or older than — the one being installed.
+        adopt::Adoption::AlreadyPresent | adopt::Adoption::Discarded => Ok(AdoptionPlan::Nothing),
         adopt::Adoption::Refused(refusal) => Err(refusal),
         adopt::Adoption::ToAdoptedCopy => Ok(AdoptionPlan::AdoptedCopy(ns_dir)),
         adopt::Adoption::ToStore => Ok(AdoptionPlan::ThirdStore { ns_dir, prior }),

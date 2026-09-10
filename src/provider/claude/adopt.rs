@@ -103,6 +103,16 @@ pub enum Refusal {
     IdentityMismatch,
     /// The existing copy could not be read.
     Unreadable,
+    /// The adopted copy beside the store already holds a **different
+    /// account's** credential.
+    ///
+    /// Condition (a) for the one row that writes that file without owning it:
+    /// `agctl-r3h`'s keep arm parks the incoming account's displaced copy in
+    /// `<D>/.credentials.adopted.json`, and `write_adopted` renames over that
+    /// name. If what is there belongs to somebody else, replacing it destroys
+    /// a credential whose store may have migrated and whose item this very
+    /// swap is overwriting — so the expiry comparison never gets to run.
+    OccupiedByAnother,
     /// What was at the target when the adoption was decided is not what is
     /// there now.
     ///
@@ -139,6 +149,11 @@ impl Refusal {
                 "the outgoing credential cannot be adopted: the copy already stored could not \
                  be read"
             }
+            Self::OccupiedByAnother => {
+                "the outgoing credential cannot be adopted: the adopted copy beside the store \
+                 belongs to another account, and replacing it would destroy that account's \
+                 only copy"
+            }
             Self::Changed => {
                 "the outgoing credential cannot be adopted: the copy already stored changed \
                  while this swap was preparing, so it was never weighed against the one being \
@@ -155,6 +170,7 @@ impl Refusal {
             Self::Migrated => "migrated",
             Self::IdentityMismatch => "identity_mismatch",
             Self::Unreadable => "unreadable",
+            Self::OccupiedByAnother => "occupied_by_another",
             Self::Changed => "changed",
         }
     }
@@ -171,6 +187,19 @@ pub enum Adoption {
     /// Write it to the adopted copy beside the store it was displaced from,
     /// `<D>/.credentials.adopted.json` (decision D-024).
     ToAdoptedCopy,
+    /// The displaced credential is the incoming account's own, and it is a
+    /// **proven duplicate or strictly older** copy of the one this pass is
+    /// installing: write nothing, adopt nowhere, and let the swap proceed.
+    ///
+    /// Not [`Self::AlreadyPresent`], which says the *target* already holds
+    /// this credential; this says the credential is not worth a target,
+    /// because the account whose it is, is the one being swapped in — and the
+    /// pass is about to put a newer copy of that same grant into the item and
+    /// (when it refreshed) into that account's own store. The other half of
+    /// the row — a copy that is *not* older — is kept, and takes
+    /// [`Self::ToAdoptedCopy`]'s guards to keep it (`agctl-5gs`,
+    /// `agctl-r3h`).
+    Discarded,
     /// Refusal **F**: the swap does not happen and nothing is written.
     Refused(Refusal),
 }
@@ -185,6 +214,53 @@ impl Adoption {
 /// Everything [`decide`] needs, all of it already read by the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Input {
+    /// Whether the displaced credential belongs to the account being swapped
+    /// **in**, rather than to the store's own account or to a third party
+    /// (`agctl-5gs`).
+    ///
+    /// The caller
+    /// signals it rather than the matrix deriving it, for the same reason
+    /// `same_namespace` is a field — deciding whose a credential is means
+    /// comparing identities, which is [`swap::same_identity`](crate::provider::claude::swap::same_identity)'s
+    /// job and not this function's.
+    ///
+    /// It selects a row, it does not skip the others' conditions: when the
+    /// row **keeps** the copy it writes the store's own D-024 sibling, so
+    /// [`Self::pending_present`] and [`Self::existing`] are consulted for that
+    /// file exactly as the `same_namespace` row consults them. What it does
+    /// skip is condition (a): the credential is the incoming account's by
+    /// construction, which is precisely what [`Self::identity_matches`]
+    /// denies.
+    pub displaced_is_incoming: bool,
+    /// When [`Self::displaced_is_incoming`] is set: the `expiresAt` of the
+    /// credential the incoming account's **own store** holds — the one this
+    /// pass read in Phase A and is about to install — so the row can ask
+    /// whether the displaced copy is the live one.
+    ///
+    /// Not an `Option`: the caller has that credential in its hand (it is
+    /// what the swap is installing) and `expiresAt` is a required field of
+    /// the blob, so "nothing to compare against" is not a state this row can
+    /// be in. Not consulted by any other row.
+    pub incoming_expires_at_ms: i64,
+    /// When [`Self::displaced_is_incoming`] is set: whether the displaced
+    /// credential and that stored one are the **same** credential, by digest.
+    ///
+    /// Expiry alone cannot answer it. Two credentials of one account can
+    /// carry the same `expiresAt` and different refresh tokens — a refresh
+    /// inside the same expiry window — and dropping one of those on an equal
+    /// expiry can kill the live chain. A proven duplicate is the only thing
+    /// this row drops without weighing it. Not consulted by any other row.
+    pub displaced_is_duplicate: bool,
+    /// When [`Self::displaced_is_incoming`] is set: whether what is already at
+    /// the target — the store's D-024 sibling — belongs to a **different
+    /// account** than the credential being adopted.
+    ///
+    /// The caller answers it with the crate's one identity predicate
+    /// (`swap::same_identity`) against the incoming record, which is the
+    /// displaced credential's own account by this row's construction. A
+    /// sibling that names no identity at all is **not** a different account
+    /// (fact F4). Not consulted by any other row.
+    pub existing_is_another_account: bool,
     /// Whether P's namespace **is** the store being swapped — the ordinary
     /// first swap of an `exec`-started session, and the case ruling OQ2
     /// permits narrowly.
@@ -218,8 +294,45 @@ pub struct Input {
 /// would file one account's credential under another's name. `adopt_tests.rs`
 /// pins the order as a table for exactly that reason.
 pub fn decide(input: &Input) -> Adoption {
-    // Condition (b), first and for both paths: an unresolved phase-1 write
-    // means the namespace has not settled, and nothing may be added to it.
+    // `agctl-5gs`'s row, first because its first half — a duplicate, or a
+    // copy older than the one being installed — needs no target at all. Its
+    // other half does write, and takes the store sibling's own conditions
+    // below. Routing this credential through the third-namespace row instead
+    // sent it to the incoming account's own `.credentials.json` — the file
+    // step 13's write-back writes — so the swap refused `Changed` against its
+    // own write and `NewerCopy` for ever afterwards (review4 N-14).
+    if input.displaced_is_incoming {
+        // Nothing to keep: the same credential the pass is installing, or a
+        // strictly older copy of that grant. Equal expiries with different
+        // digests are **not** this case — see `displaced_is_duplicate`.
+        if input.displaced_is_duplicate
+            || input.incoming_expires_at_ms > input.displaced_expires_at_ms
+        {
+            return Adoption::Discarded;
+        }
+
+        // Keeping it writes the store's own D-024 sibling, so it takes that
+        // file's conditions — every one of them, because a blind rename over
+        // that name destroys whatever the previous swap adopted there
+        // (`agctl-5gs` review F1). Condition (a) is the exception: this
+        // credential is the incoming account's by construction.
+        if input.pending_present {
+            return Adoption::Refused(Refusal::PendingPresent);
+        }
+        // Condition (a) for this file, and it outranks the expiry comparison:
+        // `place` asks whether what is there is worth keeping *as a copy of
+        // the same credential*, which is a question that means nothing across
+        // two accounts. An older credential of somebody else is not a worse
+        // copy of this one — it is somebody else's only one.
+        if input.existing_is_another_account {
+            return Adoption::Refused(Refusal::OccupiedByAnother);
+        }
+        return place(input, Adoption::ToAdoptedCopy);
+    }
+
+    // Condition (b), first for both paths that do have a target: an
+    // unresolved phase-1 write means the namespace has not settled, and
+    // nothing may be added to it.
     if input.pending_present {
         return Adoption::Refused(Refusal::PendingPresent);
     }

@@ -3805,3 +3805,316 @@ fn a_swap_that_writes_the_refresh_back_touches_nothing_outside_the_namespace_roo
     }
     live_item_never_written(&fixture);
 }
+
+// ---------------------------------------------------------------------------
+// D-017's row for the incoming account's own displaced copy (`agctl-5gs`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_item_holding_another_copy_of_the_incoming_account_applies_and_then_says_already_active() {
+    // Review4 N-14's wedge, reproduced from its probe. The state is ordinary:
+    // D's item holds a credential of **T** — which is what one earlier
+    // `use --live T` leaves — and T's own store holds T's (expired) copy.
+    //
+    // Pre-fix, `third_namespace` resolved the displaced credential to T's own
+    // record, so the adoption target was the very file step 13's write-back
+    // writes: run 1 refused **F**/exit 14 with "the copy already stored
+    // changed while this swap was preparing" — blaming a concurrent writer
+    // that did not exist — and every later run refused `NewerCopy`, because
+    // the write-back had made T's store newer than the copy being adopted.
+    // The store was wedged: `use --live T` could not succeed again.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (fixture, service) = two_accounts(&server, common::expired_at());
+    let earlier = common::identified_blob(
+        "sk-ant-oat01-t-earlier",
+        "sk-ant-ort01-t-earlier",
+        common::fresh_at(),
+        ACCT_T,
+        Some(ORG_T),
+    );
+    fixture.keychain_item(&service, &earlier);
+    let store = incoming_store(&fixture);
+
+    // Run 1 applies.
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+    assert_eq!(code, 0, "run 1 applies rather than refusing F: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], json!("applied"), "{doc}");
+    assert_eq!(doc["refusal"], Value::Null, "{doc}");
+    assert_eq!(
+        doc["adopted_to"],
+        json!(".credentials.adopted.json"),
+        "the displaced copy expires later than the one T's own store held, so it is kept in the \
+         store's D-024 sibling rather than dropped (`agctl-r3h`): {doc}"
+    );
+    assert_eq!(token.calls(), 1, "one refresh POST");
+
+    // The discarded copy went nowhere: not into T's store, not into an
+    // adopted copy beside D, not into a plaintext store for D.
+    let saved = fs::read_to_string(&store).expect("T's store is readable");
+    assert!(saved.contains("sk-ant-ort01-rotated"), "T's store holds the refreshed pair: {saved}");
+    assert!(
+        !saved.contains("t-earlier"),
+        "and not the older copy the item had been holding: {saved}"
+    );
+    let adopted =
+        fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("the adopted copy is there");
+    assert!(
+        adopted.contains("sk-ant-ort01-t-earlier") && adopted.contains("sk-ant-oat01-t-earlier"),
+        "and it holds the displaced pair, beside the **store** — never in T's own namespace, \
+         which is the file the write-back writes: {adopted}"
+    );
+    no_plaintext_store(&fixture, "after a swap whose displaced copy was adopted beside the store");
+
+    let item =
+        fs::read_to_string(fixture.keychain_item_path_for(common::KEYCHAIN_ACCOUNT, &service))
+            .expect("the item is readable");
+    assert_eq!(item, saved, "the item and T's own store hold the same credential");
+    assert_eq!(writes(&fixture).len(), 1, "one `-i` line: {:?}", writes(&fixture));
+
+    // The audit line, named: one write, `applied`, for this store's item,
+    // carrying the displaced copy's digest prefix as its `from`.
+    let lines = audit_lines(&fixture);
+    assert_eq!(lines.len(), 1, "one audit line: {lines:?}");
+    assert!(lines[0].contains("\"event\":\"write\""), "{}", lines[0]);
+    assert!(lines[0].contains("\"outcome\":\"applied\""), "{}", lines[0]);
+    assert!(
+        lines[0].contains(&format!(
+            "\"target\":\"namespace:{}\"",
+            common::sha8(&common::export_spelling(&fixture.ns_dir(ACCT, ORG)))
+        )),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        !lines[0].contains("\"from_digest8\":null"),
+        "the item held a credential, so the line names what it displaced: {}",
+        lines[0]
+    );
+    audit_carries_no_token(&fixture);
+
+    // Run 2 is `already_active`, not `NewerCopy` for ever.
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+    assert_eq!(code, 0, "run 2 is not a refusal: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], json!("already_active"), "{doc}");
+    assert_eq!(doc["refusal"], Value::Null, "{doc}");
+    assert_eq!(token.calls(), 1, "and it made no second refresh POST");
+    assert_eq!(writes(&fixture).len(), 1, "no second keychain write: {:?}", writes(&fixture));
+    assert_eq!(audit_lines(&fixture).len(), 1, "and no second audit line");
+    live_item_never_written(&fixture);
+
+    // Both runs' whole `security` conversation. Run 1: Phase A's read of the
+    // item, the probe asking whether T's store has migrated, the write-back
+    // gate's one read per candidate service name, the re-read under the hold
+    // and the verifying read. The migrated probe the *adoption* used to make
+    // is gone with the third-namespace row: this row reads no target at all.
+    // Run 2: Phase A's read, and nothing else — `already_active` is decided
+    // before any lock.
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 7), ("-i", 1), ("add-generic-password", 1)],
+    );
+}
+
+#[test]
+fn a_displaced_copy_newer_than_the_incoming_store_is_kept_and_an_undo_puts_it_back() {
+    // `agctl-r3h`. The shape a working session leaves: D's item holds a
+    // credential of **T** that a Claude Code session refreshed after an
+    // earlier `use --live T`, so it expires *later* than the copy T's own
+    // store holds — and T's store copy is still fresh, so this pass makes no
+    // refresh POST at all. Discarding the displaced copy here would drop the
+    // live half of T's refresh chain and cost that account a `login`; the row
+    // keeps it in the **store's** D-024 sibling, which touches nothing the
+    // write-back writes and is the file `use --undo` reads back.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (fixture, service) = two_accounts(&server, common::fresh_at());
+    let newer = common::identified_blob(
+        "sk-ant-oat01-t-session",
+        "sk-ant-ort01-t-session",
+        common::fresh_at() + 3_600_000,
+        ACCT_T,
+        Some(ORG_T),
+    );
+    fixture.keychain_item(&service, &newer);
+    let store = incoming_store(&fixture);
+    let before = fs::read_to_string(&store).expect("T's store is readable");
+
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], json!("applied"), "{doc}");
+    assert_eq!(doc["adopted_to"], json!(".credentials.adopted.json"), "the copy was kept: {doc}");
+    assert_eq!(token.calls(), 0, "T's own copy is fresh, so no refresh POST runs");
+
+    let adopted =
+        fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("the adopted copy is there");
+    assert!(
+        adopted.contains("sk-ant-ort01-t-session"),
+        "the adopted copy holds the displaced pair: {adopted}"
+    );
+    assert_eq!(
+        fs::read_to_string(&store).expect("T's store is readable"),
+        before,
+        "and T's own `.credentials.json` is untouched — the file the write-back writes and the \\
+         one the wedge came from"
+    );
+    let item =
+        fs::read_to_string(fixture.keychain_item_path_for(common::KEYCHAIN_ACCOUNT, &service))
+            .expect("the item is readable");
+    assert!(item.contains("sk-ant-oat01-incoming"), "the item now holds T's store copy: {item}");
+
+    // And it is recoverable: the reversal reads the store's adopted copy,
+    // which is why the copy is kept there rather than in T's namespace.
+    let (code, stdout, stderr) = undo(&fixture);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    let item =
+        fs::read_to_string(fixture.keychain_item_path_for(common::KEYCHAIN_ACCOUNT, &service))
+            .expect("the item is readable");
+    assert!(
+        item.contains("sk-ant-ort01-t-session"),
+        "the undo put the kept copy back into the item: {item}"
+    );
+    // The kept copy was consumed rather than left as a second home for it:
+    // what is in the adopted copy now is what the *reversal* displaced, which
+    // is the staging protocol's own shape ("undoing an undo is a swap").
+    let adopted =
+        fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("the adopted copy is there");
+    assert!(
+        !adopted.contains("t-session"),
+        "the kept copy is out of the adopted file and back in the item: {adopted}"
+    );
+    assert!(
+        adopted.contains("sk-ant-oat01-incoming"),
+        "and what the reversal displaced took its place: {adopted}"
+    );
+
+    // Both passes' whole `security` conversation: the swap's Phase A read,
+    // re-read under the hold and verifying read, then the undo's same three,
+    // with one `-i` write each. No migration probe on either — the swap's
+    // incoming copy is fresh, so nothing asks whether it has migrated, and
+    // this row reads no target in the keychain at all.
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 6), ("-i", 2), ("add-generic-password", 2)],
+    );
+    live_item_never_written(&fixture);
+    audit_carries_no_token(&fixture);
+}
+
+#[test]
+fn a_kept_copy_refuses_rather_than_renaming_over_the_credential_beside_the_store() {
+    // Review F1. The keep arm writes `<D>/.credentials.adopted.json`, and
+    // `write_adopted` renames over that name blind — so without the matrix's
+    // own guards the two-swap sequence the feature itself produces destroys
+    // D's only credential: D's namespace has migrated, an earlier swap parked
+    // D's credential in that sibling, the session refreshed the item, and this
+    // run's displaced copy is newer than T's store copy. The row now takes
+    // that file's conditions, so an occupied-and-newer sibling refuses **F**
+    // and the file is left exactly as it was.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (fixture, service) = two_accounts(&server, common::fresh_at());
+    fixture.keychain_item(
+        &service,
+        &common::identified_blob(
+            "sk-ant-oat01-t-session",
+            "sk-ant-ort01-t-session",
+            common::fresh_at() + 3_600_000,
+            ACCT_T,
+            Some(ORG_T),
+        ),
+    );
+    // What an earlier `use --live T` parked there: D's own credential, which
+    // exists nowhere else because D's store has migrated into the item this
+    // swap is about to overwrite. Newer than the displaced copy, which is the
+    // state the matrix refuses on.
+    let ds_own = common::identified_blob(
+        "sk-ant-oat01-d-parked",
+        "sk-ant-ort01-d-parked",
+        common::fresh_at() + 7_200_000,
+        ACCT,
+        Some(ORG),
+    );
+    fs::write(adopted_path(&fixture, ACCT, ORG), &ds_own).expect("the sibling is plantable");
+
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+
+    assert_eq!(code, 14, "SWAP_EXIT_REFUSED_F: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], json!("refused"), "{doc}");
+    assert_eq!(doc["refusal"], json!("F"), "{doc}");
+    // Identity outranks the expiry comparison, so this is the sentence even
+    // though the sibling is also newer (fix loop 3); the same-account/newer
+    // arm — `Refused(NewerCopy)` — is the unit table's row.
+    assert!(
+        stdout.contains("the adopted copy beside the store belongs to another account"),
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("the sibling is readable"),
+        ds_own,
+        "D's credential is byte-unchanged: it lives nowhere else, and a rename over it would \
+         cost an interactive login"
+    );
+    assert_eq!(token.calls(), 0, "T's copy is fresh, so no refresh POST ran");
+    assert_eq!(writes(&fixture).len(), 0, "nothing reached the item: {:?}", writes(&fixture));
+    let item =
+        fs::read_to_string(fixture.keychain_item_path_for(common::KEYCHAIN_ACCOUNT, &service))
+            .expect("the item is readable");
+    assert!(item.contains("sk-ant-oat01-t-session"), "and the item still holds it: {item}");
+}
+
+#[test]
+fn a_kept_copy_refuses_an_older_sibling_of_another_account_rather_than_replacing_it() {
+    // The same file, the same loss, one `expiresAt` away from the test above:
+    // D's parked credential is **older** than the displaced T copy, so the
+    // expiry comparison alone ("strictly older, so strictly worth replacing")
+    // would rename over it. That comparison means nothing across two
+    // accounts — an older credential of somebody else is not a worse copy of
+    // this one, it is their only one — so condition (a) applies to this file
+    // and refuses first (fix loop 3).
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (fixture, service) = two_accounts(&server, common::fresh_at());
+    fixture.keychain_item(
+        &service,
+        &common::identified_blob(
+            "sk-ant-oat01-t-session",
+            "sk-ant-ort01-t-session",
+            common::fresh_at() + 3_600_000,
+            ACCT_T,
+            Some(ORG_T),
+        ),
+    );
+    let ds_own = common::identified_blob(
+        "sk-ant-oat01-d-parked",
+        "sk-ant-ort01-d-parked",
+        common::fresh_at() - 1_800_000,
+        ACCT,
+        Some(ORG),
+    );
+    fs::write(adopted_path(&fixture, ACCT, ORG), &ds_own).expect("the sibling is plantable");
+
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+
+    assert_eq!(code, 14, "SWAP_EXIT_REFUSED_F: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], json!("refused"), "{doc}");
+    assert_eq!(doc["refusal"], json!("F"), "{doc}");
+    assert!(
+        stdout.contains("the adopted copy beside the store belongs to another account"),
+        "the refusal names what it found, rather than talking about expiries: {stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("the sibling is readable"),
+        ds_own,
+        "D's credential is byte-unchanged even though it expires sooner than the copy this swap \
+         was carrying"
+    );
+    assert_eq!(token.calls(), 0, "no refresh POST ran");
+    assert_eq!(writes(&fixture).len(), 0, "nothing reached the item: {:?}", writes(&fixture));
+}
