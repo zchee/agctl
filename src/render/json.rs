@@ -144,6 +144,18 @@ pub struct JsonRow {
     /// it does not merge them — because each is still a separate token pair
     /// that expires, refreshes and can be revoked on its own.
     pub same_identity_as: Option<&'static str>,
+    /// Who holds this row's keychain item, when a hot-swap put another
+    /// identity there: the occupant of
+    /// [`AccountState::Adopted`](crate::provider::claude::account::AccountState::Adopted),
+    /// and `None` on every other row.
+    ///
+    /// A different question from [`JsonRow::same_identity_as`], which says
+    /// two rows describe *one* account. This says the opposite: the item this
+    /// row's namespace names is *not* this row's, so the credential reported
+    /// here came from the adopted copy beside it (decision D-024). Never a
+    /// token — an email address when the occupying blob named one, an account
+    /// UUID otherwise.
+    pub occupied_by: Option<String>,
 }
 
 /// One usage window.

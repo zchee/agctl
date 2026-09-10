@@ -11,12 +11,18 @@
 //! - [`account`] — what a row is and what its state means.
 //! - [`discovery`] — turning a keychain and a registry into rows.
 //! - [`usage`] — the usage endpoint: request, response, normalization.
+//! - [`swap`] — what `use --live` decides, and in which of plan section
+//!   3.4's three phases it decides it. No I/O.
+//! - [`adopt`] — what becomes of the credential a swap displaces (decision
+//!   D-017). No I/O.
 
 pub mod account;
+pub mod adopt;
 pub mod credentials;
 pub mod discovery;
 pub mod namespace;
 pub mod oauth;
+pub mod swap;
 pub mod usage;
 
 /// The `User-Agent` agentctl sends to Anthropic.

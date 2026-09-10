@@ -73,6 +73,7 @@ use crate::provider::claude::discovery;
 use crate::provider::claude::namespace;
 use crate::provider::claude::namespace::EnvView;
 use crate::provider::claude::oauth::OauthClient;
+use crate::provider::claude::swap;
 use crate::provider::claude::usage::RefreshError;
 use crate::provider::claude::usage::TokenRefresher;
 use crate::provider::claude::usage::UsageClient;
@@ -595,6 +596,13 @@ impl RowOutcome {
             weekly_reset: json::weekly_reset_of(usage),
             note: self.note.clone(),
             same_identity_as: self.same_identity_as_live.then_some(json::SAME_IDENTITY_LIVE),
+            // Read off the state rather than carried as a second field, so
+            // the two cannot disagree: the occupant is only knowable when the
+            // row is `Adopted`, and it is exactly what that variant holds.
+            occupied_by: match &self.state {
+                AccountState::Adopted { occupant } => Some(occupant.clone()),
+                _ => None,
+            },
         }
     }
 }
@@ -1287,6 +1295,15 @@ struct MigratedItem {
     /// The `acct` attribute the read matched on, which is the only account a
     /// write may name (see [`migrated_item`]).
     account: String,
+    /// The record this item is supposed to belong to.
+    ///
+    /// Carried on the item rather than threaded through
+    /// [`refresh_in_place`] and [`after_invalid_grant`] as a fourth
+    /// parameter, because the identity guard has three call sites and two of
+    /// them are inside functions that had no `&AccountRecord` at all. One
+    /// field on the value they already share is the cheapest way to give all
+    /// three the same answer (W3 re-review N1, ruling OQ2(d)).
+    owner: AccountRecord,
 }
 
 /// The migrated item this row may refresh in place, or `None` when the item a
@@ -1330,7 +1347,7 @@ fn migrated_item(
     if found.and_then(|entry| entry.account.as_deref()).is_some_and(|listed| listed != account) {
         return Err(MIGRATED_ACCOUNT_MISMATCH);
     }
-    Ok(MigratedItem { target, sha8: sha8.sha8().to_owned(), account })
+    Ok(MigratedItem { target, sha8: sha8.sha8().to_owned(), account, owner: record.clone() })
 }
 
 /// Refreshes a migrated namespace's own keychain item in place (D-015).
@@ -1373,6 +1390,17 @@ fn refresh_in_place(
     let ns_dir = item.target.store_dir();
     let service = item.target.service();
 
+    // The identity guard's target check (W3 re-review N1, ruling OQ2(d)).
+    // Before the POST, before the digest is taken, before anything: an item
+    // whose identity is not this record's is an occupant, and refreshing it
+    // would spend this row's grant to mint a credential for somebody else and
+    // then store it under this row's name. After a hot-swap that is the
+    // ordinary state of the item, not a corruption, which is why the row it
+    // produces is a report rather than an error.
+    if !swap::same_identity(&current, &item.owner) {
+        return occupied(item, &current);
+    }
+
     // --- Phase B: the POST, holding nothing ------------------------------
     let before = current.digests();
     let reader = (shared.reader_factory)(ctx);
@@ -1390,6 +1418,14 @@ fn refresh_in_place(
     // theirs costs one read, where refreshing anyway spends a grant the server
     // is about to reject and then discards the answer under the locks.
     match location::from_keychain(reader.as_ref(), service) {
+        // The identity guard, first: an item that changed *and* stopped being
+        // this record's is not a peer refresh to adopt, it is an occupant. A
+        // concurrent `use --live` is exactly how this arm is reached.
+        Resolved::Credentials(peer)
+            if peer.digests() != before && !swap::same_identity(&peer, &item.owner) =>
+        {
+            return occupied(item, &peer);
+        }
         Resolved::Credentials(peer) if peer.digests() != before => return adopted(*peer),
         Resolved::Credentials(_) => {}
         // Absent, locked or unreadable: the value this refresh would be
@@ -1414,7 +1450,7 @@ fn refresh_in_place(
         // `agentctl claude login` — which decision D-014 forbids from writing
         // a namespaced item at all, so the advice would be a dead end.
         Err(RefreshError::InvalidGrant) => {
-            return after_invalid_grant(&shared.fault, reader.as_ref(), service, &before);
+            return after_invalid_grant(&shared.fault, reader.as_ref(), item, &before);
         }
         Err(err) => {
             return LockedResult {
@@ -1530,7 +1566,7 @@ fn refresh_in_place(
         AcquireOutcome::Busy { holder_alive, stopped_pids } => {
             return LockedResult {
                 state: Some(AccountState::Busy),
-                note: Some(busy_note(holder_alive, &stopped_pids)),
+                note: Some(swap::busy_note(holder_alive, &stopped_pids)),
                 lock_state: "busy",
                 ..LockedResult::default()
             };
@@ -1676,6 +1712,38 @@ fn adopted(peer: Credentials) -> LockedResult {
     }
 }
 
+/// The row for a namespace whose keychain item is held by a **different**
+/// identity than the record's (ruling OQ2(d), W3 re-review N1).
+///
+/// The guard's whole purpose in one function. An item that does not belong to
+/// this record is an **occupant**: a hot-swap put somebody else's credential
+/// there, and this row's own credential was adopted into the copy beside it
+/// (decision D-024). So the row reports three things and does none of the
+/// obvious wrong ones — it does **not** display the occupant's usage under
+/// this account's name, does **not** refresh the occupant's token, and does
+/// **not** adopt it as this row's own:
+///
+/// - the state names who holds the item, without any token material;
+/// - the credentials come from the adopted copy, which is this record's;
+/// - `lock_state` stays `none`, because nothing was locked to find this out.
+///
+/// An adopted copy that is missing or unreadable leaves the row with no
+/// credentials, which is honest: the record's credential is not somewhere
+/// this pass can reach.
+fn occupied(item: &MigratedItem, occupant: &Credentials) -> LockedResult {
+    let adopted = match location::from_adopted(item.target.store_dir()) {
+        Resolved::Credentials(credentials) => Some(*credentials),
+        _ => None,
+    };
+    LockedResult {
+        credentials: adopted,
+        state: Some(AccountState::Adopted { occupant: swap::occupant_of(occupant) }),
+        note: Some("its keychain item is held by another identity".to_owned()),
+        lock_state: "none",
+        ..LockedResult::default()
+    }
+}
+
 /// What an `invalid_grant` means once the item has been re-read.
 ///
 /// The grant is dead either way; the question is whose refresh consumed it.
@@ -1686,14 +1754,23 @@ fn adopted(peer: Credentials) -> LockedResult {
 fn after_invalid_grant(
     fault: &Fault,
     reader: &dyn KeychainReader,
-    service: &str,
+    item: &MigratedItem,
     before: &Digests,
 ) -> LockedResult {
+    let service = item.target.service();
     // The window a test occupies to write the item while our POST was in
     // flight, which is the only way this branch is reachable on purpose.
     // Outside every lock, like the rest of Phase B.
     fault.pause_point("before_invalid_grant_reread");
     match location::from_keychain(reader, service) {
+        // The identity guard again, and for the same reason: the grant is
+        // dead either way, but an occupant's credential is not this row's to
+        // take just because it arrived while our POST was in flight.
+        Resolved::Credentials(peer)
+            if peer.digests() != *before && !swap::same_identity(&peer, &item.owner) =>
+        {
+            occupied(item, &peer)
+        }
         Resolved::Credentials(peer) if peer.digests() != *before => adopted(*peer),
         Resolved::Credentials(_) => LockedResult {
             state: Some(AccountState::NeedsLogin),
@@ -1721,7 +1798,7 @@ fn after_invalid_grant(
 /// demonstrably not touched. A timeout killed the child *after* `spawn`
 /// returned, so it may already have written; the verifying read after the
 /// release is what settles it (W4a open question 6).
-fn left_unknown(err: &KeychainWriteError) -> bool {
+pub(crate) fn left_unknown(err: &KeychainWriteError) -> bool {
     matches!(err, KeychainWriteError::Timeout(_))
 }
 
@@ -1732,30 +1809,6 @@ fn discarded(why: &str) -> LockedResult {
         note: Some(format!("refresh discarded: {why}")),
         lock_state: "none",
         ..LockedResult::default()
-    }
-}
-
-/// Plan section 3.4's `busy` wording.
-///
-/// The stopped process ids are named because a bare `busy` is a dead end for a
-/// user whose `Ctrl-Z`'d pane is blocking every break, and the disclaimer is
-/// in the same breath because that is what makes naming them honest: a process
-/// id is not attribution to a store. Nothing here reaches the audit log, whose
-/// vocabulary names no pid at all (plan AC80).
-fn busy_note(holder_alive: bool, stopped_pids: &[u32]) -> String {
-    if !stopped_pids.is_empty() {
-        let pids: Vec<String> = stopped_pids.iter().map(u32::to_string).collect();
-        return format!(
-            "a stopped claude process is present (pid {}). agentctl will not break this lock \
-             while one is, because it cannot tell whether that process is the holder. Resume or \
-             end it, or run `agentctl claude doctor --remove-stale <path> --yes`",
-            pids.join(", ")
-        );
-    }
-    if holder_alive {
-        "another process is refreshing this store's credentials".to_owned()
-    } else {
-        "this store's refresh lock is held; agentctl did not break it".to_owned()
     }
 }
 

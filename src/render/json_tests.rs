@@ -71,6 +71,7 @@ fn row(state: &AccountState, usage: Option<&UsageSnapshot>) -> JsonRow {
         weekly_reset: weekly_reset_of(usage),
         note: None,
         same_identity_as: None,
+        occupied_by: None,
     }
 }
 
@@ -83,7 +84,7 @@ fn report(rows: Vec<JsonRow>) -> StatusReport {
 }
 
 /// Every [`AccountState`] this build can put in a row.
-fn all_states() -> [AccountState; 22] {
+fn all_states() -> [AccountState; 23] {
     [
         AccountState::Ok,
         AccountState::Expired { read_only: true },
@@ -94,6 +95,7 @@ fn all_states() -> [AccountState; 22] {
         AccountState::Foreign { source: "claude-switcher".to_owned() },
         AccountState::Forgotten,
         AccountState::MigratedToKeychain { service: "Claude Code-credentials-1234abcd".to_owned() },
+        AccountState::Adopted { occupant: "someone@example.com".to_owned() },
         AccountState::ClaudeSessionDetected {
             lock: ".oauth_refresh.lock".to_owned(),
             age_ms: 12_000,
@@ -154,6 +156,7 @@ fn json_row_of(row: &AccountRow) -> JsonRow {
         weekly_reset: None,
         note: row.note.clone(),
         same_identity_as: None,
+        occupied_by: None,
     }
 }
 

@@ -63,6 +63,22 @@ pub enum AccountState {
         /// The service name that was found.
         service: String,
     },
+    /// This namespace's keychain item is held by a **different** identity —
+    /// a hot-swap put another account there — and the record's own credential
+    /// is in the adopted copy beside it (decisions D-017, D-024).
+    ///
+    /// Distinct from [`AccountState::MigratedToKeychain`], which is the same
+    /// account's credential in a place agentctl may not write. Here the item
+    /// is readable and writable but is *not this row's*, so it is never read
+    /// for this row, never refreshed for it, and never adopted into it
+    /// (ruling OQ2(d), W3 re-review N1). The row is still perfectly usable:
+    /// the adopted copy holds a real token, which is why this is not a
+    /// failure state.
+    Adopted {
+        /// Who holds the item, as an email address when the blob named one
+        /// and an account UUID otherwise. Never a token and never a raw blob.
+        occupant: String,
+    },
     /// A Claude Code lock artefact is present in the namespace.
     ClaudeSessionDetected {
         /// The artefact's name.
@@ -126,6 +142,9 @@ impl AccountState {
             Self::Foreign { source } => format!("foreign ({source})"),
             Self::Forgotten => "forgotten".to_owned(),
             Self::MigratedToKeychain { service } => format!("migrated to keychain ({service})"),
+            Self::Adopted { occupant } => {
+                format!("adopted (its keychain item is held by another identity: {occupant})")
+            }
             Self::ClaudeSessionDetected { lock, age_ms } => format!(
                 "claude session detected — refresh refused (lock {lock}, age {}s)",
                 age_ms / 1000
@@ -173,6 +192,7 @@ impl AccountState {
             Self::Foreign { .. } => "foreign",
             Self::Forgotten => "forgotten",
             Self::MigratedToKeychain { .. } => "migrated_to_keychain",
+            Self::Adopted { .. } => "adopted",
             Self::ClaudeSessionDetected { .. } => "claude_session_detected",
             Self::KeychainLocked { .. } => "keychain_locked",
             Self::KeychainTimeout => "keychain_timeout",
@@ -203,6 +223,7 @@ impl AccountState {
             | Self::Foreign { .. }
             | Self::Forgotten
             | Self::MigratedToKeychain { .. }
+            | Self::Adopted { .. }
             | Self::PendingReplayed
             | Self::EnvToken => false,
             Self::Expired { .. }
@@ -232,6 +253,7 @@ impl AccountState {
             Self::Ok
             | Self::Expired { read_only: false }
             | Self::MigratedToKeychain { .. }
+            | Self::Adopted { .. }
             | Self::ClaudeSessionDetected { .. }
             | Self::PendingReplayed
             | Self::Stale

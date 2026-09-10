@@ -110,6 +110,26 @@ pub const PENDING_FILE: &str = ".credentials.json.pending";
 /// What the pending credentials were derived from.
 pub const PENDING_META: &str = ".pending.meta";
 
+/// Where a hot-swap parks the credential it displaced (decision D-024).
+///
+/// **Not** [`CREDENTIALS_FILE`], and the difference is the whole point. Fact
+/// F35's composed store reads the keychain first and falls through to
+/// `.credentials.json` on "no item, a read failure **or** a throttle" — not
+/// only on an absent item — so a displaced credential parked under that name
+/// would be served to the peer session whenever its keychain read hiccuped,
+/// silently undoing the swap the user asked for. The same fact deletes that
+/// file only when the keychain was *previously empty*, which after a swap it
+/// never is, so the exposure would not lapse either; and `update()` on a
+/// non-transient keychain failure overwrites it, and `delete()` — a
+/// `/logout` — removes it. Claude Code reads exactly one file name (fact
+/// F40), so any other name in the same directory is invisible to all four
+/// paths. This is that name.
+///
+/// It is adopt-only: nothing composes it, [`read_credentials`] does not look
+/// at it, and it is never replayed into [`CREDENTIALS_FILE`] the way
+/// [`PENDING_FILE`] is.
+pub const ADOPTED_FILE: &str = ".credentials.adopted.json";
+
 /// The mode every file this module creates ends up with.
 const FILE_MODE_BITS: Mode = Mode::RUSR.union(Mode::WUSR);
 
@@ -295,6 +315,22 @@ pub fn read_file_following(path: &Path, limit: u64) -> Result<ReadOutcome, FileS
 /// file, or any errno outside the absent set.
 pub fn read_credentials(ns_dir: &Path) -> Result<ReadOutcome, FileStoreError> {
     read_file(&ns_dir.join(CREDENTIALS_FILE), MAX_CREDENTIALS_BYTES)
+}
+
+/// Reads `<ns_dir>/.credentials.adopted.json` — the credential a swap
+/// displaced (decision D-024) — under the same fact-F40 rules.
+///
+/// Separate from [`read_credentials`] rather than a parameter on it, because
+/// the two answer different questions: that one asks "what is this
+/// namespace's store", this one asks "what did a swap park here". A caller
+/// that wanted either would be a caller that had not decided.
+///
+/// # Errors
+///
+/// Returns [`FileStoreError`] for a symlink, a non-regular file, an oversized
+/// file, or any errno outside the absent set.
+pub fn read_adopted(ns_dir: &Path) -> Result<ReadOutcome, FileStoreError> {
+    read_file(&ns_dir.join(ADOPTED_FILE), MAX_CREDENTIALS_BYTES)
 }
 
 /// Opens a file with `O_NOFOLLOW` and reads it, applying the size limit.
@@ -549,6 +585,260 @@ fn save_to_pending(
     Ok(WriteOutcome::SavedToPending { error: cause.to_string() })
 }
 
+/// Parks the credential a hot-swap displaced at
+/// `<ns_dir>/.credentials.adopted.json` (decision D-024, invariant I1).
+///
+/// The same machinery [`write_credentials`] uses, called directly rather than
+/// factored out of it: the walk down from the namespace root
+/// ([`open_namespace_dir`]), the symlink refusal at the target name, an
+/// `O_EXCL` temporary at 0600, `fsync`, and a rename. `write_credentials`
+/// itself is deliberately left untouched — it is the credential writer every
+/// phase-1 path depends on, and sharing a body with it would put this new
+/// caller inside its blast radius for no gain.
+///
+/// Two things it does **not** do, both on purpose:
+///
+/// - **No pending fallback.** [`WriteOutcome::SavedToPending`] exists so a
+///   failed rename does not cost a login, and [`resolve_pending`] later
+///   replays the parked file into [`CREDENTIALS_FILE`]. Replaying an adopted
+///   copy into that name is precisely the exposure [`ADOPTED_FILE`] exists to
+///   avoid, so a failed rename here is an error and the caller refuses the
+///   swap with nothing written.
+/// - **No cleanup of an existing copy first.** The rename replaces it
+///   atomically, which is what `use --undo` needs: the undo swap adopts the
+///   credential it displaces over the top of the one it is restoring.
+///
+/// Returns the identity of the file that now holds the credential.
+///
+/// # Errors
+///
+/// Returns [`FileStoreError::OutsideNamespaceRoot`] when the target is not
+/// under the namespace root, [`FileStoreError::RefusedSymlink`] or
+/// [`FileStoreError::NotRegular`] when the target — or any directory on the
+/// way to it — is not a plain file or a plain directory,
+/// [`FileStoreError::Cancelled`] when the pass stopped while the copy was
+/// staged, and [`FileStoreError::Io`] for a filesystem failure, a failed
+/// rename included.
+pub fn write_adopted(
+    paths: &Paths,
+    ns_dir: &Path,
+    blob_json: &str,
+    ctx: &PassCtx,
+) -> Result<FileSnapshot, FileStoreError> {
+    commit_staged(paths, stage_adopted(paths, ns_dir, blob_json, ctx)?)
+}
+
+/// A credential written under a temporary name, with the name that matters
+/// still holding whatever it held before.
+///
+/// The half of an adoption that can be undone. A `use --undo` restores a
+/// credential that lives **only** in [`ADOPTED_FILE`] — the store has
+/// migrated, so [`CREDENTIALS_FILE`] does not exist — and it displaces the
+/// occupant into that same name. Writing the occupant there before the item
+/// write has landed destroys the credential the rollback exists to restore,
+/// on every exit that is not a write: a peer refresh during the prompt, a
+/// busy store, a compromised hold, a budget refusal, a `security(1)` that
+/// exits non-zero. Staging separates the two: the credential is on disk and
+/// `fsync`ed, and the rename that makes it *the* copy happens only once the
+/// item demonstrably may hold what the copy held.
+///
+/// Dropping the value without committing removes the temporary, so every
+/// early return from a swap cleans up without having to remember to.
+#[derive(Debug)]
+pub struct StagedAdoption {
+    /// The namespace the copy belongs to.
+    ns_dir: PathBuf,
+    /// The temporary's name within it, for the dirfd-relative rename.
+    tmp_name: String,
+    /// The same file spelled out, for the cleanup registration and for
+    /// [`Drop`], which has no directory handle to work from.
+    tmp_path: PathBuf,
+    /// `None` once the staging has been resolved either way, which is what
+    /// stops [`Drop`] from unlinking a file that has since been renamed.
+    token: Option<cleanup::CleanupToken>,
+}
+
+impl StagedAdoption {
+    /// Forgets the cleanup registration without touching the file.
+    fn release(&mut self) {
+        if let Some(token) = self.token.take() {
+            cleanup::unregister(token);
+        }
+    }
+}
+
+impl Drop for StagedAdoption {
+    fn drop(&mut self) {
+        // Still registered means still staged: the swap took an exit that
+        // does not commit, so the temporary is removed. Leaving it would be a
+        // real token at rest under a name nothing reports.
+        if self.token.is_some() {
+            let _ = fs::remove_file(&self.tmp_path);
+            self.release();
+        }
+    }
+}
+
+/// Writes the displaced credential under a temporary name beside
+/// [`ADOPTED_FILE`], leaving that name untouched.
+///
+/// The first half of [`write_adopted`]: the namespace-root check, the
+/// `O_NOFOLLOW` walk, the symlink refusal at the target name, the `O_EXCL`
+/// temporary at 0600 and the `fsync` all happen here, so everything that can
+/// refuse an adoption has refused before anything is at stake.
+///
+/// # Errors
+///
+/// As [`write_adopted`], minus the rename.
+pub fn stage_adopted(
+    paths: &Paths,
+    ns_dir: &Path,
+    blob_json: &str,
+    ctx: &PassCtx,
+) -> Result<StagedAdoption, FileStoreError> {
+    let target = ns_dir.join(ADOPTED_FILE);
+    if !paths.is_under_namespace_root(&target) {
+        return Err(FileStoreError::OutsideNamespaceRoot(target));
+    }
+
+    let dir = open_namespace_dir(paths, ns_dir)?;
+    let dir = dir.as_fd();
+
+    match entry_at(dir, ADOPTED_FILE, &target)? {
+        Entry::Absent | Entry::Regular => {}
+        Entry::Symlink => return Err(FileStoreError::RefusedSymlink(target)),
+        Entry::Other => return Err(FileStoreError::NotRegular(target)),
+    }
+
+    let tmp_name = format!("{ADOPTED_FILE}.tmp.{}", hex8());
+    let tmp = ns_dir.join(&tmp_name);
+    let token = cleanup::register_tmp_path(tmp.clone());
+    if let Err(err) = create_new_file_at(dir, &tmp_name, blob_json.as_bytes()) {
+        let _ = unlink_at(dir, &tmp_name);
+        cleanup::unregister(token);
+        return Err(FileStoreError::io(format!("could not write `{}`", tmp.display()), err));
+    }
+
+    let staged = StagedAdoption {
+        ns_dir: ns_dir.to_path_buf(),
+        tmp_name,
+        tmp_path: tmp,
+        token: Some(token),
+    };
+
+    // The last moment at which abandoning leaves the namespace exactly as it
+    // was found is the rename, which is `commit_staged`'s — but a pass that
+    // has already been told to stop should not go on to take a hold, so the
+    // staging refuses here and its `Drop` removes the temporary.
+    if ctx.should_stop() {
+        return Err(FileStoreError::Cancelled(target));
+    }
+    Ok(staged)
+}
+
+/// Renames a staged adoption onto [`ADOPTED_FILE`].
+///
+/// The point of no return, and deliberately the only thing in this half: a
+/// caller that reaches here has already established that the credential the
+/// copy used to hold is safe to replace. The rename is atomic, so a reader
+/// sees the old copy or the new one and never a partial file, and the 0600
+/// mode set on the temporary's inode travels with it.
+///
+/// # Errors
+///
+/// Returns [`FileStoreError`] when the namespace directory cannot be reopened
+/// or the rename fails; in either case the temporary is removed and the copy
+/// still holds what it held.
+pub fn commit_staged(
+    paths: &Paths,
+    staged: StagedAdoption,
+) -> Result<FileSnapshot, FileStoreError> {
+    let mut staged = staged;
+    let target = staged.ns_dir.join(ADOPTED_FILE);
+    let dir = open_namespace_dir(paths, &staged.ns_dir)?;
+    let dir = dir.as_fd();
+
+    if let Err(errno) = rustix::fs::renameat(dir, staged.tmp_name.as_str(), dir, ADOPTED_FILE) {
+        return Err(FileStoreError::errno(
+            format!("could not adopt the displaced credential at `{}`", target.display()),
+            errno,
+        ));
+    }
+
+    // The mode was set on the temporary file's inode, which the rename
+    // carries over, so there is nothing left to chmod here.
+    let snap = snapshot_at(dir, ADOPTED_FILE, &target);
+    // The temporary name no longer names anything: releasing before the match
+    // is what stops `Drop` from unlinking the file that is now the copy.
+    staged.release();
+    match snap {
+        Ok(Some(snap)) => Ok(snap),
+        Ok(None) => Err(FileStoreError::io(
+            format!("`{}` vanished immediately after being written", target.display()),
+            io::Error::from(io::ErrorKind::NotFound),
+        )),
+        Err(err) => Err(err),
+    }
+}
+
+/// Removes the namespace's plaintext [`CREDENTIALS_FILE`], if it is there.
+///
+/// The one caller is a hot-swap's **first** write: the store had not migrated,
+/// so the credential the swap displaced was read out of this file, and once
+/// the item demonstrably holds the incoming credential this name is a second
+/// copy of the displaced one rather than its home. Fact F35's composed read
+/// falls through to it on *no item, a read failure or a throttle* — not only
+/// on an absent item — so leaving it would hand the peer session the account
+/// the user just swapped away from, on nothing worse than a keychain hiccup.
+/// The displaced credential is in [`ADOPTED_FILE`] by then, which is the name
+/// decision D-024 chose precisely because nothing reads it.
+///
+/// Returns whether a file was there to remove, so a caller can say what it
+/// did. An absent file is not an error: the same swap re-run, or a peer that
+/// removed it first, both land here.
+///
+/// The directory is reached through [`open_namespace_dir`]'s `O_NOFOLLOW`
+/// walk and the name is unlinked relative to that descriptor, so nothing on
+/// the way to it can be swapped for a link between the check and the unlink,
+/// and no `.` or `..` component can be smuggled through the leaf.
+///
+/// # Errors
+///
+/// Returns [`FileStoreError::OutsideNamespaceRoot`] when the directory is not
+/// under the namespace root, whatever [`open_namespace_dir`] refuses on the
+/// way, and [`FileStoreError::Io`] when the unlink fails for any reason other
+/// than the file not being there.
+pub fn remove_credentials_file(paths: &Paths, ns_dir: &Path) -> Result<bool, FileStoreError> {
+    let target = ns_dir.join(CREDENTIALS_FILE);
+    if !paths.is_under_namespace_root(&target) {
+        return Err(FileStoreError::OutsideNamespaceRoot(target));
+    }
+
+    let dir = open_namespace_dir(paths, ns_dir)?;
+    match rustix::fs::unlinkat(dir.as_fd(), CREDENTIALS_FILE, AtFlags::empty()) {
+        Ok(()) => Ok(true),
+        Err(errno) if errno == Errno::NOENT => Ok(false),
+        Err(errno) => {
+            Err(FileStoreError::errno(format!("could not remove `{}`", target.display()), errno))
+        }
+    }
+}
+
+/// Lists leftover `.credentials.adopted.json.tmp.<8 hex>` files.
+///
+/// The sibling of [`list_stray_tmp`] for the adopted copy: a stray one is a
+/// crashed adoption and it holds token material at rest, so the same callers
+/// that report and clean up the credential writer's strays handle these too
+/// (risk R24).
+///
+/// # Errors
+///
+/// Returns the underlying [`io::Error`], except that a missing directory is
+/// an empty list.
+pub fn list_stray_adopted_tmp(ns_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    list_stray_with_prefix(ns_dir, &format!("{ADOPTED_FILE}.tmp."))
+}
+
 /// What `.credentials.json.pending` was derived from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingMeta {
@@ -736,11 +1026,29 @@ pub fn remove_namespace(paths: &Paths, ns_dir: &Path) -> Result<(), FileStoreErr
     let Some(chain) = open_chain(&root, ns_dir, Walk::MustExist)? else { return Ok(()) };
     let Some(leaf) = chain.last() else { return Ok(()) };
 
-    let mut names: Vec<OsString> =
-        vec![CREDENTIALS_FILE.into(), PENDING_FILE.into(), PENDING_META.into()];
-    let stray = list_stray_tmp(ns_dir)
-        .map_err(|err| FileStoreError::io(format!("could not list `{}`", ns_dir.display()), err))?;
-    names.extend(stray.iter().filter_map(|path| path.file_name().map(OsStr::to_os_string)));
+    // `ADOPTED_FILE` is in this list for the reason the whole removal exists:
+    // it holds a real credential at rest (decision D-024), and an `accounts
+    // remove` that left it behind would leave the user's token in a directory
+    // they had just been told was gone.
+    let mut names: Vec<OsString> = vec![
+        CREDENTIALS_FILE.into(),
+        ADOPTED_FILE.into(),
+        PENDING_FILE.into(),
+        PENDING_META.into(),
+    ];
+    let list = |paths: io::Result<Vec<PathBuf>>| -> Result<Vec<PathBuf>, FileStoreError> {
+        paths.map_err(|err| {
+            FileStoreError::io(format!("could not list `{}`", ns_dir.display()), err)
+        })
+    };
+    let stray = list(list_stray_tmp(ns_dir))?;
+    let stray_adopted = list(list_stray_adopted_tmp(ns_dir))?;
+    names.extend(
+        stray
+            .iter()
+            .chain(stray_adopted.iter())
+            .filter_map(|path| path.file_name().map(OsStr::to_os_string)),
+    );
 
     for name in names {
         match rustix::fs::unlinkat(&leaf.fd, name.as_os_str(), AtFlags::empty()) {
@@ -780,7 +1088,16 @@ pub fn remove_namespace(paths: &Paths, ns_dir: &Path) -> Result<(), FileStoreErr
 /// Returns the underlying [`io::Error`], except that a missing directory is
 /// an empty list.
 pub fn list_stray_tmp(ns_dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let prefix = format!("{CREDENTIALS_FILE}.tmp.");
+    list_stray_with_prefix(ns_dir, &format!("{CREDENTIALS_FILE}.tmp."))
+}
+
+/// Lists the `<prefix><8 hex>` files in one directory.
+///
+/// The body [`list_stray_tmp`] had before [`ADOPTED_FILE`] gave it a second
+/// caller; the rule it applies — an eight-digit lowercase-or-uppercase hex
+/// suffix and nothing else — is unchanged, so a name that was swept before is
+/// swept now.
+fn list_stray_with_prefix(ns_dir: &Path, prefix: &str) -> io::Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(ns_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -792,7 +1109,7 @@ pub fn list_stray_tmp(ns_dir: &Path) -> io::Result<Vec<PathBuf>> {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let Some(suffix) = name.strip_prefix(&prefix) else { continue };
+        let Some(suffix) = name.strip_prefix(prefix) else { continue };
         if suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
             found.push(entry.path());
         }

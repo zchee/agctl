@@ -31,6 +31,126 @@ use thiserror::Error;
 /// citizen (plan principle P4, AC13).
 pub const WATCH_INTERVAL_FLOOR: Duration = Duration::from_secs(60);
 
+/// `claude use --live`'s refusal exit codes (plan AC67, ruling OQ4).
+///
+/// AC67 is literal: each refusal gets **its own message and its own exit
+/// code**, so a script can act on one without parsing English. They live here
+/// because `cli.rs` is the single CLI contract — the flags, and now what the
+/// process returns.
+///
+/// **The block starts at 10 because 0, 1 and 2 are taken.**
+/// [`EXIT_OK`](crate::error::EXIT_OK) is 0,
+/// [`EXIT_FATAL`](crate::error::EXIT_FATAL) is 1,
+/// [`EXIT_PARTIAL`](crate::error::EXIT_PARTIAL) is 2 — and `clap` also exits
+/// 2 for a usage error, so a swap code of 2 would be ambiguous between "the
+/// item changed under the hold" and "you misspelled a flag". Every code below
+/// is therefore ≥ 3, and in practice ≥ 10 so the block reads as one.
+///
+/// | code | meaning |
+/// |---|---|
+/// | 0 | `applied`, `already_active`, and refusal **B**'s warning line |
+/// | 1 | the W4b scope gate (`not_implemented`) |
+/// | 10–18 | the refusals below |
+///
+/// Refusal **B** — a secure-storage backend is active or of unknown kind — is
+/// deliberately **not** here: decision D-020 degraded it to a warning line
+/// and exit 0, because no storage-V5 backend exists in this build.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "`REFUSED_E` is reserved for S23 (W4b) and deliberately never emitted here, \
+                  and `ALL` is the totality the exit-code tests check"
+    )
+)]
+pub mod swap_exit {
+    /// Refusal **A**: the lock agentctl holds is compromised — its mtime
+    /// moved under us, so the protocol was already violated and nothing may
+    /// be written.
+    pub const REFUSED_A: i32 = 10;
+    /// Refusal **C**: `CLAUDE_CODE_OAUTH_TOKEN` is set in agentctl's own
+    /// environment, which short-circuits every store (fact F19).
+    pub const REFUSED_C: i32 = 11;
+    /// Refusal **D**: the credential does not fit fact F42's 4 032-byte
+    /// keychain stdin line.
+    pub const REFUSED_D: i32 = 12;
+    /// Refusal **E**: the target is the live store under a containment rule
+    /// that forbids it.
+    ///
+    /// **Reserved for S23 (W4b) and never emitted in W4a.** It is spelled out
+    /// here rather than left as a hole so the block stays contiguous and a
+    /// later step cannot reuse the number for something else.
+    pub const REFUSED_E: i32 = 13;
+    /// Refusal **F**: the outgoing credential cannot be adopted, so the swap
+    /// would lose it.
+    pub const REFUSED_F: i32 = 14;
+    /// The inherited `CLAUDE_SECURESTORAGE_CONFIG_DIR` names no store
+    /// agentctl owns (ruling OQ1). Not one of the lettered refusals — it is
+    /// decided before Phase A begins — so `--json` gives it `reason:
+    /// "not_owned"` and no `refusal` member.
+    pub const PRECONDITION: i32 = 15;
+    /// Another process holds the store's Claude Code locks and agentctl did
+    /// not break them.
+    pub const BUSY: i32 = 16;
+    /// The item changed under the hold, so the refreshed credential was
+    /// thrown away rather than written over a newer one.
+    pub const DISCARDED: i32 = 17;
+    /// The write child was killed on a timeout and the verifying read did not
+    /// settle it. Means "re-run `status`", not "failed".
+    pub const UNKNOWN: i32 = 18;
+    /// The write child ran and exited non-zero: `security(1)` refused the
+    /// write and the item is demonstrably untouched.
+    ///
+    /// **Not** [`REFUSED_A`], which it used to share. A refusal letter is a
+    /// security signal — **A** means somebody moved a lock agentctl was
+    /// holding — and an ordinary write failure is not that. Sharing the code
+    /// also made the exit code contradict the audit line, which records this
+    /// case as `"outcome":"failed"`. `--json` gives it `outcome: "failed"`
+    /// and **no** `refusal` member.
+    pub const WRITE_FAILED: i32 = 19;
+    /// Nobody agreed to the swap: the confirmation was declined, or there was
+    /// no terminal to ask at and `--yes` was not given.
+    ///
+    /// **Not** refusal **F**, which it used to share. **F** means *the
+    /// outgoing credential cannot be adopted, so the swap would lose it* — a
+    /// fact about the store that a person cannot talk agentctl out of — and a
+    /// script that saw exit 14 could not tell it from an operator answering
+    /// "no". `--json` gives this `outcome: "cancelled"` and **no** `refusal`
+    /// member, the same shape [`WRITE_FAILED`] takes.
+    pub const CANCELLED: i32 = 20;
+    /// The incoming account's credential has expired and its store has
+    /// migrated into the keychain, so the swap will not refresh it.
+    ///
+    /// A refresh rotates the server's refresh token away from whatever holds
+    /// the old one, so it may only be done by something that can save the
+    /// result. The swap can save a refreshed credential back into a plaintext
+    /// `.credentials.json`; it cannot write a *second* keychain item inside
+    /// one hold, so for a migrated store the refresh would be spent and
+    /// thrown away — which is what left the incoming account needing a fresh
+    /// `login`. `agentctl claude status` refreshes that item in place and
+    /// persists it, so the message says to run it and try again.
+    ///
+    /// `--json` gives this `outcome: "needs_refresh"` and **no** `refusal`
+    /// member: nothing is wrong with the store, and nothing was written.
+    pub const NEEDS_REFRESH: i32 = 21;
+
+    /// Every code above, for the exhaustiveness and uniqueness tests.
+    pub const ALL: [(&str, i32); 12] = [
+        ("refused_a", REFUSED_A),
+        ("refused_c", REFUSED_C),
+        ("refused_d", REFUSED_D),
+        ("refused_e", REFUSED_E),
+        ("refused_f", REFUSED_F),
+        ("precondition", PRECONDITION),
+        ("busy", BUSY),
+        ("discarded", DISCARDED),
+        ("unknown", UNKNOWN),
+        ("write_failed", WRITE_FAILED),
+        ("cancelled", CANCELLED),
+        ("needs_refresh", NEEDS_REFRESH),
+    ];
+}
+
 /// Why a duration argument could not be parsed.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DurationParseError {

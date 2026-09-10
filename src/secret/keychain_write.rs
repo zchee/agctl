@@ -530,6 +530,22 @@ fn run_write(
     line: &KeychainStdinLine,
     ctx: &PassCtx,
 ) -> Result<RunOutput, KeychainWriteError> {
+    // `keychain_write_hang` (plan AC74): the write child never answers, so
+    // the pass kills it at `WRITE_TIMEOUT` and the outcome of the write is
+    // undetermined — the one path that produces `unknown` rather than
+    // `failed`. Injected at the spawn site, before a child exists, rather
+    // than by hanging a real one: a test that had to wait out the budget
+    // would be waiting **inside a hold**, racing the very hold budget it is
+    // there to observe, and the fake `security` is deliberately a faithful
+    // `security(1)` with no stall knob. The caller sees exactly what a killed
+    // child produces, which is what AC74 is about. Compiled out entirely
+    // without the `testing` feature, so a release build has no such branch.
+    #[cfg(feature = "testing")]
+    if crate::runtime::fault::Fault::from_env().is("keychain_write_hang") {
+        let budget_ms = u64::try_from(WRITE_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+        return Err(KeychainWriteError::Timeout(budget_ms));
+    }
+
     let mut child = Command::new(bin)
         .args(WRITE_ARGV)
         .stdin(Stdio::piped())

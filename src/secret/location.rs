@@ -102,6 +102,28 @@ pub fn from_file(ns_dir: &std::path::Path) -> Resolved {
     }
 }
 
+/// Reads a namespace's adopted copy —
+/// [`ADOPTED_FILE`](file_store::ADOPTED_FILE), the credential a hot-swap
+/// displaced (decision D-024).
+///
+/// This is the source for a row whose keychain item is held by another
+/// identity: after a swap the item names the incoming account, so the item is
+/// no longer the record's credential and reading it would show one account's
+/// usage under another's row — the exact confusion the table at the top of
+/// this module refuses to risk. The record's own credential is here instead
+/// (ruling OQ2(d); rendered as
+/// [`AccountState::Adopted`](crate::provider::claude::account::AccountState::Adopted)).
+///
+/// [`Resolved::Absent`] is a real answer and not an error: a row is only read
+/// this way once something has been adopted into it.
+pub fn from_adopted(ns_dir: &std::path::Path) -> Resolved {
+    match file_store::read_adopted(ns_dir) {
+        Ok(ReadOutcome::Present { bytes, .. }) => parse(&bytes),
+        Ok(ReadOutcome::Absent) => Resolved::Absent,
+        Err(err) => Resolved::Transient(err.to_string()),
+    }
+}
+
 /// Parses a blob, reporting a corrupt one as transient rather than absent.
 ///
 /// Absent would lead to writing a new file over the corrupt one; transient

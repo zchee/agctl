@@ -1055,7 +1055,8 @@ pub fn finish(child: Child) -> Output {
 /// Plan AC61 counts `add-generic-password` lines in the suite-wide log against
 /// this list, so it has to be exactly the tests that write — one line each. In
 /// W2 that was the three S18 tests below, all in `tests/e2e_keychain.rs`; W3
-/// adds the refresh-in-place test, and W4 adds the swap tests as they land.
+/// added the refresh-in-place test, and W4a added the `use --live` tests that
+/// complete a swap.
 ///
 /// A name here does **not** mean the named test records its own calls into the
 /// aggregate — none of them does, and one that did would push the count over.
@@ -1067,11 +1068,51 @@ pub fn finish(child: Child) -> Output {
 /// write lines in it is a failure, not a pass, because "the write path did
 /// nothing" is exactly the way this criterion could otherwise be satisfied
 /// (critic M8).
-pub const KEYCHAIN_WRITE_TESTS: [&str; 4] = [
+pub const KEYCHAIN_WRITE_TESTS: [&str; 26] = [
     "ac59_the_write_transport_reads_one_line_from_stdin_and_redacts_the_hex",
     "ac60_a_service_no_test_registered_is_refused_and_stores_nothing",
     "ac61_what_the_write_path_stores_is_what_the_binary_reads",
     "ac65_a_migrated_namespace_refreshes_its_own_keychain_item_in_place",
+    // W4a's swaps: every one of these completes a `use --live` and therefore
+    // writes the store's namespaced item exactly once. Each pins that count
+    // against its own log as well (`tests/e2e_swap.rs`), which is what proves
+    // the write happened — this list only says which tests are allowed one.
+    "ac67_refusal_b_is_a_warning_line_and_exit_zero",
+    "ac81_a_swap_touches_nothing_outside_the_namespace_root",
+    "a_swap_adopts_the_displaced_credential_into_the_adopted_copy_never_the_store",
+    "the_adopted_copy_is_removed_when_the_account_is_removed",
+    "doctor_reports_the_adopted_copy_without_printing_any_of_it",
+    // The rollback writes the item a second time, so its test writes twice —
+    // which is why the aggregate is the list's length and not a per-test
+    // count. Each pins its own number against its own log.
+    "undo_puts_the_displaced_credential_back_and_parks_the_incoming_one",
+    "undo_refuses_when_the_adopted_copy_does_not_match_the_entry",
+    // The W4a fix lane's additions. Each completes one forward swap — the
+    // four `undo_*` ones do it to reach the state a reversal starts from —
+    // and each pins its own count against its own log.
+    "ac68_a_fresh_refresh_lock_is_waited_out_with_nothing_held",
+    "ac72_a_first_write_records_a_null_from_digest8_and_removes_the_shadowing_store",
+    "a_swap_whose_displaced_credential_belongs_to_a_third_account_locks_that_namespace",
+    // Fix loop 2's additions. The first-write reversal writes the item twice
+    // — once each way — and the store-moved undo writes once, on its forward
+    // half, before refusing in Phase A of the reversal.
+    "an_undo_of_a_first_write_puts_p_back_without_recreating_the_plaintext_store",
+    "the_undo_refuses_when_the_store_has_moved_since_its_item_was_named",
+    "use_live_json_carries_the_lock_timings_and_never_a_token",
+    "an_occupied_item_is_never_refreshed_for_the_record_that_names_it",
+    "an_undo_discarded_by_a_peer_write_leaves_the_restored_credential_in_the_copy",
+    "an_undo_refused_by_a_compromised_hold_leaves_the_restored_credential_in_the_copy",
+    "an_undo_that_finds_the_store_busy_leaves_the_restored_credential_in_the_copy",
+    "an_undo_whose_write_fails_leaves_the_restored_credential_in_the_copy",
+    "an_undo_whose_write_outcome_is_unknown_leaves_the_restored_credential_in_the_copy",
+    // Fix loop 3's additions. The first two complete one forward swap each —
+    // one refreshing the incoming credential on the way, one proving a fresh
+    // migrated incoming store needs no refresh. The third runs two fixtures
+    // in one test, so it writes twice, for the same reason the `undo_*` ones
+    // above do; each still pins its own number against its own log.
+    "an_applied_swap_saves_the_refreshed_credential_back_to_the_incoming_store",
+    "a_fresh_credential_in_a_migrated_incoming_store_needs_no_refresh_and_proceeds",
+    "an_applied_swap_whose_cleanup_failed_warns_on_stderr_and_in_json",
 ];
 
 /// Fact F42's keychain update line, for a test that means to write one.

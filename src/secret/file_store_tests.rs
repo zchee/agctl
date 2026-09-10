@@ -994,3 +994,116 @@ fn create_dir_under_refuses_a_symlink_above_the_directory_and_a_missing_anchor()
     assert!(matches!(err, FileStoreError::Io { .. }), "got {err:?}");
     assert!(!absent.exists(), "and nothing was made on the way to finding out");
 }
+
+// ---------------------------------------------------------------------------
+// The adopted copy, staged and committed (decision D-024, finding P1-1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn staging_an_adoption_leaves_the_copy_holding_what_it_held() {
+    // The whole point of the split. Until the commit, the name that matters
+    // still holds whatever it held — which on a reversal is the only
+    // remaining home of the credential being restored.
+    let store = store();
+    write_adopted(&store.paths, &store.ns_dir, &blob("first", Some("r1")), &ctx())
+        .expect("the first adoption should land");
+
+    let staged = stage_adopted(&store.paths, &store.ns_dir, &blob("second", Some("r2")), &ctx())
+        .expect("the staging should succeed");
+    let copy = store.ns_dir.join(ADOPTED_FILE);
+    assert!(
+        fs::read_to_string(&copy).expect("readable").contains("first"),
+        "the copy is untouched while the adoption is only staged"
+    );
+    assert_eq!(
+        list_stray_adopted_tmp(&store.ns_dir).expect("listable").len(),
+        1,
+        "and the staged credential is on disk under a temporary name"
+    );
+
+    commit_staged(&store.paths, staged).expect("the commit should succeed");
+    assert!(
+        fs::read_to_string(&copy).expect("readable").contains("second"),
+        "the commit is what replaces it"
+    );
+    assert!(
+        list_stray_adopted_tmp(&store.ns_dir).expect("listable").is_empty(),
+        "and the temporary name is gone"
+    );
+}
+
+#[test]
+fn dropping_a_staged_adoption_removes_the_temporary() {
+    // Every Phase C exit that does not write drops the staging rather than
+    // remembering to clean it up, so a token cannot be left at rest under a
+    // name nothing reports.
+    let store = store();
+    write_adopted(&store.paths, &store.ns_dir, &blob("kept", Some("r1")), &ctx())
+        .expect("the first adoption should land");
+
+    {
+        let _staged =
+            stage_adopted(&store.paths, &store.ns_dir, &blob("dropped", Some("r2")), &ctx())
+                .expect("the staging should succeed");
+        assert_eq!(list_stray_adopted_tmp(&store.ns_dir).expect("listable").len(), 1);
+    }
+
+    assert!(
+        list_stray_adopted_tmp(&store.ns_dir).expect("listable").is_empty(),
+        "the temporary is removed on drop"
+    );
+    let copy = store.ns_dir.join(ADOPTED_FILE);
+    assert!(
+        fs::read_to_string(&copy).expect("readable").contains("kept"),
+        "and the copy still holds what it held"
+    );
+    assert!(!fs::read_to_string(&copy).expect("readable").contains("dropped"));
+}
+
+#[test]
+fn a_staged_adoption_is_written_0600_and_the_mode_survives_the_commit() {
+    // The mode is set on the temporary's inode and carried by the rename, so
+    // there is no window in which the credential is readable by anyone else.
+    let store = store();
+    let staged = stage_adopted(&store.paths, &store.ns_dir, &blob("mode", Some("r1")), &ctx())
+        .expect("the staging should succeed");
+    let tmp = list_stray_adopted_tmp(&store.ns_dir).expect("listable").pop().expect("one staged");
+    assert_eq!(
+        fs::metadata(&tmp).expect("readable").permissions().mode() & 0o777,
+        FILE_MODE,
+        "the staged credential is 0600 before it is anything else"
+    );
+
+    commit_staged(&store.paths, staged).expect("the commit should succeed");
+    let copy = store.ns_dir.join(ADOPTED_FILE);
+    assert_eq!(
+        fs::metadata(&copy).expect("readable").permissions().mode() & 0o777,
+        FILE_MODE,
+        "and the rename carries it"
+    );
+}
+
+#[test]
+fn a_symlink_at_the_adopted_name_refuses_before_anything_is_written() {
+    // Somebody planted a link where the copy goes. Refusing at the staging is
+    // what makes the refusal free: nothing has been created yet.
+    let store = store();
+    fs::create_dir_all(&store.ns_dir).expect("the namespace should be creatable");
+    let target = store.ns_dir.join("elsewhere");
+    fs::write(&target, "not a credential").expect("the decoy should be writable");
+    std::os::unix::fs::symlink(&target, store.ns_dir.join(ADOPTED_FILE))
+        .expect("the symlink should be plantable");
+
+    let err = stage_adopted(&store.paths, &store.ns_dir, &blob("blocked", Some("r1")), &ctx())
+        .expect_err("a symlink at the target must refuse");
+    assert!(matches!(err, FileStoreError::RefusedSymlink(_)), "{err:?}");
+    assert!(
+        list_stray_adopted_tmp(&store.ns_dir).expect("listable").is_empty(),
+        "and nothing was staged"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).expect("readable"),
+        "not a credential",
+        "the link's target is untouched"
+    );
+}

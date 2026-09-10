@@ -529,6 +529,20 @@ fn namespace_section(
             state_of(&ns_dir.join(file_store::CREDENTIALS_FILE))
         ));
 
+        // The credential a hot-swap displaced (decision D-024). Reported
+        // because it is a real token at rest that no other row names, and
+        // because its presence is what explains an `adopted` status row. Its
+        // *contents* are never read here — only that it is there.
+        let adopted = ns_dir.join(file_store::ADOPTED_FILE);
+        if fs::symlink_metadata(&adopted).is_ok() {
+            out.push(format!(
+                "    adopted copy   {} — the credential `use --live` displaced; it holds token \
+                 material at rest, `use --undo` restores it and `accounts remove \
+                 --delete-secret` clears it",
+                state_of(&adopted)
+            ));
+        }
+
         let pending = ns_dir.join(file_store::PENDING_FILE);
         if fs::symlink_metadata(&pending).is_ok() {
             out.push(format!(
@@ -549,6 +563,20 @@ fn namespace_section(
                     out.push(format!(
                         "    stray tmp      {} — a crashed write; it holds token material at \
                          rest and `login` or `accounts remove` clears it",
+                        path.display()
+                    ));
+                }
+            }
+            Err(err) => out.push(format!("    stray tmp      could not be listed: {err}")),
+        }
+
+        match file_store::list_stray_adopted_tmp(&ns_dir) {
+            Ok(stray) if stray.is_empty() => {}
+            Ok(stray) => {
+                for path in stray {
+                    out.push(format!(
+                        "    stray tmp      {} — a crashed adoption; it holds token material at \
+                         rest and `accounts remove --delete-secret` clears it",
                         path.display()
                     ));
                 }

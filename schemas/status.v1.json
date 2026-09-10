@@ -90,6 +90,7 @@
             "foreign",
             "forgotten",
             "migrated_to_keychain",
+            "adopted",
             "claude_session_detected",
             "keychain_locked",
             "keychain_timeout",
@@ -110,7 +111,7 @@
           "type": "string"
         },
         "lock_state": {
-          "description": "What the namespace lock did on this pass. `busy` means another process held it past this run's deadline; `adopted` means this run took the winner's freshly written credentials instead of refreshing again; `migrated` means a Claude Code session has moved this namespace's credentials into the keychain and the item found is not one agentctl may write; `migrated_refreshed` means it is, and agentctl refreshed that keychain item in place under Claude Code's own lock protocol.",
+          "description": "What the namespace lock did on this pass. `busy` means another process held it past this run's deadline; `adopted` means this run took the winner's freshly written credentials instead of refreshing again \u2014 a pass action, and deliberately not the same fact as the row `state` token of the same spelling, which says this row's keychain item is held by another identity; `migrated` means a Claude Code session has moved this namespace's credentials into the keychain and the item found is not one agentctl may write; `migrated_refreshed` means it is, and agentctl refreshed that keychain item in place under Claude Code's own lock protocol.",
           "enum": [
             "none",
             "busy",
@@ -146,6 +147,10 @@
           "description": "Which other credential source on this machine holds the same `(account_uuid, organization_uuid)` pair as this row. `live` means the credentials a Claude Code session is using right now name the same account and organization; null means no other source does. The rows stay separate either way: each is its own token pair, refreshed and revoked on its own. Added alongside the members before it, so version 1 still means what it meant.",
           "type": ["string", "null"],
           "enum": ["live", null]
+        },
+        "occupied_by": {
+          "description": "Who holds this row's keychain item, when a hot-swap put another identity there; null on every other row. The opposite fact from `same_identity_as`: that one says two rows describe one account, this says the item this row's namespace names is not this row's, so the credentials reported here were read from the adopted copy beside it. An email address when the occupying credential named one, an account UUID otherwise; never token material. Additive, and deliberately absent from `required`: a consumer written against an earlier version 1 document stays valid.",
+          "type": ["string", "null"]
         }
       }
     },

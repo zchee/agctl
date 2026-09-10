@@ -19,6 +19,7 @@
 //! | `pause_before_migrated_reread` | the refresh-in-place path waits **before** the read that precedes its POST |
 //! | `pause_before_invalid_grant_reread` | the refresh-in-place path waits before the read that follows an `invalid_grant` |
 //! | `pause_before_migrated_write` | the refresh-in-place path waits after its POST and **before** it takes any lock |
+//! | `pause_before_swap_write` | the swap waits after its POST and **before** it takes any lock (plan AC71) |
 //! | `flock_enotsup` | the namespace lock reports `Unavailable` instead of locking |
 //! | `lock_contended` | [`crate::secret::claude_lock::acquire`] sees `EEXIST` on the primary lock |
 //! | `lock_stale` | every existing Claude Code lock is treated as stale, whatever its age |
@@ -28,12 +29,21 @@
 //! | `swap_write_fail` | (W4a) the keychain write fails after adoption |
 //! | `keychain_write_hang` | (W4a) the `security` write child never answers |
 //!
-//! The last three are **declared here and implemented by their own step**:
-//! W2 lands the lock protocol and the keychain transport with no caller, so
-//! there is nothing yet for a swap-shaped injection to act on, and adding a
-//! sleep-inside-the-hold branch to unreachable code would be exactly the
-//! kind of dangerous dead weight section 3.8 exists to keep out. Declaring
-//! the names now means W4a does not have to come back and edit this file.
+//! The last three were **declared by W2 and implemented by W4a**, which is
+//! the step that gave them something to act on: W2 landed the lock protocol
+//! and the keychain transport with no caller, and adding a
+//! sleep-inside-the-hold branch to unreachable code would have been exactly
+//! the kind of dangerous dead weight section 3.8 exists to keep out.
+//! Declaring the names then meant W4a did not have to invent them.
+//!
+//! **`swap_pause_in_locks` is the one fault that waits inside a hold**, which
+//! invariant I17 otherwise forbids outright. It exists so a test can observe
+//! the hold from outside — `utimes` an artefact to force refusal A, watch the
+//! window open and close — and it is why it cannot ride [`Fault::pause_point`]:
+//! that helper matches `pause_{name}`, and this name is not spelled that way.
+//! It goes through [`Fault::wait_if`] instead, which takes the whole name.
+//! Both are `testing`-only and bounded by [`PAUSE_BUDGET`], so a release
+//! build cannot wait anywhere, ever.
 //!
 //! Without the `testing` feature [`Fault::from_env`] does not exist, the set
 //! is always empty, [`Fault::is`] is always false and [`Fault::pause_point`]
@@ -125,7 +135,30 @@ impl Fault {
     /// parameter is unused.
     #[cfg(feature = "testing")]
     pub fn pause_point(&self, name: &str) {
-        if !self.is(&format!("pause_{name}")) {
+        self.wait_if(&format!("pause_{name}"));
+    }
+
+    /// Blocks at a named pause point. Inert without the `testing` feature.
+    #[cfg(not(feature = "testing"))]
+    pub fn pause_point(&self, _name: &str) {}
+
+    /// Blocks while `name` — the **whole** fault name, not a `pause_` stem —
+    /// is active.
+    ///
+    /// [`Fault::pause_point`] is this function with the `pause_` prefix
+    /// applied, and is what almost every waiting injection should use: the
+    /// prefix is what makes a fault list readable as "these ones stop, those
+    /// ones break". This is the escape hatch for a declared name that does
+    /// not carry it, which today is `swap_pause_in_locks` — a name W2 fixed
+    /// before the helper's convention existed, and one this crate would
+    /// rather honour than quietly rename in a released fault table.
+    ///
+    /// The wait ends when the file named by `AGENTCTL_FAULT_RESUME` exists,
+    /// or after [`PAUSE_BUDGET`], so a test that dies without writing one
+    /// cannot wedge a run. Without the `testing` feature it returns at once.
+    #[cfg(feature = "testing")]
+    pub fn wait_if(&self, name: &str) {
+        if !self.is(name) {
             return;
         }
 
@@ -144,9 +177,10 @@ impl Fault {
         }
     }
 
-    /// Blocks at a named pause point. Inert without the `testing` feature.
+    /// Blocks while a whole-named fault is active. Inert without the
+    /// `testing` feature.
     #[cfg(not(feature = "testing"))]
-    pub fn pause_point(&self, _name: &str) {}
+    pub fn wait_if(&self, _name: &str) {}
 
     /// Sleeps until `deadline` or cancellation, whichever comes first.
     ///

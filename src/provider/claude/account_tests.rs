@@ -17,6 +17,7 @@ fn every_state() -> Vec<AccountState> {
         AccountState::Unclaimed,
         AccountState::Forgotten,
         AccountState::MigratedToKeychain { service: "Claude Code-credentials-5cdc535f".to_owned() },
+        AccountState::Adopted { occupant: "someone@example.com".to_owned() },
         AccountState::ClaudeSessionDetected {
             lock: ".oauth_refresh.lock".to_owned(),
             age_ms: 12_000,
