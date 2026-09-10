@@ -1,6 +1,6 @@
 //! Termination-signal handling.
 //!
-//! `agentctl` can be holding a namespace lock and a half-written credential
+//! `agctl` can be holding a namespace lock and a half-written credential
 //! temporary file when the user hits Ctrl-C, and can have the terminal in raw
 //! mode and on the alternate screen when `watch` is killed. Dying on the
 //! default disposition would leave both behind. So TERM, HUP and INT are
@@ -25,7 +25,7 @@ use signal_hook::iterator::Signals;
 use crate::runtime::cleanup;
 use crate::runtime::coordinator::Cancel;
 
-/// The signals `agentctl` handles.
+/// The signals `agctl` handles.
 const HANDLED: [i32; 3] = [SIGTERM, SIGHUP, SIGINT];
 
 /// The conventional exit status for a process killed by `signal`.
@@ -49,7 +49,7 @@ fn exit_status_for(signal: i32) -> i32 {
 /// the handler thread cannot be started.
 pub fn install(cancel: Cancel) -> io::Result<()> {
     let mut signals = Signals::new(HANDLED)?;
-    thread::Builder::new().name("agentctl-signals".to_owned()).spawn(move || {
+    thread::Builder::new().name("agctl-signals".to_owned()).spawn(move || {
         // Only the first signal is ever acted on: handling it ends the
         // process, so there is no second iteration to write.
         if let Some(signal) = signals.forever().next() {

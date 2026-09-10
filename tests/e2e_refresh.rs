@@ -4,7 +4,7 @@
 //! what a signal does to a namespace mid-write.
 //!
 //! These are the tests that need more than one process. Plan AC7 asks whether
-//! two `agentctl` processes racing on one account make exactly one refresh
+//! two `agctl` processes racing on one account make exactly one refresh
 //! POST, and AC27 asks whether the lock a killed process held is available to
 //! the next one — neither of which an in-process test can answer, because both
 //! are questions about the kernel rather than about this program's data
@@ -136,7 +136,7 @@ fn ac7_two_concurrent_refreshes_make_exactly_one_post() {
         .raw()
         .args(["claude", "status", "--refresh", "--account", EMAIL])
         .spawn()
-        .expect("the first agentctl should start");
+        .expect("the first agctl should start");
     assert!(
         common::wait_until(OBSERVE_BUDGET, || common::lock_is_held(&lock)),
         "the first process should have taken the namespace lock"
@@ -146,7 +146,7 @@ fn ac7_two_concurrent_refreshes_make_exactly_one_post() {
         .raw()
         .args(["claude", "status", "--json", "--refresh", "--account", EMAIL])
         .spawn()
-        .expect("the second agentctl should start");
+        .expect("the second agctl should start");
 
     let first = common::finish(first);
     let second = common::finish(second);
@@ -176,9 +176,9 @@ fn ac7_a_lock_held_past_the_deadline_makes_the_second_process_busy() {
     let holder = fixture
         .raw()
         .args(["claude", "status", "--refresh", "--timeout", "30s", "--account", EMAIL])
-        .env("AGENTCTL_FAULT", "hold_lock")
+        .env("AGCTL_FAULT", "hold_lock")
         .spawn()
-        .expect("the holding agentctl should start");
+        .expect("the holding agctl should start");
     assert!(
         common::wait_until(OBSERVE_BUDGET, || common::lock_is_held(&lock)),
         "the first process should have taken the namespace lock"
@@ -188,7 +188,7 @@ fn ac7_a_lock_held_past_the_deadline_makes_the_second_process_busy() {
         .raw()
         .args(["claude", "status", "--json", "--refresh", "--timeout", "1s", "--account", EMAIL])
         .spawn()
-        .expect("the blocked agentctl should start");
+        .expect("the blocked agctl should start");
     let blocked = common::finish(blocked);
 
     assert_eq!(blocked.code(), 2, "a row that could not be read is a degraded row");
@@ -206,7 +206,7 @@ fn ac7_a_lock_held_past_the_deadline_makes_the_second_process_busy() {
 
 #[test]
 fn ac21_a_claude_lock_in_the_namespace_refuses_the_refresh() {
-    // Plan AC21, invariant I11: agentctl detects Claude Code's lock artefacts
+    // Plan AC21, invariant I11: agctl detects Claude Code's lock artefacts
     // and refuses. It never takes them, never removes them, and never writes
     // into a namespace that has one.
     for artefact in [".oauth_refresh.lock", ".storage-write"] {
@@ -235,10 +235,10 @@ fn ac21_a_claude_lock_in_the_namespace_refuses_the_refresh() {
         assert_eq!(
             usage.calls(),
             0,
-            "`{artefact}`: an expired credential agentctl may not refresh is not spent on a \
+            "`{artefact}`: an expired credential agctl may not refresh is not spent on a \
              fetch either"
         );
-        assert!(path.exists(), "`{artefact}`: agentctl never removes a foreign lock");
+        assert!(path.exists(), "`{artefact}`: agctl never removes a foreign lock");
         assert_eq!(
             fs::read(fixture.credentials_path(ACCT, ORG)).expect("readable"),
             before,
@@ -267,10 +267,10 @@ fn ac21_a_session_appearing_after_the_post_discards_the_refresh() {
     let child = fixture
         .raw()
         .args(["claude", "status", "--refresh", "--account", EMAIL])
-        .env("AGENTCTL_FAULT", "pause_before_rename")
-        .env("AGENTCTL_FAULT_RESUME", &resume)
+        .env("AGCTL_FAULT", "pause_before_rename")
+        .env("AGCTL_FAULT_RESUME", &resume)
         .spawn()
-        .expect("agentctl should start");
+        .expect("agctl should start");
 
     assert!(
         common::wait_until(OBSERVE_BUDGET, || token.calls() == 1),
@@ -320,13 +320,13 @@ fn ac27_sigterm_during_a_held_refresh_exits_143_and_releases_the_lock() {
     let child = fixture
         .raw()
         .args(["claude", "status", "--refresh", "--timeout", "60s", "--account", EMAIL])
-        .env("AGENTCTL_FAULT", "hold_lock")
+        .env("AGCTL_FAULT", "hold_lock")
         .spawn()
-        .expect("agentctl should start");
+        .expect("agctl should start");
     let pid = child.id();
     assert!(
         common::wait_until(OBSERVE_BUDGET, || common::lock_is_held(&lock)),
-        "agentctl should have taken the namespace lock"
+        "agctl should have taken the namespace lock"
     );
 
     common::send_sigterm(pid);
@@ -360,7 +360,7 @@ fn stage_pending(fixture: &Fixture) {
     fixture
         .cmd()
         .args(["claude", "status", "--refresh", "--account", EMAIL])
-        .env("AGENTCTL_FAULT", "rename_fail")
+        .env("AGCTL_FAULT", "rename_fail")
         .assert()
         .code(2)
         .stdout(predicates::str::contains("refresh saved to pending"));
@@ -586,7 +586,7 @@ fn ac33g_a_pending_whose_file_was_removed_is_discarded() {
 fn ac33h_a_migrated_namespace_discards_its_pending() {
     // A Claude Code session took the namespace over while the pending write
     // waited. Moving it into place now would hand that session a credential
-    // agentctl chose (invariant I2).
+    // agctl chose (invariant I2).
     let server = MockServer::start();
     let _usage = usage_ok(&server);
     let token = token_ok(&server, 28_800);
@@ -637,13 +637,13 @@ fn ac48_the_lock_body_names_the_process_holding_it() {
     let child = fixture
         .raw()
         .args(["claude", "status", "--refresh", "--timeout", "60s", "--account", EMAIL])
-        .env("AGENTCTL_FAULT", "hold_lock")
+        .env("AGCTL_FAULT", "hold_lock")
         .spawn()
-        .expect("agentctl should start");
+        .expect("agctl should start");
     let pid = child.id();
     assert!(
         common::wait_until(OBSERVE_BUDGET, || common::lock_is_held(&lock)),
-        "agentctl should have taken the namespace lock"
+        "agctl should have taken the namespace lock"
     );
     assert!(
         common::wait_until(OBSERVE_BUDGET, || fs::read_to_string(&lock)
@@ -758,7 +758,7 @@ fn json_pass(fixture: &Fixture, extra: &[&str]) -> String {
 fn ac65_a_migrated_namespace_refreshes_its_own_keychain_item_in_place() {
     // Plan AC65, decision D-015. One read of the item before the POST, one
     // POST, one write to *that* item under Claude Code's own lock protocol
-    // against agentctl's own directory, the locks gone afterwards, the live
+    // against agctl's own directory, the locks gone afterwards, the live
     // item untouched, and the plaintext file never resurrected.
     //
     // This test is named in `common::KEYCHAIN_WRITE_TESTS`, so it does not
@@ -772,7 +772,7 @@ fn ac65_a_migrated_namespace_refreshes_its_own_keychain_item_in_place() {
     // The hold's own duration is only observable through the log line the
     // release writes, and invariant I17's number is worth asserting rather
     // than assuming.
-    fixture.set("RUST_LOG", "agentctl=debug");
+    fixture.set("RUST_LOG", "agctl=debug");
     let item = fixture.keychain_item_path(&service);
     let before = fs::read_to_string(&item).expect("the migrated item should be readable");
     // Absent *before* the pass as well as after: decision D-014 is that a
@@ -987,10 +987,10 @@ fn ac65_a_peer_refresh_before_the_post_is_adopted_and_costs_no_grant() {
     let child = fixture
         .raw()
         .args(["claude", "status", "--json", "--refresh", "--timeout", "30s", "--account", EMAIL])
-        .env("AGENTCTL_FAULT", "pause_before_migrated_reread")
-        .env("AGENTCTL_FAULT_RESUME", &resume)
+        .env("AGCTL_FAULT", "pause_before_migrated_reread")
+        .env("AGCTL_FAULT_RESUME", &resume)
         .spawn()
-        .expect("agentctl should start");
+        .expect("agctl should start");
 
     // `discovery::discover` is single-threaded, so three logged reads mean the
     // first two — the migration probe and the owned row's own — have returned;
@@ -1058,7 +1058,7 @@ fn ac65_an_invalid_grant_after_a_peer_refresh_adopts_rather_than_asking_for_a_lo
     // minted, and the row takes theirs.
     //
     // The wrong answer here is `needs login`, which sends the user to
-    // `agentctl claude login` — and decision D-014 forbids that from writing a
+    // `agctl claude login` — and decision D-014 forbids that from writing a
     // namespaced item, so the advice would be a dead end for a healthy row.
     let server = MockServer::start();
     let usage = usage_ok(&server);
@@ -1077,10 +1077,10 @@ fn ac65_an_invalid_grant_after_a_peer_refresh_adopts_rather_than_asking_for_a_lo
     let child = fixture
         .raw()
         .args(["claude", "status", "--json", "--refresh", "--timeout", "30s", "--account", EMAIL])
-        .env("AGENTCTL_FAULT", "pause_before_invalid_grant_reread")
-        .env("AGENTCTL_FAULT_RESUME", &resume)
+        .env("AGCTL_FAULT", "pause_before_invalid_grant_reread")
+        .env("AGCTL_FAULT_RESUME", &resume)
         .spawn()
-        .expect("agentctl should start");
+        .expect("agctl should start");
 
     // The POST having been answered is the ordering point: the pre-POST check
     // has already run and agreed, so the item written here is invisible to it
@@ -1202,10 +1202,10 @@ fn ac65_the_hold_creates_three_locks_and_a_changed_item_discards_the_refresh() {
     let child = fixture
         .raw()
         .args(["claude", "status", "--refresh", "--timeout", "30s", "--account", EMAIL])
-        .env("AGENTCTL_FAULT", "pause_before_migrated_write,swap_lock_leak")
-        .env("AGENTCTL_FAULT_RESUME", &resume)
+        .env("AGCTL_FAULT", "pause_before_migrated_write,swap_lock_leak")
+        .env("AGCTL_FAULT_RESUME", &resume)
         .spawn()
-        .expect("agentctl should start");
+        .expect("agctl should start");
 
     assert!(
         common::wait_until(OBSERVE_BUDGET, || token.calls() == 1),
@@ -1257,7 +1257,7 @@ fn ac65_the_hold_creates_three_locks_and_a_changed_item_discards_the_refresh() {
     let body: Value =
         serde_json::from_str(&fs::read_to_string(&records[0]).expect("the record is readable"))
             .expect("the record is JSON");
-    assert_eq!(body["tree"], json!("agentctl"), "the break stayed in agentctl's tree: {body}");
+    assert_eq!(body["tree"], json!("agctl"), "the break stayed in agctl's tree: {body}");
     assert_eq!(
         body["store_dir"].as_str().unwrap_or_default(),
         fixture.ns_dir(ACCT, ORG).to_string_lossy(),
@@ -1317,7 +1317,7 @@ fn ac65_an_item_under_the_canonical_spelling_is_never_refreshed() {
     // (plan AC20), but only the item whose name the registry *predicts* —
     // `WriteTarget::migrated`, from the record's own `export_sha8` — can be a
     // write target. An item under the canonical spelling's name belongs to
-    // this directory just as plainly and is still refused, because agentctl
+    // this directory just as plainly and is still refused, because agctl
     // never created a namespace for that name.
     let server = MockServer::start();
     let usage = usage_ok(&server);
@@ -1353,7 +1353,7 @@ fn ac65_an_item_under_the_canonical_spelling_is_never_refreshed() {
     );
 
     assert_eq!(token.calls(), 0, "no refresh was attempted");
-    assert_eq!(usage.calls(), 0, "an expired credential agentctl may not refresh is not spent");
+    assert_eq!(usage.calls(), 0, "an expired credential agctl may not refresh is not spent");
     assert!(writes(&fixture).is_empty(), "nothing was written: {:?}", fixture.security_log());
     for artefact in fixture.hold_artefacts(ACCT, ORG) {
         assert!(
@@ -1429,7 +1429,7 @@ fn ac65_a_contended_store_reports_busy_and_writes_nothing() {
 fn ac65_a_blob_over_the_stdin_limit_spawns_no_write() {
     // Refusal D, invariant I15. Fact F42's line is bounded at 4 032 bytes
     // *including* its newline, and Claude Code's own fallback for a longer one
-    // is to put the hex in argv. agentctl has no such fallback: the line is
+    // is to put the hex in argv. agctl has no such fallback: the line is
     // refused, and the refusal is decided before any lock is taken and before
     // any child exists.
     let server = MockServer::start();

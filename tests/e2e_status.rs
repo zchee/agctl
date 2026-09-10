@@ -1,6 +1,6 @@
 #![cfg(feature = "testing")]
 
-//! `agentctl claude status`, driven through the real binary.
+//! `agctl claude status`, driven through the real binary.
 //!
 //! Each test here re-proves an acceptance criterion the unit tests already
 //! cover in-process, but from outside: a temporary store on disk, a scripted
@@ -8,7 +8,7 @@
 //! talks to, and assertions on the exit status, the rendered text, the bytes
 //! and inodes left on disk, and the keychain argv log.
 //!
-//! The negative claims are the point. "Zero requests for a row agentctl does
+//! The negative claims are the point. "Zero requests for a row agctl does
 //! not own" and "the file was never opened" are not things an in-process test
 //! can state as strongly as a hit count on a server the binary had to reach
 //! over a socket.
@@ -268,7 +268,7 @@ fn token_ok(server: &MockServer) -> Mock<'_> {
 #[test]
 fn ac5_an_expired_live_credential_costs_no_request() {
     // Plan AC5, decision D-001: the live entry belongs to Claude Code, which
-    // refreshes it. agentctl reports the expiry and spends nothing on it —
+    // refreshes it. agctl reports the expiry and spends nothing on it —
     // not even the usage GET, because the token it would send is the expired
     // one.
     let server = MockServer::start();
@@ -291,7 +291,7 @@ fn ac5_an_expired_live_credential_costs_no_request() {
         .stdout(contains("expired (read-only"));
 
     assert_eq!(usage.calls(), 0, "an expired read-only row is never fetched");
-    assert_eq!(token.calls(), 0, "agentctl never refreshes the live credential");
+    assert_eq!(token.calls(), 0, "agctl never refreshes the live credential");
     fixture.assert_keychain_read_only();
 }
 
@@ -396,7 +396,7 @@ fn ac31_a_hanging_security_times_out_and_owned_rows_still_refresh() {
 
     let mut fixture = Fixture::new();
     fixture.with_keychain().endpoints(&server.base_url());
-    fixture.set("AGENTCTL_FAKE_SECURITY_SLEEP", "30");
+    fixture.set("AGCTL_FAKE_SECURITY_SLEEP", "30");
     fixture.dump(&[LIVE_SERVICE]);
     fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
     fixture.write_credentials(
@@ -457,7 +457,7 @@ fn ac32_a_locked_keychain_stops_keychain_rows_and_not_owned_ones() {
 
     let mut fixture = Fixture::new();
     fixture.with_keychain().endpoints(&server.base_url());
-    fixture.set("AGENTCTL_FAKE_SECURITY_PREFLIGHT_EXIT", "36");
+    fixture.set("AGCTL_FAKE_SECURITY_PREFLIGHT_EXIT", "36");
     fixture.dump(&[LIVE_SERVICE]);
     fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
     fixture.write_credentials(
@@ -486,7 +486,7 @@ fn ac32_a_locked_keychain_stops_keychain_rows_and_not_owned_ones() {
 #[test]
 fn ac34_a_migrated_namespace_is_read_from_the_keychain_and_never_written() {
     // Plan AC34, fact F35: a Claude Code session has moved this namespace's
-    // credentials into the keychain. agentctl displays them from there and
+    // credentials into the keychain. agctl displays them from there and
     // stops writing the file entirely (invariant I2).
     //
     // The row's *state* is no longer `migrated to keychain`: decision D-015
@@ -543,7 +543,7 @@ fn ac34_a_migrated_namespace_is_read_from_the_keychain_and_never_written() {
 fn ac34_a_locked_keychain_read_never_falls_back_to_the_file() {
     // Plan AC34's second clause and invariant I10: for a keychain-backed row
     // a read failure is transient, and the plaintext file beside it is not an
-    // answer. Claude Code's own non-strict read would fall through; agentctl
+    // answer. Claude Code's own non-strict read would fall through; agctl
     // deliberately does not, and this is where that divergence is pinned.
     let server = MockServer::start();
     let usage = usage_ok(&server);
@@ -551,7 +551,7 @@ fn ac34_a_locked_keychain_read_never_falls_back_to_the_file() {
 
     let mut fixture = Fixture::new();
     fixture.with_keychain().endpoints(&server.base_url());
-    fixture.set("AGENTCTL_FAKE_SECURITY_FIND_EXIT", "36");
+    fixture.set("AGCTL_FAKE_SECURITY_FIND_EXIT", "36");
     fixture.dump(&[LIVE_SERVICE]);
     fixture.keychain_item(
         LIVE_SERVICE,
@@ -735,7 +735,7 @@ fn ac43_a_hanging_security_cannot_hold_the_pass_open() {
     // must not.
     let mut fixture = Fixture::new();
     fixture.with_keychain();
-    fixture.set("AGENTCTL_FAKE_SECURITY_SLEEP", "30");
+    fixture.set("AGCTL_FAKE_SECURITY_SLEEP", "30");
     fixture.dump(&[LIVE_SERVICE]);
 
     let started = std::time::Instant::now();
@@ -825,7 +825,7 @@ fn ac48_an_unavailable_flock_stops_the_refresh() {
 }
 
 // ---------------------------------------------------------------------------
-// `same identity as live` (`agentctl-p3-login-live-identity-warning-b90`)
+// `same identity as live` (`agctl-p3-login-live-identity-warning-b90`)
 // ---------------------------------------------------------------------------
 
 /// A second owned account, so "absent elsewhere" is a claim about a choice
@@ -875,7 +875,7 @@ fn twin_fixture(server: &MockServer) -> Fixture {
 
 #[test]
 fn b90_the_table_marks_only_the_owned_row_that_is_the_live_account() {
-    // `agentctl-p3-login-live-identity-warning-b90` (status marks the Owned
+    // `agctl-p3-login-live-identity-warning-b90` (status marks the Owned
     // row when its identity is the live one's), through the binary. The
     // symptom this answers is one email address appearing on two rows with no
     // explanation; the note is in the State column, next to the state it
@@ -943,13 +943,13 @@ fn b90_the_json_report_names_the_live_twin_and_leaves_every_other_row_null() {
 }
 
 // ---------------------------------------------------------------------------
-// `--by-identity` (`agentctl-xq8`)
+// `--by-identity` (`agctl-xq8`)
 // ---------------------------------------------------------------------------
 
 /// The live keychain item and exactly one owned namespace, the same account.
 ///
 /// One owned account rather than two, deliberately: `Fixture::owned_record`
-/// gives every owned account the same email address (`agentctl-p95`), so a
+/// gives every owned account the same email address (`agctl-p95`), so a
 /// second one could not be told from the first in rendered table text. With
 /// one, the claim is a row *count* — two rows without the flag, one with it —
 /// which needs no per-row identification at all.
@@ -980,7 +980,7 @@ fn account_lines(stdout: &str) -> Vec<&str> {
 
 #[test]
 fn xq8_by_identity_renders_one_row_where_the_default_table_renders_two() {
-    // `agentctl-xq8`: the symptom is one address on two rows. Without the
+    // `agctl-xq8`: the symptom is one address on two rows. Without the
     // flag both are shown, which is the default this does not change; with
     // it, the live credential is folded into the row of the account that owns
     // it and the `Kind` column says `live+owned`.

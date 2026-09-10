@@ -1,6 +1,6 @@
-# agentctl
+# agctl
 
-`agentctl` shows the subscription rate-limit utilization of **several Claude accounts at
+`agctl` shows the subscription rate-limit utilization of **several Claude accounts at
 once** — the 5-hour window, the weekly window, the weekly per-model window (Fable), and
 usage credits — in one table or one terminal UI, without running `claude` and without
 disturbing a Claude Code session that is already running.
@@ -22,7 +22,7 @@ The two reset columns say **when** each window rolls over as well as how long is
 5-hour window in `5h reset`, the seven-day all-models window in `Weekly reset`. The time is
 local, and carries as much of the date as it takes to name the day — nothing for a reset
 later today, the weekday for another day this week (`Sun 2:00 PM`), the date from a week out
-(`Sep 16 2:00 PM`). A reset that has already passed reads `(now)`, and a window agentctl has
+(`Sep 16 2:00 PM`). A reset that has already passed reads `(now)`, and a window agctl has
 no reset for is an em dash. A per-model weekly window other than Fable gets a continuation
 row of its own, and its reset appears in `Weekly reset`.
 
@@ -32,7 +32,7 @@ macOS only in phase 1: account discovery reads the login keychain through `secur
 
 ```sh
 cargo build --release
-./target/release/agentctl claude status
+./target/release/agctl claude status
 ```
 
 There is no published crate and no installer yet. If you install by hand, install the
@@ -41,13 +41,13 @@ There is no published crate and no installer yet. If you install by hand, instal
 ```sh
 # correct
 cargo build --release
-install -m 0755 target/release/agentctl ~/.local/bin/agentctl
+install -m 0755 target/release/agctl ~/.local/bin/agctl
 ```
 
 > **Never build or install with `--all-features`.**
 > The `testing` feature compiles the test seams into the artifact, including overrides for
 > the OAuth **token endpoint**. A production binary that honours
-> `AGENTCTL_CLAUDE_TOKEN_URL` would send your refresh token wherever an environment
+> `AGCTL_CLAUDE_TOKEN_URL` would send your refresh token wherever an environment
 > variable pointed it. `cargo install --all-features` and
 > `cargo build --release --all-features` are both wrong for anything you intend to run.
 > `scripts/release-gate.sh` builds the release artifact the correct way and proves it
@@ -59,14 +59,14 @@ install -m 0755 target/release/agentctl ~/.local/bin/agentctl
 # zsh — add to ~/.zshrc, after compinit (the script calls compdef, which
 # only exists once the completion system is loaded)
 autoload -Uz compinit && compinit
-eval "$(agentctl completions zsh)"
+eval "$(agctl completions zsh)"
 # or install the file once into a directory you own and put on fpath:
-mkdir -p ~/.zfunc && agentctl completions zsh > ~/.zfunc/_agentctl
+mkdir -p ~/.zfunc && agctl completions zsh > ~/.zfunc/_agctl
 fpath=(~/.zfunc $fpath)   # before compinit in ~/.zshrc
 # bash — add to ~/.bashrc
-eval "$(agentctl completions bash)"
+eval "$(agctl completions bash)"
 # fish
-agentctl completions fish > ~/.config/fish/completions/agentctl.fish
+agctl completions fish > ~/.config/fish/completions/agctl.fish
 ```
 
 `elvish` and `powershell` are also accepted. The script is generated from the same
@@ -76,24 +76,24 @@ rather than in the order the help text lists them; everything else is the same.
 
 ## Commands
 
-Every provider command lives under `agentctl claude`; the one top-level command is
-`agentctl completions`, above. `--config-dir DIR` is global and names *agentctl's* store; it
+Every provider command lives under `agctl claude`; the one top-level command is
+`agctl completions`, above. `--config-dir DIR` is global and names *agctl's* store; it
 is accepted before or after the subcommand.
 
 ### `status` — the table
 
 ```sh
-agentctl claude status
-agentctl claude status --json | jq '.rows[] | {id, state, windows}'
-agentctl claude status --account 8ff4… --account bob@example.com
-agentctl claude status --all --refresh --timeout 30s
+agctl claude status
+agctl claude status --json | jq '.rows[] | {id, state, windows}'
+agctl claude status --account 8ff4… --account bob@example.com
+agctl claude status --all --refresh --timeout 30s
 ```
 
 | flag | effect |
 |------|--------|
 | `--json` | the report as JSON instead of a table; the shape is fixed by `schemas/status.v1.json` |
 | `--raw` | include the untouched upstream response body under `raw` |
-| `--refresh` | refresh expired credentials agentctl owns, and bypass the usage cache |
+| `--refresh` | refresh expired credentials agctl owns, and bypass the usage cache |
 | `--no-cache` | bypass the usage cache without forcing a token refresh |
 | `--all` | also show the rows hidden by default (stale siblings, foreign items, forgotten services) |
 | `--by-identity` | fold the live credential into the row of the account that owns it, and add a `Kind` column; table only |
@@ -104,7 +104,7 @@ agentctl claude status --all --refresh --timeout 30s
 when it is not, and the email address when that is unique. A keychain item with no
 identity is addressed by its service name.
 
-One address can legitimately appear on two rows — a credential agentctl owns and the one
+One address can legitimately appear on two rows — a credential agctl owns and the one
 Claude Code is signed in as can be the same account with two independent token pairs. The
 owned row says so, with `same identity as live` in its `State` column and
 `"same_identity_as": "live"` in `--json`; the rows stay separate, because each pair
@@ -112,18 +112,18 @@ expires, refreshes and can be revoked on its own.
 
 `--by-identity` collapses that pair into one table row instead, with a `Kind` column
 reading `live+owned`. The owned row is the one that survives, because it is the one
-agentctl can refresh, relocate or forget. It is a table flag: `--json` still emits one
+agctl can refresh, relocate or forget. It is a table flag: `--json` still emits one
 object per credential source, so the two row counts differ under it, and a live row in a
 failing state is never folded away.
 
 ### `watch` — the same table, live
 
 ```sh
-agentctl claude watch
-agentctl claude watch --interval 10m
+agctl claude watch
+agctl claude watch --interval 10m
 ```
 
-`--interval` defaults to `300s` and **will not go below 60s** — agentctl declines to poll
+`--interval` defaults to `300s` and **will not go below 60s** — agctl declines to poll
 an undocumented endpoint faster than that. Keys: `q`, `Esc`, `Ctrl-C` or `Ctrl-D` quit;
 `r` refreshes now; arrows or `j`/`k` move the selection. (`Ctrl-C` is bound explicitly
 because raw mode swallows the terminal's own interrupt.)
@@ -136,14 +136,14 @@ Three things about `watch` that are not visible from the flags:
   `--interval` so large that the schedule arithmetic overflows simply schedules nothing,
   and only `r` fetches.
 - `watch` has no `--all`. The footer counts the hidden rows and points at
-  `agentctl claude status --all` to see them.
+  `agctl claude status --all` to see them.
 
-### `login` — mint a credential agentctl owns
+### `login` — mint a credential agctl owns
 
 ```sh
-agentctl claude login --label work
-agentctl claude login --manual          # paste `code#state` instead of using the loopback
-agentctl claude login --no-duplicate    # refuse if this account is already the live one
+agctl claude login --label work
+agctl claude login --manual          # paste `code#state` instead of using the loopback
+agctl claude login --no-duplicate    # refuse if this account is already the live one
 ```
 
 The browser goes to Anthropic's authorize page; the code comes back either to a loopback
@@ -162,22 +162,22 @@ one-line notice on standard error saying both sessions stay valid: two independe
 pairs for one account is a supported setup. `--no-duplicate` refuses that case instead,
 exits 1 and writes nothing; its message names the `.claude.json` the claim came from, so a
 stale one can be checked. To change which account Claude Code itself uses, that is
-`agentctl claude use --live <id>`, not a second login.
+`agctl claude use --live <id>`, not a second login.
 
-### `accounts` — inspect and edit what agentctl knows
+### `accounts` — inspect and edit what agctl knows
 
 ```sh
-agentctl claude accounts list [--all]
-agentctl claude accounts show <id>
-agentctl claude accounts remove <id> [--delete-secret] [--yes]
-agentctl claude accounts relocate <id> [--yes]
-agentctl claude accounts forget <keychain-service>
-agentctl claude accounts unforget <keychain-service>
+agctl claude accounts list [--all]
+agctl claude accounts show <id>
+agctl claude accounts remove <id> [--delete-secret] [--yes]
+agctl claude accounts relocate <id> [--yes]
+agctl claude accounts forget <keychain-service>
+agctl claude accounts unforget <keychain-service>
 ```
 
 `remove` and `relocate` mutate a namespace and therefore wait for that namespace's lock
-before touching anything; both refuse a row agentctl does not own. `forget` and
-`unforget` flip one flag in agentctl's own registry — the keychain item they hide is
+before touching anything; both refuse a row agctl does not own. `forget` and
+`unforget` flip one flag in agctl's own registry — the keychain item they hide is
 never read, never written and never removed. `relocate` moves a namespace that was
 created as `_unknown-org` into its real organization directory once the organization is
 known.
@@ -185,42 +185,42 @@ known.
 ### `import --from keychain` — record what another config directory already has
 
 ```sh
-agentctl claude import --from keychain --dry-run
-agentctl claude import --from keychain --claude-config-dir ~/work/.claude
+agctl claude import --from keychain --dry-run
+agctl claude import --from keychain --claude-config-dir ~/work/.claude
 ```
 
 An import **records what is already true and changes nothing else**: it reads Claude Code
 credential items belonging to other configuration directories, once, to learn who they
-belong to, and files them in agentctl's registry as read-only rows. No credential is
+belong to, and files them in agctl's registry as read-only rows. No credential is
 written, moved or deleted; an account already in the registry is reported and left alone,
 so a second import is a no-op. `--dry-run` prints the plan and writes nothing at all.
 
 `--claude-config-dir` names a *Claude Code* configuration directory to scan; repeat it for
 several. It is deliberately spelled differently from the global `--config-dir`, which
-always means agentctl's own store.
+always means agctl's own store.
 
 ### `doctor` — what is actually on this machine
 
 ```sh
-agentctl claude doctor
-agentctl claude doctor --remove-stale ~/.config/agentctl/claude/<acct>/<org>/.oauth_refresh.lock --yes
+agctl claude doctor
+agctl claude doctor --remove-stale ~/.config/agctl/claude/<acct>/<org>/.oauth_refresh.lock --yes
 ```
 
 The report covers the keychain preflight, every discovered row with its token expiries,
 credentials on this machine that belong to something else and are never read, the
-namespace locks and who holds them, the Claude Code locks agentctl is holding itself, the
+namespace locks and who holds them, the Claude Code locks agctl is holding itself, the
 artefacts a Claude Code session leaves behind, the files a failed write leaves behind, and
 the four situations that are not failures but are worth knowing about: a stale sibling, a
 forgotten service, two rows holding the same credential, and a namespace still called
 `_unknown-org`.
 
-**`--remove-stale` is the only thing in agentctl that deletes anything Claude Code
+**`--remove-stale` is the only thing in agctl that deletes anything Claude Code
 created, and deleting a lock that is not actually stale can corrupt a running Claude Code
 session's credential store.** It is fenced accordingly. The path must:
 
 1. spell a location under `<config-dir>/claude/`, or be named by a held-lock record whose
    process is gone — see below;
-2. not be in `.locks/` — those are agentctl's own locks, which nothing ever unlinks;
+2. not be in `.locks/` — those are agctl's own locks, which nothing ever unlinks;
 3. be named `.oauth_refresh.lock`, `.storage-write`, or a legacy `<namespace>.lock`;
 4. be a **directory**, reached without following a symbolic link: Claude Code takes every
    one of its locks with `mkdir` and releases it with `rmdir`, so a directory is the only
@@ -237,7 +237,7 @@ Anything else is refused, including a path that satisfies six of the seven. The 
 takes about twelve seconds because of step 6.
 
 Step 1 has one exception, and it is the only way `--remove-stale` reaches outside
-`<config-dir>/claude/`. When agentctl takes Claude Code's locks itself it records what it
+`<config-dir>/claude/`. When agctl takes Claude Code's locks itself it records what it
 took before taking it, and a crash leaves that record naming directories nothing else will
 ever remove. So a path outside the store is accepted when a record in
 `<config-dir>/claude/held-locks/` names **that exact path** and the process that wrote it
@@ -250,16 +250,16 @@ leaked.
 Three sources, and what separates them is who is allowed to write the credential:
 
 1. **The live keychain item** — the credentials the `claude` you run right now is using.
-   agentctl reads it and never refreshes or writes it. Identity comes from the blob's own
+   agctl reads it and never refreshes or writes it. Identity comes from the blob's own
    `tokenAccount`, or from `.claude.json` for this row only.
 2. **Per-configuration-directory keychain items** — a Claude Code credential item named
    after some *other* config directory, recorded by `import --from keychain`. Read once,
    read-only forever.
-3. **agentctl-owned namespaces** — `<config-dir>/claude/<account-uuid>/<organization-uuid>/.credentials.json`,
-   created by `login`. These are the only credentials agentctl will ever refresh or write.
+3. **agctl-owned namespaces** — `<config-dir>/claude/<account-uuid>/<organization-uuid>/.credentials.json`,
+   created by `login`. These are the only credentials agctl will ever refresh or write.
 
 A keychain item is named after a *directory spelling*, not after an account, so the same
-account can appear under several names and two names can point at one directory. agentctl
+account can appear under several names and two names can point at one directory. agctl
 therefore folds two entries into one row only when their token digests match, never by
 path. Two items naming one physical directory but holding different credentials are a
 **stale sibling of live**: real, not actionable, hidden by default and counted in the
@@ -273,48 +273,48 @@ counted; `--all` shows them.
 
 ## Security posture
 
-- **agentctl writes exactly one class of keychain item, and deletes none.** The
+- **agctl writes exactly one class of keychain item, and deletes none.** The
   `security(1)` subcommands it issues are `show-keychain-info`,
   `find-generic-password` and `dump-keychain` — all reads — plus
-  `add-generic-password -U`, on standard input, for one case: a namespace agentctl
+  `add-generic-password -U`, on standard input, for one case: a namespace agctl
   created that a Claude Code session has since migrated into the keychain. That item is
   refreshed in place under Claude Code's own lock protocol, and its name is derived from
   the account registry, so no other item is nameable as a target. The live
   `Claude Code-credentials` item is never written. There is no
   `delete-generic-password` code path at all, and no secret ever appears in a command
   line: the credential goes to `security -i` over a pipe. Every write is appended to
-  `~/.config/agentctl/claude/keychain-writes.jsonl`, which records digest prefixes and
+  `~/.config/agctl/claude/keychain-writes.jsonl`, which records digest prefixes and
   never token material; the entry is written after the write, and a failure to append
   is reported rather than rolling the write back, so a process killed between the two
   leaves a write the log does not name.
-- **agentctl never writes under a live Claude Code configuration directory, and never
+- **agctl never writes under a live Claude Code configuration directory, and never
   touches `.claude.json`.** Every file it creates is under its own configuration
   directory.
 - **Refresh tokens sit at rest in 0600 files** —
-  `~/.config/agentctl/claude/<acct>/<org>/.credentials.json`, in a directory tree created
+  `~/.config/agctl/claude/<acct>/<org>/.credentials.json`, in a directory tree created
   at 0700. This is the same posture as Claude Code's own plaintext fallback store, which
   holds the same material in the same shape at the same mode. It is not the keychain, and
   it is not encrypted: anything running as your user can read it.
 - **The namespace lock lives outside the namespace** —
-  `~/.config/agentctl/claude/.locks/<acct>.<org>.lock` — is created once, and is never
+  `~/.config/agctl/claude/.locks/<acct>.<org>.lock` — is created once, and is never
   unlinked, not even by the command that deletes the namespace it protects. `flock` locks
   an inode, so a lock file that can be deleted and recreated is a lock two processes can
   hold at the same time.
 - **Claude Code activity in a namespace is detected and the refresh is refused.** Before a
-  refresh POST, agentctl checks the write target, takes the lock, re-checks for a Claude
+  refresh POST, agctl checks the write target, takes the lock, re-checks for a Claude
   Code session under the lock, and re-checks once more immediately before the rename. Any
   surprise at any of those points ends in a refusal. There is no flag that overrides it: a
   row reading `claude session detected — refresh refused` is the system working. A
   namespace a session has *migrated* into the keychain is the one activity that is not a
-  refusal: agentctl refreshes that item instead of the file, and refuses again if the item
+  refusal: agctl refreshes that item instead of the file, and refuses again if the item
   changes while the refresh is in flight.
-- **A row agentctl does not own is never refreshed and, when expired, is not even
-  fetched.** Its owner refreshes it; agentctl reports.
-- **agentctl removes a lock artefact it did not create in exactly two circumstances.**
+- **A row agctl does not own is never refreshed and, when expired, is not even
+  fetched.** Its owner refreshes it; agctl reports.
+- **agctl removes a lock artefact it did not create in exactly two circumstances.**
   `doctor --remove-stale`, fenced by the seven conditions — and the one record-attested
   exception to the first of them — listed under
   [`doctor`](#doctor--what-is-actually-on-this-machine); and, as a protocol peer, a stale
-  Claude Code lock **inside agentctl's own directory tree** while refreshing a migrated
+  Claude Code lock **inside agctl's own directory tree** while refreshing a migrated
   namespace's keychain item. The second takes twelve seconds of modification-time
   sampling before it removes anything, stands down if any `claude` process is stopped,
   and appends the whole decision to the audit log whether it broke the lock or abandoned
@@ -328,15 +328,15 @@ Anthropic's published API, it carries no compatibility promise, and it may chang
 disappear in any Claude Code release — which is what
 [`docs/re-verify.md`](docs/re-verify.md) is for.
 
-agentctl sends an honest `User-Agent`: `agentctl/<version>`. It does not pretend to be
+agctl sends an honest `User-Agent`: `agctl/<version>`. It does not pretend to be
 Claude Code. A client that lies about who it is cannot be rate-limited, deprecated or
 excluded separately from the product it is impersonating, which is bad for both sides. If
-Anthropic ever starts refusing the honest agent, `AGENTCTL_CLAUDE_USER_AGENT` replaces the
+Anthropic ever starts refusing the honest agent, `AGCTL_CLAUDE_USER_AGENT` replaces the
 string without waiting for a release.
 
 Reading your own subscription usage with your own credentials is the same operation
 `/usage` performs, but you are responsible for your own use of Anthropic's services under
-their terms. agentctl reads usage figures and refreshes tokens it owns; it sends no
+their terms. agctl reads usage figures and refreshes tokens it owns; it sends no
 inference requests and consumes no quota.
 
 **Caching and polling.** A usage response is cached for **300 s** per account, at
@@ -348,18 +348,18 @@ a keychain that went away — the last good numbers are shown with the row marke
 
 ## One switcher at a time
 
-agentctl coexists with Claude Code. It does **not** coexist with another tool that rewrites
+agctl coexists with Claude Code. It does **not** coexist with another tool that rewrites
 the same credentials.
 
 - A third-party menu-bar account switcher (for example `claude-account-switcher`) works by
-  deleting and recreating the live keychain item on every switch. agentctl lists those
+  deleting and recreating the live keychain item on every switch. agctl lists those
   tools' `claude-switcher:*` items and never reads or writes them, but it cannot stop the
   live item from being replaced underneath it. Run one switcher, not two.
-- `/logout` inside a Claude Code session that is pointed at an agentctl namespace
+- `/logout` inside a Claude Code session that is pointed at an agctl namespace
   **deletes that namespace's credential store**. Claude Code's logout clears both the
   keychain item and the plaintext file. Nothing is corrupted, but that account needs a new
-  `agentctl claude login`.
-- Two agentctl stores with different `--config-dir` values have independent locks. Logging
+  `agctl claude login`.
+- Two agctl stores with different `--config-dir` values have independent locks. Logging
   the same account into both makes two independent holders of one refresh chain, and each
   will eventually invalidate the other's token. Use one store per account.
 
@@ -367,26 +367,26 @@ the same credentials.
 
 | variable | meaning |
 |----------|---------|
-| `AGENTCTL_CONFIG_DIR` | the environment form of `--config-dir`. Default: the XDG configuration directory plus `agentctl`, i.e. `~/.config/agentctl` |
-| `AGENTCTL_CLAUDE_USER_AGENT` | replaces the `agentctl/<version>` `User-Agent` on the usage and token endpoints |
-| `AGENTCTL_CLAUDE_OAUTH_SCOPES` | replaces the space-separated scope set requested at login. A diagnostic: the server grants the same five scopes whatever is asked for |
-| `RUST_LOG` | tracing filter for the diagnostics on stderr. Unset or unparseable means `warn`. `RUST_LOG=agentctl=trace` is the useful setting; no token material is ever logged at any level |
+| `AGCTL_CONFIG_DIR` | the environment form of `--config-dir`. Default: the XDG configuration directory plus `agctl`, i.e. `~/.config/agctl` |
+| `AGCTL_CLAUDE_USER_AGENT` | replaces the `agctl/<version>` `User-Agent` on the usage and token endpoints |
+| `AGCTL_CLAUDE_OAUTH_SCOPES` | replaces the space-separated scope set requested at login. A diagnostic: the server grants the same five scopes whatever is asked for |
+| `RUST_LOG` | tracing filter for the diagnostics on stderr. Unset or unparseable means `warn`. `RUST_LOG=agctl=trace` is the useful setting; no token material is ever logged at any level |
 | `TZ` | selects the zone the `5h reset` and `Weekly reset` columns are printed in. Unset — or set to something unrecognised — means the system zone (`/etc/localtime`), and UTC when even that cannot be determined |
 
-The three `AGENTCTL_*` names above are the whole `AGENTCTL_*` surface agentctl defines —
-`RUST_LOG` and `TZ` it only reads. Every other `AGENTCTL_*`
+The three `AGCTL_*` names above are the whole `AGCTL_*` surface agctl defines —
+`RUST_LOG` and `TZ` it only reads. Every other `AGCTL_*`
 name you may find in the source is a test seam compiled only under the `testing` feature
 and absent from a release build — see [Build](#build) and `scripts/release-gate.sh`.
 
 ### Read, but owned by Claude Code
 
-agentctl also reads a handful of variables it does not define, because they decide what
+agctl also reads a handful of variables it does not define, because they decide what
 Claude Code itself would do:
 
 | variable | meaning |
 |----------|---------|
-| `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR` | read on every run by `EnvView::from_process` in `src/provider/claude/namespace.rs`; together they decide which keychain service name agentctl rebuilds — see [docs/re-verify.md](docs/re-verify.md) section 1 |
-| `CLAUDE_CODE_OAUTH_TOKEN` | short-circuits Claude Code's own credential lookup; agentctl reports that row read-only and never refreshes it |
+| `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR` | read on every run by `EnvView::from_process` in `src/provider/claude/namespace.rs`; together they decide which keychain service name agctl rebuilds — see [docs/re-verify.md](docs/re-verify.md) section 1 |
+| `CLAUDE_CODE_OAUTH_TOKEN` | short-circuits Claude Code's own credential lookup; agctl reports that row read-only and never refreshes it |
 | `HOME` | locates the live store |
 | `USER`, `LOGNAME` | the `acct` attribute every `find-generic-password` is keyed on (`src/secret/mod.rs`); an unexpected value finds nothing rather than erroring |
 
@@ -428,7 +428,7 @@ Before releasing an artifact, run `scripts/release-gate.sh`: it builds a default
 release into a scratch directory and proves the binary contains no test seam.
 
 After a Claude Code upgrade, work through
-[**docs/re-verify.md**](docs/re-verify.md) — agentctl's correctness depends on four
+[**docs/re-verify.md**](docs/re-verify.md) — agctl's correctness depends on four
 contracts read out of Claude Code's own binary, and an upgrade can change any of them.
 
 ## Scope

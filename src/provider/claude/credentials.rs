@@ -3,11 +3,11 @@
 //!
 //! # Why the round-trip matters
 //!
-//! agentctl writes `.credentials.json` in exactly Claude Code's format
-//! (fact F40, decision D-009) so a Claude Code session pointed at an agentctl
+//! agctl writes `.credentials.json` in exactly Claude Code's format
+//! (fact F40, decision D-009) so a Claude Code session pointed at an agctl
 //! namespace can read it. That makes the file a shared format, and shared
 //! formats grow fields. Anything this build does not recognise is kept in
-//! [`Credentials::extra`] and written back out unchanged, so an agentctl
+//! [`Credentials::extra`] and written back out unchanged, so an agctl
 //! refresh never *loses* a field a newer Claude Code added — losing one would
 //! silently degrade the session that reads the file next.
 //!
@@ -66,7 +66,7 @@ pub const REFRESH_MARGIN_MS: i64 = 300_000;
 /// Claude Code's public OAuth client id (fact F8).
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-/// The scopes a live Claude Code credential carries, and the set agentctl
+/// The scopes a live Claude Code credential carries, and the set agctl
 /// requests at login (facts F4, F28).
 pub const DEFAULT_SCOPES: [&str; 5] = [
     "user:file_upload",
@@ -167,7 +167,7 @@ pub enum CredentialsError {
     #[error("the token expiry `{0}` does not fit in a 64-bit millisecond timestamp")]
     ExpiryOverflow(&'static str),
     /// A refresh was attempted without a refresh token.
-    #[error("this account has no refresh token; run `agentctl claude login`")]
+    #[error("this account has no refresh token; run `agctl claude login`")]
     NoRefreshToken,
 }
 
@@ -291,7 +291,7 @@ impl Credentials {
     /// Returns [`KeychainWriteError::LineTooLong`] when the finished line —
     /// trailing newline included — is over
     /// [`SECURITY_STDIN_LIMIT`](crate::secret::keychain_write::SECURITY_STDIN_LIMIT),
-    /// which is refusal **D**: agentctl has no argv fallback, because that
+    /// which is refusal **D**: agctl has no argv fallback, because that
     /// fallback is what would put a refresh token in `ps` (invariant I15).
     pub fn to_keychain_stdin_line(
         &self,

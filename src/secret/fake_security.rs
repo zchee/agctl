@@ -5,25 +5,25 @@
 //! in `tests/`, and the manual probes. One script means one behaviour to
 //! reason about, and — more to the point — one argv log to assert against.
 //! Plan AC25 requires that across the whole suite the only subcommands
-//! agentctl ever issues are `show-keychain-info`, `find-generic-password` and
+//! agctl ever issues are `show-keychain-info`, `find-generic-password` and
 //! `dump-keychain`; the script writes every invocation to
-//! `AGENTCTL_FAKE_SECURITY_LOG`, which turns that requirement into a grep.
+//! `AGCTL_FAKE_SECURITY_LOG`, which turns that requirement into a grep.
 //!
 //! The script is driven entirely by the environment, so one copy serves every
 //! scenario:
 //!
 //! | variable | effect |
 //! |----------|--------|
-//! | `AGENTCTL_FAKE_SECURITY_LOG` | append one line per invocation |
-//! | `AGENTCTL_FAKE_SECURITY_SLEEP` | sleep this many seconds first (the `security_hang` fault) |
-//! | `AGENTCTL_FAKE_SECURITY_PREFLIGHT_EXIT` | exit status for `show-keychain-info` (36 = locked) |
-//! | `AGENTCTL_FAKE_SECURITY_PREFLIGHT_STDERR` | stderr for `show-keychain-info` |
-//! | `AGENTCTL_FAKE_SECURITY_DUMP` | file to print for `dump-keychain` |
-//! | `AGENTCTL_FAKE_SECURITY_DUMP_EXIT` | exit status for `dump-keychain` |
-//! | `AGENTCTL_FAKE_SECURITY_ITEMS` | directory of item files, laid out by [`item_path`] |
-//! | `AGENTCTL_FAKE_SECURITY_FIND_EXIT` | force this exit status for `find-generic-password` |
-//! | `AGENTCTL_FAKE_SECURITY_WRITE_EXIT` | force this exit status for the `-i` write path |
-//! | `AGENTCTL_FAKE_SECURITY_STDERR` | stderr to print with a forced failure |
+//! | `AGCTL_FAKE_SECURITY_LOG` | append one line per invocation |
+//! | `AGCTL_FAKE_SECURITY_SLEEP` | sleep this many seconds first (the `security_hang` fault) |
+//! | `AGCTL_FAKE_SECURITY_PREFLIGHT_EXIT` | exit status for `show-keychain-info` (36 = locked) |
+//! | `AGCTL_FAKE_SECURITY_PREFLIGHT_STDERR` | stderr for `show-keychain-info` |
+//! | `AGCTL_FAKE_SECURITY_DUMP` | file to print for `dump-keychain` |
+//! | `AGCTL_FAKE_SECURITY_DUMP_EXIT` | exit status for `dump-keychain` |
+//! | `AGCTL_FAKE_SECURITY_ITEMS` | directory of item files, laid out by [`item_path`] |
+//! | `AGCTL_FAKE_SECURITY_FIND_EXIT` | force this exit status for `find-generic-password` |
+//! | `AGCTL_FAKE_SECURITY_WRITE_EXIT` | force this exit status for the `-i` write path |
+//! | `AGCTL_FAKE_SECURITY_STDERR` | stderr to print with a forced failure |
 //!
 //! Anything the script is not told about behaves like an empty keychain:
 //! `find-generic-password` exits 44 with the real tool's not-found message.
@@ -32,13 +32,13 @@
 //!
 //! # The write path (`-i`)
 //!
-//! Phase 2 gives the stand-in the one mutating transport agentctl has: argv
+//! Phase 2 gives the stand-in the one mutating transport agctl has: argv
 //! `-i`, with the `add-generic-password -U` line on **stdin** (fact F42). It
 //! reads exactly one line, refuses anything else without running it, and:
 //!
 //! - **logs the line with the hex redacted** — `-X <REDACTED:<digits>>` —
 //!   because a stand-in that logged the payload would put a credential in
-//!   every test's output (`agentctl-pww`, closed here for the write path);
+//!   every test's output (`agctl-pww`, closed here for the write path);
 //! - **refuses a service the test did not register.** One service name per
 //!   line in `<items>/.allowed-services` ([`ALLOWED_SERVICES`],
 //!   [`allow_service`]); anything else exits 1 with a `security:`-shaped
@@ -71,7 +71,7 @@ use std::path::PathBuf;
 /// The script body. `sh`, not `bash`: nothing here needs more.
 ///
 /// It lives in `fixtures/` rather than inline because the end-to-end suite
-/// cannot reach into this crate — `agentctl` is a binary with no library
+/// cannot reach into this crate — `agctl` is a binary with no library
 /// target, so `tests/` has no way to call [`write_fake_security`]. A fixture
 /// both sides `include_str!` keeps the argv log AC25 asserts against, and the
 /// behaviour the unit tests assert against, one script rather than two.
@@ -79,7 +79,7 @@ const SCRIPT: &str = include_str!("../../fixtures/fake-security.sh");
 
 /// Writes the stand-in into `dir` and returns its path.
 ///
-/// The caller points `AGENTCTL_SECURITY_BIN` at the returned path.
+/// The caller points `AGCTL_SECURITY_BIN` at the returned path.
 ///
 /// # Errors
 ///
@@ -150,7 +150,7 @@ pub const ALLOWED_SERVICES: &str = ".allowed-services";
 ///
 /// Additive, one name per line: a test that means to write two items calls
 /// this twice. Nothing else in the stand-in may be written, which is what
-/// makes "agentctl wrote an item nobody asked for" a failing test rather than
+/// makes "agctl wrote an item nobody asked for" a failing test rather than
 /// a silently created file.
 ///
 /// # Errors

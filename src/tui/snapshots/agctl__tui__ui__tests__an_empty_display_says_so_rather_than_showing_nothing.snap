@@ -2,7 +2,7 @@
 source: src/tui/ui_tests.rs
 expression: terminal.backend()
 ---
-"agentctl claude watch · 0 accounts · last fetch — · next fet"
+"agctl claude watch · 0 accounts · last fetch — · next fetch "
 "no accounts to show                                         "
 "                                                            "
 "                                                            "

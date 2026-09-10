@@ -1,4 +1,4 @@
-//! `agentctl claude status` — the pass that produces the table.
+//! `agctl claude status` — the pass that produces the table.
 //!
 //! The shape is plan section 3.3, and its five steps are the five stages
 //! below: load and preflight, discover, fan out, normalize, render and exit.
@@ -6,7 +6,7 @@
 //!
 //! # Refusing is the default
 //!
-//! agentctl writes exactly one file per account it owns, and only when it is
+//! agctl writes exactly one file per account it owns, and only when it is
 //! certain nothing else is using that namespace. Before a refresh POST is
 //! sent the pass checks the write target, takes a lock that lives *outside*
 //! the namespace, re-checks for a Claude Code session under that lock, and
@@ -14,15 +14,15 @@
 //! Any surprise at any of those points ends in a refusal, not a write. A row
 //! that says `claude session detected` is the system working.
 //!
-//! Rows agentctl does *not* own — the live credential, a foreign
+//! Rows agctl does *not* own — the live credential, a foreign
 //! configuration directory — are never refreshed and, when expired, are not
 //! even fetched (decision D-001, plan AC5). Their owner refreshes them;
-//! agentctl reports.
+//! agctl reports.
 //!
-//! A namespace agentctl created that a Claude Code session has since migrated
+//! A namespace agctl created that a Claude Code session has since migrated
 //! into the keychain is the one case that used to be in that list and is not
-//! any more. agentctl still owns the namespace, so it refreshes the *keychain
-//! item* in place — under Claude Code's own lock protocol, against agentctl's
+//! any more. agctl still owns the namespace, so it refreshes the *keychain
+//! item* in place — under Claude Code's own lock protocol, against agctl's
 //! own directory, and never the live item (decision D-015, plan AC65/AC66).
 //! The plaintext store is not resurrected: the namespace stays migrated
 //! (decision D-014). An item under a name the registry cannot predict is
@@ -57,7 +57,7 @@ use crate::cli::Cli;
 use crate::cli::StatusArgs;
 use crate::config::AccountKind;
 use crate::config::AccountRecord;
-use crate::config::AgentctlConfig;
+use crate::config::AgctlConfig;
 use crate::config::paths::Paths;
 use crate::error::AppError;
 use crate::provider::AccountRef;
@@ -131,7 +131,7 @@ use crate::usage::model::UsageSnapshot;
 /// pass open past anything the user asked for.
 pub const PASS_TIMEOUT_MULTIPLIER: u32 = 3;
 
-/// Runs `agentctl claude status`.
+/// Runs `agctl claude status`.
 ///
 /// # Errors
 ///
@@ -143,7 +143,7 @@ pub fn run(cli: &Cli, args: &StatusArgs, cancel: &Cancel) -> Result<(), AppError
     // cache write later would otherwise fail on a store that does not exist.
     let paths = Arc::new(Paths::resolve(cli.config_dir.as_deref())?);
     paths.ensure_dirs()?;
-    let config = AgentctlConfig::load(&paths)?;
+    let config = AgctlConfig::load(&paths)?;
     let env = EnvView::from_process();
 
     let deadline = pass_deadline(args.timeout);
@@ -183,7 +183,7 @@ pub fn run(cli: &Cli, args: &StatusArgs, cancel: &Cancel) -> Result<(), AppError
         .count();
 
     // The zone the two reset columns are printed in. `TimeZone::system()`
-    // reads *this* process's `TZ` and `/etc/localtime` — agentctl's own
+    // reads *this* process's `TZ` and `/etc/localtime` — agctl's own
     // environment, not another process's — and falls back to UTC rather than
     // failing when neither says anything.
     let report = Report {
@@ -294,7 +294,7 @@ fn mark_same_identity(outcomes: &mut [RowOutcome]) {
 /// The rows the table renders, with `--by-identity` applied.
 ///
 /// Without the flag this is one row per credential source, unchanged. With
-/// it, an identity that has both a live credential and a store agentctl owns
+/// it, an identity that has both a live credential and a store agctl owns
 /// renders once: the owned row survives, its `Kind` cell reads `live+owned`,
 /// and the live row is dropped.
 ///
@@ -650,7 +650,7 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
     let now_ms = now_ms();
     // Every row gets a cache entry, including one keyed by a keychain service
     // name: `cache::path` names a file for any identifier at all, so a row
-    // agentctl cannot refresh is still not made to re-fetch on every pass.
+    // agctl cannot refresh is still not made to re-fetch on every pass.
     let cache_path = cache::path(&shared.paths, &record.account_uuid, &record.organization_uuid);
     let entry = cache::load(&cache_path);
     let cached_usage = || {
@@ -664,7 +664,7 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
 
     // Decision D-015: a namespace a Claude Code session has migrated into the
     // keychain is no longer terminal (plan AC66). When the item found is the
-    // one the registry predicts, agentctl refreshes *that item* in place,
+    // one the registry predicts, agctl refreshes *that item* in place,
     // through the same transport the session uses, so the row reports on the
     // credential the session is actually holding rather than on the fact of
     // the migration.
@@ -672,7 +672,7 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
     // An item under any other name stays terminal. The canonical spelling's
     // variant is the case that matters: discovery looks for both spellings
     // (plan AC20), and one that is *not* the registry's `export_sha8` is an
-    // item agentctl did not create a namespace for, so it can never be a
+    // item agctl did not create a namespace for, so it can never be a
     // write target (invariant I1′). The row says so rather than silently
     // reporting `ok`.
     let migrated_service = match &outcome.state {
@@ -700,7 +700,7 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
     // an unreadable row is not made readable by one.
     let mut network_allowed = outcome.state.allows_network();
     // Discovery has already looked for a session or a migration; a row it
-    // flagged is one agentctl must not write, whoever owns the record. The
+    // flagged is one agctl must not write, whoever owns the record. The
     // one exception is the block above: a migrated namespace whose item the
     // registry predicts has just had its state replaced by `Ok`, and it is
     // refreshed through the keychain rather than through the file.
@@ -1259,7 +1259,7 @@ fn refused(state: AccountState, lock_state: &'static str) -> LockedResult {
 ///
 /// Its own sentence rather than a state, because the row is still perfectly
 /// readable — it is the *write* that is refused, and the reason is worth
-/// naming: an item agentctl cannot predict the name of is an item it did not
+/// naming: an item agctl cannot predict the name of is an item it did not
 /// create a namespace for (invariant I1′).
 const MIGRATED_NAME_MISMATCH: &str =
     "item name does not match the recorded export spelling; refusing to refresh";
@@ -1353,7 +1353,7 @@ fn migrated_item(
 /// Refreshes a migrated namespace's own keychain item in place (D-015).
 ///
 /// This is the first caller of [`claude_lock`] and [`keychain_write`], and it
-/// is plan section 3.4's Phase A/B/C shape against a target agentctl owns:
+/// is plan section 3.4's Phase A/B/C shape against a target agctl owns:
 ///
 /// - **Phase A** happened already. The item was read once, during discovery,
 ///   and [`migrated_item`] checked that its name is the one the registry
@@ -1447,7 +1447,7 @@ fn refresh_in_place(
         // the token is still the item's: when a peer refreshed while our POST
         // was in flight it is *their* refresh that consumed the grant, and the
         // row should take their credential rather than send the user to
-        // `agentctl claude login` — which decision D-014 forbids from writing
+        // `agctl claude login` — which decision D-014 forbids from writing
         // a namespaced item at all, so the advice would be a dead end.
         Err(RefreshError::InvalidGrant) => {
             return after_invalid_grant(&shared.fault, reader.as_ref(), item, &before);
@@ -1515,12 +1515,12 @@ fn refresh_in_place(
 
     // --- Phase C: under the three locks -----------------------------------
     let clock = Clock::system();
-    let subject = LockSubject { store_dir: ns_dir, tree: Tree::Agentctl };
+    let subject = LockSubject { store_dir: ns_dir, tree: Tree::Agctl };
     // Split into the draft and the rest **before** either is looked at, so
     // that invariant I16's append below is one unconditional statement rather
     // than a call that each way out has to remember. The `Err` half is why:
     // an acquire that failed may already have `rmdir`ed a peer's lock, and
-    // before `agentctl-nq3` every failing path dropped that evidence.
+    // before `agctl-nq3` every failing path dropped that evidence.
     let (break_record, resolved) =
         match claude_lock::acquire(subject, &shared.paths, &shared.env, &clock, ctx, &shared.fault)
         {

@@ -69,7 +69,7 @@ fn refusal_d_is_decided_before_any_child_process_can_exist() {
 #[test]
 fn the_adoption_refusal_is_decided_in_phase_b_under_the_namespace_locks() {
     // Ruling OQ2 condition (c): the adoption write runs in Phase B, under D's
-    // namespace lock — which is agentctl's own lock, not one Claude Code
+    // namespace lock — which is agctl's own lock, not one Claude Code
     // wants — and its refusal is decided there with it.
     assert_eq!(Refusal::CannotAdopt(adopt::Refusal::NewerCopy).decided_in(), Phase::B);
 }
@@ -250,7 +250,7 @@ fn the_outcome_words_are_distinct_and_only_the_two_successes_exit_zero() {
 #[test]
 fn a_failed_write_is_an_outcome_of_its_own_and_never_a_refusal_letter() {
     // A refusal letter is a security signal: **A** means somebody moved a
-    // lock agentctl was holding. An ordinary `security(1)` refusal is not
+    // lock agctl was holding. An ordinary `security(1)` refusal is not
     // that, and while the two shared a code the exit status contradicted the
     // audit line the same pass had written (`"outcome":"failed"`).
     assert_eq!(Outcome::Failed.word(), "failed");

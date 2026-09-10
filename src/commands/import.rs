@@ -1,4 +1,4 @@
-//! `agentctl claude import` — record accounts another tool already knows.
+//! `agctl claude import` — record accounts another tool already knows.
 //!
 //! The whole command is: build a plan, print it, and — unless `--dry-run` —
 //! apply it to the registry. Everything that decides *what* the plan says
@@ -8,7 +8,7 @@
 //!
 //! # One write, and it is the registry
 //!
-//! `AgentctlConfig::update` is the only mutation, and it is reached once, at
+//! `AgctlConfig::update` is the only mutation, and it is reached once, at
 //! the end, after every decision is made. No credential is written, moved or
 //! deleted; the keychain is read and never written (invariant I1); and
 //! `--dry-run` reaches neither, which is why it leaves a store that did not
@@ -28,7 +28,7 @@ use std::time::Instant;
 
 use crate::cli::ImportArgs;
 use crate::cli::ImportSource;
-use crate::config::AgentctlConfig;
+use crate::config::AgctlConfig;
 use crate::config::import;
 use crate::config::import::ImportPlan;
 use crate::config::paths::Paths;
@@ -58,13 +58,13 @@ pub struct Import<'a> {
     pub env: &'a EnvView,
 }
 
-/// Runs `agentctl claude import`.
+/// Runs `agctl claude import`.
 ///
 /// # Errors
 ///
 /// Returns [`AppError::Config`] when the source cannot be read — a locked,
 /// timed-out or unavailable keychain — and whatever
-/// [`AgentctlConfig::update`] reports when the registry cannot be written.
+/// [`AgctlConfig::update`] reports when the registry cannot be written.
 /// All of them are fatal: an import either records what it found or it does
 /// not.
 pub fn run(config_dir: Option<&Path>, args: &ImportArgs, cancel: &Cancel) -> Result<(), AppError> {
@@ -94,7 +94,7 @@ pub fn run(config_dir: Option<&Path>, args: &ImportArgs, cancel: &Cancel) -> Res
 ///
 /// See [`run`].
 pub fn run_with(import: &Import<'_>) -> Result<Vec<String>, AppError> {
-    let existing = AgentctlConfig::load(import.paths)?;
+    let existing = AgctlConfig::load(import.paths)?;
     // Matched rather than called directly so that a second source cannot be
     // added to the command line without being wired up here.
     let plan = match import.args.from {
@@ -108,7 +108,7 @@ pub fn run_with(import: &Import<'_>) -> Result<Vec<String>, AppError> {
         return Ok(lines);
     }
     if !records.is_empty() {
-        AgentctlConfig::update(import.paths, |config| {
+        AgctlConfig::update(import.paths, |config| {
             for record in records {
                 config.upsert(record);
             }
@@ -118,7 +118,7 @@ pub fn run_with(import: &Import<'_>) -> Result<Vec<String>, AppError> {
 }
 
 /// Plans an import of per-configuration-directory keychain items.
-fn keychain_plan(import: &Import<'_>, existing: &AgentctlConfig) -> Result<ImportPlan, AppError> {
+fn keychain_plan(import: &Import<'_>, existing: &AgctlConfig) -> Result<ImportPlan, AppError> {
     match import.reader.preflight() {
         KeychainStatus::Unlocked => {}
         KeychainStatus::Locked => {

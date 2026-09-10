@@ -5,7 +5,7 @@
 //! - **The target** (plan AC59, AC82): the two constructors, the derivation
 //!   from one [`EnvView`], and the two mechanical checks that stand in for the
 //!   compile-fail tests. `trybuild` is not a dependency and a `compile_fail`
-//!   doc-test cannot help either: `agentctl` is a **binary** crate, so cargo
+//!   doc-test cannot help either: `agctl` is a **binary** crate, so cargo
 //!   never compiles its doc-tests and a `compile_fail` block in this crate
 //!   would pass by never running. What is asserted instead is the property the
 //!   doc-test was there to protect — that the fields are private and that no
@@ -162,7 +162,7 @@ fn migrated_names_the_records_own_item_and_its_own_namespace() {
 }
 
 #[test]
-fn owned_sha8_refuses_every_kind_agentctl_does_not_own() {
+fn owned_sha8_refuses_every_kind_agctl_does_not_own() {
     let dir = TempDir::new().expect("a temporary directory");
     let paths = Paths::with_config_dir(dir.path().to_path_buf());
 
@@ -580,7 +580,7 @@ fn the_transport_binary_is_resolved_without_being_told() {
     #[cfg(not(feature = "testing"))]
     assert!(security_bin().expect("a release build always has one").is_absolute());
 
-    // A `testing` build fails closed instead. `AGENTCTL_SECURITY_BIN` is unset
+    // A `testing` build fails closed instead. `AGCTL_SECURITY_BIN` is unset
     // in this process — a unit test cannot set one safely — and the answer is
     // a refusal rather than `/usr/bin/security`, so no test can reach the
     // developer's own keychain by forgetting to wire a stand-in. This is the
@@ -641,8 +641,8 @@ mod against_the_fake_script {
         let bin = wired(
             dir.path(),
             &[
-                ("AGENTCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned()),
-                ("AGENTCTL_FAKE_SECURITY_LOG", log.to_string_lossy().into_owned()),
+                ("AGCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned()),
+                ("AGCTL_FAKE_SECURITY_LOG", log.to_string_lossy().into_owned()),
             ],
         );
         write_item_through(&bin, &target, ACCOUNT, line_for(ACCOUNT, target.service()), &ctx())
@@ -682,7 +682,7 @@ mod against_the_fake_script {
 
         let bin = wired(
             dir.path(),
-            &[("AGENTCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned())],
+            &[("AGCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned())],
         );
         let refused =
             write_item_through(&bin, &target, ACCOUNT, line_for(ACCOUNT, target.service()), &ctx())
@@ -709,8 +709,8 @@ mod against_the_fake_script {
         let bin = wired(
             dir.path(),
             &[
-                ("AGENTCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned()),
-                ("AGENTCTL_FAKE_SECURITY_WRITE_EXIT", "36".to_owned()),
+                ("AGCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned()),
+                ("AGCTL_FAKE_SECURITY_WRITE_EXIT", "36".to_owned()),
             ],
         );
         let refused =

@@ -5,7 +5,7 @@
               `mod common` is compiled once per file"
 )]
 
-//! The end-to-end harness: one isolated `agentctl` per test.
+//! The end-to-end harness: one isolated `agctl` per test.
 //!
 //! Everything here exists to make one promise cheap to keep — **no test ever
 //! reaches the developer's real home directory, keychain or Anthropic
@@ -15,7 +15,7 @@
 //!
 //! - `--config-dir` and `HOME` point into a temporary directory;
 //! - `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`,
-//!   `CLAUDE_CODE_OAUTH_TOKEN` and `AGENTCTL_CONFIG_DIR` are removed, so an
+//!   `CLAUDE_CODE_OAUTH_TOKEN` and `AGCTL_CONFIG_DIR` are removed, so an
 //!   inherited value cannot point the binary back at the real machine;
 //! - the three endpoint overrides default to `127.0.0.1:1`, which nothing
 //!   listens on, so a regression that fetched anyway fails loudly here rather
@@ -26,10 +26,10 @@
 //! # The fake `security` is one script, shared with the unit tests
 //!
 //! [`FAKE_SECURITY`] is the same `fixtures/fake-security.sh` that
-//! `src/secret/fake_security.rs` compiles in, because `agentctl` is a binary
+//! `src/secret/fake_security.rs` compiles in, because `agctl` is a binary
 //! with no library target and `tests/` cannot call into it. One script means
 //! one behaviour and, more to the point, one argv log: plan AC25 requires that
-//! across the whole suite the only subcommands agentctl ever issues are
+//! across the whole suite the only subcommands agctl ever issues are
 //! `show-keychain-info`, `find-generic-password` and `dump-keychain`, and
 //! [`Fixture::assert_keychain_read_only`] turns that into an assertion every
 //! keychain-using test makes for itself.
@@ -106,11 +106,11 @@ pub const UNKNOWN_ORG: &str = "_unknown-org";
 pub const KEYCHAIN_ACCOUNT: &str = "example";
 
 // ---------------------------------------------------------------------------
-// One isolated agentctl
+// One isolated agctl
 // ---------------------------------------------------------------------------
 
 /// A temporary store, a fake home, and the environment that points one
-/// `agentctl` process at both and at nothing else.
+/// `agctl` process at both and at nothing else.
 pub struct Fixture {
     root: TempDir,
     env: Vec<(String, String)>,
@@ -134,13 +134,13 @@ impl Fixture {
         let mut fixture = Self { root, env: Vec::new() };
         // Unroutable by default. A test that means to talk to a server
         // overrides these; a test that does not, cannot reach anything.
-        fixture.set("AGENTCTL_CLAUDE_USAGE_URL", "http://127.0.0.1:1");
-        fixture.set("AGENTCTL_CLAUDE_TOKEN_URL", "http://127.0.0.1:1/token");
-        fixture.set("AGENTCTL_CLAUDE_AUTHORIZE_URL", "http://127.0.0.1:1/authorize");
+        fixture.set("AGCTL_CLAUDE_USAGE_URL", "http://127.0.0.1:1");
+        fixture.set("AGCTL_CLAUDE_TOKEN_URL", "http://127.0.0.1:1/token");
+        fixture.set("AGCTL_CLAUDE_AUTHORIZE_URL", "http://127.0.0.1:1/authorize");
         // `login` prints the URL either way; opening a window on the
         // developer's desktop from a test run is not acceptable.
-        fixture.set("AGENTCTL_NO_BROWSER", "1");
-        fixture.set("AGENTCTL_KEYCHAIN_BACKEND", "none");
+        fixture.set("AGCTL_NO_BROWSER", "1");
+        fixture.set("AGCTL_KEYCHAIN_BACKEND", "none");
         // Pinned rather than inherited: `current_account()` reads `USER` and
         // falls back to `LOGNAME`, and both must name the account the fake
         // keychain's items are filed under, or a read matches nothing on the
@@ -150,7 +150,7 @@ impl Fixture {
         fixture
     }
 
-    /// The agentctl configuration directory (`--config-dir`).
+    /// The agctl configuration directory (`--config-dir`).
     #[must_use]
     pub fn config_dir(&self) -> PathBuf {
         self.root.path().join("config")
@@ -204,7 +204,7 @@ impl Fixture {
         self.config_dir().join("claude").join("keychain-writes.jsonl")
     }
 
-    /// Where agentctl records the Claude Code locks it is holding.
+    /// Where agctl records the Claude Code locks it is holding.
     #[must_use]
     pub fn held_locks_dir(&self) -> PathBuf {
         self.config_dir().join("claude").join("held-locks")
@@ -214,7 +214,7 @@ impl Fixture {
     /// order the peer's own nesting takes them (facts F46, F58).
     ///
     /// The legacy lock is the store directory's *sibling*, named after the
-    /// store's own last component — which for an agentctl namespace is the
+    /// store's own last component — which for an agctl namespace is the
     /// organization directory (fact F17).
     #[must_use]
     pub fn hold_artefacts(&self, acct: &str, org: &str) -> [PathBuf; 3] {
@@ -241,15 +241,15 @@ impl Fixture {
 
     /// Points the usage and token endpoints at a mock server.
     pub fn endpoints(&mut self, base_url: &str) -> &mut Self {
-        self.set("AGENTCTL_CLAUDE_USAGE_URL", base_url);
-        self.set("AGENTCTL_CLAUDE_TOKEN_URL", &format!("{base_url}{TOKEN_PATH}"));
-        self.set("AGENTCTL_CLAUDE_AUTHORIZE_URL", &format!("{base_url}/oauth/authorize"));
+        self.set("AGCTL_CLAUDE_USAGE_URL", base_url);
+        self.set("AGCTL_CLAUDE_TOKEN_URL", &format!("{base_url}{TOKEN_PATH}"));
+        self.set("AGCTL_CLAUDE_AUTHORIZE_URL", &format!("{base_url}/oauth/authorize"));
         self
     }
 
     /// Turns on fault injection.
     pub fn fault(&mut self, names: &str) -> &mut Self {
-        self.set("AGENTCTL_FAULT", names)
+        self.set("AGCTL_FAULT", names)
     }
 
     // -----------------------------------------------------------------------
@@ -377,11 +377,11 @@ impl Fixture {
         file.sync_all().expect("the fake `security` should be flushed");
         drop(file);
 
-        self.env.retain(|(key, _)| key != "AGENTCTL_KEYCHAIN_BACKEND");
-        self.set("AGENTCTL_SECURITY_BIN", &path.to_string_lossy());
-        self.set("AGENTCTL_FAKE_SECURITY_LOG", &self.security_log_path().to_string_lossy());
-        self.set("AGENTCTL_FAKE_SECURITY_ITEMS", &self.items_dir().to_string_lossy());
-        self.set("AGENTCTL_FAKE_SECURITY_DUMP", &self.dump_path().to_string_lossy());
+        self.env.retain(|(key, _)| key != "AGCTL_KEYCHAIN_BACKEND");
+        self.set("AGCTL_SECURITY_BIN", &path.to_string_lossy());
+        self.set("AGCTL_FAKE_SECURITY_LOG", &self.security_log_path().to_string_lossy());
+        self.set("AGCTL_FAKE_SECURITY_ITEMS", &self.items_dir().to_string_lossy());
+        self.set("AGCTL_FAKE_SECURITY_DUMP", &self.dump_path().to_string_lossy());
         self.dump(&[]);
         self
     }
@@ -494,7 +494,7 @@ impl Fixture {
     /// This is how the end-to-end suite reaches the write path in W2, and the
     /// reason it has to: `keychain_write::write_item` has **no caller** in the
     /// shipped binary yet — that is the whole point of landing the dangerous
-    /// module on its own — and `agentctl` is a binary crate, so `tests/` has
+    /// module on its own — and `agctl` is a binary crate, so `tests/` has
     /// no library to call it through. What is exercised here is therefore the
     /// far side of the transport: the argv, the line on stdin, the stand-in's
     /// parsing, its redaction, its allowlist and the item it stores. The near
@@ -588,7 +588,7 @@ impl Fixture {
     ///
     /// # Panics
     ///
-    /// Panics when agentctl issued any `security` subcommand other than the
+    /// Panics when agctl issued any `security` subcommand other than the
     /// three read-only ones — which would mean a keychain write path exists.
     pub fn assert_keychain_read_only(&self) {
         let lines = self.security_log();
@@ -599,7 +599,7 @@ impl Fixture {
                     subcommand,
                     "show-keychain-info" | "find-generic-password" | "dump-keychain"
                 ),
-                "agentctl issued a `security {subcommand}`, which phase 1 has no code path for \
+                "agctl issued a `security {subcommand}`, which phase 1 has no code path for \
                  (plan invariant I1, AC25); full argv: {line}"
             );
         }
@@ -613,8 +613,8 @@ impl Fixture {
     /// Refuses to start a child that could reach the real `security(1)`.
     ///
     /// Every fixture must be in one of exactly two states: the fake is wired
-    /// (`AGENTCTL_SECURITY_BIN`), or the keychain is switched off outright
-    /// (`AGENTCTL_KEYCHAIN_BACKEND=none`). A fixture in neither has a reader
+    /// (`AGCTL_SECURITY_BIN`), or the keychain is switched off outright
+    /// (`AGCTL_KEYCHAIN_BACKEND=none`). A fixture in neither has a reader
     /// and a write transport with nothing behind them, and the binary is
     /// built with the `testing` feature, so this is the layer that decides
     /// whether a test *could* touch the developer's own keychain.
@@ -632,7 +632,7 @@ impl Fixture {
     fn assert_keychain_seam(&self) {
         let wired = |key: &str| self.env.iter().any(|(name, _)| name == key);
         assert!(
-            wired("AGENTCTL_SECURITY_BIN") || wired("AGENTCTL_KEYCHAIN_BACKEND"),
+            wired("AGCTL_SECURITY_BIN") || wired("AGCTL_KEYCHAIN_BACKEND"),
             "this fixture wires neither the fake `security` nor the disabled backend, so the \
              child would have no keychain seam at all; call `with_keychain()` if the test needs \
              a keychain, and leave `Fixture::new`'s default alone if it does not"
@@ -642,12 +642,12 @@ impl Fixture {
     /// An `assert_cmd` handle to the binary, isolated.
     #[must_use]
     pub fn cmd(&self) -> Command {
-        // `CARGO_BIN_EXE_agentctl` rather than `assert_cmd`'s `cargo_bin`,
-        // which guesses `target/debug/agentctl` relative to the manifest. This
+        // `CARGO_BIN_EXE_agctl` rather than `assert_cmd`'s `cargo_bin`,
+        // which guesses `target/debug/agctl` relative to the manifest. This
         // project builds into a tmpfs target directory, so that guess can find
         // a stale binary from some earlier build and silently test it.
         self.assert_keychain_seam();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agentctl"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agctl"));
         command.args(["--config-dir", &self.config_dir().to_string_lossy()]);
         command.env("HOME", self.home());
         // Removals first: several of these are also things a test sets, and an
@@ -664,14 +664,14 @@ impl Fixture {
     /// A `std::process::Command` handle to the binary, isolated, with every
     /// standard stream piped.
     ///
-    /// Used where a test has to interleave with a *running* agentctl — send it
+    /// Used where a test has to interleave with a *running* agctl — send it
     /// a signal, read the authorize URL it prints, start a second process
     /// while the first holds a lock — which `assert_cmd` cannot express
     /// because it runs a command to completion.
     #[must_use]
     pub fn raw(&self) -> StdCommand {
         self.assert_keychain_seam();
-        let mut command = StdCommand::new(env!("CARGO_BIN_EXE_agentctl"));
+        let mut command = StdCommand::new(env!("CARGO_BIN_EXE_agctl"));
         command.args(["--config-dir", &self.config_dir().to_string_lossy()]);
         command.env("HOME", self.home());
         for key in REMOVED_ENV {
@@ -694,7 +694,7 @@ impl Default for Fixture {
 /// Environment every command starts without.
 ///
 /// An inherited value for any of these would either point the binary back at
-/// the real machine — the Claude Code store, the developer's own agentctl
+/// the real machine — the Claude Code store, the developer's own agctl
 /// store — or quietly change what a test is measuring: a fault switch, a scope
 /// set, a keychain backend, or one of the fake `security` script's own
 /// scripting variables. Removed *before* the fixture's own settings are
@@ -704,20 +704,20 @@ const REMOVED_ENV: [&str; 18] = [
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
-    "AGENTCTL_CONFIG_DIR",
-    "AGENTCTL_FAULT",
-    "AGENTCTL_FAULT_RESUME",
-    "AGENTCTL_CLAUDE_OAUTH_SCOPES",
-    "AGENTCTL_CLAUDE_USER_AGENT",
-    "AGENTCTL_KEYCHAIN_BACKEND",
-    "AGENTCTL_SECURITY_BIN",
-    "AGENTCTL_FAKE_SECURITY_SLEEP",
-    "AGENTCTL_FAKE_SECURITY_PREFLIGHT_EXIT",
-    "AGENTCTL_FAKE_SECURITY_FIND_EXIT",
-    "AGENTCTL_FAKE_SECURITY_WRITE_EXIT",
-    "AGENTCTL_FAKE_SECURITY_DUMP_EXIT",
-    "AGENTCTL_FAKE_SECURITY_STDERR",
-    "AGENTCTL_FAKE_SECURITY_PREFLIGHT_STDERR",
+    "AGCTL_CONFIG_DIR",
+    "AGCTL_FAULT",
+    "AGCTL_FAULT_RESUME",
+    "AGCTL_CLAUDE_OAUTH_SCOPES",
+    "AGCTL_CLAUDE_USER_AGENT",
+    "AGCTL_KEYCHAIN_BACKEND",
+    "AGCTL_SECURITY_BIN",
+    "AGCTL_FAKE_SECURITY_SLEEP",
+    "AGCTL_FAKE_SECURITY_PREFLIGHT_EXIT",
+    "AGCTL_FAKE_SECURITY_FIND_EXIT",
+    "AGCTL_FAKE_SECURITY_WRITE_EXIT",
+    "AGCTL_FAKE_SECURITY_DUMP_EXIT",
+    "AGCTL_FAKE_SECURITY_STDERR",
+    "AGCTL_FAKE_SECURITY_PREFLIGHT_STDERR",
     // A developer's own `RUST_LOG` would change what every command prints,
     // which is what `e2e_tracing` measures; it sets its own through the
     // fixture, and the removals above run first, so this takes nothing away
@@ -794,7 +794,7 @@ pub fn identified_blob(
 /// `hex(sha256(nfc(raw)))[0..8]`, the way Claude Code names a keychain item.
 ///
 /// A second implementation of `provider::claude::namespace::sha8` rather than a
-/// call to it, because `agentctl` has no library target for `tests/` to link
+/// call to it, because `agctl` has no library target for `tests/` to link
 /// against. Plan AC11 pins the same function's vectors inside the crate, so a
 /// divergence between the two would fail there.
 #[must_use]
@@ -884,7 +884,7 @@ pub fn mode_of(path: &Path) -> u32 {
 /// Whether some *other* process holds the exclusive lock on `path`.
 ///
 /// Opens the file and tries a non-blocking `flock`, which is exactly what
-/// agentctl does. `false` when the file does not exist yet, so a caller can
+/// agctl does. `false` when the file does not exist yet, so a caller can
 /// poll this from the moment it starts a child.
 #[must_use]
 pub fn lock_is_held(path: &Path) -> bool {
@@ -1030,7 +1030,7 @@ impl Output {
 /// `wait_with_output` rather than reading the two pipes in turn: a pipe holds
 /// about 64 KiB before it blocks the writer, so draining standard output to
 /// end-of-file first deadlocks against any child that fills standard error
-/// before it finishes writing standard output — which `RUST_LOG=agentctl=trace`
+/// before it finishes writing standard output — which `RUST_LOG=agctl=trace`
 /// makes easy. The standard library reads both at once.
 ///
 /// # Panics
@@ -1118,7 +1118,7 @@ pub const KEYCHAIN_WRITE_TESTS: [&str; 26] = [
 /// Fact F42's keychain update line, for a test that means to write one.
 ///
 /// Spelled out here rather than reached through the crate, for the reason
-/// [`Fixture::security_write`] gives: `agentctl` has no library target. A
+/// [`Fixture::security_write`] gives: `agctl` has no library target. A
 /// divergence from the line the crate builds would fail
 /// `src/secret/keychain_write_tests.rs`, which asserts the same text against
 /// the transport's own output.
@@ -1275,7 +1275,7 @@ impl LoginSession {
     }
 }
 
-/// Starts `agentctl claude login --manual` and reads back its authorize URL.
+/// Starts `agctl claude login --manual` and reads back its authorize URL.
 ///
 /// `env` carries anything the individual test needs on top of the fixture's
 /// own isolation, such as a fault switch.
@@ -1295,7 +1295,7 @@ pub fn start_login(fixture: &Fixture, args: &[&str], env: &[(&str, &str)]) -> Lo
     for (key, value) in env {
         command.env(key, value);
     }
-    let mut child = command.spawn().expect("`agentctl claude login` should start");
+    let mut child = command.spawn().expect("`agctl claude login` should start");
     let stdout = child.stdout.take().expect("stdout was piped");
     let mut reader = std::io::BufReader::new(stdout);
 

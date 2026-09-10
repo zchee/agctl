@@ -45,7 +45,7 @@ pub struct AccountRef<'a> {
 pub enum FetchError {
     /// The server rejected the bearer token.
     ///
-    /// For an account agentctl owns this is the refresh-once trigger: the
+    /// For an account agctl owns this is the refresh-once trigger: the
     /// access token expired between the expiry check and the request, which
     /// happens routinely because the two use different clocks.
     #[error("the access token was rejected")]

@@ -1,4 +1,4 @@
-//! `agentctl claude doctor` — what is actually on this machine, and one
+//! `agctl claude doctor` — what is actually on this machine, and one
 //! carefully fenced way to clean up after Claude Code.
 //!
 //! The report is a read of the whole store: the keychain preflight, every
@@ -10,16 +10,16 @@
 //! service, two rows holding the same credential, and a namespace still
 //! called `_unknown-org`.
 //!
-//! # `--remove-stale` is the only thing in agentctl that deletes a lock
+//! # `--remove-stale` is the only thing in agctl that deletes a lock
 //!
-//! Invariant I11 says agentctl never removes a lock artefact. This command is
+//! Invariant I11 says agctl never removes a lock artefact. This command is
 //! the single exception, and it is fenced so tightly that it is easier to
 //! state what it *will* do than what it will not:
 //!
 //! 1. the path must spell a location under
 //!    [`Paths::namespace_root`](crate::config::paths::Paths::namespace_root),
 //!    *or* be named by a held-lock record whose process is dead — see below;
-//! 2. it must not be in `.locks` — those are agentctl's own locks, which are
+//! 2. it must not be in `.locks` — those are agctl's own locks, which are
 //!    never unlinked by anything (plan section 3.5);
 //! 3. its file name must be `.oauth_refresh.lock`, `.storage-write`, or a
 //!    legacy `<namespace>.lock`;
@@ -40,7 +40,7 @@
 //! # The one path outside the namespace root
 //!
 //! Rule 1 has an exception, and it is the only relaxation in this command:
-//! when agentctl itself holds Claude Code's locks it writes a held-lock record
+//! when agctl itself holds Claude Code's locks it writes a held-lock record
 //! before the first `mkdir` (plan section 3.4 step 6), and a crash leaves that
 //! record behind naming directories nothing will ever remove. Those
 //! directories can be in the live `~/.claude` by construction, so refusing
@@ -73,7 +73,7 @@ use crate::commands::Tty;
 use crate::commands::isolate;
 use crate::config::AccountKind;
 use crate::config::AccountRecord;
-use crate::config::AgentctlConfig;
+use crate::config::AgctlConfig;
 use crate::config::paths::Paths;
 use crate::config::paths::UNKNOWN_ORG;
 use crate::error::AppError;
@@ -113,7 +113,7 @@ pub const STALE_SAMPLE_INTERVAL: Duration = Duration::from_secs(12);
 /// directory rather than inside it (fact F17).
 pub const LEGACY_LOCK_SUFFIX: &str = ".lock";
 
-/// Runs `agentctl claude doctor`.
+/// Runs `agctl claude doctor`.
 ///
 /// # Errors
 ///
@@ -180,7 +180,7 @@ pub fn report(
     ctx: &PassCtx,
     io: &mut dyn Prompt,
 ) -> Result<(), AppError> {
-    let config = AgentctlConfig::load(doctor.paths)?;
+    let config = AgctlConfig::load(doctor.paths)?;
     let found = discovery::discover(&config, doctor.paths, reader, doctor.env, ctx);
 
     let mut out = Vec::new();
@@ -253,7 +253,7 @@ pub fn report(
 /// The credentials on this machine that belong to something else.
 ///
 /// Listed because they are there and a user comparing `security dump-keychain`
-/// against this report should not have to wonder whether agentctl is quietly
+/// against this report should not have to wonder whether agctl is quietly
 /// using them; named "never read" because that is the invariant. A
 /// `claude-switcher:*` item is a third-party tool's (fact F10) and is not
 /// opened even to learn whose it is — the address in the service name is the
@@ -271,7 +271,7 @@ fn foreign_section(env: &EnvView, found: &discovery::Discovery) -> Vec<String> {
         }
         empty = false;
         out.push(format!(
-            "  {}  belongs to claude-switcher; agentctl never reads or writes it",
+            "  {}  belongs to claude-switcher; agctl never reads or writes it",
             entry.service
         ));
     }
@@ -280,7 +280,7 @@ fn foreign_section(env: &EnvView, found: &discovery::Discovery) -> Vec<String> {
         empty = false;
         out.push(format!(
             "  {}  is set in the environment and short-circuits every credential store; \
-             agentctl reports it and never reads its value",
+             agctl reports it and never reads its value",
             namespace::OAUTH_TOKEN_ENV
         ));
     }
@@ -333,7 +333,7 @@ fn relative(at_ms: i64, now_ms: i64) -> String {
     }
 }
 
-/// agentctl's own namespace locks, and who holds them.
+/// agctl's own namespace locks, and who holds them.
 fn lock_section(paths: &Paths, cancel: &Cancel) -> Vec<String> {
     let mut out = vec!["namespace locks".to_owned()];
     let locks_dir = paths.locks_dir();
@@ -380,11 +380,11 @@ fn lock_section(paths: &Paths, cancel: &Cancel) -> Vec<String> {
     out
 }
 
-/// The locks agentctl itself took inside a Claude Code store, and whether the
+/// The locks agctl itself took inside a Claude Code store, and whether the
 /// process that took them is still there (plan section 3.9).
 ///
 /// Claude Code's locks are directories, and nothing releases a directory when
-/// a process dies — so the record agentctl writes before its first `mkdir` is
+/// a process dies — so the record agctl writes before its first `mkdir` is
 /// the only evidence a crash leaves. Two of the partial states in the plan's
 /// contract are visible here and nowhere else: a record whose directories are
 /// gone is stale and holds nothing, and a record whose directories are still
@@ -399,7 +399,7 @@ fn held_locks_section(doctor: &Doctor<'_>) -> Vec<String> {
     }
 
     for held in &records {
-        let pid = held.record.agentctl_pid;
+        let pid = held.record.agctl_pid;
         let state = proc::holder(pid, doctor.cancel);
         // The same question `--remove-stale` asks, so the report cannot offer a
         // removal the command would refuse — or withhold one it would allow: a
@@ -459,7 +459,7 @@ pub struct Artefact {
 /// with `rmdir` (fact F45), so the only shape that can be a lapsed lock is a
 /// directory. The other three are reported and left alone — and the regular
 /// file is the interesting one, because phase 1 believed it was the *only*
-/// removable shape and therefore removed nothing at all (`agentctl-nz5`).
+/// removable shape and therefore removed nothing at all (`agctl-nz5`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtefactKind {
     /// A directory: what Claude Code's `mkdir` makes.
@@ -476,8 +476,8 @@ impl ArtefactKind {
     /// How the report describes this shape.
     ///
     /// Only [`Self::Directory`] is a candidate; the rest say why they are not,
-    /// because "agentctl found something here and said nothing about it" is
-    /// how `agentctl-nz5` survived a whole phase.
+    /// because "agctl found something here and said nothing about it" is
+    /// how `agctl-nz5` survived a whole phase.
     fn note(self) -> &'static str {
         match self {
             Self::Directory => "",
@@ -500,12 +500,12 @@ pub const ANOMALOUS_REGULAR_FILE: &str =
 /// Everything owned namespaces have to say about themselves.
 ///
 /// The two-sample pass runs only when at least one artefact was found, so the
-/// common case — a machine with no Claude Code session in an agentctl
+/// common case — a machine with no Claude Code session in an agctl
 /// namespace — costs nothing. When one *is* found, the wait is announced
 /// first, because twelve silent seconds look like a hang.
 fn namespace_section(
     doctor: &Doctor<'_>,
-    config: &AgentctlConfig,
+    config: &AgctlConfig,
     io: &mut dyn Prompt,
 ) -> Vec<String> {
     let owned: Vec<&AccountRecord> = config
@@ -516,7 +516,7 @@ fn namespace_section(
 
     let mut out = vec!["namespaces".to_owned()];
     if owned.is_empty() {
-        out.push("  none created by agentctl".to_owned());
+        out.push("  none created by agctl".to_owned());
         return out;
     }
 
@@ -600,7 +600,7 @@ fn namespace_section(
         artefacts.into_iter().partition(|artefact| artefact.kind == ArtefactKind::Directory);
     for artefact in &anomalies {
         out.push(format!(
-            "  {}  {} — agentctl refuses to refresh this namespace and will not remove it",
+            "  {}  {} — agctl refuses to refresh this namespace and will not remove it",
             artefact.path.display(),
             artefact.kind.note()
         ));
@@ -619,7 +619,7 @@ fn namespace_section(
 
     for (artefact, holder_alive) in candidates.iter().zip(alive) {
         out.push(format!(
-            "  {}  age {}s, holder {} — agentctl refuses to refresh this namespace{}",
+            "  {}  age {}s, holder {} — agctl refuses to refresh this namespace{}",
             artefact.path.display(),
             artefact.age.as_secs(),
             if holder_alive { "alive (heartbeat seen)" } else { "not beating" },
@@ -637,7 +637,7 @@ fn namespace_section(
 ///
 /// Two inside it and one beside it, named after the resolved directory with
 /// `.lock` appended (fact F17) — which is why the legacy one is looked for
-/// under the canonical spelling rather than the one agentctl uses.
+/// under the canonical spelling rather than the one agctl uses.
 fn claude_artefacts(ns_dir: &Path) -> Vec<Artefact> {
     let mut out: Vec<Artefact> = [ns_dir.join(REFRESH_LOCK), ns_dir.join(STORAGE_WRITE_LOCK)]
         .iter()
@@ -730,7 +730,7 @@ fn second_sample(artefacts: &[Artefact], interval: Duration, cancel: &Cancel) ->
 /// namespaces, and evidence of a second store (risks R20 and R25).
 fn attention_section(
     doctor: &Doctor<'_>,
-    config: &AgentctlConfig,
+    config: &AgctlConfig,
     found: &discovery::Discovery,
 ) -> Vec<String> {
     let mut out = vec!["worth knowing".to_owned()];
@@ -809,7 +809,7 @@ fn attention_section(
             empty = false;
             out.push(format!(
                 "  {}/{}  was created as `{export_spelling}` but this store spells it \
-                 `{current}`: the store moved, or another agentctl store holds the same account \
+                 `{current}`: the store moved, or another agctl store holds the same account \
                  (risk R25)",
                 record.account_uuid, record.organization_uuid
             ));
@@ -819,7 +819,7 @@ fn attention_section(
             empty = false;
             out.push(format!(
                 "  {migrated}  a keychain item exists for this namespace: a Claude Code session \
-                 has migrated it, and agentctl will not write the file again"
+                 has migrated it, and agctl will not write the file again"
             ));
         }
     }
@@ -868,7 +868,7 @@ pub fn remove_stale(
     let permit = permit_for(doctor, path)?;
     if path.parent() == Some(doctor.paths.locks_dir().as_path()) {
         return Err(refuse(format!(
-            "`{}` is one of agentctl's own namespace locks. Those are never unlinked: `flock` \
+            "`{}` is one of agctl's own namespace locks. Those are never unlinked: `flock` \
              locks an inode, and a recreated lock file is a second inode two processes could \
              hold at once",
             path.display()
@@ -886,19 +886,19 @@ pub fn remove_stale(
         .map_err(|err| refuse(format!("`{}` cannot be examined: {err}", path.display())))?;
     if meta.file_type().is_symlink() {
         return Err(refuse(format!(
-            "`{}` is a symbolic link; agentctl will not delete through one",
+            "`{}` is a symbolic link; agctl will not delete through one",
             path.display()
         )));
     }
     if !meta.is_dir() {
-        // `agentctl-nz5`: phase 1 had this the other way round, so it refused
+        // `agctl-nz5`: phase 1 had this the other way round, so it refused
         // every real artefact — and could not have removed one anyway, since
         // `unlinkat` without `AT_REMOVEDIR` does not remove directories.
         return Err(refuse(if meta.is_file() {
             format!(
                 "`{}` is {ANOMALOUS_REGULAR_FILE}: every Claude Code lock artefact is a directory \
                  made by `mkdir` (fact F45), so a regular file at that name was written by \
-                 something else and agentctl will not remove it",
+                 something else and agctl will not remove it",
                 path.display()
             )
         } else {
@@ -924,7 +924,7 @@ pub fn remove_stale(
 
     if let Permit::Attested { record, .. } = &permit {
         io.tell(&format!(
-            "`{}` is outside `{}`. The held-lock record `{}` names it and the agentctl process \
+            "`{}` is outside `{}`. The held-lock record `{}` names it and the agctl process \
              that wrote it is gone — that record is the only reason this removal is allowed.",
             path.display(),
             doctor.paths.namespace_root().display(),
@@ -934,7 +934,7 @@ pub fn remove_stale(
 
     io.tell(&format!(
         "About to remove `{}`.\n\
-         This is Claude Code's lock, not agentctl's. If a session is holding it and its \
+         This is Claude Code's lock, not agctl's. If a session is holding it and its \
          heartbeat is merely slow, removing it lets two processes write that store at once, \
          which ends with one of them holding a refresh token the server has already rotated \
          — and a login lost.\n\
@@ -965,7 +965,7 @@ pub fn remove_stale(
     // Not `fs::remove_dir`. Every check above is lexical or an `lstat` of the
     // final component; none of them can see a symbolic link planted at
     // `<acct>` or `<org>`, and `remove_dir` would resolve the path afresh —
-    // turning the one deletion agentctl is allowed to make into a deletion
+    // turning the one deletion agctl is allowed to make into a deletion
     // somewhere else entirely, the live `~/.claude/.oauth_refresh.lock` being
     // the obvious target. This walks down from the permitted root with
     // `O_NOFOLLOW` and removes relative to the directory that walk produced,
@@ -977,7 +977,7 @@ pub fn remove_stale(
     };
     removal.map_err(|err| match err {
         file_store::FileStoreError::RefusedSymlink(shown) => refuse(format!(
-            "`{}` is reached through a symbolic link; agentctl will not delete through one",
+            "`{}` is reached through a symbolic link; agctl will not delete through one",
             shown.display()
         )),
         file_store::FileStoreError::OutsideNamespaceRoot(shown) => refuse(format!(
@@ -987,7 +987,7 @@ pub fn remove_stale(
         )),
         file_store::FileStoreError::NotEmpty(shown) => refuse(format!(
             "`{}` has something in it, so it is not the empty directory a lapsed lock leaves \
-             behind; agentctl removes one directory and never a tree",
+             behind; agctl removes one directory and never a tree",
             shown.display()
         )),
         file_store::FileStoreError::NotRegular(shown) => {
@@ -1047,7 +1047,7 @@ fn permit_for(doctor: &Doctor<'_>, path: &Path) -> Result<Permit, AppError> {
 
     let outside = || {
         AppError::Config(format!(
-            "`{}` is not inside `{}`; agentctl removes lock artefacts only inside its own \
+            "`{}` is not inside `{}`; agctl removes lock artefacts only inside its own \
              namespace root",
             path.display(),
             doctor.paths.namespace_root().display()
@@ -1079,12 +1079,12 @@ fn permit_for(doctor: &Doctor<'_>, path: &Path) -> Result<Permit, AppError> {
 
     let held = attesting.first().ok_or_else(outside)?;
     Err(AppError::Config(format!(
-        "`{}` is named by the held-lock record `{}`, but agentctl process {} is {} — that lock \
+        "`{}` is named by the held-lock record `{}`, but agctl process {} is {} — that lock \
          is being held, not leaked",
         path.display(),
         held.file.display(),
-        held.record.agentctl_pid,
-        proc::holder(held.record.agentctl_pid, doctor.cancel).label()
+        held.record.agctl_pid,
+        proc::holder(held.record.agctl_pid, doctor.cancel).label()
     )))
 }
 
@@ -1134,7 +1134,7 @@ struct IsolationContext<'a> {
 /// `session_root()`.
 fn collect_isolation(
     doctor: &Doctor<'_>,
-    config: &AgentctlConfig,
+    config: &AgctlConfig,
     listing: &[ServiceEntry],
 ) -> IsolationData {
     let paths = doctor.paths;
@@ -1192,7 +1192,7 @@ fn discover_sessions(session_root: &Path) -> Vec<(String, String, PathBuf)> {
 /// One session directory's row.
 fn isolation_row(
     paths: &Paths,
-    config: &AgentctlConfig,
+    config: &AgctlConfig,
     env: &EnvView,
     acct: &str,
     org: &str,
@@ -1256,7 +1256,7 @@ fn isolation_row(
         mcp,
         drift,
         migrated,
-        forget_command: format!("agentctl claude use --forget {forget_target}"),
+        forget_command: format!("agctl claude use --forget {forget_target}"),
     }
 }
 

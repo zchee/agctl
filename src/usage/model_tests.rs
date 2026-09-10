@@ -52,7 +52,7 @@ fn ac24_percent_round_maps_the_same_vectors_to_the_nearest_whole_number() {
 #[test]
 fn percent_round_and_percent_floor_disagree_where_it_matters() {
     // The two exist side by side on purpose: a window percentage is floored
-    // so agentctl never reads a point above the web UI (fact F21), while
+    // so agctl never reads a point above the web UI (fact F21), while
     // plan section 3.8 specifies the credits figure as rounded.
     assert_eq!(percent_floor(35.9), Some(35));
     assert_eq!(percent_round(35.9), Some(36));
@@ -61,7 +61,7 @@ fn percent_round_and_percent_floor_disagree_where_it_matters() {
 #[test]
 fn percent_floor_never_rounds_up() {
     // Fact F21: the web UI floors, so 35.9 must read 35 and not 36. Rounding
-    // half-up here is what would put agentctl a point above the site.
+    // half-up here is what would put agctl a point above the site.
     assert_eq!(percent_floor(35.9), Some(35));
     assert_eq!(percent_floor(0.999), Some(0));
     assert_eq!(percent_floor(99.999), Some(99));

@@ -18,7 +18,7 @@
 //! | P's namespace is **not** the store being swapped | `<namespace(P)>/.credentials.json` — P's own store, which is where P belongs |
 //! | P's namespace **is** the store being swapped | `<D>/.credentials.adopted.json` (decision D-024) |
 //!
-//! The second row is the ordinary first swap of an `agentctl claude exec`
+//! The second row is the ordinary first swap of an `agctl claude exec`
 //! session, and it is the case the plan's own matrix used to refuse outright:
 //! a store whose credentials have migrated into the keychain has no plaintext
 //! file, and writing one back resurrects a store fact F35's composed read
@@ -125,7 +125,7 @@ impl Refusal {
             }
             Self::PendingPresent => {
                 "the outgoing credential cannot be adopted: an unresolved pending write is \
-                 parked in that namespace; run `agentctl claude status` to settle it first"
+                 parked in that namespace; run `agctl claude status` to settle it first"
             }
             Self::Migrated => {
                 "the outgoing credential cannot be adopted: that namespace has migrated into \

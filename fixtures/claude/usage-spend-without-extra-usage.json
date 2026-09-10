@@ -1,5 +1,5 @@
 {
-  "_comment": "SYNTHETIC. Hand-written for plan section 3.8 and risk R14: the under-delivery case. The response carries no `extra_usage` key at all, while `spend` reports an enabled, non-zero balance. agentctl reads credits from `extra_usage` only (decision D-006), so the column reads `n/a` — and this is the one body that must produce a warning saying so, because otherwise a user with credits would be told nothing and see nothing. Not captured from the API.",
+  "_comment": "SYNTHETIC. Hand-written for plan section 3.8 and risk R14: the under-delivery case. The response carries no `extra_usage` key at all, while `spend` reports an enabled, non-zero balance. agctl reads credits from `extra_usage` only (decision D-006), so the column reads `n/a` — and this is the one body that must produce a warning saying so, because otherwise a user with credits would be told nothing and see nothing. Not captured from the API.",
   "five_hour": {
     "utilization": 21.0,
     "resets_at": "2026-09-08T03:29:59.817079+00:00",

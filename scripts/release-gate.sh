@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # AC37 — the release-artifact gate.
 #
-# Builds agentctl the way a release is built (default features, release profile)
+# Builds agctl the way a release is built (default features, release profile)
 # into a scratch target directory, then proves two things about the artifact:
 #
 #   1. none of the ten test-seam environment-variable names appear in it, and
@@ -9,7 +9,7 @@
 #
 # The ten are one representative name per seam-owning module, not the whole
 # test-only surface — fixtures/fake-security.sh alone defines ten
-# AGENTCTL_FAKE_SECURITY_* names on its own. The fake's write knob is the one
+# AGCTL_FAKE_SECURITY_* names on its own. The fake's write knob is the one
 # exception to "one per owner": the keychain *write* path is the only seam that
 # can change a keychain, so it is gated by name rather than by family. A new
 # seam-owning module adds its representative to the `seams` array below and to
@@ -18,14 +18,14 @@
 #
 # The first is the one that matters. The `testing` feature compiles overrides for
 # the OAuth token endpoint, the authorize endpoint and the usage endpoint; a
-# release binary that honoured AGENTCTL_CLAUDE_TOKEN_URL would send a refresh
+# release binary that honoured AGCTL_CLAUDE_TOKEN_URL would send a refresh
 # token wherever an environment variable pointed it. The second half is there so
 # that a build which somehow contains no strings at all cannot pass by accident.
 #
 # The build goes to a scratch directory, never ./target and never the shared
 # dev target dir (~/.cache/rust/target, formerly /Volumes/tmpfs/target), so
 # running this cannot disturb a working tree's artifacts or another lane's
-# build. Override with AGENTCTL_RELEASE_GATE_TARGET.
+# build. Override with AGCTL_RELEASE_GATE_TARGET.
 #
 # No dev-profile cargo config is passed: this is a release build with its own
 # --target-dir.
@@ -78,31 +78,31 @@ canonicalize() {
 
 # The test-only seams. Every one of these must be ABSENT from the artifact.
 seams=(
-	AGENTCTL_FAULT
-	AGENTCTL_FAULT_RESUME
-	AGENTCTL_KEYCHAIN_BACKEND
-	AGENTCTL_SECURITY_BIN
-	AGENTCTL_CLAUDE_USAGE_URL
-	AGENTCTL_CLAUDE_TOKEN_URL
-	AGENTCTL_CLAUDE_AUTHORIZE_URL
-	AGENTCTL_FAKE_SECURITY_LOG
-	AGENTCTL_FAKE_SECURITY_WRITE_EXIT
-	AGENTCTL_NO_BROWSER
+	AGCTL_FAULT
+	AGCTL_FAULT_RESUME
+	AGCTL_KEYCHAIN_BACKEND
+	AGCTL_SECURITY_BIN
+	AGCTL_CLAUDE_USAGE_URL
+	AGCTL_CLAUDE_TOKEN_URL
+	AGCTL_CLAUDE_AUTHORIZE_URL
+	AGCTL_FAKE_SECURITY_LOG
+	AGCTL_FAKE_SECURITY_WRITE_EXIT
+	AGCTL_NO_BROWSER
 )
 
 # The production surface. Every one of these must be PRESENT.
 production=(
-	AGENTCTL_CONFIG_DIR
-	AGENTCTL_CLAUDE_USER_AGENT
-	AGENTCTL_CLAUDE_OAUTH_SCOPES
+	AGCTL_CONFIG_DIR
+	AGCTL_CLAUDE_USER_AGENT
+	AGCTL_CLAUDE_OAUTH_SCOPES
 )
 
-if [ -n "${AGENTCTL_RELEASE_GATE_TARGET:-}" ]; then
-	target_dir=$AGENTCTL_RELEASE_GATE_TARGET
+if [ -n "${AGCTL_RELEASE_GATE_TARGET:-}" ]; then
+	target_dir=$AGCTL_RELEASE_GATE_TARGET
 elif [ -d "${XDG_CACHE_HOME:-$HOME/.cache}/rust" ]; then
-	target_dir=${XDG_CACHE_HOME:-$HOME/.cache}/rust/agentctl-release-gate
+	target_dir=${XDG_CACHE_HOME:-$HOME/.cache}/rust/agctl-release-gate
 else
-	target_dir=${TMPDIR:-/tmp}/agentctl-release-gate
+	target_dir=${TMPDIR:-/tmp}/agctl-release-gate
 fi
 
 target_dir=$(canonicalize "$target_dir")
@@ -125,7 +125,7 @@ echo "release-gate: target-dir $target_dir"
 echo "release-gate: building default-feature release"
 cargo build --release --target-dir "$target_dir"
 
-binary=$target_dir/release/agentctl
+binary=$target_dir/release/agctl
 if [ ! -f "$binary" ]; then
 	echo "release-gate: FAIL — no binary at $binary" >&2
 	exit 1
@@ -169,5 +169,5 @@ fi
 
 echo "release-gate: FAIL — $failures check(s) failed" >&2
 echo "release-gate: a seam in a release artifact means the build enabled the \`testing\`" >&2
-echo "release-gate: feature. Never build or install agentctl with --all-features." >&2
+echo "release-gate: feature. Never build or install agctl with --all-features." >&2
 exit 1

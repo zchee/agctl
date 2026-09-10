@@ -39,7 +39,7 @@ fn show_keychain_info_exits_zero_by_default_and_honours_an_override() {
     let (_dir, path) = script();
     assert_eq!(run(&path, &[], &["show-keychain-info"]).status.code(), Some(0));
     assert_eq!(
-        run(&path, &[("AGENTCTL_FAKE_SECURITY_PREFLIGHT_EXIT", "36")], &["show-keychain-info"])
+        run(&path, &[("AGCTL_FAKE_SECURITY_PREFLIGHT_EXIT", "36")], &["show-keychain-info"])
             .status
             .code(),
         Some(36)
@@ -63,7 +63,7 @@ fn an_item_is_served_from_the_items_directory() {
 
     let output = run(
         &path,
-        &[("AGENTCTL_FAKE_SECURITY_ITEMS", &items.to_string_lossy())],
+        &[("AGCTL_FAKE_SECURITY_ITEMS", &items.to_string_lossy())],
         &["find-generic-password", "-a", "u", "-w", "-s", "Claude Code-credentials"],
     );
     assert_eq!(output.status.code(), Some(0));
@@ -73,7 +73,7 @@ fn an_item_is_served_from_the_items_directory() {
 #[test]
 fn every_mutating_subcommand_but_the_one_transport_is_refused() {
     // The double implements the three read subcommands and the one write
-    // transport agentctl has — argv `-i`, payload on stdin (fact F42) — and
+    // transport agctl has — argv `-i`, payload on stdin (fact F42) — and
     // refuses everything else, so a code path that grew a second way to
     // change a keychain would fail loudly in the tests before it ever ran
     // against a real one.
@@ -135,8 +135,8 @@ fn the_write_path_stores_the_decoded_blob_and_redacts_the_log() {
     let log = dir.path().join("argv.log");
     allow_service(&items, "Claude Code-credentials").expect("registrable");
     let env = [
-        ("AGENTCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned()),
-        ("AGENTCTL_FAKE_SECURITY_LOG", log.to_string_lossy().into_owned()),
+        ("AGCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned()),
+        ("AGCTL_FAKE_SECURITY_LOG", log.to_string_lossy().into_owned()),
     ];
     let env: Vec<(&str, &str)> = env.iter().map(|(n, v)| (*n, v.as_str())).collect();
 
@@ -169,7 +169,7 @@ fn the_write_path_refuses_anything_but_one_recognised_line() {
     let (dir, path) = script();
     let items = dir.path().join("items");
     allow_service(&items, "Claude Code-credentials").expect("registrable");
-    let env = [("AGENTCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned())];
+    let env = [("AGCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned())];
     let env: Vec<(&str, &str)> = env.iter().map(|(n, v)| (*n, v.as_str())).collect();
     let one = write_line("u", "Claude Code-credentials", b"{}");
 
@@ -208,7 +208,7 @@ fn the_write_path_refuses_a_service_nobody_registered() {
     let (dir, path) = script();
     let items = dir.path().join("items");
     std::fs::create_dir_all(&items).expect("creatable");
-    let env = [("AGENTCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned())];
+    let env = [("AGCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned())];
     let env: Vec<(&str, &str)> = env.iter().map(|(n, v)| (*n, v.as_str())).collect();
 
     let output =
@@ -225,9 +225,9 @@ fn the_write_path_honours_the_forced_exit_knob() {
     let items = dir.path().join("items");
     allow_service(&items, "Claude Code-credentials").expect("registrable");
     let env = [
-        ("AGENTCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned()),
-        ("AGENTCTL_FAKE_SECURITY_WRITE_EXIT", "44".to_owned()),
-        ("AGENTCTL_FAKE_SECURITY_STDERR", "security: forced".to_owned()),
+        ("AGCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned()),
+        ("AGCTL_FAKE_SECURITY_WRITE_EXIT", "44".to_owned()),
+        ("AGCTL_FAKE_SECURITY_STDERR", "security: forced".to_owned()),
     ];
     let env: Vec<(&str, &str)> = env.iter().map(|(n, v)| (*n, v.as_str())).collect();
 
@@ -245,7 +245,7 @@ fn the_write_path_honours_the_forced_exit_knob() {
 fn the_argv_log_records_one_line_per_invocation() {
     let (dir, path) = script();
     let log = dir.path().join("argv.log");
-    let env = [("AGENTCTL_FAKE_SECURITY_LOG", log.to_string_lossy().into_owned())];
+    let env = [("AGCTL_FAKE_SECURITY_LOG", log.to_string_lossy().into_owned())];
     let env: Vec<(&str, &str)> = env.iter().map(|(n, v)| (*n, v.as_str())).collect();
 
     run(&path, &env, &["show-keychain-info"]);
@@ -271,7 +271,7 @@ fn the_item_file_name_fold_matches_the_shell_s() {
         write_item(&items, "u", service, service.as_bytes()).expect("writable");
         let output = run(
             &path,
-            &[("AGENTCTL_FAKE_SECURITY_ITEMS", &items.to_string_lossy())],
+            &[("AGCTL_FAKE_SECURITY_ITEMS", &items.to_string_lossy())],
             &["find-generic-password", "-a", "u", "-w", "-s", service],
         );
         assert_eq!(output.status.code(), Some(0), "`{service}` should be found");

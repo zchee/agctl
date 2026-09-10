@@ -160,7 +160,7 @@ fn holder_from_status(status: u32) -> Holder {
 /// phase-1 build carries the old spelling, so a phase-2 `doctor` comparing it
 /// against a fresh read sees a mismatch and prints `dead (pid recycled)` for
 /// a holder that may well be alive. That errs towards suspicion rather than
-/// towards trusting a stale claim, `doctor` never removes an agentctl
+/// towards trusting a stale claim, `doctor` never removes an agctl
 /// namespace lock, and the next acquire rewrites the body.
 pub fn start_time(pid: u32, _cancel: &Cancel) -> Option<String> {
     let info = ffi::bsd_info(pid).ok()?;

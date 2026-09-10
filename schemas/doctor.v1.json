@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/zchee/agentctl/schemas/doctor.v1.json",
-  "title": "agentctl claude doctor isolation report, version 1",
-  "description": "The `isolation`/`isolation_policy` half of `agentctl claude doctor`'s report (plan AC58). Not yet reachable through a CLI flag; this schema is what a future `doctor --json` would emit, and is validated today against the type `render::json::DoctorReport` builds directly. It carries no token material: nothing here is read from a credential, only from `.claude.json`, a symlink target, and a settings file.",
+  "$id": "https://github.com/zchee/agctl/schemas/doctor.v1.json",
+  "title": "agctl claude doctor isolation report, version 1",
+  "description": "The `isolation`/`isolation_policy` half of `agctl claude doctor`'s report (plan AC58). Not yet reachable through a CLI flag; this schema is what a future `doctor --json` would emit, and is validated today against the type `render::json::DoctorReport` builds directly. It carries no token material: nothing here is read from a credential, only from `.claude.json`, a symlink target, and a settings file.",
   "type": "object",
   "additionalProperties": false,
   "required": ["version", "isolation", "isolation_policy"],
@@ -147,7 +147,7 @@
           "type": ["boolean", "null"]
         },
         "backend_observable": {
-          "description": "Always false: agentctl cannot observe which secure-storage backend a session activates from outside it.",
+          "description": "Always false: agctl cannot observe which secure-storage backend a session activates from outside it.",
           "const": false
         }
       }

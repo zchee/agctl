@@ -44,8 +44,8 @@ fn map_cases() -> std::collections::BTreeMap<&'static str, Case> {
         Case { cli: None, env: Some(PathBuf::from("/from/env")), expected: "/from/env" },
     );
     tests.insert(
-        "success: xdg fallback appends agentctl",
-        Case { cli: None, env: None, expected: "/xdg/config/agentctl" },
+        "success: xdg fallback appends agctl",
+        Case { cli: None, env: None, expected: "/xdg/config/agctl" },
     );
     tests
 }
@@ -194,13 +194,13 @@ fn validate_segment_rejects_separators_and_dots() {
 
 #[test]
 fn resolve_reads_the_documented_environment_variable_name() {
-    assert_eq!(CONFIG_DIR_ENV, "AGENTCTL_CONFIG_DIR");
+    assert_eq!(CONFIG_DIR_ENV, "AGCTL_CONFIG_DIR");
 }
 
 #[test]
 fn resolve_honours_a_cli_override_without_touching_the_environment() {
     // The full `resolve`, not the injectable half: an override must win over
-    // both `AGENTCTL_CONFIG_DIR` and the XDG base directory, whatever this
+    // both `AGCTL_CONFIG_DIR` and the XDG base directory, whatever this
     // test runner's environment happens to hold.
     let dir = temp();
     let resolved = Paths::resolve(Some(dir.path())).expect("an override always resolves");

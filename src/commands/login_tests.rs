@@ -1,4 +1,4 @@
-//! Tests for `agentctl claude login`.
+//! Tests for `agctl claude login`.
 //!
 //! Each of these runs the whole command against a mock token endpoint and a
 //! temporary configuration directory, and then asserts on the bytes and modes
@@ -121,7 +121,7 @@ fn client_for(server: &MockServer) -> OauthClient {
         &server.url("/cai/oauth/authorize"),
         &server.url("/v1/oauth/token"),
         &server.url("/api/oauth/profile"),
-        "agentctl/test",
+        "agctl/test",
     )
     .expect("the mock endpoints should parse")
 }
@@ -205,7 +205,7 @@ fn a_manual_login_writes_the_f40_blob_and_records_an_owned_account() {
         "expiresAt should be now + expires_in*1000, got {expires_at}"
     );
 
-    let config = AgentctlConfig::load(&paths).expect("the config should load");
+    let config = AgctlConfig::load(&paths).expect("the config should load");
     let record = config.get(ACCOUNT, ORGANIZATION).expect("the account should be recorded");
     assert_eq!(record.label.as_deref(), Some("work"));
     assert_eq!(record.email.as_deref(), Some("user@example.com"));
@@ -266,7 +266,7 @@ fn a_login_without_an_organization_lands_in_the_unknown_org_namespace() {
     let ns_dir = paths.namespace_dir(ACCOUNT, UNKNOWN_ORG);
     assert_eq!(mode_of(&ns_dir.join(file_store::CREDENTIALS_FILE)), Some(0o600));
 
-    let config = AgentctlConfig::load(&paths).expect("the config should load");
+    let config = AgctlConfig::load(&paths).expect("the config should load");
     assert!(config.get(ACCOUNT, UNKNOWN_ORG).is_some(), "the placeholder org is the record key");
 }
 
@@ -304,7 +304,7 @@ fn an_identity_the_exchange_omits_is_recovered_from_the_profile() {
         .expect("the login should succeed");
 
     profile.assert();
-    let config = AgentctlConfig::load(&paths).expect("the config should load");
+    let config = AgctlConfig::load(&paths).expect("the config should load");
     let record = config.get(ACCOUNT, ORGANIZATION).expect("the profile should have named it");
     assert_eq!(record.email.as_deref(), Some("fallback@example.com"));
     assert_eq!(record.org_name.as_deref(), Some("Fallback Org"));
@@ -418,7 +418,7 @@ fn logging_the_same_account_in_twice_asks_first_and_then_overwrites() {
     run_with(&second, &client, &mut io).expect("the confirmed overwrite should succeed");
     assert_eq!(io.confirmations, 1, "an existing account must be confirmed over");
 
-    let config = AgentctlConfig::load(&paths).expect("the config should load");
+    let config = AgctlConfig::load(&paths).expect("the config should load");
     assert_eq!(config.accounts.len(), 1, "an overwrite replaces the record rather than adding one");
     assert_eq!(
         config.get(ACCOUNT, ORGANIZATION).and_then(|rec| rec.label.as_deref()),
@@ -467,7 +467,7 @@ fn a_declined_confirmation_leaves_the_stored_credentials_alone() {
 
     assert_eq!(err.exit_code(), crate::error::EXIT_FATAL);
     assert_eq!(stored_blob(&ns_dir), before, "the stored blob must be untouched");
-    let config = AgentctlConfig::load(&paths).expect("the config should load");
+    let config = AgctlConfig::load(&paths).expect("the config should load");
     assert_eq!(
         config.get(ACCOUNT, ORGANIZATION).and_then(|rec| rec.label.as_deref()),
         Some("first")
@@ -551,7 +551,7 @@ fn the_same_account_in_two_organizations_gets_sibling_namespaces() {
     assert!(paths.namespace_dir(ACCOUNT, ORGANIZATION).join(file_store::CREDENTIALS_FILE).exists());
     assert!(paths.namespace_dir(ACCOUNT, OTHER_ORG).join(file_store::CREDENTIALS_FILE).exists());
 
-    let config = AgentctlConfig::load(&paths).expect("the config should load");
+    let config = AgctlConfig::load(&paths).expect("the config should load");
     assert_eq!(config.accounts.len(), 2);
 }
 
@@ -684,7 +684,7 @@ fn a_profile_document_without_an_identity_changes_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// `same identity as live` (`agentctl-p3-login-live-identity-warning-b90`)
+// `same identity as live` (`agctl-p3-login-live-identity-warning-b90`)
 // ---------------------------------------------------------------------------
 
 /// The live identity a test declares, without touching the environment.
@@ -732,7 +732,7 @@ fn try_login_with_live(
 
 #[test]
 fn b90_a_login_into_the_live_account_says_so_and_completes_anyway() {
-    // `agentctl-p3-login-live-identity-warning-b90` (login notices when the
+    // `agctl-p3-login-live-identity-warning-b90` (login notices when the
     // new identity is the live one's). Decision D-011: a second independent
     // token pair for one account is a supported `use --new-only` setup, so
     // the default is a sentence, not a refusal — the credential is written
@@ -767,7 +767,7 @@ fn b90_a_login_into_the_live_account_says_so_and_completes_anyway() {
     let ns_dir = paths.namespace_dir(ACCOUNT, ORGANIZATION);
     assert!(ns_dir.join(file_store::CREDENTIALS_FILE).is_file(), "the credential was written");
     assert!(
-        AgentctlConfig::load(&paths)
+        AgctlConfig::load(&paths)
             .expect("the registry should load")
             .get(ACCOUNT, ORGANIZATION)
             .is_some(),
@@ -818,7 +818,7 @@ fn b90_an_organization_less_identity_matches_the_unknown_org_the_store_uses() {
 }
 
 // ---------------------------------------------------------------------------
-// `--no-duplicate` (`agentctl-3m0`)
+// `--no-duplicate` (`agctl-3m0`)
 // ---------------------------------------------------------------------------
 
 /// Everything under a store's namespace root, recursively, by relative path.
@@ -850,7 +850,7 @@ fn namespace_tree(paths: &Paths) -> Vec<String> {
 
 #[test]
 fn m3m0_no_duplicate_refuses_the_live_account_and_writes_nothing() {
-    // `agentctl-3m0`: the opt-in refusal. It happens before `ensure_dirs`,
+    // `agctl-3m0`: the opt-in refusal. It happens before `ensure_dirs`,
     // before the namespace lock and before any store or registry write, so a
     // refused login leaves the machine exactly as it found it.
     let server = MockServer::start();
@@ -914,13 +914,13 @@ fn m3m0_no_duplicate_is_inert_for_any_other_account() {
         paths.namespace_dir(ACCOUNT, ORGANIZATION).join(file_store::CREDENTIALS_FILE).is_file(),
         "the credential was written"
     );
-    let config = AgentctlConfig::load(&paths).expect("the registry should load");
+    let config = AgctlConfig::load(&paths).expect("the registry should load");
     assert!(config.get(ACCOUNT, ORGANIZATION).is_some(), "and the account recorded");
 }
 
 #[test]
 fn m3m0_without_the_flag_the_same_login_is_a_notice_and_not_a_refusal() {
-    // The default is unchanged by `agentctl-3m0`: decision D-011 says a second
+    // The default is unchanged by `agctl-3m0`: decision D-011 says a second
     // independent session of one account is a supported setup, so the opt-in
     // is what says "not this time".
     let server = MockServer::start();

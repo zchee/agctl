@@ -1,8 +1,8 @@
-//! The records agentctl leaves behind while it holds a Claude Code lock.
+//! The records agctl leaves behind while it holds a Claude Code lock.
 //!
 //! Claude Code's lock artefacts are directories made by `mkdir` (fact F45),
 //! and the kernel releases nothing when the process holding one dies. So the
-//! only evidence a crash leaves is a record agentctl writes *before* the first
+//! only evidence a crash leaves is a record agctl writes *before* the first
 //! `mkdir`: which store it is locking, which directories it made, and the
 //! process id that made them (plan section 3.4 step 6).
 //!
@@ -56,7 +56,7 @@ pub fn dir(paths: &Paths) -> PathBuf {
 /// Which credential store's locks a record describes.
 ///
 /// Named in the record rather than inferred from the path, because the whole
-/// point of invariant I11′'s containment is being able to tell a lock agentctl
+/// point of invariant I11′'s containment is being able to tell a lock agctl
 /// took inside its own tree from one it took in the live `~/.claude`.
 ///
 /// Re-exported rather than declared: [`crate::secret::audit`] holds the crate's
@@ -70,8 +70,8 @@ pub use crate::secret::audit::Tree;
 /// a field name or a `tree` spelling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldLockRecord {
-    /// The agentctl process that took the locks.
-    pub agentctl_pid: u32,
+    /// The agctl process that took the locks.
+    pub agctl_pid: u32,
     /// When that process started, so a recycled process id cannot pass for the
     /// one that wrote the record.
     ///
@@ -80,7 +80,7 @@ pub struct HeldLockRecord {
     /// time falls back to the process id alone, which is weaker but is what
     /// phase 1 had. Filled from [`proc::self_start_time`].
     #[serde(default)]
-    pub agentctl_start_time: Option<String>,
+    pub agctl_start_time: Option<String>,
     /// Which tree they are in.
     pub tree: Tree,
     /// The credential store directory being locked.
@@ -106,11 +106,11 @@ impl HeldLockRecord {
     /// one is not evidence of anything, and reading it as one would turn every
     /// record written by an older build into a permitted removal.
     pub fn writer_is_gone(&self, cancel: &Cancel) -> bool {
-        if proc::holder(self.agentctl_pid, cancel) == proc::Holder::Dead {
+        if proc::holder(self.agctl_pid, cancel) == proc::Holder::Dead {
             return true;
         }
-        let Some(recorded) = self.agentctl_start_time.as_deref() else { return false };
-        match proc::start_time(self.agentctl_pid, cancel) {
+        let Some(recorded) = self.agctl_start_time.as_deref() else { return false };
+        match proc::start_time(self.agctl_pid, cancel) {
             Some(now) => now != recorded,
             None => false,
         }

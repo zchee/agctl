@@ -8,7 +8,7 @@
 //! moment it is deleted and recreated, two processes hold locks on two
 //! different inodes and both believe they are alone. So the lock lives in
 //! `<namespace_root>/.locks/<acct>.<org>.lock`, is created once, and is
-//! **never unlinked** (plan section 3.5). Nothing in agentctl removes it,
+//! **never unlinked** (plan section 3.5). Nothing in agctl removes it,
 //! including the code that removes the namespace it protects.
 //!
 //! # Why not `fd-lock`
@@ -25,7 +25,7 @@
 //! Any error that is not "somebody else holds it" makes acquisition fail with
 //! [`LockError::Unavailable`], and a caller that cannot take the lock does not
 //! write. A filesystem that does not implement `flock` — a network mount, a
-//! container's overlay — is therefore a filesystem agentctl declines to
+//! container's overlay — is therefore a filesystem agctl declines to
 //! refresh on, rather than one it silently refreshes on without mutual
 //! exclusion. That is invariant I12, and it is the conservative side of a
 //! trade whose other side is two processes rotating one refresh chain.
@@ -181,7 +181,7 @@ pub fn acquire(
 
 /// Takes an exclusive `flock` on `path`, creating the file if needed.
 ///
-/// Shared with [`crate::config::AgentctlConfig::update`], which wants the same
+/// Shared with [`crate::config::AgctlConfig::update`], which wants the same
 /// semantics over `.config.lock`.
 ///
 /// # Errors

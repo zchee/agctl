@@ -31,7 +31,7 @@ fn env() -> EnvView {
 
 fn paths() -> (TempDir, Paths) {
     let dir = TempDir::new().expect("a temporary directory should be available");
-    let paths = Paths::with_config_dir(dir.path().join("agentctl"));
+    let paths = Paths::with_config_dir(dir.path().join("agctl"));
     (dir, paths)
 }
 

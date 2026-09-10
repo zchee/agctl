@@ -2,7 +2,7 @@
 //!
 //! # Why these live here and the rest of the lock suite does not
 //!
-//! `agentctl` is a **binary-only crate**: there is no `[lib]` target, so an
+//! `agctl` is a **binary-only crate**: there is no `[lib]` target, so an
 //! integration test cannot reach `secret::claude_lock` or `runtime::proc` at
 //! all. The acquire truth table (AC62), the break rule (AC63) and the drift
 //! check (AC64) therefore live in the sibling unit-test files, where they can
@@ -12,7 +12,7 @@
 //! What is left for this file is the half that needs no crate API and could
 //! not be asserted from inside one module anyway: **greps over the whole
 //! tree, and over the built artifact.** They are the mechanical form of a
-//! rule the reviews reached twice — that agentctl reads process *state* and
+//! rule the reviews reached twice — that agctl reads process *state* and
 //! never process arguments or environment — and they are here so that a later
 //! edit to any module has to trip them.
 
@@ -139,7 +139,7 @@ fn the_grep_can_fail() {
     assert!(contains_token("let e = environ;", "environ"));
     assert!(contains_token("environ", "environ"));
     assert!(contains_token("(environ)", "environ"));
-    assert!(!contains_token("agentctl reads no environment", "environ"));
+    assert!(!contains_token("agctl reads no environment", "environ"));
     assert!(!contains_token("environments", "environ"));
     assert!(!contains_token("my_environ_var", "environ"));
     assert!("Command::new(\"ps\")".contains("Command::new(\"ps\")"));
@@ -202,7 +202,7 @@ fn no_production_source_reads_the_lock_suites_own_test_variables() {
     // `#[cfg(test)]` file and nowhere else, so they are not crate seams: they
     // cannot reach a release artifact and the release gate has nothing to
     // register.
-    for name in ["AGENTCTL_LOCK_CHILD_ROLE", "AGENTCTL_LOCK_CHILD_DIR"] {
+    for name in ["AGCTL_LOCK_CHILD_ROLE", "AGCTL_LOCK_CHILD_DIR"] {
         for path in production_sources() {
             let source = std::fs::read_to_string(&path).expect("a readable source file");
             assert!(!source.contains(name), "`{name}` appears in {}", path.display());
@@ -219,7 +219,7 @@ fn the_built_binary_carries_no_process_lister_and_no_argument_api() {
     // The same claim as the source greps, one level down: a string that is
     // not in the source cannot be in the binary, but a dependency could
     // reintroduce one, and this is the artifact a user runs.
-    let binary = std::fs::read(env!("CARGO_BIN_EXE_agentctl")).expect("the test binary exists");
+    let binary = std::fs::read(env!("CARGO_BIN_EXE_agctl")).expect("the test binary exists");
     for needle in ["/bin/ps", "pgrep", "KERN_PROCARGS"] {
         assert!(!contains_bytes(&binary, needle.as_bytes()), "`{needle}` is in the built artifact");
     }
@@ -261,7 +261,7 @@ fn the_stale_remover_refuses_a_path_outside_the_namespace_root_without_a_record(
     let outside = store.path().join(".oauth_refresh.lock");
     std::fs::create_dir(&outside).expect("a lock directory, as Claude Code makes it");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_agentctl"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_agctl"))
         .arg("--config-dir")
         .arg(config.path())
         .arg("claude")

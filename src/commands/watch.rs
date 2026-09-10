@@ -1,4 +1,4 @@
-//! `agentctl claude watch` — the same pass as `status`, on a loop, in a TUI.
+//! `agctl claude watch` — the same pass as `status`, on a loop, in a TUI.
 //!
 //! The command adds no data flow of its own. Every pass goes through
 //! [`status::collect`](crate::commands::status::collect), so the refusals, the
@@ -73,7 +73,7 @@ use crate::commands::status::collect;
 use crate::commands::status::current_fault;
 use crate::commands::status::default_refresher;
 use crate::commands::status::production_readers;
-use crate::config::AgentctlConfig;
+use crate::config::AgctlConfig;
 use crate::config::paths::Paths;
 use crate::error::AppError;
 use crate::provider::claude::discovery;
@@ -122,7 +122,7 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// budget can be spent in full and still leave room.
 pub const QUIT_DRAIN_BUDGET: Duration = Duration::from_millis(250);
 
-/// Runs `agentctl claude watch`.
+/// Runs `agctl claude watch`.
 ///
 /// # Errors
 ///
@@ -135,7 +135,7 @@ pub fn run(cli: &Cli, args: &WatchArgs, cancel: &Cancel) -> Result<(), AppError>
     // usage API rather than a nicety of the command line (plan principle P4).
     if args.interval < WATCH_INTERVAL_FLOOR {
         return Err(AppError::Config(format!(
-            "`--interval {}s` is below the {}s floor; agentctl will not poll the usage API more \
+            "`--interval {}s` is below the {}s floor; agctl will not poll the usage API more \
              often than once every {} seconds",
             args.interval.as_secs(),
             WATCH_INTERVAL_FLOOR.as_secs(),
@@ -226,7 +226,7 @@ impl Pass for Session {
     fn run(&self, forced: bool, cancel: &Cancel, deadline: Instant) -> Option<Vec<RowOutcome>> {
         // The registry is re-read every pass: `login`, `accounts remove` or
         // `import` may have run in another terminal since the last one.
-        let config = match AgentctlConfig::load(&self.paths) {
+        let config = match AgctlConfig::load(&self.paths) {
             Ok(config) => config,
             Err(err) => {
                 tracing::warn!(error = %err, "the account registry could not be read this pass");
@@ -490,7 +490,7 @@ fn start_pass(
     let pass = Arc::clone(pass);
     let cancel = cancel.clone();
 
-    match thread::Builder::new().name("agentctl-watch-pass".to_owned()).spawn(move || {
+    match thread::Builder::new().name("agctl-watch-pass".to_owned()).spawn(move || {
         let rows = pass.run(forced, &cancel, deadline);
         // The receiver is gone when the loop has already left; there is
         // nobody to tell and nothing to do about it.

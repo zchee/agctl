@@ -3,7 +3,7 @@ use clap::ValueEnum;
 use super::run;
 use crate::cli::CompletionsArgs;
 
-/// Every subcommand `agentctl` currently parses. Empirically, every
+/// Every subcommand `agctl` currently parses. Empirically, every
 /// `clap_complete` generator spells a subcommand out as a literal word
 /// somewhere in its script — a `case`/`switch` label, a quoted candidate, or
 /// a `complete -a`/`-f -a` argument — so this list holds for all five
@@ -31,7 +31,7 @@ fn every_shell_generates_a_non_empty_script_naming_every_subcommand() {
 
         let script = String::from_utf8(out).unwrap_or_else(|err| panic!("{shell:?}: {err}"));
         assert!(!script.is_empty(), "{shell:?}: the generated script is empty");
-        assert!(script.contains("agentctl"), "{shell:?}: the binary name is missing");
+        assert!(script.contains("agctl"), "{shell:?}: the binary name is missing");
 
         for name in SUBCOMMANDS {
             assert!(
@@ -48,7 +48,7 @@ fn zsh_script_starts_with_the_compdef_header() {
     let mut out = Vec::new();
     run(&args, &mut out).expect("zsh should generate");
     let script = String::from_utf8(out).expect("the script is valid UTF-8");
-    assert_eq!(script.lines().next(), Some("#compdef agentctl"));
+    assert_eq!(script.lines().next(), Some("#compdef agctl"));
 }
 
 #[test]
@@ -77,7 +77,7 @@ fn a_write_error_other_than_a_closed_reader_is_reported() {
 fn a_broken_pipe_write_error_is_swallowed() {
     /// A writer that reports every write as `BrokenPipe`, standing in for a
     /// reader that closed its end of the pipe — an ordinary, expected way to
-    /// consume a completion script (`agentctl completions zsh | head -1`).
+    /// consume a completion script (`agctl completions zsh | head -1`).
     struct BrokenPipeWriter;
 
     impl std::io::Write for BrokenPipeWriter {

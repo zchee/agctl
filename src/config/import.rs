@@ -1,4 +1,4 @@
-//! Learning about accounts from something that is not agentctl.
+//! Learning about accounts from something that is not agctl.
 //!
 //! One source, one rule: **an import records what is already true and changes
 //! nothing else** (decision D-007). Nothing here writes a credential, moves
@@ -34,7 +34,7 @@ use std::path::PathBuf;
 
 use crate::config::AccountKind;
 use crate::config::AccountRecord;
-use crate::config::AgentctlConfig;
+use crate::config::AgctlConfig;
 use crate::config::new_record;
 use crate::config::paths::UNKNOWN_ORG;
 use crate::provider::claude::credentials::Identity;
@@ -189,7 +189,7 @@ pub fn plan_keychain(
     listing: &[ServiceEntry],
     reader: &dyn KeychainReader,
     env: &EnvView,
-    existing: &AgentctlConfig,
+    existing: &AgctlConfig,
 ) -> ImportPlan {
     // The live item is claimed by definition: it has its own row, built from
     // the environment rather than from the registry, and it is never a
@@ -212,7 +212,7 @@ fn plan_listed_services(
     listing: &[ServiceEntry],
     reader: &dyn KeychainReader,
     env: &EnvView,
-    existing: &AgentctlConfig,
+    existing: &AgctlConfig,
     claimed: &[String],
 ) -> ImportPlan {
     let mut plan = ImportPlan::default();
@@ -256,7 +256,7 @@ fn plan_named_dirs(
     listing: &[ServiceEntry],
     reader: &dyn KeychainReader,
     env: &EnvView,
-    existing: &AgentctlConfig,
+    existing: &AgctlConfig,
     claimed: &[String],
 ) -> ImportPlan {
     let mut plan = ImportPlan::default();
@@ -324,7 +324,7 @@ fn plan_named_dirs(
 fn push_keychain_record(
     plan: &mut ImportPlan,
     planned: &mut Vec<(String, String)>,
-    existing: &AgentctlConfig,
+    existing: &AgctlConfig,
     reader: &dyn KeychainReader,
     kind: AccountKind,
     service: &str,
@@ -362,7 +362,7 @@ fn push_keychain_record(
         // Keyed by the service name rather than by an account, and
         // deliberately not run through `validate_segment`: a service name
         // holds a space, and it is not a path. A `ConfigDirReadOnly` record
-        // never gets a namespace directory — agentctl may not write one
+        // never gets a namespace directory — agctl may not write one
         // (decision D-009) — so nothing derives a path from this key.
         None => service_keyed_record(uuid.clone(), kind),
     };
@@ -442,7 +442,7 @@ fn shares_live_dir_by_path(dir: &Path, live_canonical: Option<&Path>) -> bool {
 
 /// The decision for a key the registry — or this run — already covers.
 fn already_planned(
-    existing: &AgentctlConfig,
+    existing: &AgctlConfig,
     planned: &[(String, String)],
     uuid: &str,
     org: &str,

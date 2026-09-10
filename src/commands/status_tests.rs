@@ -2,10 +2,10 @@
 //!
 //! These are not unit tests of a function: each one stands up a temporary
 //! store, a scripted keychain, and an `httpmock` server, runs
-//! [`collect`] — the same code path `agentctl claude status` runs — and
+//! [`collect`] — the same code path `agctl claude status` runs — and
 //! asserts on the rows *and* on what reached the wire and the filesystem.
 //! That is what makes them able to prove the negative claims the plan cares
-//! about: zero requests for a row agentctl does not own, exactly one POST
+//! about: zero requests for a row agctl does not own, exactly one POST
 //! when two passes race, no temporary file left behind.
 //!
 //! # Nothing here reads or writes the process environment
@@ -39,7 +39,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use super::*;
-use crate::config::AgentctlConfig;
+use crate::config::AgctlConfig;
 use crate::config::new_record;
 use crate::provider::claude::credentials::CLIENT_ID;
 use crate::provider::claude::namespace::export_spelling;
@@ -130,10 +130,10 @@ fn write_credential_file(store: &Store, blob: &str) -> PathBuf {
 }
 
 /// A registry holding one account this store owns.
-fn owned_config(store: &Store) -> AgentctlConfig {
+fn owned_config(store: &Store) -> AgctlConfig {
     let ns_dir = store.paths.namespace_dir(ACCT, ORG);
     let spelling = export_spelling(&ns_dir);
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     let mut record = new_record(
         ACCT.to_owned(),
         ORG.to_owned(),
@@ -185,7 +185,7 @@ fn readers(items: Vec<(String, String)>) -> ReaderFactory {
 /// Discovery, run against a scripted keychain and a fake home.
 fn discover_with(
     store: &Store,
-    config: &AgentctlConfig,
+    config: &AgctlConfig,
     reader: &FakeReader,
 ) -> crate::provider::claude::discovery::Discovery {
     let env = EnvView::with_home(store.home.clone());
@@ -224,7 +224,7 @@ fn pass(
     let shared = Shared {
         paths: Arc::clone(&store.paths),
         env: EnvView::with_home(store.home.clone()),
-        client: UsageClient::new(&server.base_url(), "agentctl/test", setup.timeout),
+        client: UsageClient::new(&server.base_url(), "agctl/test", setup.timeout),
         refresher: setup.refresher,
         reader_factory: setup.readers,
         listing: found.listing,
@@ -382,7 +382,7 @@ fn token_response(value: &Value) -> TokenResponse {
 }
 
 // ---------------------------------------------------------------------------
-// AC5 — a row agentctl does not own is never refreshed and never fetched
+// AC5 — a row agctl does not own is never refreshed and never fetched
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -399,7 +399,7 @@ fn ac5_an_expired_live_row_makes_no_request_at_all() {
         LIVE_SERVICE.to_owned(),
         blob("sk-ant-oat01-live", "sk-ant-ort01-live", expired_at()),
     )]);
-    let found = discover_with(&store, &AgentctlConfig::default(), &reader);
+    let found = discover_with(&store, &AgctlConfig::default(), &reader);
 
     let rows = pass(&store, &server, found, Setup::new(&server));
     let live = &rows[0];
@@ -422,7 +422,7 @@ fn ac5_a_fresh_live_row_is_fetched_but_still_never_refreshed() {
         LIVE_SERVICE.to_owned(),
         blob("sk-ant-oat01-live", "sk-ant-ort01-live", fresh_at()),
     )]);
-    let found = discover_with(&store, &AgentctlConfig::default(), &reader);
+    let found = discover_with(&store, &AgctlConfig::default(), &reader);
 
     let rows = pass(&store, &server, found, Setup::new(&server));
 
@@ -703,7 +703,7 @@ fn ac21_a_foreign_refresh_lock_refuses_the_refresh_and_leaves_it_alone() {
         assert!(row.state.is_failure(), "the row drives exit 2");
 
         let after = fs::metadata(&lock).expect("the artefact is still there");
-        assert_eq!(before.ino(), after.ino(), "agentctl never removes a lock artefact");
+        assert_eq!(before.ino(), after.ino(), "agctl never removes a lock artefact");
         assert_eq!(
             fs::read(&lock).expect("readable"),
             b"claude code was here",
@@ -1191,7 +1191,7 @@ fn ac33h_a_migrated_namespace_takes_the_pending_over() {
     );
 
     // A Claude Code session migrated this namespace into the keychain
-    // (fact F35): agentctl must stop writing it, and the pending copy of a
+    // (fact F35): agctl must stop writing it, and the pending copy of a
     // refresh token must not survive.
     let service = migration_service(&store);
     let items =
@@ -1292,7 +1292,7 @@ fn ac66_an_item_under_the_canonical_spelling_stays_terminal() {
     assert_eq!(
         row.state,
         AccountState::MigratedToKeychain { service: canonical },
-        "an item agentctl cannot predict the name of is not refreshed"
+        "an item agctl cannot predict the name of is not refreshed"
     );
     assert_eq!(row.lock_state, "migrated");
     assert_eq!(
@@ -1310,13 +1310,13 @@ fn ac66_an_item_under_the_canonical_spelling_stays_terminal() {
 /// [`migrated_item`] is asked about the listing alone, so the rest is inert on
 /// purpose: an unroutable usage endpoint and an empty reader. Driving these
 /// refusals through a whole pass would need a *refreshable* row, and a unit
-/// test has no `AGENTCTL_SECURITY_BIN` — the write would spawn the real
+/// test has no `AGCTL_SECURITY_BIN` — the write would spawn the real
 /// `/usr/bin/security`.
 fn shared_listing(store: &Store, listing: Vec<ServiceEntry>) -> Shared {
     Shared {
         paths: Arc::clone(&store.paths),
         env: EnvView::with_home(store.home.clone()),
-        client: UsageClient::new("http://127.0.0.1:1", "agentctl/test", Duration::from_secs(1)),
+        client: UsageClient::new("http://127.0.0.1:1", "agctl/test", Duration::from_secs(1)),
         refresher: Arc::new(HttpRefresher::new("http://127.0.0.1:1/token".to_owned())),
         reader_factory: readers(Vec::new()),
         listing,
@@ -1744,7 +1744,7 @@ fn a_keychain_that_cannot_be_read_never_falls_through_to_a_file() {
     let usage = usage_ok(&server);
 
     let reader = FakeReader::unlocked().with_preflight(KeychainStatus::Locked);
-    let found = discover_with(&store, &AgentctlConfig::default(), &reader);
+    let found = discover_with(&store, &AgctlConfig::default(), &reader);
     let rows = pass(&store, &server, found, Setup::new(&server));
 
     assert!(
@@ -1769,7 +1769,7 @@ fn a_cancelled_pass_returns_without_fetching() {
     let shared = Shared {
         paths: Arc::clone(&store.paths),
         env: EnvView::with_home(store.home.clone()),
-        client: UsageClient::new(&server.base_url(), "agentctl/test", Duration::from_secs(5)),
+        client: UsageClient::new(&server.base_url(), "agctl/test", Duration::from_secs(5)),
         refresher: Arc::new(HttpRefresher::new(server.url(TOKEN_PATH))),
         reader_factory: readers(Vec::new()),
         listing: found.listing,
@@ -1832,7 +1832,7 @@ fn ac8_a_row_keyed_by_a_service_name_caches_like_any_other() {
     // The cache file used to be named only for identifiers that were valid
     // path segments, and a keychain service name holds a space — so this row
     // missed the cache on every pass and spent a request against Anthropic
-    // each time, for an account agentctl cannot even refresh. Worse, the
+    // each time, for an account agctl cannot even refresh. Worse, the
     // stale-while-error path AC8 rests on had nothing to fall back to: a 429
     // rendered an empty row rather than the last known numbers.
     let store = store();
@@ -1892,7 +1892,7 @@ fn ac8_a_row_keyed_by_a_service_name_caches_like_any_other() {
 }
 
 // ---------------------------------------------------------------------------
-// `same identity as live` (`agentctl-p3-login-live-identity-warning-b90`)
+// `same identity as live` (`agctl-p3-login-live-identity-warning-b90`)
 // ---------------------------------------------------------------------------
 
 /// A second owned account, so "only the matching row is marked" is a claim
@@ -1903,7 +1903,7 @@ const OTHER_ACCT: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 const OTHER_ORG: &str = "ffffffff-0000-1111-2222-333333333333";
 
 /// `owned_config`, plus a second owned account that is nobody's twin.
-fn owned_config_with_stranger(store: &Store) -> AgentctlConfig {
+fn owned_config_with_stranger(store: &Store) -> AgctlConfig {
     let mut config = owned_config(store);
     let ns_dir = store.paths.namespace_dir(OTHER_ACCT, OTHER_ORG);
     let spelling = export_spelling(&ns_dir);
@@ -1927,7 +1927,7 @@ fn row_for<'a>(rows: &'a [RowOutcome], kind: &str, account_uuid: &str) -> &'a Ro
 
 #[test]
 fn b90_the_owned_twin_of_the_live_account_is_marked_and_nothing_else_is() {
-    // `agentctl-p3-login-live-identity-warning-b90` (status marks the Owned
+    // `agctl-p3-login-live-identity-warning-b90` (status marks the Owned
     // row when its identity is the live one's). One account, two independent
     // token pairs — a legitimate `use --new-only` setup (decision D-011) —
     // renders as two rows carrying one email address, which is the confusion
@@ -2015,7 +2015,7 @@ fn b90_a_live_row_with_no_identity_marks_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// `--by-identity` (`agentctl-xq8`)
+// `--by-identity` (`agctl-xq8`)
 // ---------------------------------------------------------------------------
 
 /// The `Kind` cell of each rendered row, in order.
@@ -2025,7 +2025,7 @@ fn kinds(rows: &[StatusRow]) -> Vec<&'static str> {
 
 #[test]
 fn xq8_by_identity_folds_the_live_row_into_the_owned_one_and_leaves_json_alone() {
-    // `agentctl-xq8`: one account with a live credential and a store agentctl
+    // `agctl-xq8`: one account with a live credential and a store agctl
     // owns renders once under the flag. The owned row is the survivor because
     // it is the one anything can be done to — refreshed, relocated, forgotten
     // — while the live row is read-only.

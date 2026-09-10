@@ -420,12 +420,12 @@ fn a_continuation_rows_reset_sits_in_the_weekly_column() {
 }
 
 // ---------------------------------------------------------------------------
-// `--by-identity` (`agentctl-xq8`)
+// `--by-identity` (`agctl-xq8`)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn by_identity_adds_a_kind_column_after_plan_and_the_default_table_has_none() {
-    // `agentctl-xq8`: the eleventh column is opt-in. Plan section 3.1 fixed
+    // `agctl-xq8`: the eleventh column is opt-in. Plan section 3.1 fixed
     // ten columns for the default table, and an opt-in view is not a reason
     // to widen what everyone else sees.
     assert_eq!(headings(false), HEADINGS.to_vec(), "the default table is untouched");

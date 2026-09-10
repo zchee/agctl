@@ -1,4 +1,4 @@
-//! `agentctl claude login` — mint a credential agentctl owns.
+//! `agctl claude login` — mint a credential agctl owns.
 //!
 //! The flow is plan section 3.7: PKCE, an authorize URL the user opens, a code
 //! that comes back either through a loopback listener or by hand, an exchange,
@@ -42,7 +42,7 @@ use std::time::Instant;
 use crate::cli::LoginArgs;
 use crate::config::AccountKind;
 use crate::config::AccountRecord;
-use crate::config::AgentctlConfig;
+use crate::config::AgctlConfig;
 use crate::config::new_record;
 use crate::config::paths::Paths;
 use crate::config::paths::UNKNOWN_ORG;
@@ -144,7 +144,7 @@ pub trait LoginIo {
 /// section 3.9): a release build must not be talkable out of showing the user
 /// the URL it is asking them to authorize.
 #[cfg(feature = "testing")]
-pub const NO_BROWSER_ENV: &str = "AGENTCTL_NO_BROWSER";
+pub const NO_BROWSER_ENV: &str = "AGCTL_NO_BROWSER";
 
 /// The real terminal.
 pub struct Terminal;
@@ -197,7 +197,7 @@ impl LoginIo for Terminal {
     }
 }
 
-/// Runs `agentctl claude login`.
+/// Runs `agctl claude login`.
 ///
 /// # Errors
 ///
@@ -247,7 +247,7 @@ pub fn run_with(
     };
 
     let url = oauth::authorize_url(client, &pkce, &redirect, &scopes).map_err(fatal)?;
-    io.tell(&format!("Open this URL to authorize agentctl:\n\n  {url}\n"));
+    io.tell(&format!("Open this URL to authorize agctl:\n\n  {url}\n"));
     io.open_browser(url.as_str());
 
     let code = match listener {
@@ -283,7 +283,7 @@ pub fn run_with(
 
     let Some(identity) = credentials.identity() else {
         return Err(AppError::Config(
-            "the login succeeded but named no account, so agentctl cannot tell which account \
+            "the login succeeded but named no account, so agctl cannot tell which account \
              these credentials belong to; nothing was written"
                 .to_owned(),
         ));
@@ -305,7 +305,7 @@ pub fn run_with(
         io.warn(&same_identity_notice(&account_uuid, &organization_uuid));
     }
 
-    if AgentctlConfig::load(login.paths)?.get(&account_uuid, &organization_uuid).is_some() {
+    if AgctlConfig::load(login.paths)?.get(&account_uuid, &organization_uuid).is_some() {
         let question = format!(
             "`{account_uuid}/{organization_uuid}` is already logged in. Replace its stored \
              credentials?"
@@ -375,14 +375,14 @@ pub fn run_with(
         tracing::warn!("the credential file could not be replaced ({error}); saved as pending");
         io.tell(
             "The credentials could not be written into place and were saved as pending; the \
-             next `agentctl claude status` will finish the job.",
+             next `agctl claude status` will finish the job.",
         );
     }
 
     // Re-read rather than reuse a copy from before the write: the identifier
     // shown here is `<acct>` or `<acct>/<org>` depending on what else is in
     // the registry, so it has to be derived from what is actually stored now.
-    let id = AgentctlConfig::load(login.paths)
+    let id = AgctlConfig::load(login.paths)
         .ok()
         .and_then(|config| {
             config
@@ -430,7 +430,7 @@ fn same_identity_notice(account_uuid: &str, organization_uuid: &str) -> String {
     format!(
         "Note: `{account_uuid}/{organization_uuid}` is the account Claude Code is signed in as \
          right now. This login mints a second, independent session; both stay valid. To hand \
-         Claude Code a different account instead, use `agentctl claude use --live <id>`."
+         Claude Code a different account instead, use `agctl claude use --live <id>`."
     )
 }
 
@@ -441,7 +441,7 @@ fn same_identity_notice(account_uuid: &str, organization_uuid: &str) -> String {
 /// - **Where the claim comes from.** The live identity is read from
 ///   `.claude.json` and nowhere else — `login` never touches the keychain —
 ///   and that file's `oauthAccount` is written by Claude Code at *its* login,
-///   so it can be stale. Naming the path is what turns "agentctl thinks this
+///   so it can be stale. Naming the path is what turns "agctl thinks this
 ///   is already live" into something the reader can go and check.
 /// - **The other intent.** Someone who ran this meaning to *change* which
 ///   account Claude Code uses wants `use --live`, which under decision D-017
@@ -457,7 +457,7 @@ fn no_duplicate_refusal(account_uuid: &str, organization_uuid: &str, source: &Pa
     format!(
         "`{account_uuid}/{organization_uuid}` is already the account Claude Code is signed in \
          as (per `{}`), and `--no-duplicate` was given, so nothing was written. To hand Claude \
-         Code a different account, run `agentctl claude use --live <id>`, which adopts the \
+         Code a different account, run `agctl claude use --live <id>`, which adopts the \
          credential it displaces. To mint a second independent session for this account after \
          all, run the same login without `--no-duplicate`.",
         source.display()
@@ -468,7 +468,7 @@ fn no_duplicate_refusal(account_uuid: &str, organization_uuid: &str, source: &Pa
 ///
 /// **Every registry mutation this command makes goes through here**, and this
 /// is the only place that is allowed to. A registry write is a
-/// read-modify-write of a file two `agentctl` processes may be touching at
+/// read-modify-write of a file two `agctl` processes may be touching at
 /// once, so the read, the mutation and the write have to happen under one
 /// hold of `.config.lock` — which is why the sequence is confined to a
 /// function small enough to be swapped for a single call that does exactly
@@ -486,7 +486,7 @@ fn no_duplicate_refusal(account_uuid: &str, organization_uuid: &str, source: &Pa
 /// the configuration lock cannot be taken, [`AppError::Io`] for a filesystem
 /// failure.
 fn record_owned(paths: &Paths, record: AccountRecord) -> Result<(), AppError> {
-    AgentctlConfig::update(paths, |config| config.upsert(record))
+    AgctlConfig::update(paths, |config| config.upsert(record))
 }
 
 /// Turns any OAuth failure into a fatal application error.
@@ -563,7 +563,7 @@ fn apply_profile(credentials: &mut Credentials, document: &serde_json::Value) {
 pub fn clear_stale_files(paths: &Paths, ns_dir: &Path) -> Result<(), AppError> {
     if !paths.is_under_namespace_root(ns_dir) {
         return Err(AppError::Config(format!(
-            "`{}` is outside the agentctl namespace root; refusing to touch it",
+            "`{}` is outside the agctl namespace root; refusing to touch it",
             ns_dir.display()
         )));
     }

@@ -405,7 +405,7 @@ where
 {
     let (tx, rx) = mpsc::channel();
     thread::Builder::new()
-        .name("agentctl-pass".to_owned())
+        .name("agctl-pass".to_owned())
         .spawn(move || coordinate(jobs, cancel, deadline, max_workers, tx))
         .expect("the operating system refused to start the pass coordinator thread");
     rx

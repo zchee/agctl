@@ -124,7 +124,7 @@ impl CacheEntry {
 /// had no cache at all: an `import --from keychain` record for an item that
 /// named nobody is keyed by its *keychain service name*, which holds a space,
 /// so every pass over such a row was a cache miss and a fresh request against
-/// Anthropic — for a row agentctl cannot even refresh. Refusing to name a file
+/// Anthropic — for a row agctl cannot even refresh. Refusing to name a file
 /// was the wrong answer to "this identifier has a space in it".
 ///
 /// The digest is what makes the sanitized name safe rather than merely

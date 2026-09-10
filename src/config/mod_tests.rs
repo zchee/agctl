@@ -8,7 +8,7 @@ use super::*;
 
 fn store() -> (TempDir, Paths) {
     let dir = TempDir::new().expect("a temporary directory should be available");
-    let paths = Paths::with_config_dir(dir.path().join("agentctl"));
+    let paths = Paths::with_config_dir(dir.path().join("agctl"));
     (dir, paths)
 }
 
@@ -29,8 +29,8 @@ fn owned(acct: &str, org: &str) -> AccountRecord {
 #[test]
 fn an_absent_file_loads_as_an_empty_registry() {
     let (_dir, paths) = store();
-    let config = AgentctlConfig::load(&paths).expect("an absent file is not an error");
-    assert_eq!(config, AgentctlConfig::default());
+    let config = AgctlConfig::load(&paths).expect("an absent file is not an error");
+    assert_eq!(config, AgctlConfig::default());
     assert_eq!(config.version, CONFIG_VERSION);
     assert!(config.accounts.is_empty());
 }
@@ -38,7 +38,7 @@ fn an_absent_file_loads_as_an_empty_registry() {
 #[test]
 fn saving_and_loading_round_trips_every_kind() {
     let (_dir, paths) = store();
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(owned("acct-1", "org-1"));
     config.upsert(
         new_record("acct-2".to_owned(), paths::UNKNOWN_ORG.to_owned(), AccountKind::Live)
@@ -66,16 +66,15 @@ fn saving_and_loading_round_trips_every_kind() {
     );
 
     let saved = config.clone();
-    AgentctlConfig::update(&paths, |registry| *registry = config)
-        .expect("the registry should save");
-    let loaded = AgentctlConfig::load(&paths).expect("the registry should load");
+    AgctlConfig::update(&paths, |registry| *registry = config).expect("the registry should save");
+    let loaded = AgctlConfig::load(&paths).expect("the registry should load");
     assert_eq!(loaded, saved);
 }
 
 #[test]
 fn the_saved_file_is_0600_and_the_lock_file_stays() {
     let (_dir, paths) = store();
-    AgentctlConfig::update(&paths, |_| ()).expect("the registry should save");
+    AgctlConfig::update(&paths, |_| ()).expect("the registry should save");
 
     let mode =
         std::fs::metadata(paths.config_file()).expect("the file exists").permissions().mode();
@@ -86,8 +85,8 @@ fn the_saved_file_is_0600_and_the_lock_file_stays() {
 #[test]
 fn saving_twice_leaves_no_temporary_file() {
     let (_dir, paths) = store();
-    AgentctlConfig::update(&paths, |_| ()).expect("the first save should succeed");
-    AgentctlConfig::update(&paths, |registry| registry.upsert(owned("acct-1", "org-1")))
+    AgctlConfig::update(&paths, |_| ()).expect("the first save should succeed");
+    AgctlConfig::update(&paths, |registry| registry.upsert(owned("acct-1", "org-1")))
         .expect("the second save should succeed");
 
     let strays: Vec<_> = std::fs::read_dir(paths.config_dir())
@@ -106,7 +105,7 @@ fn a_future_version_is_refused_rather_than_misread() {
     std::fs::write(paths.config_file(), br#"{"version": 99, "accounts": []}"#)
         .expect("the file should be writable");
 
-    let err = AgentctlConfig::load(&paths).expect_err("a newer schema should not be guessed at");
+    let err = AgctlConfig::load(&paths).expect_err("a newer schema should not be guessed at");
     assert!(err.to_string().contains("version 99"), "{err}");
 }
 
@@ -115,12 +114,12 @@ fn a_corrupt_file_is_refused() {
     let (_dir, paths) = store();
     paths.ensure_dirs().expect("directories should be creatable");
     std::fs::write(paths.config_file(), b"{not json").expect("the file should be writable");
-    assert!(AgentctlConfig::load(&paths).is_err());
+    assert!(AgctlConfig::load(&paths).is_err());
 }
 
 #[test]
 fn upsert_replaces_by_account_and_organization() {
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(owned("acct-1", "org-1"));
     config.upsert(owned("acct-1", "org-2"));
     assert_eq!(config.accounts.len(), 2, "a second organization is a second namespace (D-008)");
@@ -134,7 +133,7 @@ fn upsert_replaces_by_account_and_organization() {
 
 #[test]
 fn resolve_id_accepts_a_uuid_a_pair_a_label_and_an_email() {
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(owned("acct-1", "org-1"));
     let mut labelled = owned("acct-2", "org-2");
     labelled.label = Some("work".to_owned());
@@ -149,7 +148,7 @@ fn resolve_id_accepts_a_uuid_a_pair_a_label_and_an_email() {
 
 #[test]
 fn resolve_id_reports_an_ambiguous_account_with_its_candidates() {
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(owned("acct-1", "org-1"));
     config.upsert(owned("acct-1", "org-2"));
 
@@ -167,7 +166,7 @@ fn resolve_id_reports_an_ambiguous_account_with_its_candidates() {
 
 #[test]
 fn resolve_id_reports_an_unknown_id() {
-    let config = AgentctlConfig::default();
+    let config = AgctlConfig::default();
     assert!(config.resolve_id("nobody").is_err());
 }
 
@@ -232,13 +231,13 @@ fn two_concurrent_updates_both_land() {
         for acct in ["acct-1", "acct-2"] {
             let paths = &paths;
             scope.spawn(move || {
-                AgentctlConfig::update(paths, |registry| registry.upsert(owned(acct, "org")))
+                AgctlConfig::update(paths, |registry| registry.upsert(owned(acct, "org")))
                     .unwrap_or_else(|err| panic!("`{acct}` should have been written: {err}"));
             });
         }
     });
 
-    let loaded = AgentctlConfig::load(&paths).expect("the registry should load");
+    let loaded = AgctlConfig::load(&paths).expect("the registry should load");
     let mut accounts: Vec<&str> =
         loaded.accounts.iter().map(|record| record.account_uuid.as_str()).collect();
     accounts.sort_unstable();
@@ -248,13 +247,13 @@ fn two_concurrent_updates_both_land() {
 #[test]
 fn update_returns_the_closure_s_value_and_persists_the_change() {
     let (_dir, paths) = store();
-    let key = AgentctlConfig::update(&paths, |registry| {
+    let key = AgctlConfig::update(&paths, |registry| {
         registry.upsert(owned("acct-1", "org-1"));
         registry.accounts.len()
     })
     .expect("the registry should save");
     assert_eq!(key, 1, "the closure's value is handed back once the write succeeded");
 
-    let loaded = AgentctlConfig::load(&paths).expect("the registry should load");
+    let loaded = AgctlConfig::load(&paths).expect("the registry should load");
     assert_eq!(loaded.get("acct-1", "org-1").map(AccountRecord::key), Some(("acct-1", "org-1")));
 }

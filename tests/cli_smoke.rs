@@ -26,15 +26,15 @@ use tempfile::TempDir;
 
 /// The binary under test.
 ///
-/// `CARGO_BIN_EXE_agentctl` — the path cargo built for *this* test target —
+/// `CARGO_BIN_EXE_agctl` — the path cargo built for *this* test target —
 /// rather than `assert_cmd`'s `cargo_bin`, which guesses
-/// `<manifest>/target/debug/agentctl`. This project builds into a tmpfs target
+/// `<manifest>/target/debug/agctl`. This project builds into a tmpfs target
 /// directory (`~/.config/rust/config.dev.toml`), so that guess finds whatever
 /// a bare `cargo build` happened to leave in the worktree: on this machine a
 /// binary from an earlier build, of a different size, from different sources.
 /// A smoke test asserting against a stale artifact is worse than no smoke test.
-fn agentctl() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_agentctl"))
+fn agctl() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_agctl"))
 }
 
 /// The binary under test, cut off from every real credential store.
@@ -43,37 +43,37 @@ fn agentctl() -> Command {
 /// dropping it removes the store the command was pointed at.
 fn isolated() -> (Command, TempDir) {
     let dir = TempDir::new().expect("a temporary directory should be creatable");
-    let mut command = agentctl();
+    let mut command = agctl();
     command
         .args(["--config-dir", &dir.path().join("config").to_string_lossy()])
         // `none` selects the reader whose preflight is `Unavailable`, whose
         // listing is empty and whose every read is `Ok(None)`: no `security`
         // child is ever spawned.
-        .env("AGENTCTL_KEYCHAIN_BACKEND", "none")
+        .env("AGCTL_KEYCHAIN_BACKEND", "none")
         // An unroutable base, so a regression that fetched anyway would fail
         // loudly here rather than quietly reaching Anthropic.
-        .env("AGENTCTL_CLAUDE_USAGE_URL", "http://127.0.0.1:1")
+        .env("AGCTL_CLAUDE_USAGE_URL", "http://127.0.0.1:1")
         .env("HOME", dir.path())
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CLAUDE_SECURESTORAGE_CONFIG_DIR")
         .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
-        .env_remove("AGENTCTL_CONFIG_DIR");
+        .env_remove("AGCTL_CONFIG_DIR");
     (command, dir)
 }
 
 #[test]
 fn help_exits_zero() {
-    agentctl().arg("--help").assert().success();
+    agctl().arg("--help").assert().success();
 }
 
 #[test]
 fn version_exits_zero() {
-    agentctl().arg("--version").assert().success();
+    agctl().arg("--version").assert().success();
 }
 
 #[test]
 fn claude_help_lists_every_subcommand() {
-    agentctl()
+    agctl()
         .args(["claude", "--help"])
         .assert()
         .success()
@@ -93,7 +93,7 @@ fn watch_refuses_an_interval_below_the_polling_floor() {
     // still be asked to do from outside a terminal is refuse: the polling floor
     // is enforced by the parser, before the process goes anywhere near raw mode
     // (plan AC13).
-    agentctl()
+    agctl()
         .args(["claude", "watch", "--interval", "30s"])
         .assert()
         .failure()
@@ -200,41 +200,37 @@ fn status_rejects_an_account_selector_that_matches_nothing() {
 
 #[test]
 fn an_unknown_subcommand_is_rejected() {
-    agentctl().args(["claude", "bogus"]).assert().failure();
+    agctl().args(["claude", "bogus"]).assert().failure();
 }
 
 #[test]
 fn top_level_help_lists_completions() {
-    agentctl().arg("--help").assert().success().stdout(contains("completions"));
+    agctl().arg("--help").assert().success().stdout(contains("completions"));
 }
 
 #[test]
 fn completions_zsh_starts_with_the_compdef_header() {
-    let assert = agentctl().args(["completions", "zsh"]).assert().success();
+    let assert = agctl().args(["completions", "zsh"]).assert().success();
     let stdout =
         String::from_utf8(assert.get_output().stdout.clone()).expect("the script is valid UTF-8");
-    assert_eq!(stdout.lines().next(), Some("#compdef agentctl"));
+    assert_eq!(stdout.lines().next(), Some("#compdef agctl"));
 }
 
 #[test]
 fn completions_bash_defines_the_bash_completion_function() {
-    agentctl().args(["completions", "bash"]).assert().success().stdout(contains("_agentctl"));
+    agctl().args(["completions", "bash"]).assert().success().stdout(contains("_agctl"));
 }
 
 #[test]
 fn completions_fish_uses_complete_dash_c() {
-    agentctl()
-        .args(["completions", "fish"])
-        .assert()
-        .success()
-        .stdout(contains("complete -c agentctl"));
+    agctl().args(["completions", "fish"]).assert().success().stdout(contains("complete -c agctl"));
 }
 
 #[test]
 fn completions_rejects_an_unknown_shell() {
     // clap's own usage error for a value outside the `Shell` enum, exit 2
     // like any other rejected argument (`watch --interval 30s` above).
-    agentctl().args(["completions", "tcsh"]).assert().code(2).stderr(contains("invalid value"));
+    agctl().args(["completions", "tcsh"]).assert().code(2).stderr(contains("invalid value"));
 }
 
 #[test]
@@ -250,7 +246,7 @@ fn completions_bash_does_not_abort_when_the_reader_closes_early() {
     use std::process::Command;
     use std::process::Stdio;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agctl"))
         .args(["completions", "bash"])
         .stdout(Stdio::piped())
         .spawn()

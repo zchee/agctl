@@ -1,4 +1,4 @@
-//! Where agentctl keeps its own state, and nothing else.
+//! Where agctl keeps its own state, and nothing else.
 //!
 //! Every path this crate is allowed to write to is derived here, from one
 //! root: the configuration directory. Invariant I1 is stated as "nothing
@@ -41,16 +41,16 @@ pub const UNKNOWN_ORG: &str = "_unknown-org";
 /// decision D-011).
 pub const SESSION_ROOT: &str = "claude-sessions";
 
-/// The directory mode for everything agentctl creates.
+/// The directory mode for everything agctl creates.
 pub const DIR_MODE: u32 = 0o700;
 
-/// The file mode for everything agentctl creates.
+/// The file mode for everything agctl creates.
 pub const FILE_MODE: u32 = 0o600;
 
 /// The environment form of `--config-dir`.
-pub const CONFIG_DIR_ENV: &str = "AGENTCTL_CONFIG_DIR";
+pub const CONFIG_DIR_ENV: &str = "AGCTL_CONFIG_DIR";
 
-/// The resolved location of this agentctl store.
+/// The resolved location of this agctl store.
 ///
 /// Two stores with different [`Paths::config_dir`] values are independent and
 /// have independent locks (invariant I14): logging the same account into both
@@ -64,8 +64,8 @@ pub struct Paths {
 impl Paths {
     /// Resolves the configuration directory.
     ///
-    /// Precedence: `--config-dir`, then `AGENTCTL_CONFIG_DIR`, then the XDG
-    /// configuration directory with `agentctl` appended. `etcetera`'s
+    /// Precedence: `--config-dir`, then `AGCTL_CONFIG_DIR`, then the XDG
+    /// configuration directory with `agctl` appended. `etcetera`'s
     /// `choose_base_strategy` is XDG on every platform this targets —
     /// including macOS, where the "native" strategy would be
     /// `~/Library/Application Support` — which is what decision D-004 asks
@@ -108,7 +108,7 @@ impl Paths {
         let config_dir = match (cli_override, env_override) {
             (Some(dir), _) => dir.to_path_buf(),
             (None, Some(dir)) => dir.to_path_buf(),
-            (None, None) => xdg()?.join("agentctl"),
+            (None, None) => xdg()?.join("agctl"),
         };
         Ok(Self { config_dir })
     }

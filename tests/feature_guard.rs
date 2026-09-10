@@ -13,7 +13,7 @@
 //! See plan section 3.9.
 
 #[cfg(not(feature = "testing"))]
-compile_error!("agentctl e2e tests require --all-features (see /check)");
+compile_error!("agctl e2e tests require --all-features (see /check)");
 
 /// Present so the target has a test to run once the feature is enabled, and so
 /// a passing run is evidence the guard is satisfied rather than skipped.

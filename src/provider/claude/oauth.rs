@@ -130,15 +130,15 @@ pub const MAX_ERROR_BODY_BYTES: usize = 512;
 const MAX_RESPONSE_BYTES: u64 = 1 << 20;
 
 /// The environment variable that replaces the requested scope set.
-pub const SCOPES_ENV: &str = "AGENTCTL_CLAUDE_OAUTH_SCOPES";
+pub const SCOPES_ENV: &str = "AGCTL_CLAUDE_OAUTH_SCOPES";
 
 /// Test-only override for the token endpoint (plan section 3.9).
 #[cfg(feature = "testing")]
-pub const TOKEN_URL_ENV: &str = "AGENTCTL_CLAUDE_TOKEN_URL";
+pub const TOKEN_URL_ENV: &str = "AGCTL_CLAUDE_TOKEN_URL";
 
 /// Test-only override for the authorize endpoint (plan section 3.9).
 #[cfg(feature = "testing")]
-pub const AUTHORIZE_URL_ENV: &str = "AGENTCTL_CLAUDE_AUTHORIZE_URL";
+pub const AUTHORIZE_URL_ENV: &str = "AGCTL_CLAUDE_AUTHORIZE_URL";
 
 /// A successful response from the token endpoint (facts F8, F25).
 pub struct TokenResponse {
@@ -249,7 +249,7 @@ impl From<TokenResponseWire> for TokenResponse {
 #[derive(Debug, thiserror::Error)]
 pub enum OauthError {
     /// The grant was rejected as dead. Never retried (risk R26).
-    #[error("the grant was rejected (invalid_grant); run `agentctl claude login`")]
+    #[error("the grant was rejected (invalid_grant); run `agctl claude login`")]
     InvalidGrant,
 
     /// The `state` that came back is not the one that went out.
@@ -374,7 +374,7 @@ fn random_bytes() -> [u8; 32] {
 /// The scopes to request at login.
 ///
 /// The five scopes a live Claude Code credential carries (facts F4, F28).
-/// `AGENTCTL_CLAUDE_OAUTH_SCOPES` replaces the set, space-separated; probe S3
+/// `AGCTL_CLAUDE_OAUTH_SCOPES` replaces the set, space-separated; probe S3
 /// showed the server grants exactly these five whatever is asked for, so the
 /// override is a diagnostic rather than a feature.
 pub fn requested_scopes() -> Vec<String> {
@@ -398,8 +398,8 @@ pub struct OauthClient {
 impl OauthClient {
     /// Builds a client for the real endpoints.
     ///
-    /// With the `testing` feature, `AGENTCTL_CLAUDE_TOKEN_URL` and
-    /// `AGENTCTL_CLAUDE_AUTHORIZE_URL` redirect the two endpoints at a mock
+    /// With the `testing` feature, `AGCTL_CLAUDE_TOKEN_URL` and
+    /// `AGCTL_CLAUDE_AUTHORIZE_URL` redirect the two endpoints at a mock
     /// server. Both are compiled out otherwise: a release build that could be
     /// pointed at an arbitrary token endpoint by an environment variable is an
     /// exfiltration vector (plan section 3.9, AC37).
@@ -923,8 +923,8 @@ fn read_callback(stream: TcpStream, expected_state: &str) -> Result<String, Oaut
 
     let outcome = parse_callback(&request_line, expected_state);
     let page = match &outcome {
-        Ok(_) => "<!doctype html><title>agentctl</title><p>Login complete. You can close this tab.",
-        Err(_) => "<!doctype html><title>agentctl</title><p>Login failed. Return to the terminal.",
+        Ok(_) => "<!doctype html><title>agctl</title><p>Login complete. You can close this tab.",
+        Err(_) => "<!doctype html><title>agctl</title><p>Login failed. Return to the terminal.",
     };
     let status = if outcome.is_ok() { "200 OK" } else { "400 Bad Request" };
     let response = format!(

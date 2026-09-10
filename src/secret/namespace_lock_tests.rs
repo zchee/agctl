@@ -10,7 +10,7 @@ use super::*;
 
 fn store() -> (TempDir, Paths) {
     let dir = TempDir::new().expect("a temporary directory should be available");
-    let paths = Paths::with_config_dir(dir.path().join("agentctl"));
+    let paths = Paths::with_config_dir(dir.path().join("agctl"));
     (dir, paths)
 }
 
@@ -187,7 +187,7 @@ fn two_namespaces_do_not_contend() {
 #[cfg(feature = "testing")]
 #[test]
 fn an_unsupported_flock_fails_closed() {
-    // Plan AC48(b): a filesystem without `flock` is one agentctl declines to
+    // Plan AC48(b): a filesystem without `flock` is one agctl declines to
     // refresh on, rather than one it writes to without mutual exclusion.
     let (_dir, paths) = store();
     let err =
@@ -259,16 +259,16 @@ fn a_file_where_the_locks_directory_belongs_is_refused() {
 #[test]
 fn a_symlinked_configuration_directory_is_followed_rather_than_refused() {
     // The counterpart to the `.locks` rule, and the reason the two paths are
-    // opened differently. `.locks` lives inside a directory agentctl created,
+    // opened differently. `.locks` lives inside a directory agctl created,
     // so a link there is nobody's legitimate layout. The configuration
     // directory is a path the *user* names, and a dotfile manager pointing it
     // at a repository is ordinary; `Paths::ensure_dirs` and the config writer
     // both follow it, so the lock has to as well or the layout is only
     // half-supported.
     let dir = TempDir::new().expect("a temporary directory should be available");
-    let real = dir.path().join("dotfiles-agentctl");
+    let real = dir.path().join("dotfiles-agctl");
     std::fs::create_dir_all(&real).expect("directories should be creatable");
-    let linked = dir.path().join("agentctl");
+    let linked = dir.path().join("agctl");
     std::os::unix::fs::symlink(&real, &linked).expect("the symlink should be creatable");
 
     let paths = Paths::with_config_dir(linked);
@@ -285,7 +285,7 @@ fn many_threads_racing_to_create_one_fresh_lock_file_all_open_it() {
     // so `openat(dirfd, name, O_RDWR | O_CREAT, ..)` on a lock file that does
     // not exist yet returns `ENOENT` — not `EEXIST` — for a large fraction of
     // the racers: a two-thread probe measured 328 failures in 800 attempts on
-    // this machine, and it cost roughly four `AgentctlConfig::update` runs in
+    // this machine, and it cost roughly four `AgctlConfig::update` runs in
     // five before `open_lock_file` split the create out behind `O_EXCL`.
     //
     // `open_lock_file` is exercised rather than `acquire` on purpose: the

@@ -2,12 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`agentctl` is a CLI for managing AI coding agents. Binary-only, single crate, no public
+`agctl` is a CLI for managing AI coding agents. Binary-only, single crate, no public
 library API. Phase 1 is a multi-account Claude subscription usage viewer, and the module
 layout follows the data as it moves: `cli.rs` parses (every flag lives there and nowhere
 else) and `main.rs` dispatches one arm per command into `commands/` (`status`, `watch`,
 `login`, `accounts`, `import`, `doctor`, `completions`); `config/` owns the account registry and
-`config/paths.rs` derives every path agentctl is allowed to write; `provider/claude/`
+`config/paths.rs` derives every path agctl is allowed to write; `provider/claude/`
 holds the provider-specific knowledge — namespace and keychain-service naming, credential
 blobs, discovery, OAuth, the usage request — behind the `provider` traits that phase 3
 will implement a second time; `secret/` is the only code that touches credentials on disk
@@ -108,7 +108,7 @@ adding a single argument can re-flow an entire call. Expect diffs larger than th
 
 ## Issue tracking
 
-Work items live in beads (`br`), issue prefix `agentctl`. Use `br ready` to find actionable
+Work items live in beads (`br`), issue prefix `agctl`. Use `br ready` to find actionable
 work, `br create` to file it, `br update` to move it. The JSONL export (`.beads/issues.jsonl`)
 is the git-tracked source of truth; `.beads/beads.db` is not.
 

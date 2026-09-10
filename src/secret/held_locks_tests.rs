@@ -21,7 +21,7 @@ struct Store {
 
 fn store() -> Store {
     let dir = TempDir::new().expect("a temporary directory should be available");
-    let paths = Paths::with_config_dir(dir.path().join("agentctl"));
+    let paths = Paths::with_config_dir(dir.path().join("agctl"));
     fs::create_dir_all(dir_of(&paths)).expect("the held-locks directory should be creatable");
     Store { _dir: dir, paths }
 }
@@ -42,7 +42,7 @@ fn write_record(store: &Store, name: &str, body: &str) -> PathBuf {
 fn record_json(pid: u32, tree: &str, store_dir: &str, paths: &[&str]) -> String {
     let paths: Vec<String> = paths.iter().map(|path| format!("\"{path}\"")).collect();
     format!(
-        r#"{{"agentctl_pid":{pid},"tree":"{tree}","store_dir":"{store_dir}",
+        r#"{{"agctl_pid":{pid},"tree":"{tree}","store_dir":"{store_dir}",
            "paths":[{}],"taken_at":"2026-09-09T12:00:00Z"}}"#,
         paths.join(",")
     )
@@ -56,15 +56,15 @@ fn the_record_writer_and_reader_are_the_same_type() {
     // variants and would diverge the moment a two-word one arrived. There is
     // now one type and one `Tree`, and this is the assertion that says so.
     let record = HeldLockRecord {
-        agentctl_pid: 7,
-        agentctl_start_time: None,
-        tree: Tree::Agentctl,
+        agctl_pid: 7,
+        agctl_start_time: None,
+        tree: Tree::Agctl,
         store_dir: PathBuf::from("/store"),
         paths: Vec::new(),
         taken_at: "2026-09-09T12:00:00Z".to_owned(),
     };
     let written = serde_json::to_string(&record).expect("serializable");
-    assert!(written.contains("\"tree\":\"agentctl\""), "{written}");
+    assert!(written.contains("\"tree\":\"agctl\""), "{written}");
     assert_eq!(
         std::any::TypeId::of::<HeldLockRecord>(),
         std::any::TypeId::of::<crate::secret::claude_lock::HeldLockRecord>(),
@@ -95,7 +95,7 @@ fn read_all_parses_the_shape_claude_lock_writes() {
 
     assert_eq!(found.len(), 1, "one record, one entry: {found:?}");
     assert_eq!(found[0].file, file, "the entry names the file it came from");
-    assert_eq!(found[0].record.agentctl_pid, 4242);
+    assert_eq!(found[0].record.agctl_pid, 4242);
     assert_eq!(found[0].record.tree, Tree::Live);
     assert_eq!(found[0].record.store_dir, Path::new("/Users/someone/.claude"));
     assert_eq!(found[0].record.paths.len(), 2);
@@ -103,20 +103,20 @@ fn read_all_parses_the_shape_claude_lock_writes() {
 }
 
 #[test]
-fn the_tree_field_is_spelled_agentctl_or_live() {
+fn the_tree_field_is_spelled_agctl_or_live() {
     // Both spellings, in both directions: this is the one field whose value a
     // reader and a writer in different lanes have to agree on.
     let store = store();
-    write_record(&store, "a.json", &record_json(1, "agentctl", "/store/acct/org", &[]));
+    write_record(&store, "a.json", &record_json(1, "agctl", "/store/acct/org", &[]));
     write_record(&store, "b.json", &record_json(2, "live", "/store/live", &[]));
 
     let found = read_all(&store.paths);
     assert_eq!(found.len(), 2, "{found:?}");
-    assert_eq!(found[0].record.tree, Tree::Agentctl);
+    assert_eq!(found[0].record.tree, Tree::Agctl);
     assert_eq!(found[1].record.tree, Tree::Live);
 
-    let rendered = serde_json::to_string(&Tree::Agentctl).expect("serializable");
-    assert_eq!(rendered, "\"agentctl\"", "the writer's spelling is the reader's");
+    let rendered = serde_json::to_string(&Tree::Agctl).expect("serializable");
+    assert_eq!(rendered, "\"agctl\"", "the writer's spelling is the reader's");
     assert_eq!(serde_json::to_string(&Tree::Live).expect("serializable"), "\"live\"");
 }
 
@@ -125,7 +125,7 @@ fn read_all_is_empty_when_there_is_no_directory_at_all() {
     // The common case on every machine that has never held a Claude Code
     // lock, and it must not be an error: `doctor` reports it as "none".
     let dir = TempDir::new().expect("a temporary directory should be available");
-    let paths = Paths::with_config_dir(dir.path().join("agentctl"));
+    let paths = Paths::with_config_dir(dir.path().join("agctl"));
     assert!(read_all(&paths).is_empty());
 }
 
@@ -134,8 +134,8 @@ fn read_all_skips_what_is_not_a_readable_record() {
     // A `doctor` that refuses to report because one file here is malformed is
     // a `doctor` that cannot diagnose the machine it was run on.
     let store = store();
-    write_record(&store, "good.json", &record_json(7, "agentctl", "/store/acct/org", &[]));
-    write_record(&store, "truncated.json", "{\"agentctl_pid\":");
+    write_record(&store, "good.json", &record_json(7, "agctl", "/store/acct/org", &[]));
+    write_record(&store, "truncated.json", "{\"agctl_pid\":");
     write_record(&store, "wrong-tree.json", &record_json(8, "somewhere-else", "/store", &[]));
     write_record(&store, "notes.txt", &record_json(9, "live", "/store", &[]));
     fs::create_dir(dir_of(&store.paths).join("a-directory.json"))
@@ -144,7 +144,7 @@ fn read_all_skips_what_is_not_a_readable_record() {
     let found = read_all(&store.paths);
 
     assert_eq!(found.len(), 1, "only the parseable record survives: {found:?}");
-    assert_eq!(found[0].record.agentctl_pid, 7);
+    assert_eq!(found[0].record.agctl_pid, 7);
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn read_all_refuses_a_record_larger_than_the_limit() {
         &store,
         "huge.json",
         &format!(
-            r#"{{"agentctl_pid":1,"tree":"live","store_dir":"/store","paths":[],
+            r#"{{"agctl_pid":1,"tree":"live","store_dir":"/store","paths":[],
                "taken_at":"{padding}"}}"#
         ),
     );
@@ -237,7 +237,7 @@ fn a_live_process_that_did_not_write_the_record_is_gone_too() {
     let cancel = Cancel::new();
 
     let mismatched = format!(
-        r#"{{"agentctl_pid":{ours},"agentctl_start_time":"1999-01-01T00:00:00Z",
+        r#"{{"agctl_pid":{ours},"agctl_start_time":"1999-01-01T00:00:00Z",
            "tree":"live","store_dir":"/store","paths":[],"taken_at":"2026-09-09T12:00:00Z"}}"#
     );
     write_record(&first, "recycled.json", &mismatched);
@@ -250,7 +250,7 @@ fn a_live_process_that_did_not_write_the_record_is_gone_too() {
     let second = store();
     let start = proc::self_start_time(&cancel).expect("this platform answers");
     let matching = format!(
-        r#"{{"agentctl_pid":{ours},"agentctl_start_time":"{start}",
+        r#"{{"agctl_pid":{ours},"agctl_start_time":"{start}",
            "tree":"live","store_dir":"/store","paths":[],"taken_at":"2026-09-09T12:00:00Z"}}"#
     );
     write_record(&second, "held.json", &matching);
@@ -270,7 +270,7 @@ fn an_unknown_start_time_is_not_evidence_of_anything() {
     let found = read_all(&store.paths);
     let record = &found.first().expect("one record").record;
 
-    assert_eq!(record.agentctl_start_time, None);
+    assert_eq!(record.agctl_start_time, None);
     assert!(!record.writer_is_gone(&Cancel::new()), "a live process id is still a live holder");
 }
 
@@ -288,15 +288,15 @@ fn the_anchor_is_the_store_directorys_parent() {
 
 #[test]
 fn the_serialized_record_is_the_exact_document_doctor_and_remove_stale_read() {
-    // `agentctl-p2-held-locks-dir-through-symlink-1yj` changed **where** the
+    // `agctl-p2-held-locks-dir-through-symlink-1yj` changed **where** the
     // record is written — through a walked descriptor rather than by path —
     // and nothing about **what** is written. This pins the second half: the
     // field names, their order, and the `tree` spelling, so a later change to
     // the writer that moved any of them would fail here rather than in
     // somebody's `doctor --remove-stale` months later.
     let record = HeldLockRecord {
-        agentctl_pid: 4242,
-        agentctl_start_time: Some("1757400000".to_owned()),
+        agctl_pid: 4242,
+        agctl_start_time: Some("1757400000".to_owned()),
         tree: Tree::Live,
         store_dir: PathBuf::from("/Users/someone/.claude"),
         paths: vec![
@@ -309,7 +309,7 @@ fn the_serialized_record_is_the_exact_document_doctor_and_remove_stale_read() {
     assert_eq!(
         serde_json::to_string(&record).expect("the record serializes"),
         concat!(
-            r#"{"agentctl_pid":4242,"agentctl_start_time":"1757400000","tree":"live","#,
+            r#"{"agctl_pid":4242,"agctl_start_time":"1757400000","tree":"live","#,
             r#""store_dir":"/Users/someone/.claude","#,
             r#""paths":["/Users/someone/.claude/.oauth_refresh.lock","/Users/someone/.claude.lock"],"#,
             r#""taken_at":"2026-09-09T12:00:00Z"}"#,
@@ -324,12 +324,8 @@ fn the_serialized_record_is_the_exact_document_doctor_and_remove_stale_read() {
 
     // A record written by a build that predates the start time still parses,
     // and still reads as "unknown" rather than as a mismatch.
-    let older: HeldLockRecord = serde_json::from_str(&record_json(
-        7,
-        "agentctl",
-        "/store",
-        &["/store/.oauth_refresh.lock"],
-    ))
-    .expect("a record without `agentctl_start_time` parses");
-    assert_eq!(older.agentctl_start_time, None);
+    let older: HeldLockRecord =
+        serde_json::from_str(&record_json(7, "agctl", "/store", &["/store/.oauth_refresh.lock"]))
+            .expect("a record without `agctl_start_time` parses");
+    assert_eq!(older.agctl_start_time, None);
 }

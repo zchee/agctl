@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/zchee/agentctl/schemas/status.v1.json",
-  "title": "agentctl claude status report, version 1",
-  "description": "The document `agentctl claude status --json` writes to stdout. It carries no token material: the only upstream bytes it reproduces are usage response bodies, under `raw`, and those contain usage figures alone.",
+  "$id": "https://github.com/zchee/agctl/schemas/status.v1.json",
+  "title": "agctl claude status report, version 1",
+  "description": "The document `agctl claude status --json` writes to stdout. It carries no token material: the only upstream bytes it reproduces are usage response bodies, under `raw`, and those contain usage figures alone.",
   "type": "object",
   "additionalProperties": false,
   "required": ["version", "generated_at", "rows", "hidden"],
@@ -71,7 +71,7 @@
         "email": { "type": ["string", "null"] },
         "org_name": { "type": ["string", "null"] },
         "kind": {
-          "description": "Where the credentials live, and so whether agentctl may write them. Only `owned` is ever refreshed. `foreign` is synthesized by discovery for a credential that belongs to something else — a third-party tool's keychain item, or a token in the environment — and is never recorded in the registry.",
+          "description": "Where the credentials live, and so whether agctl may write them. Only `owned` is ever refreshed. `foreign` is synthesized by discovery for a credential that belongs to something else — a third-party tool's keychain item, or a token in the environment — and is never recorded in the registry.",
           "enum": ["owned", "live", "config_dir", "foreign"]
         },
         "source": {
@@ -111,7 +111,7 @@
           "type": "string"
         },
         "lock_state": {
-          "description": "What the namespace lock did on this pass. `busy` means another process held it past this run's deadline; `adopted` means this run took the winner's freshly written credentials instead of refreshing again \u2014 a pass action, and deliberately not the same fact as the row `state` token of the same spelling, which says this row's keychain item is held by another identity; `migrated` means a Claude Code session has moved this namespace's credentials into the keychain and the item found is not one agentctl may write; `migrated_refreshed` means it is, and agentctl refreshed that keychain item in place under Claude Code's own lock protocol.",
+          "description": "What the namespace lock did on this pass. `busy` means another process held it past this run's deadline; `adopted` means this run took the winner's freshly written credentials instead of refreshing again \u2014 a pass action, and deliberately not the same fact as the row `state` token of the same spelling, which says this row's keychain item is held by another identity; `migrated` means a Claude Code session has moved this namespace's credentials into the keychain and the item found is not one agctl may write; `migrated_refreshed` means it is, and agctl refreshed that keychain item in place under Claude Code's own lock protocol.",
           "enum": [
             "none",
             "busy",

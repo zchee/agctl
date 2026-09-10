@@ -23,7 +23,7 @@
 //!   true statement about the machine. `accounts forget` hides it.
 //! - **`claude-switcher:*` items are listed and never touched** (fact F10).
 //!   They belong to a third-party tool that rewrites the live item on every
-//!   switch; agentctl neither reads nor writes them.
+//!   switch; agctl neither reads nor writes them.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -33,7 +33,7 @@ use std::sync::PoisonError;
 
 use crate::config::AccountKind;
 use crate::config::AccountRecord;
-use crate::config::AgentctlConfig;
+use crate::config::AgctlConfig;
 use crate::config::paths::Paths;
 use crate::config::paths::UNKNOWN_ORG;
 use crate::provider::claude::account::AccountRow;
@@ -72,7 +72,7 @@ const MIGRATION_PROBE_SKIPPED: &str = "keychain locked — migration probe skipp
 
 /// The largest `.claude.json` that will be read for the live row's identity.
 ///
-/// `.claude.json` belongs to Claude Code, not to agentctl: it accumulates
+/// `.claude.json` belongs to Claude Code, not to agctl: it accumulates
 /// session history and project state, it is measured in hundreds of kilobytes
 /// on a machine in daily use, and nothing bounds it. Sixteen mebibytes is far
 /// above anything observed and still small enough that reading it cannot
@@ -93,7 +93,7 @@ pub struct Discovery {
 
 /// Builds the row list for one pass.
 pub fn discover(
-    cfg: &AgentctlConfig,
+    cfg: &AgctlConfig,
     paths: &Paths,
     reader: &dyn KeychainReader,
     env: &EnvView,
@@ -238,7 +238,7 @@ fn live_row(
 /// another row.
 fn record_row(
     record: &AccountRecord,
-    cfg: &AgentctlConfig,
+    cfg: &AgctlConfig,
     paths: &Paths,
     reader: &dyn KeychainReader,
     preflight: &KeychainStatus,
@@ -527,7 +527,7 @@ fn env_token_row() -> AccountRow {
     }
 }
 
-/// The state of a row agentctl may read but never refresh.
+/// The state of a row agctl may read but never refresh.
 fn read_only_state(credentials: Option<&Credentials>, preflight: &KeychainStatus) -> AccountState {
     match (credentials, preflight) {
         (Some(credentials), _) => {
@@ -631,11 +631,11 @@ static CLAUDE_JSON_MEMO: Mutex<Option<(PathBuf, FileSnapshot, Option<Identity>)>
 /// Claude Code sessions (fact F41), so catching a partial write is expected
 /// rather than exceptional, and the consequence — `identity unknown` on one
 /// pass — is mild. What must not happen is the row disappearing, or an
-/// unbounded read of a file agentctl does not control.
+/// unbounded read of a file agctl does not control.
 fn claude_json_identity(path: &Path) -> Option<Identity> {
     // The `lstat` is what makes the memo worth having: it is one syscall
     // against a read of a quarter of a megabyte and a parse of the same.
-    // Symbolic links are followed here: this is Claude Code's file, agentctl
+    // Symbolic links are followed here: this is Claude Code's file, agctl
     // only reads it, and on the reference machine `~/.claude.json` is a link
     // into the real configuration directory (fact F41).
     if let Ok(Some(snap)) = file_store::snapshot_following(path) {

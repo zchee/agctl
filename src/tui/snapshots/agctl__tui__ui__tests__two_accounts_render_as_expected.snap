@@ -2,7 +2,7 @@
 source: src/tui/ui_tests.rs
 expression: terminal.backend()
 ---
-"agentctl claude watch · 2 accounts · last fetch 30s ago · next fetch in 4m          "
+"agctl claude watch · 2 accounts · last fetch 30s ago · next fetch in 4m             "
 "┌▸ owner@example.com · Acme · max ─────────────────────────────────────────────────┐"
 "│5h        ███████████████                   21%                                   │"
 "│weekly    █████████████████████████         35%                                   │"
@@ -21,4 +21,4 @@ expression: terminal.backend()
 "                                                                                    "
 "                                                                                    "
 "q quit · r refresh · ↑↓ select                                                      "
-"1 entry hidden (agentctl claude status --all)                                       "
+"1 entry hidden (agctl claude status --all)                                          "

@@ -127,13 +127,8 @@ fn a_listed_item_naming_the_live_directorys_other_spelling_is_a_stale_sibling() 
     let reader = FakeReader::unlocked()
         .with_item(&service, blob(FIRST_ACCT, Some(FIRST_ORG), "sibling@example.com").as_bytes());
 
-    let plan = plan_keychain(
-        &[],
-        &reader.entries.clone(),
-        &reader,
-        &env.view(),
-        &AgentctlConfig::default(),
-    );
+    let plan =
+        plan_keychain(&[], &reader.entries.clone(), &reader, &env.view(), &AgctlConfig::default());
 
     let records = records_of(&plan);
     assert_eq!(records.len(), 1);
@@ -157,7 +152,7 @@ fn ac19_a_named_directory_is_recorded_from_its_keychain_item() {
         &reader.entries.clone(),
         &reader,
         &env.view(),
-        &AgentctlConfig::default(),
+        &AgctlConfig::default(),
     );
 
     let records = records_of(&plan);
@@ -187,7 +182,7 @@ fn ac19_a_directory_with_no_keychain_item_is_reported_and_not_recorded() {
         &[],
         &reader,
         &env.view(),
-        &AgentctlConfig::default(),
+        &AgctlConfig::default(),
     );
 
     assert!(records_of(&plan).is_empty());
@@ -213,7 +208,7 @@ fn ac19_an_alias_of_the_live_directory_is_warned_about_and_recorded_as_a_sibling
         &reader.entries.clone(),
         &reader,
         &env.view(),
-        &AgentctlConfig::default(),
+        &AgctlConfig::default(),
     );
 
     let warnings = warnings_of(&plan);
@@ -241,7 +236,7 @@ fn an_item_that_names_nobody_is_keyed_by_its_service_and_reads_identity_unknown(
         &reader.entries.clone(),
         &reader,
         &env.view(),
-        &AgentctlConfig::default(),
+        &AgctlConfig::default(),
     );
 
     let records = records_of(&plan);
@@ -270,7 +265,7 @@ fn naming_the_directory_the_live_session_uses_reports_the_live_row() {
     let reader = FakeReader::unlocked();
 
     let plan =
-        plan_keychain(std::slice::from_ref(&live), &[], &reader, &view, &AgentctlConfig::default());
+        plan_keychain(std::slice::from_ref(&live), &[], &reader, &view, &AgctlConfig::default());
 
     assert!(records_of(&plan).is_empty());
     assert_eq!(
@@ -285,8 +280,7 @@ fn an_empty_directory_argument_names_the_live_item_and_is_refused() {
     let env = env();
     let reader = FakeReader::unlocked();
 
-    let plan =
-        plan_keychain(&[PathBuf::new()], &[], &reader, &env.view(), &AgentctlConfig::default());
+    let plan = plan_keychain(&[PathBuf::new()], &[], &reader, &env.view(), &AgctlConfig::default());
 
     assert!(records_of(&plan).is_empty());
     assert_eq!(skips_of(&plan)[0].1, "names the live keychain item");
@@ -306,13 +300,8 @@ fn without_any_directory_every_unclaimed_credential_item_is_imported() {
         // A legacy API-key item (fact F5): listed, classified, and dropped.
         .with_entry("Claude Code-86c75be7");
 
-    let plan = plan_keychain(
-        &[],
-        &reader.entries.clone(),
-        &reader,
-        &env.view(),
-        &AgentctlConfig::default(),
-    );
+    let plan =
+        plan_keychain(&[], &reader.entries.clone(), &reader, &env.view(), &AgctlConfig::default());
 
     let records = records_of(&plan);
     assert_eq!(records.len(), 2, "the live item and the legacy key are not imported: {records:?}");
@@ -335,7 +324,7 @@ fn a_service_a_record_already_claims_is_reported_rather_than_imported_twice() {
     let env = env();
     let other = env.home.join("work");
     let service = env.service_for(&other);
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(
         new_record(
             FIRST_ACCT.to_owned(),
@@ -372,7 +361,7 @@ fn an_unreadable_item_still_records_the_service_it_could_not_identify() {
         &reader.entries.clone(),
         &reader,
         &env.view(),
-        &AgentctlConfig::default(),
+        &AgctlConfig::default(),
     );
 
     let records = records_of(&plan);
@@ -387,6 +376,6 @@ fn a_locked_keychain_is_the_callers_problem_not_the_planners() {
     // nothing: no record, no panic, no invented identity.
     let env = env();
     let reader = FakeReader::unlocked().with_preflight(KeychainStatus::Locked);
-    let plan = plan_keychain(&[], &[], &reader, &env.view(), &AgentctlConfig::default());
+    let plan = plan_keychain(&[], &[], &reader, &env.view(), &AgctlConfig::default());
     assert_eq!(plan.summary(), "imported 0, skipped 0, already known 0");
 }

@@ -8,7 +8,7 @@
 //! `--forget` is not exercised here for the same reason `run_forget` is not:
 //! it calls [`crate::config::paths::Paths::resolve`] with no override, which
 //! in this in-process unit-test binary would resolve to whatever
-//! `AGENTCTL_CONFIG_DIR`/XDG names on the machine actually running the
+//! `AGCTL_CONFIG_DIR`/XDG names on the machine actually running the
 //! tests — never a directory a test controls. `isolate::forget_session`
 //! itself is exercised directly, with a `Paths::with_config_dir` fixture, in
 //! `isolate_tests.rs`; the dispatch wiring is exercised end-to-end, with the

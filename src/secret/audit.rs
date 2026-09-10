@@ -21,9 +21,9 @@
 //!
 //! One JSON object per line, `O_APPEND`, mode 0600, `fsync` per entry, at
 //! `<config_dir>/claude/keychain-writes.jsonl`. One `write` syscall per entry
-//! keeps two agentctl processes from interleaving half-lines. The
-//! provenance fields — `ts`, `monotonic_ms`, `agentctl_pid` — come first and
-//! belong to *this* process; the plan moved `agentctl_pid` up here precisely
+//! keeps two agctl processes from interleaving half-lines. The
+//! provenance fields — `ts`, `monotonic_ms`, `agctl_pid` — come first and
+//! belong to *this* process; the plan moved `agctl_pid` up here precisely
 //! so it cannot be read as the pid of somebody else's lock holder (ledger
 //! #70), which the vocabulary in [`HolderEvidence`] never names.
 
@@ -67,7 +67,7 @@ pub const DIGEST_PREFIX_LEN: usize = 8;
 /// of a break that spanned one.
 static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-/// Where the log lives for one agentctl store.
+/// Where the log lives for one agctl store.
 pub fn log_path(paths: &Paths) -> PathBuf {
     paths.namespace_root().join(LOG_FILE)
 }
@@ -81,8 +81,8 @@ pub struct AuditEntry {
     /// Milliseconds on this process's monotonic clock, for the reason
     /// [`PROCESS_START`] gives.
     pub monotonic_ms: u64,
-    /// **agentctl's own** process id — never a holder's (plan AC80).
-    pub agentctl_pid: u32,
+    /// **agctl's own** process id — never a holder's (plan AC80).
+    pub agctl_pid: u32,
     /// What happened.
     #[serde(flatten)]
     pub event: AuditEvent,
@@ -96,14 +96,14 @@ impl AuditEntry {
         Self {
             ts: Timestamp::now(),
             monotonic_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-            agentctl_pid: std::process::id(),
+            agctl_pid: std::process::id(),
             event,
         }
     }
 
     /// This entry's identity: its timestamp and the process that wrote it.
     pub fn id(&self) -> AuditId {
-        AuditId { ts: self.ts, agentctl_pid: self.agentctl_pid }
+        AuditId { ts: self.ts, agctl_pid: self.agctl_pid }
     }
 }
 
@@ -139,7 +139,7 @@ pub enum AuditEvent {
 
 /// Which keychain item an event is about.
 ///
-/// `live` for the unsuffixed item, `namespace:<sha8>` for one of agentctl's
+/// `live` for the unsuffixed item, `namespace:<sha8>` for one of agctl's
 /// own. Rendered as one string rather than an object so a `doctor` line, a
 /// `jq` filter and a human reading the file all see the same token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,8 +213,8 @@ pub enum WriteOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tree {
-    /// Under `<config_dir>/claude/` — a store agentctl owns.
-    Agentctl,
+    /// Under `<config_dir>/claude/` — a store agctl owns.
+    Agctl,
     /// The live Claude Code store. Only W4b can break a lock here.
     Live,
 }
@@ -223,7 +223,7 @@ impl Tree {
     /// The words `doctor` prints for this tree.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Agentctl => "agentctl's own tree",
+            Self::Agctl => "agctl's own tree",
             Self::Live => "the live store",
         }
     }
@@ -268,7 +268,7 @@ pub enum HolderEvidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BreakOutcome {
-    /// The directory was removed and re-created by agentctl.
+    /// The directory was removed and re-created by agctl.
     Broken,
     /// The rule refused; the directory was left exactly as it was.
     Abandoned,
@@ -347,7 +347,7 @@ pub struct LockBreakRecord {
     /// Whether the artefact was removed.
     pub outcome: BreakOutcome,
     /// Why not, when it was not — and `retaken` when it was removed and a peer
-    /// took it back before agentctl could.
+    /// took it back before agctl could.
     ///
     /// Absent for a clean break: every member of [`BreakReason`] is a reason
     /// *not* to have broken a lock, so a break with nothing to explain records
@@ -366,12 +366,12 @@ pub struct AuditId {
     /// The entry's timestamp.
     pub ts: Timestamp,
     /// The process that wrote it.
-    pub agentctl_pid: u32,
+    pub agctl_pid: u32,
 }
 
 impl fmt::Display for AuditId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}#{}", self.ts, self.agentctl_pid)
+        write!(f, "{}#{}", self.ts, self.agctl_pid)
     }
 }
 
@@ -447,7 +447,7 @@ pub struct Tail {
 /// An absent log is no entries rather than an error: a store that has never
 /// written a keychain item has nothing to explain. A line carrying *unknown
 /// members* is not unreadable either — serde ignores them, so a log written by
-/// a later agentctl still reads here (principle P3).
+/// a later agctl still reads here (principle P3).
 ///
 /// # Errors
 ///

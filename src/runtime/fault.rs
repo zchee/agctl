@@ -8,7 +8,7 @@
 //! only reproducible by breaking the machine.
 //!
 //! So the branches are reachable through one environment variable,
-//! `AGENTCTL_FAULT`, holding a comma-separated list of names:
+//! `AGCTL_FAULT`, holding a comma-separated list of names:
 //!
 //! | name | effect |
 //! |------|--------|
@@ -59,12 +59,12 @@ use std::time::Instant;
 
 /// The environment variable that carries the active fault names.
 #[cfg(any(test, feature = "testing"))]
-pub const FAULT_ENV: &str = "AGENTCTL_FAULT";
+pub const FAULT_ENV: &str = "AGCTL_FAULT";
 
 /// The environment variable naming the file whose appearance releases a
 /// [`Fault::pause_point`].
 #[cfg(any(test, feature = "testing"))]
-pub const FAULT_RESUME_ENV: &str = "AGENTCTL_FAULT_RESUME";
+pub const FAULT_RESUME_ENV: &str = "AGCTL_FAULT_RESUME";
 
 /// How long a [`Fault::pause_point`] waits before giving up on its resume
 /// file, so a test that crashes without writing one cannot wedge a run.
@@ -95,7 +95,7 @@ impl Fault {
         Self::default()
     }
 
-    /// Reads the active fault set from `AGENTCTL_FAULT`.
+    /// Reads the active fault set from `AGCTL_FAULT`.
     ///
     /// Names are separated by commas; surrounding whitespace is trimmed and
     /// empty entries are dropped, so `"rename_fail, hold_lock"` and
@@ -124,7 +124,7 @@ impl Fault {
 
     /// Blocks at a named pause point when `pause_<name>` is active.
     ///
-    /// The wait ends when the file named by `AGENTCTL_FAULT_RESUME` exists, or
+    /// The wait ends when the file named by `AGCTL_FAULT_RESUME` exists, or
     /// after [`PAUSE_BUDGET`]. It exists so a test can interleave with a
     /// window that is otherwise a few microseconds wide — the moment between
     /// a refresh POST returning and the new credentials being renamed into
@@ -153,7 +153,7 @@ impl Fault {
     /// before the helper's convention existed, and one this crate would
     /// rather honour than quietly rename in a released fault table.
     ///
-    /// The wait ends when the file named by `AGENTCTL_FAULT_RESUME` exists,
+    /// The wait ends when the file named by `AGCTL_FAULT_RESUME` exists,
     /// or after [`PAUSE_BUDGET`], so a test that dies without writing one
     /// cannot wedge a run. Without the `testing` feature it returns at once.
     #[cfg(feature = "testing")]

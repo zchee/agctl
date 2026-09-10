@@ -41,7 +41,7 @@ const AGGREGATE_TOKENS: [&str; 5] =
     ["show-keychain-info", "find-generic-password", "dump-keychain", "-i", "add-generic-password"];
 
 /// Subcommands whose presence anywhere would mean the keychain was mutated in
-/// a way agentctl has no code path for.
+/// a way agctl has no code path for.
 ///
 /// `add-generic-password` is deliberately **not** here any more — phase 2 has
 /// one write transport — but it is counted instead, exactly, below. A delete
@@ -119,7 +119,7 @@ fn ac25_no_command_in_the_suite_ever_mutates_the_keychain() {
         let token = line.split_whitespace().next().unwrap_or_default();
         assert!(
             AGGREGATE_TOKENS.contains(&token),
-            "the suite issued `security {token}`, which agentctl has no code path for \
+            "the suite issued `security {token}`, which agctl has no code path for \
              (plan invariant I1′, AC25); full argv: {line}"
         );
         for forbidden in FORBIDDEN_SUBCOMMANDS {
@@ -132,7 +132,7 @@ fn ac25_no_command_in_the_suite_ever_mutates_the_keychain() {
 fn ac25_the_stand_in_refuses_the_argv_form_of_a_write() {
     // Invariant I15's other half, and the reason the transport is `-i` at all:
     // fact F42 says Claude Code falls back to putting the hex in **argv** for
-    // an over-long line, and agentctl has no such fallback. The stand-in
+    // an over-long line, and agctl has no such fallback. The stand-in
     // refuses that shape outright, so a regression that grew one could not
     // pass here by being silently tolerated. Asserted by running the script
     // directly — the one place in the suite where a mutating argv is
@@ -218,7 +218,7 @@ fn ac60_a_service_no_test_registered_is_refused_and_stores_nothing() {
 #[test]
 fn ac61_what_the_write_path_stores_is_what_the_binary_reads() {
     // The round trip, with the shipped binary on the reading end: an item this
-    // suite created through the write transport is one `agentctl` finds,
+    // suite created through the write transport is one `agctl` finds,
     // reads and parses. It is also the assertion that the *binary* issued no
     // write of its own — the write came from this test, and every line the
     // binary added afterwards is a read.
@@ -294,7 +294,7 @@ fn ac61_the_aggregate_log_holds_one_write_per_named_test_and_no_delete() {
     assert_eq!(
         aggregate.lines().filter(|line| line.contains("delete-generic-password")).count(),
         0,
-        "agentctl issues no delete anywhere (fact F43, invariant I1′): {aggregate}"
+        "agctl issues no delete anywhere (fact F43, invariant I1′): {aggregate}"
     );
     assert!(
         !aggregate.contains("sk-ant-"),

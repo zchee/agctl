@@ -1,4 +1,4 @@
-//! `agentctl claude use` — an isolated session, or a hot-swap of a live one.
+//! `agctl claude use` — an isolated session, or a hot-swap of a live one.
 //!
 //! Bare `use <id>` is exactly `isolate::ensure_session` followed by
 //! `export::exec_command` against `claude` on `PATH`, with the same
@@ -17,7 +17,7 @@
 //! - **Phase B** prepares. The adoption is decided, the operator is asked,
 //!   the refresh POST is made and the adoption is written — in that order,
 //!   because both the POST and the write are irreversible and neither may
-//!   happen in front of the consent gate — under agentctl's **own**
+//!   happen in front of the consent gate — under agctl's **own**
 //!   namespace locks —
 //!   never Claude Code's. That is invariant I17's whole content: the things
 //!   that block are done before the things Claude Code is waiting for are
@@ -51,7 +51,7 @@ use crate::commands::isolate;
 use crate::commands::status;
 use crate::config::AccountKind;
 use crate::config::AccountRecord;
-use crate::config::AgentctlConfig;
+use crate::config::AgctlConfig;
 use crate::config::paths::Paths;
 use crate::error::AppError;
 use crate::error::EXIT_OK;
@@ -94,7 +94,7 @@ use crate::secret::namespace_lock;
 /// person reading a prompt. Phase C has its own, much tighter budget.
 const SWAP_DEADLINE: Duration = Duration::from_secs(120);
 
-/// `agentctl claude use [<id>] [--live] [--claude-config-dir <PATH>]
+/// `agctl claude use [<id>] [--live] [--claude-config-dir <PATH>]
 /// [--fresh-context] [--no-mcp] [--yes] [--json]` · `use --undo [--yes]` ·
 /// `use --forget <id> [--yes]`.
 ///
@@ -262,12 +262,12 @@ fn break_summary(record: &audit::LockBreakRecord) -> serde_json::Value {
 ///
 /// It is not a refusal — no storage-V5 backend exists in this build, so
 /// refusing on one would be refusing on a hypothesis — but it is still a fact
-/// about what agentctl could and could not see, and it says whose environment
+/// about what agctl could and could not see, and it says whose environment
 /// was inspected (plan AC67, critic M4).
-const BACKEND_NOTE: &str = "agentctl inspected its own environment for a secure-storage backend \
+const BACKEND_NOTE: &str = "agctl inspected its own environment for a secure-storage backend \
                             and found none; it cannot inspect the target session's";
 
-/// `claude use --live <id>`: plan section 3.4 against a store agentctl owns.
+/// `claude use --live <id>`: plan section 3.4 against a store agctl owns.
 fn run_live(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Result<i32, AppError> {
     // Before `Paths::resolve`, deliberately: a usage error must not create a
     // config directory on the way to being reported.
@@ -279,15 +279,15 @@ fn run_live(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
 
     let paths = Paths::resolve(config_dir)?;
     paths.ensure_dirs()?;
-    let config = AgentctlConfig::load(&paths)?;
+    let config = AgctlConfig::load(&paths)?;
     let incoming = config.resolve_id(id)?.clone();
 
-    // Phase A step 1: only an account agentctl owns can be swapped in — the
+    // Phase A step 1: only an account agctl owns can be swapped in — the
     // same fact `export::spec_for` states, in the same words.
     if !matches!(incoming.kind, AccountKind::Owned { .. }) {
         return Err(AppError::Config(format!(
-            "only an account agentctl owns can be swapped into a live store; `{}` is `{}`, whose \
-             credentials live outside agentctl's own store",
+            "only an account agctl owns can be swapped into a live store; `{}` is `{}`, whose \
+             credentials live outside agctl's own store",
             incoming.account_uuid,
             incoming.kind.name()
         )));
@@ -324,7 +324,7 @@ fn run_live(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
             Refusal::NotOwned,
             "",
             format!(
-                "`{inherited}` is not a store agentctl owns, so there is no record saying whose \
+                "`{inherited}` is not a store agctl owns, so there is no record saying whose \
                  credentials are in it or where the displaced one should go"
             ),
         );
@@ -375,7 +375,7 @@ fn recorded_spelling(record: &AccountRecord) -> &str {
 }
 
 /// The `Owned` record whose `export_spelling` is exactly `inherited`.
-fn owned_by_spelling<'a>(config: &'a AgentctlConfig, inherited: &str) -> Option<&'a AccountRecord> {
+fn owned_by_spelling<'a>(config: &'a AgctlConfig, inherited: &str) -> Option<&'a AccountRecord> {
     config.accounts.iter().find(|record| match &record.kind {
         AccountKind::Owned { export_spelling, .. } => export_spelling == inherited,
         _ => false,
@@ -442,8 +442,7 @@ fn swap_phases(
         return Report::refused(
             Refusal::NotOwned,
             "",
-            "the store's recorded export spelling does not name a namespace agentctl owns"
-                .to_owned(),
+            "the store's recorded export spelling does not name a namespace agctl owns".to_owned(),
         );
     };
     let target = WriteTarget::migrated(sha8.clone());
@@ -471,21 +470,21 @@ fn swap_phases(
             &service,
             format!(
                 "this store is named `{inherited}`, but `{}`'s namespace now spells `{spelled}`; \
-                 the store moved, so agentctl would take the Claude Code locks in a different \
-                 directory than the session reads — see `agentctl claude doctor`",
+                 the store moved, so agctl would take the Claude Code locks in a different \
+                 directory than the session reads — see `agctl claude doctor`",
                 store.account_uuid
             ),
         );
     }
 
-    // Step 6, refusal C: agentctl's **own** environment only (decision
-    // D-020). agentctl cannot read another process's environment and will not
+    // Step 6, refusal C: agctl's **own** environment only (decision
+    // D-020). agctl cannot read another process's environment and will not
     // guess at one, so the message says whose was inspected.
     if env.oauth_token_set {
         return Report::refused(
             Refusal::EnvToken,
             &service,
-            "`CLAUDE_CODE_OAUTH_TOKEN` is set in agentctl's own environment, which short-circuits \
+            "`CLAUDE_CODE_OAUTH_TOKEN` is set in agctl's own environment, which short-circuits \
              every credential store; unset it and run this again"
                 .to_owned(),
         );
@@ -585,7 +584,7 @@ fn swap_phases(
     // where it is used. A forward swap whose displaced credential belongs to
     // somebody else — the ordinary state of the second and every later swap
     // of one store — adopts it into *that* account's `.credentials.json`, and
-    // ruling OQ11 ordered only two locks. A write agentctl does not hold the
+    // ruling OQ11 ordered only two locks. A write agctl does not hold the
     // namespace lock for is a blind overwrite of a namespace a concurrent
     // `status` may be refreshing, against invariant I3'. Resolving it before
     // the first lock is taken is what keeps the whole set sorted, so three
@@ -602,7 +601,7 @@ fn swap_phases(
     // Step 10: the namespace locks, in ascending namespace-key order so two
     // concurrent swaps cannot take each other's locks in opposite orders and
     // deadlock (ruling OQ11, extended to the third namespace above). Held
-    // across Phase B *and* Phase C. These are agentctl's own locks; Claude
+    // across Phase B *and* Phase C. These are agctl's own locks; Claude
     // Code neither takes nor waits for them.
     let deadline = Instant::now() + SWAP_DEADLINE;
     let mut locked: Vec<&AccountRecord> = vec![incoming.record, store];
@@ -729,7 +728,7 @@ fn swap_phases(
                 &service,
                 format!(
                     "`{}`'s credential has expired and its store has migrated into the keychain, \
-                     so this swap cannot refresh it without discarding the result; run `agentctl \
+                     so this swap cannot refresh it without discarding the result; run `agctl \
                      claude status` to refresh that item in place and run this again",
                     incoming.record.email.as_deref().unwrap_or(&incoming.record.account_uuid)
                 ),
@@ -836,11 +835,11 @@ fn swap_phases(
 ///
 /// `None` when the credential is the store's own — including the case where
 /// it names no identity at all, which fact F4 says is an older blob rather
-/// than a different account — and `None` when it names one agentctl has no
+/// than a different account — and `None` when it names one agctl has no
 /// record for, which [`adopt_displaced`] turns into a refusal rather than
 /// manufacturing a namespace for it.
 fn third_namespace(
-    config: &AgentctlConfig,
+    config: &AgctlConfig,
     store: &AccountRecord,
     displaced: &Credentials,
 ) -> Option<AccountRecord> {
@@ -882,7 +881,7 @@ enum Direction {
 /// that changed between two readings could make them disagree (risk R42).
 struct Swap<'a> {
     paths: &'a Paths,
-    config: &'a AgentctlConfig,
+    config: &'a AgctlConfig,
     env: &'a EnvView,
     /// The spelling the store is named by: the inherited
     /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` on the forward path, and the same
@@ -973,13 +972,13 @@ fn phase_c(
     };
 
     let clock = Clock::system();
-    let subject = LockSubject { store_dir: c.store_dir, tree: Tree::Agentctl };
+    let subject = LockSubject { store_dir: c.store_dir, tree: Tree::Agctl };
 
     // Split the acquire into the draft and the rest **before** either is
     // looked at, so the append below is one unconditional statement. An
     // acquire that failed may already have removed a peer's stale lock, and
     // that removal is exactly what invariant I16 wants recorded
-    // (`agentctl-nq3` — a completed break's draft was dropped on every Err).
+    // (`agctl-nq3` — a completed break's draft was dropped on every Err).
     let (break_record, resolved) =
         match claude_lock::acquire(subject, paths, env, &clock, ctx, fault) {
             Ok(acquisition) => (acquisition.break_record, Ok(acquisition.outcome)),
@@ -1012,12 +1011,12 @@ fn phase_c(
         }
     };
 
-    // Refusal A: the lock agentctl holds moved under it, so the protocol was
+    // Refusal A: the lock agctl holds moved under it, so the protocol was
     // violated before anything was written.
     if let Err(err) = hold.drift_check() {
         return ended(
             Outcome::Refused(Refusal::CompromisedHold),
-            format!("the lock agentctl holds is compromised: {err}"),
+            format!("the lock agctl holds is compromised: {err}"),
             held(&lock, &hold),
         );
     }
@@ -1069,7 +1068,7 @@ fn phase_c(
     if let Err(err) = hold.drift_check() {
         return ended(
             Outcome::Refused(Refusal::CompromisedHold),
-            format!("the lock agentctl holds is compromised: {err}"),
+            format!("the lock agctl holds is compromised: {err}"),
             held(&lock, &hold),
         );
     }
@@ -1123,7 +1122,7 @@ fn phase_c(
         // Its **own** outcome and its own exit code. It used to report
         // refusal **A**, which made the exit code contradict the audit line
         // this call just wrote (`"outcome":"failed"`) and filled the one
-        // signal that means *somebody moved a lock agentctl was holding* with
+        // signal that means *somebody moved a lock agctl was holding* with
         // ordinary write failures.
         return Report {
             outcome: Outcome::Failed,
@@ -1141,7 +1140,7 @@ fn phase_c(
                     // Forward: P sits in the adopted copy, written in Phase B and
                     // committed there, and the item still holds it too.
                     Direction::Forward => {
-                        "The outgoing credential is still recoverable with `agentctl claude use \
+                        "The outgoing credential is still recoverable with `agctl claude use \
                      --undo`"
                     }
                     // Reverse: the staged copy was never committed, so the copy
@@ -1204,7 +1203,7 @@ fn phase_c(
             // temporary is removed and the copy keeps the restored credential.
             drop(staged);
             note = Some(
-                "the write could not be confirmed; re-run `agentctl claude status`. The \
+                "the write could not be confirmed; re-run `agctl claude status`. The \
                  credential this rollback was restoring is untouched in the adopted copy, and \
                  the one it displaced was deliberately not parked there — so this reversal \
                  cannot itself be undone; that credential is still in its own namespace store"
@@ -1246,7 +1245,7 @@ fn phase_c(
                 }
             }
         } else {
-            // Finding N-9: this used to say "re-run `agentctl claude
+            // Finding N-9: this used to say "re-run `agctl claude
             // status`", which cannot do anything about the file — nothing in
             // `status`, `doctor` or `accounts` removes a `.credentials.json`
             // — so the sentence sent the operator to a command that would
@@ -1257,8 +1256,8 @@ fn phase_c(
             Some(format!(
                 "the write could not be confirmed, so `{}` was kept and still holds the \
                  credential this swap displaced. The item may already hold the incoming one: run \
-                 `agentctl claude status` to see which, and if it does, remove that file by hand \
-                 — Claude Code reads it whenever the keychain is unavailable. `agentctl claude \
+                 `agctl claude status` to see which, and if it does, remove that file by hand \
+                 — Claude Code reads it whenever the keychain is unavailable. `agctl claude \
                  doctor` reports it until then",
                 file_store::CREDENTIALS_FILE
             ))
@@ -1271,7 +1270,7 @@ fn phase_c(
         }
     }
     if note.is_none() && !applied {
-        note = Some("the write could not be confirmed; re-run `agentctl claude status`".to_owned());
+        note = Some("the write could not be confirmed; re-run `agctl claude status`".to_owned());
     }
 
     Report {
@@ -1321,7 +1320,7 @@ fn refresh_incoming(
         Err(RefreshError::InvalidGrant) => Err(Box::new(Report::refused(
             Refusal::CannotAdopt(adopt::Refusal::Unreadable),
             service,
-            "the incoming account's refresh token has been rotated away; run `agentctl claude \
+            "the incoming account's refresh token has been rotated away; run `agctl claude \
              login` for it first"
                 .to_owned(),
         ))),
@@ -1347,7 +1346,7 @@ fn refresh_incoming(
 /// plaintext `.credentials.json`. A reversal reads the store's adopted copy,
 /// which is the file the staging protocol protects and whose contents a later
 /// `--undo`'s digest guard compares against; writing a refreshed credential
-/// there needs its own ruling and is filed as `agentctl-bk5`.
+/// there needs its own ruling and is filed as `agctl-bk5`.
 ///
 /// A failure here does not fail the swap: the item write is what the operator
 /// asked for, and a saved refresh is a repair, not a precondition. It is
@@ -1561,7 +1560,7 @@ impl Incoming<'_> {
                  yet"
             );
         }
-        format!("`{who}` has no readable credential to swap in; run `agentctl claude login` for it")
+        format!("`{who}` has no readable credential to swap in; run `agctl claude login` for it")
     }
 }
 
@@ -1648,7 +1647,7 @@ fn decide_adoption(
 
     // Condition (a): whether the item's identity is the record's. An absent
     // `tokenAccount` is an older blob (fact F4), not a different identity, so
-    // `same_identity` passes it — and a credential agentctl cannot identify
+    // `same_identity` passes it — and a credential agctl cannot identify
     // belongs to the store it was found in, which is the same conclusion.
     let identity_matches = swap::same_identity(displaced, store);
     let same_namespace = identity_matches;
@@ -1659,7 +1658,7 @@ fn decide_adoption(
         (store_dir.to_path_buf(), classify(read, displaced), None)
     } else {
         // Somebody else's credential is in this store's item. It belongs in
-        // *their* namespace, if agentctl has one for them — and `third` is
+        // *their* namespace, if agctl has one for them — and `third` is
         // that record, resolved in Phase A so its namespace lock is in the
         // set taken at step 10. Resolving it here instead would write a
         // namespace whose lock nobody took.
@@ -2095,7 +2094,7 @@ pub(crate) fn select_undo(tail: &audit::Tail) -> Undoable {
 /// becomes the new displaced one and is parked in that same copy in turn, so
 /// the operation is its own inverse.
 ///
-/// Refusal **E** does not arise: the store is one agentctl owns and sits
+/// Refusal **E** does not arise: the store is one agctl owns and sits
 /// inside `namespace_root()`, and nothing on this path touches the live
 /// store. A reversal of a **live** swap is S23's, and is the one case that
 /// still reports `not_implemented`.
@@ -2114,7 +2113,7 @@ fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
         Undoable::Unreadable(line) => {
             return Err(AppError::Config(format!(
                 "the audit log's line {line} could not be read, and it may be the entry \
-                 `--undo` needs; agentctl will not guess which swap to reverse"
+                 `--undo` needs; agctl will not guess which swap to reverse"
             )));
         }
         Undoable::Nothing => {
@@ -2129,7 +2128,7 @@ fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
         Undoable::Found { sha8, from_digest8, to_digest8 } => (sha8, from_digest8, to_digest8),
     };
 
-    let config = AgentctlConfig::load(&paths)?;
+    let config = AgctlConfig::load(&paths)?;
     // The entry names the item by its suffix; the store is whichever owned
     // record still derives that suffix. "Still" is the operative word — a
     // record that has been removed or relocated since the swap leaves an
@@ -2144,7 +2143,7 @@ fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
         .cloned()
     else {
         return Err(AppError::Config(format!(
-            "the swap to undo named the keychain item `{sha8}`, which no account agentctl \
+            "the swap to undo named the keychain item `{sha8}`, which no account agctl \
              currently owns still derives; there is nothing to put it back into"
         )));
     };
@@ -2170,7 +2169,7 @@ fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
             if found8.as_deref() != Some(from_digest8.as_str()) {
                 return Err(AppError::Config(format!(
                     "the adopted copy in `{}` holds `{}`, but the swap being undone displaced \
-                     `{}`; agentctl will not put back a credential it cannot match to that swap",
+                     `{}`; agctl will not put back a credential it cannot match to that swap",
                     store_dir.display(),
                     found8.as_deref().unwrap_or("an unreadable digest"),
                     from_digest8
@@ -2188,7 +2187,7 @@ fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
             if found8.as_deref() == Some(to_digest8.as_str()) {
                 return Err(AppError::Config(format!(
                     "the adopted copy in `{}` holds `{}`, which is the credential that swap \
-                     wrote rather than the one it displaced; agentctl will not put back a \
+                     wrote rather than the one it displaced; agctl will not put back a \
                      credential it cannot match to that swap",
                     store_dir.display(),
                     to_digest8
@@ -2213,7 +2212,7 @@ fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
     // the record itself carries — which is byte-for-byte the string the
     // forward swap matched against, because that is how the record was chosen
     // in the first place. The guard it feeds is the same one: the namespace
-    // agentctl derives now must be the namespace the item was made for.
+    // agctl derives now must be the namespace the item was made for.
     let inherited = recorded_spelling(&store).to_owned();
     let swap = Swap {
         paths: &paths,
@@ -2256,7 +2255,7 @@ const UNDO_TAIL: usize = 256;
 fn run_forget(config_dir: Option<&Path>, id: &str, yes: bool) -> Result<i32, AppError> {
     let paths = Paths::resolve(config_dir)?;
     paths.ensure_dirs()?;
-    let config = AgentctlConfig::load(&paths)?;
+    let config = AgctlConfig::load(&paths)?;
     let record = config.resolve_id(id)?.clone();
     let prompt = &mut Tty;
     isolate::forget_session(&paths, &record, prompt, yes)?;

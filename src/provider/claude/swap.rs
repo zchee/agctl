@@ -85,13 +85,13 @@ impl Phase {
 /// OQ1 added in front of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// **A** — the lock agentctl holds is compromised: its mtime moved under
+    /// **A** — the lock agctl holds is compromised: its mtime moved under
     /// us, so the protocol was violated before anything was written.
     CompromisedHold,
-    /// **C** — `CLAUDE_CODE_OAUTH_TOKEN` is set in agentctl's **own**
+    /// **C** — `CLAUDE_CODE_OAUTH_TOKEN` is set in agctl's **own**
     /// environment, which short-circuits every store (fact F19).
     ///
-    /// Decision D-020 narrowed this to agentctl's own environment: agentctl
+    /// Decision D-020 narrowed this to agctl's own environment: agctl
     /// cannot read another process's environment and will not guess at one.
     EnvToken,
     /// **D** — the credential does not fit fact F42's 4 032-byte keychain
@@ -101,7 +101,7 @@ pub enum Refusal {
     /// lose it (decision D-017).
     CannotAdopt(adopt::Refusal),
     /// The inherited `CLAUDE_SECURESTORAGE_CONFIG_DIR` names no store
-    /// agentctl owns (ruling OQ1).
+    /// agctl owns (ruling OQ1).
     ///
     /// Deliberately **not** lettered: it is decided before Phase A's work
     /// begins, and `--json` gives it `reason: "not_owned"` rather than a
@@ -193,7 +193,7 @@ pub enum Outcome {
     /// It is an outcome and **not** a lettered refusal. Reporting it as
     /// refusal **A** — as this used to — made the exit code contradict the
     /// audit line, which records `"outcome":"failed"`, and it filled the one
-    /// signal that means *somebody moved a lock agentctl was holding* with
+    /// signal that means *somebody moved a lock agctl was holding* with
     /// ordinary write failures.
     Failed,
     /// Nobody agreed to the swap: the confirmation was declined, or there was
@@ -220,13 +220,13 @@ pub enum Outcome {
     ///
     /// An outcome and **not** a lettered refusal: nothing about the store is
     /// wrong, nothing was written, and the remedy is one command
-    /// (`agentctl claude status`, which refreshes that item in place and
+    /// (`agctl claude status`, which refreshes that item in place and
     /// persists the result) rather than an investigation.
     NeedsRefresh,
     /// A refresh completed and was thrown away rather than written over a
     /// newer credential.
     Discarded,
-    /// Another process holds the store's locks and agentctl did not break
+    /// Another process holds the store's locks and agctl did not break
     /// them.
     Busy,
     /// One of plan section 3.4's refusals.
@@ -337,16 +337,16 @@ pub(crate) fn busy_note(holder_alive: bool, stopped_pids: &[u32]) -> String {
     if !stopped_pids.is_empty() {
         let pids: Vec<String> = stopped_pids.iter().map(u32::to_string).collect();
         return format!(
-            "a stopped claude process is present (pid {}). agentctl will not break this lock \
+            "a stopped claude process is present (pid {}). agctl will not break this lock \
              while one is, because it cannot tell whether that process is the holder. Resume or \
-             end it, or run `agentctl claude doctor --remove-stale <path> --yes`",
+             end it, or run `agctl claude doctor --remove-stale <path> --yes`",
             pids.join(", ")
         );
     }
     if holder_alive {
         "another process is refreshing this store's credentials".to_owned()
     } else {
-        "this store's refresh lock is held; agentctl did not break it".to_owned()
+        "this store's refresh lock is held; agctl did not break it".to_owned()
     }
 }
 

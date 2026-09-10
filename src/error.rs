@@ -9,7 +9,7 @@
 //! - [`EXIT_PARTIAL`] — the run produced output, but at least one *shown* row
 //!   failed, was refused, was locked, was busy, or could only be read stale.
 //!
-//! The partial/fatal split matters to callers that script `agentctl`: a exit
+//! The partial/fatal split matters to callers that script `agctl`: a exit
 //! status of 2 still carries a usable table on stdout, so a wrapper can render
 //! it and flag the degraded rows, whereas 1 means there is nothing to render.
 
@@ -83,7 +83,7 @@ fn retry_suffix(retry_after: Option<Duration>) -> String {
     }
 }
 
-/// Every failure `agentctl` reports to its caller.
+/// Every failure `agctl` reports to its caller.
 #[derive(Debug, Error)]
 pub enum AppError {
     /// The request cannot be carried out as configured. Fatal.
@@ -118,7 +118,7 @@ pub enum AppError {
 
     /// An OAuth grant was rejected.
     #[error("{}", if *invalid_grant {
-        "the stored refresh token was rejected (invalid_grant); run `agentctl claude login`"
+        "the stored refresh token was rejected (invalid_grant); run `agctl claude login`"
     } else {
         "authentication failed"
     })]
@@ -128,7 +128,7 @@ pub enum AppError {
         invalid_grant: bool,
     },
 
-    /// `agentctl` declined to act, to avoid disturbing another holder.
+    /// `agctl` declined to act, to avoid disturbing another holder.
     #[error("refused: {reason}")]
     Refused {
         /// Why the action was declined, in the user's terms.

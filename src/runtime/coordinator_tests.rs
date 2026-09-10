@@ -34,7 +34,7 @@ struct ChildOutcome {
 ///
 /// Shells out to `ps` rather than calling `kill(pid, 0)` so this stays inside
 /// the standard library: `libc` is only a transitive dependency here and
-/// nothing in agentctl uses it directly.
+/// nothing in agctl uses it directly.
 fn pid_is_alive(pid: u32) -> bool {
     let output = Command::new("/bin/ps")
         .arg("-p")

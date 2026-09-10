@@ -101,7 +101,7 @@ mod against_the_fake_script {
     /// cannot set environment variables safely — `std::env::set_var` is
     /// `unsafe` in edition 2024 and would race every other test in the
     /// binary. So the values are baked into a wrapper script instead, which
-    /// is what `AGENTCTL_SECURITY_BIN` would point at in the end-to-end
+    /// is what `AGCTL_SECURITY_BIN` would point at in the end-to-end
     /// suite.
     fn with_env(dir: &TempDir, vars: &[(&str, String)], inner: &std::path::Path) -> PathBuf {
         let mut script = String::from("#!/bin/sh\n");
@@ -136,16 +136,16 @@ mod against_the_fake_script {
 
     #[test]
     fn exit_36_is_locked() {
-        let harness = wired(&[("AGENTCTL_FAKE_SECURITY_PREFLIGHT_EXIT", "36".to_owned())]);
+        let harness = wired(&[("AGCTL_FAKE_SECURITY_PREFLIGHT_EXIT", "36".to_owned())]);
         assert_eq!(harness.reader.preflight(), KeychainStatus::Locked);
     }
 
     #[test]
     fn a_preflight_failure_is_unavailable_with_the_class_named() {
         let harness = wired(&[
-            ("AGENTCTL_FAKE_SECURITY_PREFLIGHT_EXIT", "1".to_owned()),
+            ("AGCTL_FAKE_SECURITY_PREFLIGHT_EXIT", "1".to_owned()),
             (
-                "AGENTCTL_FAKE_SECURITY_PREFLIGHT_STDERR",
+                "AGCTL_FAKE_SECURITY_PREFLIGHT_STDERR",
                 "security: unable to open the keychain".to_owned(),
             ),
         ]);
@@ -169,8 +169,7 @@ mod against_the_fake_script {
         fake_security::write_item(&items, "example", "Claude Code-credentials", b"{\"a\":1}\n")
             .expect("the item should be writable");
 
-        let harness =
-            wired(&[("AGENTCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned())]);
+        let harness = wired(&[("AGCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned())]);
         let blob = harness
             .reader
             .read("Claude Code-credentials")
@@ -183,8 +182,7 @@ mod against_the_fake_script {
     fn listing_parses_the_fixture_dump_and_filters_by_prefix() {
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/claude/security-dump.txt");
-        let harness =
-            wired(&[("AGENTCTL_FAKE_SECURITY_DUMP", path.to_string_lossy().into_owned())]);
+        let harness = wired(&[("AGCTL_FAKE_SECURITY_DUMP", path.to_string_lossy().into_owned())]);
 
         let claude = harness.reader.list_services("Claude Code").expect("the dump should parse");
         assert_eq!(claude.len(), 4, "three credential items plus the legacy key");
@@ -201,8 +199,8 @@ mod against_the_fake_script {
         let dir = TempDir::new().expect("a temporary directory");
         let log = dir.path().join("argv.log");
         let harness = wired(&[
-            ("AGENTCTL_FAKE_SECURITY_DUMP", dump.to_string_lossy().into_owned()),
-            ("AGENTCTL_FAKE_SECURITY_LOG", log.to_string_lossy().into_owned()),
+            ("AGCTL_FAKE_SECURITY_DUMP", dump.to_string_lossy().into_owned()),
+            ("AGCTL_FAKE_SECURITY_LOG", log.to_string_lossy().into_owned()),
         ]);
 
         harness.reader.list_services("Claude Code").expect("the dump should parse");
@@ -224,8 +222,8 @@ mod against_the_fake_script {
         let dir = TempDir::new().expect("a temporary directory");
         let log = dir.path().join("argv.log");
         let harness = wired(&[
-            ("AGENTCTL_FAKE_SECURITY_DUMP", dump.to_string_lossy().into_owned()),
-            ("AGENTCTL_FAKE_SECURITY_LOG", log.to_string_lossy().into_owned()),
+            ("AGCTL_FAKE_SECURITY_DUMP", dump.to_string_lossy().into_owned()),
+            ("AGCTL_FAKE_SECURITY_LOG", log.to_string_lossy().into_owned()),
         ]);
 
         harness.reader.preflight();
@@ -260,8 +258,8 @@ mod against_the_fake_script {
         .expect("the item should be writable");
         let log = dir.path().join("argv.log");
         let harness = wired(&[
-            ("AGENTCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned()),
-            ("AGENTCTL_FAKE_SECURITY_LOG", log.to_string_lossy().into_owned()),
+            ("AGCTL_FAKE_SECURITY_ITEMS", items.to_string_lossy().into_owned()),
+            ("AGCTL_FAKE_SECURITY_LOG", log.to_string_lossy().into_owned()),
         ]);
 
         harness.reader.read("Claude Code-credentials").expect("no error");
@@ -274,7 +272,7 @@ mod against_the_fake_script {
     fn a_hanging_child_is_killed_at_its_budget() {
         // Fact F34's 2 000 ms read budget, and invariant I12: a keychain
         // prompt nobody answers must not hold the pass open.
-        let harness = wired(&[("AGENTCTL_FAKE_SECURITY_SLEEP", "30".to_owned())]);
+        let harness = wired(&[("AGCTL_FAKE_SECURITY_SLEEP", "30".to_owned())]);
         let start = Instant::now();
         let status = harness.reader.preflight();
         let elapsed = start.elapsed();
@@ -286,7 +284,7 @@ mod against_the_fake_script {
 
     #[test]
     fn a_hanging_read_is_a_timeout_not_a_fallback() {
-        let harness = wired(&[("AGENTCTL_FAKE_SECURITY_SLEEP", "30".to_owned())]);
+        let harness = wired(&[("AGCTL_FAKE_SECURITY_SLEEP", "30".to_owned())]);
         let err = harness
             .reader
             .read("Claude Code-credentials")
@@ -311,8 +309,8 @@ mod against_the_fake_script {
     #[test]
     fn a_classified_read_failure_carries_its_class() {
         let harness = wired(&[
-            ("AGENTCTL_FAKE_SECURITY_FIND_EXIT", "1".to_owned()),
-            ("AGENTCTL_FAKE_SECURITY_STDERR", "errSecInteractionNotAllowed".to_owned()),
+            ("AGCTL_FAKE_SECURITY_FIND_EXIT", "1".to_owned()),
+            ("AGCTL_FAKE_SECURITY_STDERR", "errSecInteractionNotAllowed".to_owned()),
         ]);
         let err = harness.reader.read("Claude Code-credentials").expect_err("exit 1 is a failure");
         assert!(
@@ -329,7 +327,7 @@ mod against_the_fake_script {
 
     #[test]
     fn exit_36_on_a_read_is_locked() {
-        let harness = wired(&[("AGENTCTL_FAKE_SECURITY_FIND_EXIT", "36".to_owned())]);
+        let harness = wired(&[("AGCTL_FAKE_SECURITY_FIND_EXIT", "36".to_owned())]);
         let err = harness.reader.read("Claude Code-credentials").expect_err("36 is a failure");
         assert_eq!(err, KeychainError::Locked);
     }

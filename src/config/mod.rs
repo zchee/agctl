@@ -1,13 +1,13 @@
-//! The account registry: what agentctl knows about, and how it knows it.
+//! The account registry: what agctl knows about, and how it knows it.
 //!
 //! One JSON document, `config.json`, holds one [`AccountRecord`] per account
-//! agentctl has been told about. The record's [`AccountKind`] is the important
+//! agctl has been told about. The record's [`AccountKind`] is the important
 //! part, because it decides where the credentials come from and — far more
-//! importantly — whether agentctl may write them:
+//! importantly — whether agctl may write them:
 //!
-//! - [`AccountKind::Owned`] — created by `agentctl claude login`. The
+//! - [`AccountKind::Owned`] — created by `agctl claude login`. The
 //!   credentials live in this store, under `claude/<acct>/<org>/`, and
-//!   agentctl refreshes them.
+//!   agctl refreshes them.
 //! - [`AccountKind::Live`] — the credentials Claude Code itself is using.
 //!   Read-only, always (decision D-001): a refresh here would rotate the
 //!   token out from under a running session.
@@ -16,11 +16,11 @@
 //!   only so the user can see it exists.
 //! - [`AccountKind::Foreign`] — a credential that exists on the machine but
 //!   belongs to something else: another tool's keychain item, or a token in
-//!   the environment. agentctl reports that it is there and never reads it,
+//!   the environment. agctl reports that it is there and never reads it,
 //!   so such a row is always `needs login`.
 //!
 //! The registry is small and rewritten whole. It is still written under a lock
-//! and through a temporary file, because two `agentctl` processes racing to
+//! and through a temporary file, because two `agctl` processes racing to
 //! add an account must not leave a truncated document behind.
 
 pub mod import;
@@ -55,7 +55,7 @@ pub const CONFIG_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The registry document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentctlConfig {
+pub struct AgctlConfig {
     /// Schema version; [`CONFIG_VERSION`] for anything this build wrote.
     pub version: u32,
     /// Every account this store knows about, in insertion order.
@@ -74,7 +74,7 @@ pub struct AgentctlConfig {
     pub forgotten_services: Vec<String>,
 }
 
-impl Default for AgentctlConfig {
+impl Default for AgctlConfig {
     fn default() -> Self {
         Self { version: CONFIG_VERSION, accounts: Vec::new(), forgotten_services: Vec::new() }
     }
@@ -94,7 +94,7 @@ pub struct AccountRecord {
     pub org_name: Option<String>,
     /// A user-chosen label, from `login --label`.
     pub label: Option<String>,
-    /// Where the credentials live and whether agentctl may write them.
+    /// Where the credentials live and whether agctl may write them.
     pub kind: AccountKind,
     /// Whether the user has asked for this row to be hidden.
     #[serde(default)]
@@ -128,7 +128,7 @@ impl AccountRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AccountKind {
-    /// Created by `agentctl claude login`; agentctl owns and refreshes it.
+    /// Created by `agctl claude login`; agctl owns and refreshes it.
     Owned {
         /// The namespace directory as it was spelled at login time, NFC
         /// normalized. Recorded so a moved store can be reported rather than
@@ -151,8 +151,8 @@ pub enum AccountKind {
         /// account.
         shares_live_dir: bool,
     },
-    /// A credential belonging to something that is not agentctl and not
-    /// Claude Code, so there is nothing here agentctl may read.
+    /// A credential belonging to something that is not agctl and not
+    /// Claude Code, so there is nothing here agctl may read.
     ///
     /// Synthesized by discovery from the keychain listing and from the
     /// environment; no command records one.
@@ -176,7 +176,7 @@ impl AccountKind {
     }
 }
 
-impl AgentctlConfig {
+impl AgctlConfig {
     /// Reads the registry, treating an absent file as an empty registry.
     ///
     /// # Errors
@@ -197,7 +197,7 @@ impl AgentctlConfig {
         };
 
         let config: Self = serde_json::from_slice(&bytes).map_err(|err| {
-            AppError::Config(format!("`{}` is not a valid agentctl config: {err}", path.display()))
+            AppError::Config(format!("`{}` is not a valid agctl config: {err}", path.display()))
         })?;
         if config.version != CONFIG_VERSION {
             return Err(AppError::Config(format!(

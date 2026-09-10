@@ -1,11 +1,11 @@
 #![cfg(feature = "testing")]
 
-//! `doctor --remove-stale` outside agentctl's own namespace root (plan AC73,
+//! `doctor --remove-stale` outside agctl's own namespace root (plan AC73,
 //! section 3.9 row 2), driven through the real binary.
 //!
 //! Invariant I11′ confines every lock removal to
 //! `<config-dir>/claude` — with exactly one exception, and this file is that
-//! exception's test. When agentctl holds Claude Code's locks it writes a
+//! exception's test. When agctl holds Claude Code's locks it writes a
 //! held-lock record before its first `mkdir`, and a crash leaves the record
 //! behind naming directories nothing else will ever remove. Those directories
 //! can be in `~/.claude` by construction, so without this branch premortem PM9
@@ -55,7 +55,7 @@ fn write_record(fixture: &Fixture, pid: u32, store_dir: &Path, held: &[&Path]) -
     fs::create_dir_all(&dir).expect("the held-locks directory should be creatable");
     let held: Vec<String> = held.iter().map(|path| path.to_string_lossy().into_owned()).collect();
     let record = json!({
-        "agentctl_pid": pid,
+        "agctl_pid": pid,
         "tree": "live",
         "store_dir": store_dir.to_string_lossy(),
         "paths": held,
@@ -104,7 +104,7 @@ fn ac73_remove_stale_clears_a_leak_a_dead_record_names() {
 
     assert!(!leaked.exists(), "the leaked lock directory is gone");
     assert!(fixture.live_store_dir().exists(), "and the store around it is untouched");
-    assert!(fixture.credentials_path(ACCT, ORG).exists(), "as is everything agentctl owns");
+    assert!(fixture.credentials_path(ACCT, ORG).exists(), "as is everything agctl owns");
 }
 
 #[test]

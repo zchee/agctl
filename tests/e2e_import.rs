@@ -1,6 +1,6 @@
 #![cfg(feature = "testing")]
 
-//! `agentctl claude import --from keychain`, driven through the real binary.
+//! `agctl claude import --from keychain`, driven through the real binary.
 //!
 //! Decision D-010 removed the `claude-switcher` importer, so the keychain is
 //! the only source left and plan AC10 keeps its dry-run and idempotency
@@ -117,7 +117,7 @@ fn ac10_a_second_import_is_a_no_op() {
 #[test]
 fn ac10_an_import_never_downgrades_a_logged_in_account() {
     // Decision D-007's real point. The item in the keychain and the account
-    // agentctl owns are the same account, reached two ways. Recording the
+    // agctl owns are the same account, reached two ways. Recording the
     // keychain one would turn a refreshable account into a read-only row, so
     // the import reports it and stops.
     let mut fixture = Fixture::new();
@@ -164,7 +164,7 @@ fn ac10_an_import_never_downgrades_a_logged_in_account() {
 fn ac19_an_import_records_in_place_and_writes_nothing_else() {
     // Plan AC19, decision D-009 and invariant I1: the credentials stay exactly
     // where they were — in the login keychain, which phase 1 never writes —
-    // and the only thing that changes on disk is agentctl's own registry.
+    // and the only thing that changes on disk is agctl's own registry.
     let fixture = keychain_store();
     let before = fixture.keychain_items();
 
@@ -199,7 +199,7 @@ fn ac19_an_alias_of_the_live_directory_is_warned_about() {
     // line can turn out to be the live store under another spelling. It is
     // recorded — under the name it was given, because that spelling is what
     // the keychain item is named after — but flagged, because its credentials
-    // are the live account's and refreshing it is not agentctl's business.
+    // are the live account's and refreshing it is not agctl's business.
     let mut fixture = Fixture::new();
     fixture.with_keychain();
 

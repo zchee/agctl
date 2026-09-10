@@ -17,9 +17,9 @@
 //!    I15), which is the whole reason this transport exists rather than the
 //!    argv form Claude Code falls back to for an over-long line.
 //! 3. **There is no delete path.** `delete-generic-password` is issued
-//!    nowhere in agentctl (fact F43, non-goal in plan section 1.2): a swap
+//!    nowhere in agctl (fact F43, non-goal in plan section 1.2): a swap
 //!    updates an item in place with `-U`, so a failed write leaves the
-//!    previous credential intact and nothing agentctl does can make an item
+//!    previous credential intact and nothing agctl does can make an item
 //!    disappear. This comment is the only place in `src/` that names the
 //!    subcommand, so the gate's grep has exactly one hit to expect.
 //!
@@ -76,7 +76,7 @@ use crate::secret::security_cli::EXIT_NOT_FOUND;
 ///
 /// Claude Code compares `<= 4032` against the whole line including the `\n`
 /// and, when the line is longer, falls back to putting the hex in **argv**.
-/// agentctl has no such fallback: a line one byte over the limit is
+/// agctl has no such fallback: a line one byte over the limit is
 /// [`KeychainWriteError::LineTooLong`] and nothing is spawned (refusal D,
 /// invariant I15).
 pub const SECURITY_STDIN_LIMIT: usize = 4032;
@@ -108,7 +108,7 @@ const WRITE_ARGV: [&str; 1] = ["-i"];
 ///
 /// Private fields on purpose (invariant I1′): with no public constructor
 /// taking a string, and no struct literal available outside this module, the
-/// set of items agentctl can write is exactly the set the two constructors
+/// set of items agctl can write is exactly the set the two constructors
 /// below can name. `#[derive(Debug)]` is safe — a service name and a directory
 /// are not secrets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,7 +152,7 @@ impl WriteTarget {
         Ok(Self { store_dir: live_store_dir(env), service: service_name(env) })
     }
 
-    /// The namespaced item a Claude Code session migrated an agentctl
+    /// The namespaced item a Claude Code session migrated an agctl
     /// namespace to (fact F35, decision D-015).
     pub fn migrated(sha8: OwnedSha8) -> Self {
         Self { store_dir: sha8.store_dir, service: format!("{LIVE_SERVICE}-{}", sha8.sha8) }
@@ -169,9 +169,9 @@ impl WriteTarget {
     }
 }
 
-/// The `sha8` of a namespace agentctl owns, and that namespace's directory.
+/// The `sha8` of a namespace agctl owns, and that namespace's directory.
 ///
-/// One constructor, from a registry record, because an item agentctl did not
+/// One constructor, from a registry record, because an item agctl did not
 /// create must never be nameable as a write target (risk R40). Private fields
 /// for the same reason [`WriteTarget`]'s are private.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,7 +184,7 @@ impl OwnedSha8 {
     /// The `sha8` of an [`AccountKind::Owned`] record, or `None`.
     ///
     /// `None` for every other kind — `Live`, `ConfigDirReadOnly` and `Foreign`
-    /// are read-only by decision D-001 and have no namespace agentctl
+    /// are read-only by decision D-001 and have no namespace agctl
     /// refreshes — and also for a record whose stored `export_sha8` is not
     /// eight lowercase hex digits, or whose namespace directory does not spell
     /// a path under [`Paths::namespace_root`]. Both of those mean a registry
@@ -237,7 +237,7 @@ pub enum KeychainWriteError {
     /// Not in the plan's enum, and added deliberately: the two parameters that
     /// name the item — `account` and the target's service — are otherwise
     /// unused by the transport, because the names travel *inside* the line. If
-    /// they are allowed to disagree, agentctl writes one item and audits
+    /// they are allowed to disagree, agctl writes one item and audits
     /// another, which is risk R42 arriving by a different road.
     #[error("this keychain line was built for `{found}`, not for `{expected}`")]
     TargetMismatch {
@@ -495,7 +495,7 @@ fn security_bin() -> Result<PathBuf, KeychainWriteError> {
 
 /// The `security(1)` a `testing` build may write through, or a refusal.
 ///
-/// **Fails closed.** With `AGENTCTL_SECURITY_BIN` unset there is no stand-in
+/// **Fails closed.** With `AGCTL_SECURITY_BIN` unset there is no stand-in
 /// wired, and falling back to the real binary would let any test that reached
 /// this path create an item in the developer's own login keychain — which is
 /// exactly what happened once, from a unit test that made a migrated namespace

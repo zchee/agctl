@@ -1,4 +1,4 @@
-//! `agentctl claude import`, run end to end in this process.
+//! `agctl claude import`, run end to end in this process.
 //!
 //! Each test stands up a temporary store and a scripted keychain, runs
 //! [`run_with`] — the same code path the command runs — and then asserts on
@@ -82,8 +82,8 @@ impl Store {
         found
     }
 
-    fn config(&self) -> AgentctlConfig {
-        AgentctlConfig::load(&self.paths).expect("the registry should be readable")
+    fn config(&self) -> AgctlConfig {
+        AgctlConfig::load(&self.paths).expect("the registry should be readable")
     }
 
     fn registry_bytes(&self) -> Vec<u8> {
@@ -110,9 +110,9 @@ fn collect_files(root: &Path, dir: &Path, found: &mut Vec<String>) {
 ///
 /// Going through `clap` rather than building the struct pins the spellings
 /// down too: `--claude-config-dir` is deliberately not `--config-dir`, which
-/// is the global option naming agentctl's own store.
+/// is the global option naming agctl's own store.
 fn args(argv: &[&str]) -> ImportArgs {
-    let mut full = vec!["agentctl", "claude", "import"];
+    let mut full = vec!["agctl", "claude", "import"];
     full.extend_from_slice(argv);
     let cli = Cli::try_parse_from(full).expect("the argument list should parse");
     let Command::Claude { command: ClaudeCommand::Import(args) } = cli.command else {

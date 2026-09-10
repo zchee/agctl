@@ -30,7 +30,7 @@
 //! A response describes the same credit balance twice, in `extra_usage` and
 //! in `spend`, and the two disagree in shape and sometimes in value. Only
 //! `extra_usage` is read (decision D-006): it is the object the web UI drives
-//! its own credits panel from, so following it is what keeps agentctl and the
+//! its own credits panel from, so following it is what keeps agctl and the
 //! site quoting the same number. `spend` is peeked at for exactly two
 //! contradiction checks and is otherwise passed through untouched, visible in
 //! `--raw` alone — parsing it into a second typed value would create a second
@@ -118,7 +118,7 @@ pub const PERCENT_AGREEMENT_TOLERANCE: f64 = 1.0;
 
 /// Redirects the base URL. Test seam only (plan section 3.9).
 #[cfg(feature = "testing")]
-pub const USAGE_URL_ENV: &str = "AGENTCTL_CLAUDE_USAGE_URL";
+pub const USAGE_URL_ENV: &str = "AGCTL_CLAUDE_USAGE_URL";
 
 /// A client for one pass's worth of usage requests.
 ///
@@ -295,7 +295,7 @@ pub fn parse_usage(
         tracing::warn!(
             credits.warning = %warning,
             "the credits column may not match the web UI for this account; \
-             `agentctl claude status --raw` shows what the server sent"
+             `agctl claude status --raw` shows what the server sent"
         );
     }
 

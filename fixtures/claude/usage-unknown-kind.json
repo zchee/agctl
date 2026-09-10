@@ -1,5 +1,5 @@
 {
-  "_comment": "SYNTHETIC. Hand-written for plan AC4 and risk R3: a `limits[]` entry whose `kind` this build has never seen (`monthly_foo`, with a `group` and a `scope` shape to match). agentctl must render it as an `Unknown` row and exit 0 rather than dropping it or failing, which is what keeps a server-side addition visible instead of silent. Not captured from the API.",
+  "_comment": "SYNTHETIC. Hand-written for plan AC4 and risk R3: a `limits[]` entry whose `kind` this build has never seen (`monthly_foo`, with a `group` and a `scope` shape to match). agctl must render it as an `Unknown` row and exit 0 rather than dropping it or failing, which is what keeps a server-side addition visible instead of silent. Not captured from the API.",
   "five_hour": null,
   "seven_day": null,
   "seven_day_opus": null,

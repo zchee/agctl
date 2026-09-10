@@ -1,4 +1,4 @@
-//! agentctl's own credential file: reading it, replacing it atomically, and
+//! agctl's own credential file: reading it, replacing it atomically, and
 //! recovering when the replacement did not land.
 //!
 //! The file is `<config_dir>/claude/<acct>/<org>/.credentials.json`, in
@@ -25,7 +25,7 @@
 //! fallback: Claude Code has one (fact F40) and it is the right call for a
 //! program that must not fail to save a login, but a truncate-then-write of a
 //! credentials file is a window in which a crash leaves no credentials at all.
-//! agentctl would rather leave the old file in place and hand the new one to
+//! agctl would rather leave the old file in place and hand the new one to
 //! the next run, which is what [`WriteOutcome::SavedToPending`] is.
 //!
 //! # The path check and the directory walk are two different checks
@@ -34,7 +34,7 @@
 //! is lexical: it says what a path *spells*, not where it *points*. On its own
 //! it does not stop a symlinked `<acct>` or `<org>` component from redirecting
 //! a write — or a delete — into a running Claude Code's store, which is a
-//! directory another local process can create before agentctl first writes
+//! directory another local process can create before agctl first writes
 //! there. So every mutation in this module goes through
 //! [`open_namespace_dir`], which walks down from the namespace root one
 //! component at a time with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` and then
@@ -170,7 +170,7 @@ pub enum ReadOutcome {
 pub enum FileStoreError {
     /// The path, or a directory on the way to it, is a symbolic link. Never
     /// followed, never overwritten.
-    #[error("`{0}` is a symbolic link; agentctl will not read or write through one")]
+    #[error("`{0}` is a symbolic link; agctl will not read or write through one")]
     RefusedSymlink(PathBuf),
     /// The path exists but is not what belongs there: a credentials or
     /// metadata file must be a regular file, and a component of the namespace
@@ -188,7 +188,7 @@ pub enum FileStoreError {
         limit: u64,
     },
     /// The path is not inside this store's namespace root (invariant I1).
-    #[error("`{0}` is outside the agentctl namespace root; refusing to write")]
+    #[error("`{0}` is outside the agctl namespace root; refusing to write")]
     OutsideNamespaceRoot(PathBuf),
     /// A directory that had to be empty was not. Reported rather than
     /// recursed: see [`remove_dir_under`].
@@ -274,7 +274,7 @@ pub fn snapshot(path: &Path) -> io::Result<Option<FileSnapshot>> {
     Ok(Some(snapshot_of(&meta)))
 }
 
-/// [`snapshot`] for a file agentctl only ever reads and never writes, such as
+/// [`snapshot`] for a file agctl only ever reads and never writes, such as
 /// Claude Code's own `.claude.json`: symbolic links are followed, because on
 /// this machine `~/.claude.json` *is* one (fact F41) and refusing it would
 /// blind the live row rather than protect anything.
@@ -290,7 +290,7 @@ pub fn snapshot_following(path: &Path) -> io::Result<Option<FileSnapshot>> {
     }
 }
 
-/// [`read_file`] for a file agentctl only ever reads and never writes: the
+/// [`read_file`] for a file agctl only ever reads and never writes: the
 /// same regular-file and size rules, but a symbolic link is followed rather
 /// than refused (see [`snapshot_following`]).
 ///
@@ -1201,7 +1201,7 @@ pub fn open_namespace_dir(paths: &Paths, ns_dir: &Path) -> Result<OwnedFd, FileS
 /// to it without ever following a symbolic link.
 ///
 /// `doctor --remove-stale` is the only caller, and it is the only thing in
-/// agentctl that removes a lock artefact at all. Its own path check is
+/// agctl that removes a lock artefact at all. Its own path check is
 /// lexical — it compares spellings — and a lexical check cannot see a
 /// symbolic link planted at `<acct>` or `<org>`:
 /// `<root>/<acct>/<org>/.oauth_refresh.lock` spells a location under the root
@@ -1213,7 +1213,7 @@ pub fn open_namespace_dir(paths: &Paths, ns_dir: &Path) -> Result<OwnedFd, FileS
 ///
 /// This replaced a phase-1 `remove_file_under_root` that unlinked *without*
 /// `AT_REMOVEDIR`, which could not remove a lock artefact at all: every one of
-/// them is a directory (`agentctl-nz5`, fact F45). Nothing else in the crate
+/// them is a directory (`agctl-nz5`, fact F45). Nothing else in the crate
 /// needed the file version, so it is gone rather than left as a second, wrong
 /// way to do this.
 ///
@@ -1236,7 +1236,7 @@ pub fn remove_dir_under_root(paths: &Paths, path: &Path) -> Result<(), FileStore
 /// [`remove_dir_under_root`] with the `O_NOFOLLOW` walk anchored elsewhere.
 ///
 /// `doctor --remove-stale` uses the other anchor for the single path outside
-/// the namespace root it will act on: a lock directory a crashed agentctl left
+/// the namespace root it will act on: a lock directory a crashed agctl left
 /// in the store it was holding, named by a held-lock record whose process is
 /// dead (plan section 3.9). That anchor is the record's store directory's
 /// *parent*, which leaves both components the record cannot vouch for — the
@@ -1462,7 +1462,7 @@ fn create_dir_at(
 ) -> Result<OwnedFd, FileStoreError> {
     match rustix::fs::mkdirat(dir, name, Mode::RWXU) {
         Ok(()) => {}
-        // Another process creating it first is a race agentctl wins by
+        // Another process creating it first is a race agctl wins by
         // re-opening rather than by failing; the re-open still refuses a link.
         Err(errno) if errno == Errno::EXIST => {}
         Err(errno) => {

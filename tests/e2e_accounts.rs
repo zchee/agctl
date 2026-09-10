@@ -5,7 +5,7 @@
 //! These commands are the ones that *remove* things, so the tests are mostly
 //! about what they refuse. Invariant I1 says phase 1 never writes or deletes a
 //! keychain item; invariant I9 says a namespace is only ever deleted under its
-//! own lock, and never the lock itself; invariant I11 says agentctl removes a
+//! own lock, and never the lock itself; invariant I11 says agctl removes a
 //! Claude Code lock artefact in exactly one circumstance and no other. Each of
 //! those is a sentence about something that must *not* happen, which is what
 //! makes it worth asserting from outside the process.
@@ -97,7 +97,7 @@ fn ac26_remove_with_delete_secret_clears_the_namespace_and_keeps_the_lock() {
 #[test]
 fn ac26_remove_refuses_a_read_only_row() {
     // Invariant I9 and I1: the credentials behind a keychain-backed row are
-    // not agentctl's to delete, and phase 1 has no code path that could.
+    // not agctl's to delete, and phase 1 has no code path that could.
     let mut fixture = Fixture::new();
     fixture.with_keychain();
     let service = format!("{LIVE_SERVICE}-deadbeef");
@@ -239,7 +239,7 @@ fn ac40_relocate_refuses_when_the_target_is_occupied() {
 
 #[test]
 fn ac47_forget_hides_a_service_without_ever_reading_it_again() {
-    // Plan AC47: `forget` is a display decision, recorded in agentctl's own
+    // Plan AC47: `forget` is a display decision, recorded in agctl's own
     // registry. The keychain item is not touched — not written, not deleted,
     // and after this, not even read (the check happens before the
     // `find-generic-password`, invariant I1).
@@ -398,7 +398,7 @@ fn ac45_doctor_remove_stale_refuses_everything_it_should() {
 
     // A regular file at an artefact's name. Claude Code makes its locks with
     // `mkdir` (fact F45), so this was written by something else: it is
-    // reported as anomalous and never removed (`agentctl-nz5`, AC73).
+    // reported as anomalous and never removed (`agctl-nz5`, AC73).
     let anomalous = ns_dir.join(".storage-write");
     fs::write(&anomalous, "{}").expect("writable");
     age(&anomalous);
@@ -431,7 +431,7 @@ fn ac45_doctor_remove_stale_refuses_everything_it_should() {
         .assert()
         .code(1)
         .stderr(contains("`--yes` is required"))
-        .stdout(contains("This is Claude Code's lock, not agentctl's"));
+        .stdout(contains("This is Claude Code's lock, not agctl's"));
     assert!(fresh.exists(), "nothing was removed");
     assert!(fixture.credentials_path(ACCT, ORG).exists());
 }
@@ -448,7 +448,7 @@ fn ac45_doctor_remove_stale_removes_a_lapsed_artefact_after_two_samples() {
     // A directory, because that is what Claude Code's `mkdir` leaves (fact
     // F45). Phase 1's fixture wrote a regular file here, which is the whole of
     // why AC45 passed against a command that could not remove a real artefact
-    // (`agentctl-nz5`, AC73).
+    // (`agctl-nz5`, AC73).
     fs::create_dir(&artefact).expect("the lock directory should be creatable");
     age(&artefact);
 

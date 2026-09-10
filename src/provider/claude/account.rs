@@ -1,4 +1,4 @@
-//! What one row of `agentctl claude status` is, and what its state means.
+//! What one row of `agctl claude status` is, and what its state means.
 //!
 //! [`AccountState`] is the vocabulary the whole program shares for "what is
 //! going on with this account". Two of its methods carry real weight beyond
@@ -26,7 +26,7 @@ pub enum AccountState {
     Ok,
     /// The access token has expired.
     Expired {
-        /// Whether this row is one agentctl may not refresh — the live row,
+        /// Whether this row is one agctl may not refresh — the live row,
         /// a foreign configuration directory, a migrated namespace. Such a
         /// row can only wait for its owner to refresh it (decision D-001).
         read_only: bool,
@@ -40,14 +40,14 @@ pub enum AccountState {
     /// A keychain item naming the same physical directory as the live store,
     /// holding different credentials. Hidden by default (plan AC42).
     StaleSiblingOfLive,
-    /// A Claude Code credentials item that no agentctl record claims.
+    /// A Claude Code credentials item that no agctl record claims.
     Unclaimed,
-    /// A credential belonging to something that is not agentctl and not
+    /// A credential belonging to something that is not agctl and not
     /// Claude Code — another tool's keychain item (fact F10). Listed so the
     /// user can see it is there, hidden by default, and never read.
     ///
     /// Distinct from [`AccountState::Unclaimed`], which is a Claude Code
-    /// credentials item agentctl *could* adopt. Nothing here is adoptable, so
+    /// credentials item agctl *could* adopt. Nothing here is adoptable, so
     /// a consumer branching on the `state` token must be able to tell the two
     /// apart.
     Foreign {
@@ -68,7 +68,7 @@ pub enum AccountState {
     /// is in the adopted copy beside it (decisions D-017, D-024).
     ///
     /// Distinct from [`AccountState::MigratedToKeychain`], which is the same
-    /// account's credential in a place agentctl may not write. Here the item
+    /// account's credential in a place agctl may not write. Here the item
     /// is readable and writable but is *not this row's*, so it is never read
     /// for this row, never refreshed for it, and never adopted into it
     /// (ruling OQ2(d), W3 re-review N1). The row is still perfectly usable:

@@ -2,7 +2,7 @@
 //! AC47).
 //!
 //! Every test stands up a temporary store and a scripted keychain, runs the
-//! same functions `agentctl claude accounts` runs, and then asserts on the
+//! same functions `agctl claude accounts` runs, and then asserts on the
 //! filesystem and the registry rather than only on the words printed. That is
 //! what lets them prove the negative claims: the lock file survives the
 //! command that deletes the namespace it protects, `forget` never issues a
@@ -65,8 +65,8 @@ impl Store {
         PassCtx::standalone(self.cancel.clone(), Instant::now() + Duration::from_secs(30))
     }
 
-    fn config(&self) -> AgentctlConfig {
-        AgentctlConfig::load(&self.paths).expect("the registry should be readable")
+    fn config(&self) -> AgctlConfig {
+        AgctlConfig::load(&self.paths).expect("the registry should be readable")
     }
 
     fn ns_dir(&self, org: &str) -> PathBuf {
@@ -193,7 +193,7 @@ fn record_owned(store: &Store, org: &str) {
     .expect("the fixture identifiers are valid path segments");
     record.email = Some("owner@example.com".to_owned());
     record.org_name = Some("Acme".to_owned());
-    AgentctlConfig::update(&store.paths, |config| config.upsert(record))
+    AgctlConfig::update(&store.paths, |config| config.upsert(record))
         .expect("the registry should be writable");
 }
 
@@ -210,7 +210,7 @@ fn record_config_dir(store: &Store, service: &str, shares_live_dir: bool) {
     )
     .expect("the fixture identifiers are valid path segments");
     record.email = Some("other@example.com".to_owned());
-    AgentctlConfig::update(&store.paths, |config| config.upsert(record))
+    AgctlConfig::update(&store.paths, |config| config.upsert(record))
         .expect("the registry should be writable");
 }
 
@@ -237,7 +237,7 @@ fn record_service_keyed(store: &Store, service: &str) {
         forgotten: false,
         created_at: jiff::Timestamp::now().to_string(),
     };
-    AgentctlConfig::update(&store.paths, |config| config.upsert(record))
+    AgctlConfig::update(&store.paths, |config| config.upsert(record))
         .expect("the registry should be writable");
 }
 
@@ -268,7 +268,7 @@ fn sibling_service(store: &Store) -> String {
     format!("{LIVE_SERVICE}-{}", sha8(&export_spelling(&store.home.join(".claude"))))
 }
 
-/// A keychain no agentctl record claims.
+/// A keychain no agctl record claims.
 fn unclaimed_service() -> String {
     format!("{LIVE_SERVICE}-6cdd6b98")
 }
@@ -483,7 +483,7 @@ fn remove_declined_changes_nothing() {
 #[test]
 fn remove_refuses_a_read_only_row() {
     // Invariant I9. Deleting the record would leave the credential exactly
-    // where it is, because agentctl cannot delete a keychain item at all.
+    // where it is, because agctl cannot delete a keychain item at all.
     let store = store();
     let service = unclaimed_service();
     record_config_dir(&store, &service, false);
@@ -642,7 +642,7 @@ fn relocate_falls_back_to_the_profile_endpoint() {
         &server.url("/authorize"),
         &server.url("/token"),
         &server.url(PROFILE_PATH),
-        "agentctl/test",
+        "agctl/test",
     )
     .expect("the mock endpoints are usable URLs");
 
@@ -748,7 +748,7 @@ fn remove_delete_secret_refuses_a_service_keyed_read_only_record() {
     // organization is `_unknown-org`. `--delete-secret` on it must refuse
     // before it goes looking for `claude/<service name>/_unknown-org/`, and
     // must not drop the record either — the credential is in the login
-    // keychain, which agentctl never writes (invariant I9, decision D-001).
+    // keychain, which agctl never writes (invariant I9, decision D-001).
     let store = store();
     let service = unclaimed_service();
     record_service_keyed(&store, &service);
@@ -843,12 +843,12 @@ fn show_still_prints_the_account_uuid_of_an_identified_read_only_row() {
 }
 
 #[test]
-fn forget_refuses_a_service_that_is_not_agentctls_to_hide() {
-    // Plan AC47 hides agentctl's own rows. A `claude-switcher:*` item is not
+fn forget_refuses_a_service_that_is_not_agctls_to_hide() {
+    // Plan AC47 hides agctl's own rows. A `claude-switcher:*` item is not
     // one: it is hidden already, never read (fact F10), and `forgotten_services`
     // is consulted only where an unclaimed `Claude Code-credentials-<sha8>`
     // item is being decided about — so recording one would change nothing
-    // while telling the user agentctl had touched another tool's credential.
+    // while telling the user agctl had touched another tool's credential.
     let store = store();
     let switcher = format!("{SWITCHER_SERVICE_PREFIX}someone@example.com");
 
@@ -876,7 +876,7 @@ fn forget_refuses_a_service_that_is_not_agentctls_to_hide() {
     let err = forget(&store.accounts(), "Claude Code-6cdd6b98", true, &mut io)
         .expect_err("a legacy API-key item is refused");
     let message = err.to_string();
-    assert!(message.contains("is not an item agentctl reports"), "{message}");
+    assert!(message.contains("is not an item agctl reports"), "{message}");
     assert_eq!(err.exit_code(), crate::error::EXIT_FATAL);
     assert!(store.config().forgotten_services.is_empty(), "still nothing was recorded");
 }

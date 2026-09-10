@@ -4,7 +4,7 @@
 //! the process except to Anthropic.**
 //!
 //! The plan's own verification step is to run the suite under
-//! `RUST_LOG=agentctl=trace` and grep the log for `sk-ant-`. Run that way from
+//! `RUST_LOG=agctl=trace` and grep the log for `sk-ant-`. Run that way from
 //! the outside it proves less than it looks like it does: every command the
 //! end-to-end harness starts has its standard error read through a pipe, so
 //! the binary's trace stream never reaches the file being grepped.
@@ -61,7 +61,7 @@ fn assert_no_token_material(what: &str, stdout: &str, stderr: &str) {
 #[test]
 fn the_harness_drains_a_child_that_fills_its_standard_error_pipe() {
     // Turning the trace level up is what makes this file's other tests
-    // interesting, and it is also what makes agentctl write far more to
+    // interesting, and it is also what makes agctl write far more to
     // standard error than a pipe holds — about 64 KiB. A harness that read the
     // two streams in turn would sit on standard output forever while the child
     // sat on a full standard error, so this pins the property `common::finish`
@@ -131,7 +131,7 @@ fn section_9_4_a_traced_refresh_and_fetch_print_no_token_material() {
 
     let mut fixture = Fixture::new();
     fixture.with_keychain().endpoints(&server.base_url());
-    fixture.set("RUST_LOG", "agentctl=trace");
+    fixture.set("RUST_LOG", "agctl=trace");
     fixture.dump(&[LIVE_SERVICE]);
     fixture.keychain_item(
         LIVE_SERVICE,
@@ -148,7 +148,7 @@ fn section_9_4_a_traced_refresh_and_fetch_print_no_token_material() {
         .raw()
         .args(["claude", "status", "--refresh", "--all", "--json", "--raw"])
         .spawn()
-        .expect("agentctl should start");
+        .expect("agctl should start");
     let finished = common::finish(child);
 
     assert!(
@@ -192,7 +192,7 @@ fn section_9_4_a_traced_login_prints_no_token_material() {
 
     let mut fixture = Fixture::new();
     fixture.endpoints(&server.base_url());
-    fixture.set("RUST_LOG", "agentctl=trace");
+    fixture.set("RUST_LOG", "agctl=trace");
 
     let mut session = common::start_login(&fixture, &[], &[]);
     let state = session.state.clone();
@@ -232,7 +232,7 @@ fn section_9_4_a_traced_failure_path_prints_no_token_material() {
 
     let mut fixture = Fixture::new();
     fixture.endpoints(&server.base_url());
-    fixture.set("RUST_LOG", "agentctl=trace");
+    fixture.set("RUST_LOG", "agctl=trace");
     fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
     fixture.write_credentials(
         ACCT,
@@ -244,7 +244,7 @@ fn section_9_4_a_traced_failure_path_prints_no_token_material() {
         .raw()
         .args(["claude", "status", "--refresh", "--account", EMAIL])
         .spawn()
-        .expect("agentctl should start");
+        .expect("agctl should start");
     let finished = common::finish(child);
 
     assert_eq!(finished.code(), 2);

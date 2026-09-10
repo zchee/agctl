@@ -1,6 +1,6 @@
 #![cfg(feature = "testing")]
 
-//! `agentctl claude login`, driven through the real binary.
+//! `agctl claude login`, driven through the real binary.
 //!
 //! A login is the one command that mints a credential, so these tests are the
 //! ones that watch bytes arrive on disk: the namespace directory's mode, the
@@ -36,7 +36,7 @@ const EXCHANGE_ORG: &str = "22222222-2222-4222-8222-222222222222";
 /// How long the access token the mock mints lasts (fact F25).
 const EXPIRES_IN: i64 = 28_800;
 
-/// The scope set agentctl asks for (fact F4, F28).
+/// The scope set agctl asks for (fact F4, F28).
 const SCOPES: &str =
     "user:file_upload user:inference user:mcp_servers user:profile user:sessions:claude_code";
 
@@ -262,8 +262,7 @@ fn ac27_sigterm_with_a_staged_write_removes_the_temporary_file() {
     let mut fixture = Fixture::new();
     fixture.endpoints(&server.base_url());
 
-    let mut session =
-        common::start_login(&fixture, &[], &[("AGENTCTL_FAULT", "pause_before_rename")]);
+    let mut session = common::start_login(&fixture, &[], &[("AGCTL_FAULT", "pause_before_rename")]);
     let state = session.state.clone();
     session.paste(&format!("minted-code#{state}"));
 
@@ -301,7 +300,7 @@ fn ac27_sigterm_with_a_staged_write_removes_the_temporary_file() {
 }
 
 // ---------------------------------------------------------------------------
-// `same identity as live` (`agentctl-p3-login-live-identity-warning-b90`)
+// `same identity as live` (`agctl-p3-login-live-identity-warning-b90`)
 // ---------------------------------------------------------------------------
 
 /// Writes a `.claude.json` naming `acct`/`org` as the signed-in account.
@@ -328,7 +327,7 @@ fn claude_json(fixture: &Fixture, acct: &str, org: &str) {
 
 #[test]
 fn b90_a_login_into_the_live_account_notices_on_stderr_and_still_logs_in() {
-    // `agentctl-p3-login-live-identity-warning-b90` (login notices when the
+    // `agctl-p3-login-live-identity-warning-b90` (login notices when the
     // new identity is the live one's), through the binary. Standard error, so
     // that the "Logged in as …" line a script may be reading stays the only
     // new thing on standard output; exit 0 and a credential on disk, because
@@ -399,7 +398,7 @@ fn b90_a_login_into_another_account_says_nothing_about_the_live_one() {
 }
 
 // ---------------------------------------------------------------------------
-// `--no-duplicate` (`agentctl-3m0`)
+// `--no-duplicate` (`agctl-3m0`)
 // ---------------------------------------------------------------------------
 
 /// Everything under the fixture's configuration directory, by relative path.
@@ -429,7 +428,7 @@ fn config_tree(fixture: &Fixture) -> Vec<String> {
 
 #[test]
 fn m3m0_no_duplicate_refuses_the_live_account_and_leaves_the_store_untouched() {
-    // `agentctl-3m0`, through the binary: non-zero exit, a message that names
+    // `agctl-3m0`, through the binary: non-zero exit, a message that names
     // where the claim came from, and a store that is byte-for-byte what it was.
     let server = MockServer::start();
     let token = exchange(&server, Some(EXCHANGE_ORG));
@@ -490,6 +489,6 @@ fn m3m0_no_duplicate_lets_a_login_into_any_other_account_through() {
         "the credential was written"
     );
     // Keyed on the account UUID, not the email: `Fixture::owned_record` gives
-    // every owned account the same address (`agentctl-p95`).
+    // every owned account the same address (`agctl-p95`).
     assert_eq!(registry(&fixture)["accounts"][0]["account_uuid"], json!(EXCHANGE_ACCT));
 }

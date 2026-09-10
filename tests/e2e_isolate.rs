@@ -57,7 +57,7 @@ fn ac52_exec_delivers_exactly_the_expected_environment_delta() {
     let output = fixture
         .cmd()
         .env("CLAUDE_CODE_OAUTH_TOKEN", "leaked-token-must-not-reach-the-child")
-        .env("AGENTCTL_E2E_MARKER", "marker-value")
+        .env("AGCTL_E2E_MARKER", "marker-value")
         .args(["claude", "exec", ACCT, "--", "/usr/bin/env"])
         .output()
         .expect("`claude exec` should run");
@@ -88,7 +88,7 @@ fn ac52_exec_delivers_exactly_the_expected_environment_delta() {
         "the parent's token must not reach the child; full delta: {vars:#?}"
     );
     assert_eq!(
-        vars.get("AGENTCTL_E2E_MARKER"),
+        vars.get("AGCTL_E2E_MARKER"),
         Some(&"marker-value".to_owned()),
         "an unrelated inherited variable must pass through unchanged"
     );
@@ -528,7 +528,7 @@ fn ac57_never_rewrites_the_seed_once_claude_code_has_extended_it() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Simulate Claude Code's own first run: it treats the session's
-    // `.claude.json` as its own and extends it with a key agentctl never
+    // `.claude.json` as its own and extends it with a key agctl never
     // wrote.
     let mut extended = seeded.clone();
     extended["lastOnboardingVersion"] = json!("9.9.9");

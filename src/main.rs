@@ -1,4 +1,4 @@
-//! `agentctl` — a CLI for managing AI coding agents.
+//! `agctl` — a CLI for managing AI coding agents.
 //!
 //! This binary is deliberately thin. It parses the command line, brings up
 //! logging and signal handling, dispatches, and turns the result into a
@@ -42,14 +42,14 @@ fn main() {
     if let Err(err) = signals::install(cancel.clone()) {
         // Without signal handling a Ctrl-C could strand a temporary file
         // holding token material, so this is fatal rather than a warning.
-        eprintln!("agentctl: could not install signal handling: {err}");
+        eprintln!("agctl: could not install signal handling: {err}");
         process::exit(error::EXIT_FATAL);
     }
 
     match dispatch(&cli, &cancel) {
         Ok(code) => process::exit(code),
         Err(err) => {
-            eprintln!("agentctl: {err}");
+            eprintln!("agctl: {err}");
             process::exit(err.exit_code());
         }
     }
@@ -93,9 +93,9 @@ fn dispatch(cli: &Cli, cancel: &Cancel) -> Result<i32, AppError> {
     }
 }
 
-/// Routes a parsed `agentctl claude` subcommand.
+/// Routes a parsed `agctl claude` subcommand.
 ///
-/// Every arm is one line. Most commands follow agentctl's own 0/1/2 contract
+/// Every arm is one line. Most commands follow agctl's own 0/1/2 contract
 /// ([`error`]), so they are mapped to [`EXIT_OK`] on success; `use` and
 /// `exec` instead launch a child the user is meant to interact with, so
 /// their success value is that child's own exit code (plan AC52) rather than

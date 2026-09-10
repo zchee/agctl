@@ -1,4 +1,4 @@
-//! The terminal `agentctl claude watch` draws on, and the two guarantees that
+//! The terminal `agctl claude watch` draws on, and the two guarantees that
 //! make entering it safe.
 //!
 //! A TUI takes the terminal away from the shell: raw mode swallows the line

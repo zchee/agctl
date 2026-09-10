@@ -37,7 +37,7 @@ fn sample(mtime_ns: i64, age_ms: u64) -> LockSample {
 ///
 /// `outcome: broken` with `reason: retaken` is the one combination that
 /// populates both: a lock that *was* removed and that a peer took back before
-/// agentctl could re-create it. Every other reason implies `abandoned`, and a
+/// agctl could re-create it. Every other reason implies `abandoned`, and a
 /// clean break carries no reason at all — which is what
 /// [`a_clean_break_records_no_reason`] pins.
 fn break_record() -> LockBreakRecord {
@@ -66,7 +66,7 @@ fn an_entry_round_trips_through_the_log() {
     let id = append(&paths, &entry).expect("the log should be appendable");
     assert_eq!(id, entry.id());
     assert_eq!(id.ts, entry.ts);
-    assert_eq!(id.agentctl_pid, std::process::id());
+    assert_eq!(id.agctl_pid, std::process::id());
 
     let read = tail(&paths, 10).expect("the log should be readable");
     assert_eq!(read.entries, vec![entry]);
@@ -213,7 +213,7 @@ fn rewrite_log(path: &std::path::Path, text: &str) {
 
 #[test]
 fn an_entry_with_members_this_build_does_not_know_still_reads() {
-    // Principle P3: a log written by a later agentctl must remain readable, so
+    // Principle P3: a log written by a later agctl must remain readable, so
     // an unknown member is ignored rather than fatal.
     let (_dir, paths) = store();
     append(&paths, &AuditEntry::new(write_event("aaaaaaaa", None))).expect("appendable");
@@ -279,7 +279,7 @@ fn a_break_record_serialises_with_the_plans_field_names() {
         [
             "ts",
             "monotonic_ms",
-            "agentctl_pid",
+            "agctl_pid",
             "event",
             "path",
             "store_dir",
@@ -321,7 +321,7 @@ fn a_write_serialises_with_the_documented_field_names() {
         [
             "ts",
             "monotonic_ms",
-            "agentctl_pid",
+            "agctl_pid",
             "event",
             "target",
             "from_digest8",
@@ -367,7 +367,7 @@ fn the_vocabulary_serialises_to_the_documented_tokens() {
         assert!(!text.contains("pid"), "{text}");
     }
 
-    for (value, token) in [(Tree::Agentctl, "\"agentctl\""), (Tree::Live, "\"live\"")] {
+    for (value, token) in [(Tree::Agctl, "\"agctl\""), (Tree::Live, "\"live\"")] {
         assert_eq!(serde_json::to_string(&value).expect("serializable"), token);
     }
     for (value, token) in

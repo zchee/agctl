@@ -3,9 +3,9 @@
 //! The shape here is fixed by plan section 3.2. Two details are worth stating
 //! because they are not obvious from the struct definitions:
 //!
-//! **`--config-dir` is a global option and names the agentctl store.** It is
-//! accepted before or after the subcommand (`agentctl claude status
-//! --config-dir DIR`), and `AGENTCTL_CONFIG_DIR` is its environment form. The
+//! **`--config-dir` is a global option and names the agctl store.** It is
+//! accepted before or after the subcommand (`agctl claude status
+//! --config-dir DIR`), and `AGCTL_CONFIG_DIR` is its environment form. The
 //! foreign Claude Code directories that `import --from keychain` scans are a
 //! different thing and are spelled `--claude-config-dir` so the two never
 //! collide inside `clap` (a global option propagates into every subcommand).
@@ -27,7 +27,7 @@ use clap::Subcommand;
 use clap::ValueEnum;
 use thiserror::Error;
 
-/// The slowest polling `watch` will accept, so agentctl stays a good API
+/// The slowest polling `watch` will accept, so agctl stays a good API
 /// citizen (plan principle P4, AC13).
 pub const WATCH_INTERVAL_FLOOR: Duration = Duration::from_secs(60);
 
@@ -64,11 +64,11 @@ pub const WATCH_INTERVAL_FLOOR: Duration = Duration::from_secs(60);
     )
 )]
 pub mod swap_exit {
-    /// Refusal **A**: the lock agentctl holds is compromised — its mtime
+    /// Refusal **A**: the lock agctl holds is compromised — its mtime
     /// moved under us, so the protocol was already violated and nothing may
     /// be written.
     pub const REFUSED_A: i32 = 10;
-    /// Refusal **C**: `CLAUDE_CODE_OAUTH_TOKEN` is set in agentctl's own
+    /// Refusal **C**: `CLAUDE_CODE_OAUTH_TOKEN` is set in agctl's own
     /// environment, which short-circuits every store (fact F19).
     pub const REFUSED_C: i32 = 11;
     /// Refusal **D**: the credential does not fit fact F42's 4 032-byte
@@ -85,11 +85,11 @@ pub mod swap_exit {
     /// would lose it.
     pub const REFUSED_F: i32 = 14;
     /// The inherited `CLAUDE_SECURESTORAGE_CONFIG_DIR` names no store
-    /// agentctl owns (ruling OQ1). Not one of the lettered refusals — it is
+    /// agctl owns (ruling OQ1). Not one of the lettered refusals — it is
     /// decided before Phase A begins — so `--json` gives it `reason:
     /// "not_owned"` and no `refusal` member.
     pub const PRECONDITION: i32 = 15;
-    /// Another process holds the store's Claude Code locks and agentctl did
+    /// Another process holds the store's Claude Code locks and agctl did
     /// not break them.
     pub const BUSY: i32 = 16;
     /// The item changed under the hold, so the refreshed credential was
@@ -102,7 +102,7 @@ pub mod swap_exit {
     /// write and the item is demonstrably untouched.
     ///
     /// **Not** [`REFUSED_A`], which it used to share. A refusal letter is a
-    /// security signal — **A** means somebody moved a lock agentctl was
+    /// security signal — **A** means somebody moved a lock agctl was
     /// holding — and an ordinary write failure is not that. Sharing the code
     /// also made the exit code contradict the audit line, which records this
     /// case as `"outcome":"failed"`. `--json` gives it `outcome: "failed"`
@@ -113,7 +113,7 @@ pub mod swap_exit {
     ///
     /// **Not** refusal **F**, which it used to share. **F** means *the
     /// outgoing credential cannot be adopted, so the swap would lose it* — a
-    /// fact about the store that a person cannot talk agentctl out of — and a
+    /// fact about the store that a person cannot talk agctl out of — and a
     /// script that saw exit 14 could not tell it from an operator answering
     /// "no". `--json` gives this `outcome: "cancelled"` and **no** `refusal`
     /// member, the same shape [`WRITE_FAILED`] takes.
@@ -127,7 +127,7 @@ pub mod swap_exit {
     /// `.credentials.json`; it cannot write a *second* keychain item inside
     /// one hold, so for a migrated store the refresh would be spent and
     /// thrown away — which is what left the incoming account needing a fresh
-    /// `login`. `agentctl claude status` refreshes that item in place and
+    /// `login`. `agctl claude status` refreshes that item in place and
     /// persists it, so the message says to run it and try again.
     ///
     /// `--json` gives this `outcome: "needs_refresh"` and **no** `refusal`
@@ -246,7 +246,7 @@ fn watch_interval_value_parser(input: &str) -> Result<Duration, String> {
     let interval = parse_duration(input).map_err(|err| err.to_string())?;
     if interval < WATCH_INTERVAL_FLOOR {
         return Err(format!(
-            "interval `{input}` is below the 60s floor; agentctl will not poll the usage API more often than once every 60 seconds"
+            "interval `{input}` is below the 60s floor; agctl will not poll the usage API more often than once every 60 seconds"
         ));
     }
     Ok(interval)
@@ -254,10 +254,10 @@ fn watch_interval_value_parser(input: &str) -> Result<Duration, String> {
 
 /// Manage AI coding agents.
 #[derive(Debug, Parser)]
-#[command(name = "agentctl", version, about, long_about = None)]
+#[command(name = "agctl", version, about, long_about = None)]
 pub struct Cli {
-    /// Use this agentctl configuration directory instead of the default.
-    #[arg(long, value_name = "DIR", env = "AGENTCTL_CONFIG_DIR", global = true)]
+    /// Use this agctl configuration directory instead of the default.
+    #[arg(long, value_name = "DIR", env = "AGCTL_CONFIG_DIR", global = true)]
     pub config_dir: Option<PathBuf>,
 
     /// The subcommand to run.
@@ -274,11 +274,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ClaudeCommand,
     },
-    /// Print a shell completion script for agentctl to stdout.
+    /// Print a shell completion script for agctl to stdout.
     Completions(CompletionsArgs),
 }
 
-/// Arguments for `agentctl completions`.
+/// Arguments for `agctl completions`.
 #[derive(Debug, Args)]
 pub struct CompletionsArgs {
     /// Which shell to generate a completion script for.
@@ -286,7 +286,7 @@ pub struct CompletionsArgs {
     pub shell: clap_complete::Shell,
 }
 
-/// Subcommands under `agentctl claude`.
+/// Subcommands under `agctl claude`.
 #[derive(Debug, Subcommand)]
 pub enum ClaudeCommand {
     /// Show subscription usage for every known account.
@@ -295,7 +295,7 @@ pub enum ClaudeCommand {
     Watch(WatchArgs),
     /// Log in to an Anthropic account and store its credentials.
     Login(LoginArgs),
-    /// Inspect and manage the accounts agentctl knows about.
+    /// Inspect and manage the accounts agctl knows about.
     Accounts {
         /// The `accounts` subcommand to run.
         #[command(subcommand)]
@@ -313,7 +313,7 @@ pub enum ClaudeCommand {
     Env(EnvArgs),
 }
 
-/// Arguments for `agentctl claude status`.
+/// Arguments for `agctl claude status`.
 #[derive(Debug, Args)]
 pub struct StatusArgs {
     /// Emit the report as JSON instead of a table.
@@ -350,7 +350,7 @@ pub struct StatusArgs {
     pub timeout: Duration,
 }
 
-/// Arguments for `agentctl claude watch`.
+/// Arguments for `agctl claude watch`.
 #[derive(Debug, Args)]
 pub struct WatchArgs {
     /// How often to refetch usage; must be at least 60s.
@@ -358,7 +358,7 @@ pub struct WatchArgs {
     pub interval: Duration,
 }
 
-/// Arguments for `agentctl claude login`.
+/// Arguments for `agctl claude login`.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
     /// Paste the `code#state` value by hand instead of using a loopback
@@ -376,7 +376,7 @@ pub struct LoginArgs {
     pub no_duplicate: bool,
 }
 
-/// Subcommands under `agentctl claude accounts`.
+/// Subcommands under `agctl claude accounts`.
 #[derive(Debug, Subcommand)]
 pub enum AccountsCommand {
     /// List known accounts.
@@ -394,7 +394,7 @@ pub enum AccountsCommand {
     Remove {
         /// Account id, or `uuid/org-uuid` when the uuid is ambiguous.
         id: String,
-        /// Also delete the credential file agentctl wrote for this account.
+        /// Also delete the credential file agctl wrote for this account.
         #[arg(long)]
         delete_secret: bool,
         /// Do not prompt for confirmation.
@@ -421,7 +421,7 @@ pub enum AccountsCommand {
     },
 }
 
-/// Where `agentctl claude import` should read accounts from.
+/// Where `agctl claude import` should read accounts from.
 ///
 /// One source, still spelled as a value rather than as a bare flag: the
 /// keychain is not the only place accounts could come from, and a command
@@ -433,7 +433,7 @@ pub enum ImportSource {
     Keychain,
 }
 
-/// Arguments for `agentctl claude import`.
+/// Arguments for `agctl claude import`.
 #[derive(Debug, Args)]
 pub struct ImportArgs {
     /// Which source to import from.
@@ -449,7 +449,7 @@ pub struct ImportArgs {
     pub dry_run: bool,
 }
 
-/// Arguments for `agentctl claude doctor`.
+/// Arguments for `agctl claude doctor`.
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
     /// Remove one stale Claude Code lock artefact, named by absolute path.
@@ -472,7 +472,7 @@ pub enum Shell {
     Fish,
 }
 
-/// Arguments for `agentctl claude use`.
+/// Arguments for `agctl claude use`.
 ///
 /// Three shapes share this struct, distinguished by which fields are set:
 /// `use [<id>] [--live] [--claude-config-dir <PATH>] [--fresh-context]
@@ -524,7 +524,7 @@ pub struct UseArgs {
     pub json: bool,
 }
 
-/// Arguments for `agentctl claude exec <id> -- <command> [args...]`.
+/// Arguments for `agctl claude exec <id> -- <command> [args...]`.
 #[derive(Debug, Args)]
 pub struct ExecArgs {
     /// Account selector: the same syntax `accounts remove` accepts.
@@ -548,7 +548,7 @@ pub struct ExecArgs {
     pub command: Vec<OsString>,
 }
 
-/// Arguments for `agentctl claude env <id>`.
+/// Arguments for `agctl claude env <id>`.
 #[derive(Debug, Args)]
 pub struct EnvArgs {
     /// Account selector: the same syntax `accounts remove` accepts.

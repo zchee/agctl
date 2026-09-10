@@ -17,10 +17,10 @@
 //! - [`keychain_write`] is the one write transport: fact F42's stdin form, one
 //!   argv array, no secret in it.
 //! - [`audit`] is the append-only log of every write and every lock break.
-//! - [`file_store`] is agentctl's own credential file, in Claude Code's
+//! - [`file_store`] is agctl's own credential file, in Claude Code's
 //!   on-disk shape (fact F40).
 //! - [`namespace_lock`] is the `flock` that makes a namespace single-writer.
-//! - [`held_locks`] reads the records agentctl writes while it holds a Claude
+//! - [`held_locks`] reads the records agctl writes while it holds a Claude
 //!   Code lock, which is how `doctor` finds a leaked one.
 //! - [`claude_lock`] is Claude Code's own `mkdir` lock protocol, implemented
 //!   as a peer. Landed with no caller in W2; a swap wires it up in W4a.
@@ -59,16 +59,16 @@ use crate::runtime::coordinator::PassCtx;
 pub const CLAUDE_SERVICE_PREFIX: &str = "Claude Code-credentials";
 
 /// The service prefix used by `claude-account-switcher`, a third-party tool
-/// whose items agentctl recognises but never touches (fact F10).
+/// whose items agctl recognises but never touches (fact F10).
 pub const SWITCHER_SERVICE_PREFIX: &str = "claude-switcher:";
 
 /// Selects the keychain backend under the `testing` feature.
 #[cfg(feature = "testing")]
-pub const KEYCHAIN_BACKEND_ENV: &str = "AGENTCTL_KEYCHAIN_BACKEND";
+pub const KEYCHAIN_BACKEND_ENV: &str = "AGCTL_KEYCHAIN_BACKEND";
 
 /// Overrides the `security(1)` binary under the `testing` feature.
 #[cfg(feature = "testing")]
-pub const SECURITY_BIN_ENV: &str = "AGENTCTL_SECURITY_BIN";
+pub const SECURITY_BIN_ENV: &str = "AGCTL_SECURITY_BIN";
 
 /// The production `security(1)` binary. An absolute path, never resolved
 /// through `PATH`: this process must not be talked into running some other
@@ -91,7 +91,7 @@ pub trait KeychainReader {
     ///
     /// This is **not** memoized. Claude Code memoizes it for its process
     /// lifetime, which is right for a session that starts, works and exits;
-    /// `agentctl watch` runs for hours, and a keychain that locks — or is
+    /// `agctl watch` runs for hours, and a keychain that locks — or is
     /// unlocked — between passes must be noticed on the next one (plan AC44).
     fn preflight(&self) -> KeychainStatus;
 
@@ -210,7 +210,7 @@ impl From<KeychainError> for AppError {
 /// The order of the variants is the order the classifier tries them in, and
 /// both are Claude Code's, verbatim. Matching Claude Code matters because the
 /// classification decides whether a failure is transient — and therefore
-/// whether agentctl leaves a namespace alone — so the two tools must agree
+/// whether agctl leaves a namespace alone — so the two tools must agree
 /// about what a given message means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StderrClass {
@@ -278,7 +278,7 @@ pub fn classify_stderr(stderr: &str) -> StderrClass {
 
 /// A reader that answers "there is no keychain here" to everything.
 ///
-/// Selected by `AGENTCTL_KEYCHAIN_BACKEND=none` under the `testing` feature,
+/// Selected by `AGCTL_KEYCHAIN_BACKEND=none` under the `testing` feature,
 /// and the default for every test that is not specifically exercising the
 /// keychain: it makes it impossible for a test run to reach the real
 /// keychain by accident.
@@ -304,8 +304,8 @@ impl KeychainReader for DisabledReader {
 /// Production is always [`security_cli::SecurityCli`] against
 /// [`SECURITY_BIN`], with the current `$USER` as the item account (fact F14).
 /// Under the `testing` feature two environment variables redirect it:
-/// `AGENTCTL_KEYCHAIN_BACKEND=none` selects [`DisabledReader`], and
-/// `AGENTCTL_SECURITY_BIN` points at the fake script from
+/// `AGCTL_KEYCHAIN_BACKEND=none` selects [`DisabledReader`], and
+/// `AGCTL_SECURITY_BIN` points at the fake script from
 /// [`fake_security`].
 ///
 /// A `testing` build with **neither** set also gets [`DisabledReader`], and

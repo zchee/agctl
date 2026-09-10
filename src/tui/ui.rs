@@ -1,4 +1,4 @@
-//! One frame of `agentctl claude watch`.
+//! One frame of `agctl claude watch`.
 //!
 //! The frame is a header line, one bordered block per shown account, and a
 //! footer. Everything it needs is in the [`App`] it is handed; nothing here
@@ -78,7 +78,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 
 /// The status line above the accounts.
 pub fn header_line(app: &App) -> String {
-    let mut parts = vec![format!("agentctl claude watch · {}", account_count(app.rows.len()))];
+    let mut parts = vec![format!("agctl claude watch · {}", account_count(app.rows.len()))];
 
     parts.push(match app.last_fetch {
         // `render_countdown` measures forwards, so the arguments are the
@@ -120,7 +120,7 @@ pub fn footer_text(app: &App) -> String {
 /// at the command that does rather than at a flag this one does not accept.
 pub fn hidden_footer(hidden: usize) -> String {
     let noun = if hidden == 1 { "entry" } else { "entries" };
-    format!("{hidden} {noun} hidden (agentctl claude status --all)")
+    format!("{hidden} {noun} hidden (agctl claude status --all)")
 }
 
 /// The badge for a row, when its state has one.

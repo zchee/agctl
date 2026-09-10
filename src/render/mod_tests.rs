@@ -78,7 +78,7 @@ fn a_note_is_appended_to_the_state_in_parentheses() {
 
 #[test]
 fn the_same_identity_note_joins_the_row_s_own_note_rather_than_replacing_it() {
-    // `agentctl-p3-login-live-identity-warning-b90`: a row can be both in a
+    // `agctl-p3-login-live-identity-warning-b90`: a row can be both in a
     // state that needs explaining and the live account's twin, and a reader
     // who is told only one of the two has been told the less useful half.
     let mut row = row("alice", true);

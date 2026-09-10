@@ -126,7 +126,7 @@ fn the_footer_points_at_the_command_that_shows_the_hidden_rows() {
     assert!(footer.starts_with(HELP_LINE), "{footer}");
     assert_eq!(
         footer.lines().nth(1),
-        Some("1 entry hidden (agentctl claude status --all)"),
+        Some("1 entry hidden (agctl claude status --all)"),
         "`watch` has no `--all` of its own, so the footer names the command that does"
     );
 }

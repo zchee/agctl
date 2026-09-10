@@ -126,7 +126,7 @@ struct SpyFs {
     /// Paths a "peer" recreates immediately after a successful `rmdir`,
     /// which is the only way to reach section 3.8's `retaken`.
     retake: Mutex<Vec<PathBuf>>,
-    /// Paths a "peer" creates just *before* agentctl's own `mkdir`, which is
+    /// Paths a "peer" creates just *before* agctl's own `mkdir`, which is
     /// the only way to reach an `EEXIST` on a lock that was free when the
     /// lock-free probe looked at it.
     plant_before: Mutex<Vec<PathBuf>>,
@@ -166,7 +166,7 @@ impl SpyFs {
         }
     }
 
-    /// Makes a peer recreate `path` the moment agentctl removes it.
+    /// Makes a peer recreate `path` the moment agctl removes it.
     fn retake_after_rmdir(&self, path: &Path) {
         lock(&self.retake).push(path.to_path_buf());
     }
@@ -190,8 +190,8 @@ impl SpyFs {
 impl LockFs for SpyFs {
     fn mkdir(&self, at: LockSlot<'_>) -> Result<(), FsError> {
         if lock(&self.plant_before).iter().any(|planted| planted.as_path() == at.shown) {
-            // The peer's own `mkdir`, not agentctl's: deliberately not
-            // recorded, because the timeline is a record of what agentctl did.
+            // The peer's own `mkdir`, not agctl's: deliberately not
+            // recorded, because the timeline is a record of what agctl did.
             let _ = self.real.mkdir(at);
         }
         let result = self.real.mkdir(at);
@@ -218,7 +218,7 @@ impl LockFs for SpyFs {
             return None;
         }
         // Passed through and deliberately **not** recorded: the timeline is
-        // what agentctl did to the filesystem, and a `stat` does nothing to it.
+        // what agctl did to the filesystem, and a `stat` does nothing to it.
         self.real.mtime(at)
     }
 }
@@ -227,7 +227,7 @@ impl LockFs for SpyFs {
 ///
 /// By path, because these are a *peer's* actions — a Claude Code session
 /// heartbeating or releasing its own lock — and a peer holds no descriptor of
-/// agentctl's.
+/// agctl's.
 ///
 /// A wall-clock step is applied by the caller, under its own lock, because it
 /// changes the clock rather than the world.
@@ -409,7 +409,7 @@ impl HolderEvidence for FakeHolders {
 // Fixtures
 // ---------------------------------------------------------------------------
 
-/// A store directory, an agentctl store beside it, and the three lock paths.
+/// A store directory, an agctl store beside it, and the three lock paths.
 ///
 /// **No test in this file calls [`cleanup::emergency`].** That function is
 /// process-wide and takes *every* registered entry, so calling it would
@@ -443,13 +443,13 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// A store inside agentctl's own tree.
+    /// A store inside agctl's own tree.
     ///
     /// Under `namespace_root()`, because that is now a **precondition** rather
-    /// than a convention: `Tree::Agentctl` with a store anywhere else is
+    /// than a convention: `Tree::Agctl` with a store anywhere else is
     /// refused before anything is created (review P1-2).
     fn new() -> Self {
-        Self::in_tree(Tree::Agentctl)
+        Self::in_tree(Tree::Agctl)
     }
 
     /// A store that *is* the live one this environment names — the only store
@@ -460,7 +460,7 @@ impl Fixture {
 
     /// The live store reached through a symbolic link, which is what a normal
     /// machine looks like: `$HOME/.claude` is a link to a directory elsewhere
-    /// (fact F41, `agentctl-p1-live-tree-symlinked-store-anchor-ory`).
+    /// (fact F41, `agctl-p1-live-tree-symlinked-store-anchor-ory`).
     fn live_through_link() -> Self {
         Self::build(Tree::Live, true)
     }
@@ -474,10 +474,10 @@ impl Fixture {
     fn build(tree: Tree, through_link: bool) -> Self {
         let root = tempfile::tempdir().expect("a temporary directory");
         let paths = Paths::with_config_dir(root.path().join("config"));
-        paths.ensure_dirs().expect("the agentctl store should be creatable");
+        paths.ensure_dirs().expect("the agctl store should be creatable");
         let env = EnvView::with_home(root.path().to_path_buf());
         let store = match tree {
-            Tree::Agentctl => paths.namespace_dir("acct", "org"),
+            Tree::Agctl => paths.namespace_dir("acct", "org"),
             Tree::Live => namespace::live_store_dir(&env),
         };
         if through_link {
@@ -491,11 +491,11 @@ impl Fixture {
         } else {
             fs::create_dir_all(&store).expect("the store directory should be creatable");
         }
-        // `Tree::Agentctl` resolves nothing — a link below its own root is an
+        // `Tree::Agctl` resolves nothing — a link below its own root is an
         // attack, not a configuration — so there the artefacts land under the
         // spelling the caller handed in.
         let resolved = match tree {
-            Tree::Agentctl => store.clone(),
+            Tree::Agctl => store.clone(),
             Tree::Live => namespace::canonical(&store).expect("the live store resolves"),
         };
 
@@ -648,7 +648,7 @@ fn acquire_creates_all_three_in_the_peers_nesting() {
 
     let AcquireOutcome::Held(hold) = acquired.outcome else { panic!("expected a hold") };
     assert_eq!(hold.store_dir(), fixture.store, "the hold knows what it is about");
-    assert_eq!(hold.tree(), Tree::Agentctl, "and which tree it is in (invariant I11′)");
+    assert_eq!(hold.tree(), Tree::Agctl, "and which tree it is in (invariant I11′)");
     assert_eq!(hold.paths(), fixture.all().to_vec(), "primary, legacy, `.storage-write` innermost");
     for path in fixture.all() {
         assert!(
@@ -675,17 +675,17 @@ fn acquire_creates_all_three_in_the_peers_nesting() {
     assert_eq!(records.len(), 1, "one record per live hold");
     let held = &records[0];
     assert_eq!(held.file, hold.record_path());
-    assert_eq!(held.record.agentctl_pid, std::process::id());
+    assert_eq!(held.record.agctl_pid, std::process::id());
     assert_eq!(
-        held.record.agentctl_start_time,
+        held.record.agctl_start_time,
         proc::self_start_time(&Cancel::new()),
         "and when that process started, so a recycled id cannot pass for it"
     );
-    assert_eq!(held.record.tree, Tree::Agentctl);
+    assert_eq!(held.record.tree, Tree::Agctl);
     assert_eq!(held.record.store_dir, fixture.store);
     assert_eq!(held.record.paths, fixture.all().to_vec());
     assert!(!held.record.taken_at.is_empty());
-    assert_eq!(mode_of(&held.file), FILE_MODE, "0600, like every other file agentctl writes");
+    assert_eq!(mode_of(&held.file), FILE_MODE, "0600, like every other file agctl writes");
 
     drop(hold);
     for path in fixture.all() {
@@ -987,7 +987,7 @@ fn a_lock_nobody_is_beating_is_broken_once() {
     assert_eq!(record.reason, None, "every reason in the vocabulary is a reason NOT to break");
     assert_eq!(record.path, fixture.primary);
     assert_eq!(record.store_dir, fixture.store, "the rule is told which store it is resolving");
-    assert_eq!(record.tree, Tree::Agentctl, "and which tree that store is in");
+    assert_eq!(record.tree, Tree::Agctl, "and which tree that store is in");
     assert_eq!(record.holder_evidence, HolderEvidence3::NoStoppedClaude);
     let (a, b, c) = samples(&record);
     assert_eq!(a.mtime_ns, b.mtime_ns, "all three samples recorded, and identical");
@@ -1309,7 +1309,7 @@ fn a_stopped_same_user_claude_abandons_the_break_before_any_wait() {
     let record = completed(outcome.record.expect("an abandoned break is audited"));
     assert_eq!(record.holder_evidence, HolderEvidence3::StoppedClaudePresent);
     let entry = AuditEntry::new(AuditEvent::LockBreak(record));
-    assert_eq!(entry.agentctl_pid, std::process::id(), "our own pid, never the holder's");
+    assert_eq!(entry.agctl_pid, std::process::id(), "our own pid, never the holder's");
     let json = serde_json::to_string(&entry).expect("serializable");
     assert!(!json.contains("41207"), "the audit entry names no holder pid (AC80)");
 }
@@ -1359,7 +1359,7 @@ fn a_cancelled_sampling_wait_decides_nothing_and_audits_nothing() {
 #[test]
 fn a_lock_retaken_after_the_rmdir_is_busy_and_is_not_broken_twice() {
     // Plan AC63's last positive-turned-negative: at most one break per
-    // acquire, so agentctl cannot loop against a peer that recreates a lock.
+    // acquire, so agctl cannot loop against a peer that recreates a lock.
     let fixture = Fixture::new();
     fixture.plant(&fixture.primary, stale_age());
     fixture.fs.retake_after_rmdir(&fixture.primary);
@@ -1378,7 +1378,7 @@ fn a_lock_retaken_after_the_rmdir_is_busy_and_is_not_broken_twice() {
     assert_eq!(record.outcome, Outcome::Broken, "the directory *was* removed");
     assert_eq!(record.reason, Some(Reason::Retaken), "and immediately retaken");
     assert_eq!(record.store_dir, fixture.store);
-    assert_eq!(record.tree, Tree::Agentctl);
+    assert_eq!(record.tree, Tree::Agctl);
     assert_eq!(
         fixture.timeline.ops().iter().filter(|op| matches!(op, Op::Rmdir(_))).count(),
         1,
@@ -1450,8 +1450,8 @@ fn a_third_party_touching_any_held_lock_is_refusal_a() {
 
 #[test]
 fn a_lock_whose_modification_time_cannot_be_read_is_refused_at_the_take() {
-    // `agentctl-p2-lock-take-without-mtime-no-drift-check-axs`. Refusal A is
-    // the only thing that tells agentctl a third party touched a lock it
+    // `agctl-p2-lock-take-without-mtime-no-drift-check-axs`. Refusal A is
+    // the only thing that tells agctl a third party touched a lock it
     // holds, and it compares against the reading taken at that lock's own
     // `mkdir`. A lock with no such reading is a lock held with refusal A
     // switched off, so the take refuses instead of recording `None`.
@@ -1467,7 +1467,7 @@ fn a_lock_whose_modification_time_cannot_be_read_is_refused_at_the_take() {
 
         let err = fixture
             .acquire(&seams, &cancel, &Fault::none())
-            .expect_err("a lock that cannot be re-stated is not a lock agentctl holds");
+            .expect_err("a lock that cannot be re-stated is not a lock agctl holds");
         let LockError::Io { context, message } = err.error else {
             panic!("position {position}: expected `Io`, got {err:?}");
         };
@@ -1664,7 +1664,7 @@ fn the_injected_leak_leaves_the_directories_and_a_record_that_names_them() {
     assert_eq!(held.file, record_path);
     assert_eq!(held.record.tree, Tree::Live, "and says which tree they are in");
     assert_eq!(held.record.paths, fixture.all().to_vec(), "naming every leaked directory");
-    assert_eq!(held.record.agentctl_pid, std::process::id());
+    assert_eq!(held.record.agctl_pid, std::process::id());
 
     // Left as found: the leaked directories are what a crashed hold leaves,
     // and the temporary directory takes them with it. The registry still
@@ -1684,10 +1684,10 @@ fn the_injected_leak_leaves_the_directories_and_a_record_that_names_them() {
 /// Read **only** here, in a `#[cfg(test)]` file: it is not a crate seam, it
 /// cannot reach a release artifact, and `tests/e2e_lock.rs` asserts that no
 /// non-test source mentions it.
-const CHILD_ROLE_ENV: &str = "AGENTCTL_LOCK_CHILD_ROLE";
+const CHILD_ROLE_ENV: &str = "AGCTL_LOCK_CHILD_ROLE";
 
 /// Where the child builds its store and reports progress.
-const CHILD_DIR_ENV: &str = "AGENTCTL_LOCK_CHILD_DIR";
+const CHILD_DIR_ENV: &str = "AGCTL_LOCK_CHILD_DIR";
 
 /// The child half of the two signal tests. A no-op in a normal run.
 #[test]
@@ -1704,13 +1704,13 @@ fn lock_child_harness() {
     std::panic::set_hook(Box::new(|_| cleanup::emergency()));
 
     let paths = Paths::with_config_dir(dir.join("config"));
-    paths.ensure_dirs().expect("the agentctl store should be creatable");
+    paths.ensure_dirs().expect("the agctl store should be creatable");
     let store = child_store(&dir);
     fs::create_dir_all(&store).expect("the store should be creatable");
 
     let ctx = PassCtx::standalone(cancel, Instant::now() + Duration::from_secs(60));
     let acquired = acquire(
-        LockSubject { store_dir: &store, tree: Tree::Agentctl },
+        LockSubject { store_dir: &store, tree: Tree::Agctl },
         &paths,
         &EnvView::with_home(dir.clone()),
         &Clock::system(),
@@ -1858,7 +1858,7 @@ fn the_outcome_and_reason_vocabularies_are_exactly_section_38s() {
     for (value, spelling) in reasons {
         assert_eq!(serde_json::to_string(&value).expect("ok"), spelling);
     }
-    assert_eq!(serde_json::to_string(&Tree::Agentctl).expect("ok"), "\"agentctl\"");
+    assert_eq!(serde_json::to_string(&Tree::Agctl).expect("ok"), "\"agctl\"");
     assert_eq!(serde_json::to_string(&Tree::Live).expect("ok"), "\"live\"");
 }
 
@@ -1870,7 +1870,7 @@ fn a_break_record_carries_one_pid_and_it_is_ours() {
     // has no other.
     // Asserted on the **audit entry**, because that is the object section 3.8
     // fixes and the only shape a record ever reaches a file in: the provenance
-    // fields — `ts`, `monotonic_ms`, `agentctl_pid` — belong to the entry, and
+    // fields — `ts`, `monotonic_ms`, `agctl_pid` — belong to the entry, and
     // a second copy of them inside the record would duplicate them here.
     let fixture = Fixture::new();
     fixture.plant(&fixture.primary, stale_age());
@@ -1883,8 +1883,8 @@ fn a_break_record_carries_one_pid_and_it_is_ours() {
     let json = serde_json::to_value(&entry).expect("serializable");
     let object = json.as_object().expect("an object");
     let pid_keys: Vec<&String> = object.keys().filter(|key| key.contains("pid")).collect();
-    assert_eq!(pid_keys, vec!["agentctl_pid"], "one pid field, unambiguously ours");
-    assert_eq!(object["agentctl_pid"], std::process::id());
+    assert_eq!(pid_keys, vec!["agctl_pid"], "one pid field, unambiguously ours");
+    assert_eq!(object["agctl_pid"], std::process::id());
     assert_eq!(object["event"], "lock_break");
     assert!(object.contains_key("sample_a"));
     assert!(object.contains_key("interval_wall_ms"));
@@ -1899,8 +1899,8 @@ fn the_held_lock_record_has_the_shape_the_stale_remover_reads() {
     // names that exact path and the recorded process is dead. S19 owns the
     // reader; this pins the shape both halves agreed on.
     let record = HeldLockRecord {
-        agentctl_pid: 4242,
-        agentctl_start_time: Some("2026-09-09T00:00:00Z".to_owned()),
+        agctl_pid: 4242,
+        agctl_start_time: Some("2026-09-09T00:00:00Z".to_owned()),
         tree: Tree::Live,
         store_dir: PathBuf::from("/store"),
         paths: vec![PathBuf::from("/store/.oauth_refresh.lock")],
@@ -1910,8 +1910,8 @@ fn the_held_lock_record_has_the_shape_the_stale_remover_reads() {
     assert_eq!(
         json,
         serde_json::json!({
-            "agentctl_pid": 4242,
-            "agentctl_start_time": "2026-09-09T00:00:00Z",
+            "agctl_pid": 4242,
+            "agctl_start_time": "2026-09-09T00:00:00Z",
             "tree": "live",
             "store_dir": "/store",
             "paths": ["/store/.oauth_refresh.lock"],
@@ -1925,14 +1925,14 @@ fn the_held_lock_record_has_the_shape_the_stale_remover_reads() {
     // field defaults to "unknown" rather than making the record unparseable,
     // which would turn a leak nobody can explain into a leak nobody can clear.
     let older = serde_json::json!({
-        "agentctl_pid": 4242,
+        "agctl_pid": 4242,
         "tree": "live",
         "store_dir": "/store",
         "paths": ["/store/.oauth_refresh.lock"],
         "taken_at": "2026-09-09T00:00:00Z",
     });
     let read: HeldLockRecord = serde_json::from_value(older).expect("an older record still reads");
-    assert_eq!(read.agentctl_start_time, None);
+    assert_eq!(read.agctl_start_time, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -1971,7 +1971,7 @@ fn every_profile_refuses_to_retry_under_the_hold() {
 #[test]
 fn the_legacy_lock_is_the_entry_the_resolved_spelling_names() {
     // Fact F17/F46: the peer names the legacy lock after `realpath` of the
-    // store directory. agentctl does not call `realpath` — it walks to the
+    // store directory. agctl does not call `realpath` — it walks to the
     // store one `O_NOFOLLOW` component at a time and creates the artefact
     // relative to the parent that walk reached — and this test is what proves
     // the two land on the same directory entry, which is the whole reason
@@ -1999,7 +1999,7 @@ fn the_legacy_lock_is_the_entry_the_resolved_spelling_names() {
     assert_ne!(peers_spelling, fixture.legacy, "the two spellings really do differ here");
     assert!(
         peers_spelling.is_dir(),
-        "the lock agentctl made is the one `{}` names",
+        "the lock agctl made is the one `{}` names",
         peers_spelling.display()
     );
 
@@ -2010,7 +2010,7 @@ fn the_legacy_lock_is_the_entry_the_resolved_spelling_names() {
 #[test]
 fn the_real_operations_make_and_remove_a_directory() {
     // `AT_REMOVEDIR` is the whole point: `unlink` cannot remove a directory,
-    // which is the defect `agentctl-nz5` records.
+    // which is the defect `agctl-nz5` records.
     let dir = tempfile::tempdir().expect("a temporary directory");
     let lock = dir.path().join(REFRESH_LOCK);
     let fd = dir_fd(dir.path());
@@ -2065,10 +2065,10 @@ fn a_symlinked_component_above_the_store_is_refused_before_anything_is_created()
     // `<root>/<acct>/<org>/.oauth_refresh.lock` is inside `namespace_root()`,
     // so a path-based hold would `mkdir` — and later `rmdir` — Claude Code's
     // live locks while the record and the audit entry both said
-    // `tree: agentctl`.
+    // `tree: agctl`.
     let root = tempfile::tempdir().expect("a temporary directory");
     let paths = Paths::with_config_dir(root.path().join("config"));
-    paths.ensure_dirs().expect("the agentctl store should be creatable");
+    paths.ensure_dirs().expect("the agctl store should be creatable");
 
     // The attacker's target, shaped like a real store so that a redirected
     // hold would succeed rather than fail for some unrelated reason.
@@ -2085,7 +2085,7 @@ fn a_symlinked_component_above_the_store_is_refused_before_anything_is_created()
 
     let cancel = Cancel::new();
     let env = EnvView::with_home(root.path().to_path_buf());
-    let subject = LockSubject { store_dir: &store, tree: Tree::Agentctl };
+    let subject = LockSubject { store_dir: &store, tree: Tree::Agctl };
 
     // No seams are injected, and none could be: the refusal happens while the
     // anchor is being opened, which is before any `LockFs` is consulted. That
@@ -2116,22 +2116,22 @@ fn a_symlinked_component_above_the_store_is_refused_before_anything_is_created()
 }
 
 #[test]
-fn a_store_outside_the_namespace_root_cannot_claim_the_agentctl_tree() {
+fn a_store_outside_the_namespace_root_cannot_claim_the_agctl_tree() {
     // Review P1-2. `tree` is the field `doctor`, `--remove-stale`'s attested
     // branch and invariant I11′'s containment all key on, so it is derived
     // from the store directory rather than believed.
     let root = tempfile::tempdir().expect("a temporary directory");
     let paths = Paths::with_config_dir(root.path().join("config"));
-    paths.ensure_dirs().expect("the agentctl store should be creatable");
+    paths.ensure_dirs().expect("the agctl store should be creatable");
     let env = EnvView::with_home(root.path().to_path_buf());
     let store = root.path().join("somewhere-else");
     fs::create_dir(&store).expect("creatable");
 
     let refused =
-        LockAnchor::open(LockSubject { store_dir: &store, tree: Tree::Agentctl }, &paths, &env)
-            .expect_err("a store outside the root is not agentctl's");
-    assert_eq!(refused, LockError::WrongTree { store_dir: store.clone(), tree: Tree::Agentctl });
-    assert!(refused.to_string().contains("agentctl's own tree"), "{refused}");
+        LockAnchor::open(LockSubject { store_dir: &store, tree: Tree::Agctl }, &paths, &env)
+            .expect_err("a store outside the root is not agctl's");
+    assert_eq!(refused, LockError::WrongTree { store_dir: store.clone(), tree: Tree::Agctl });
+    assert!(refused.to_string().contains("agctl's own tree"), "{refused}");
 }
 
 #[test]
@@ -2144,7 +2144,7 @@ fn a_store_that_is_not_the_live_one_cannot_claim_the_live_tree() {
         &fixture.paths,
         &fixture.env,
     )
-    .expect_err("agentctl's own namespace is not the live store");
+    .expect_err("agctl's own namespace is not the live store");
     assert_eq!(
         refused,
         LockError::WrongTree { store_dir: fixture.store.clone(), tree: Tree::Live }
@@ -2158,7 +2158,7 @@ fn a_store_that_is_not_the_live_one_cannot_claim_the_live_tree() {
 
 // ---------------------------------------------------------------------------
 // The live store through a symbolic link
-// (`agentctl-p1-live-tree-symlinked-store-anchor-ory`)
+// (`agctl-p1-live-tree-symlinked-store-anchor-ory`)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -2199,7 +2199,7 @@ fn a_symlinked_live_store_is_locked_where_it_resolves_to() {
         fs::canonicalize(&fixture.store).expect("the live store resolves").display()
     ));
     assert_eq!(fixture.legacy, peers_spelling);
-    assert!(peers_spelling.is_dir(), "`{}` is agentctl's", peers_spelling.display());
+    assert!(peers_spelling.is_dir(), "`{}` is agctl's", peers_spelling.display());
     let beside_the_link = PathBuf::from(format!("{}{LEGACY_LOCK_SUFFIX}", fixture.store.display()));
     assert!(
         !beside_the_link.exists(),
@@ -2256,7 +2256,7 @@ fn a_live_store_that_does_not_resolve_is_refused_before_anything_is_created() {
     // path that is not there.
     let root = tempfile::tempdir().expect("a temporary directory");
     let paths = Paths::with_config_dir(root.path().join("config"));
-    paths.ensure_dirs().expect("the agentctl store should be creatable");
+    paths.ensure_dirs().expect("the agctl store should be creatable");
     let env = EnvView::with_home(root.path().to_path_buf());
     let store = namespace::live_store_dir(&env);
     std::os::unix::fs::symlink(root.path().join("gone"), &store).expect("plantable");
@@ -2279,7 +2279,7 @@ fn a_live_store_link_to_something_that_is_not_a_directory_is_refused() {
     // below the resolved anchor rather than the resolution's.
     let root = tempfile::tempdir().expect("a temporary directory");
     let paths = Paths::with_config_dir(root.path().join("config"));
-    paths.ensure_dirs().expect("the agentctl store should be creatable");
+    paths.ensure_dirs().expect("the agctl store should be creatable");
     let env = EnvView::with_home(root.path().to_path_buf());
     let target = root.path().join("a-file");
     fs::write(&target, b"not a directory").expect("writable");
@@ -2298,14 +2298,14 @@ fn a_live_store_link_to_something_that_is_not_a_directory_is_refused() {
 }
 
 #[test]
-fn a_symlinked_agentctl_store_is_still_refused() {
-    // `Tree::Agentctl` is deliberately not relaxed. agentctl owns every
+fn a_symlinked_agctl_store_is_still_refused() {
+    // `Tree::Agctl` is deliberately not relaxed. agctl owns every
     // component below its own root, so a link planted at the store is an
     // attack rather than a configuration, and following it would put a lock
     // wherever the attacker pointed.
     let root = tempfile::tempdir().expect("a temporary directory");
     let paths = Paths::with_config_dir(root.path().join("config"));
-    paths.ensure_dirs().expect("the agentctl store should be creatable");
+    paths.ensure_dirs().expect("the agctl store should be creatable");
     let env = EnvView::with_home(root.path().to_path_buf());
 
     let elsewhere = root.path().join("elsewhere");
@@ -2315,8 +2315,8 @@ fn a_symlinked_agentctl_store_is_still_refused() {
     std::os::unix::fs::symlink(&elsewhere, &store).expect("the store link should be plantable");
 
     let refused =
-        LockAnchor::open(LockSubject { store_dir: &store, tree: Tree::Agentctl }, &paths, &env)
-            .expect_err("a symbolic link at agentctl's own store is refused");
+        LockAnchor::open(LockSubject { store_dir: &store, tree: Tree::Agctl }, &paths, &env)
+            .expect_err("a symbolic link at agctl's own store is refused");
     let LockError::Unreachable { path, message } = &refused else {
         panic!("expected `Unreachable`, got {refused:?}")
     };
@@ -2331,15 +2331,15 @@ fn a_symlinked_agentctl_store_is_still_refused() {
 
 // ---------------------------------------------------------------------------
 // Refusal E on the lock side
-// (`agentctl-p2-live-tree-securestorage-dir-refusal-r4v`)
+// (`agctl-p2-live-tree-securestorage-dir-refusal-r4v`)
 // ---------------------------------------------------------------------------
 
-/// A temporary root, agentctl's own store under it, and an `EnvView` whose
+/// A temporary root, agctl's own store under it, and an `EnvView` whose
 /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` is whatever the case is about.
 fn securestorage_fixture(value: Option<&str>) -> (tempfile::TempDir, Paths, EnvView) {
     let root = tempfile::tempdir().expect("a temporary directory");
     let paths = Paths::with_config_dir(root.path().join("config"));
-    paths.ensure_dirs().expect("the agentctl store should be creatable");
+    paths.ensure_dirs().expect("the agctl store should be creatable");
     let mut env = EnvView::with_home(root.path().to_path_buf());
     env.securestorage_dir = value.map(str::to_owned);
     (root, paths, env)
@@ -2354,7 +2354,7 @@ fn a_set_securestorage_dir_refuses_the_live_tree_before_anything_is_created() {
     // "live". The two halves must agree about what "live" means (risk R42).
     let root = tempfile::tempdir().expect("a temporary directory");
     let paths = Paths::with_config_dir(root.path().join("config"));
-    paths.ensure_dirs().expect("the agentctl store should be creatable");
+    paths.ensure_dirs().expect("the agctl store should be creatable");
     let namespace_dir = root.path().join("pointed-at");
     fs::create_dir(&namespace_dir).expect("creatable");
     let mut env = EnvView::with_home(root.path().to_path_buf());
@@ -2407,16 +2407,16 @@ fn an_empty_securestorage_dir_is_not_refused() {
 }
 
 #[test]
-fn a_set_securestorage_dir_leaves_the_agentctl_tree_alone() {
-    // The refusal is about what "live" means, and agentctl's own tree does not
+fn a_set_securestorage_dir_leaves_the_agctl_tree_alone() {
+    // The refusal is about what "live" means, and agctl's own tree does not
     // depend on the variable at all: a `--claude-config-dir` session in a shell
     // pointed at a namespace still has its own locks to take.
     let (_root, paths, env) = securestorage_fixture(Some("/somewhere/else"));
     let store = paths.namespace_dir("acct", "org");
     fs::create_dir_all(&store).expect("creatable");
 
-    LockAnchor::open(LockSubject { store_dir: &store, tree: Tree::Agentctl }, &paths, &env)
-        .expect("agentctl's own tree is not the live one and never was");
+    LockAnchor::open(LockSubject { store_dir: &store, tree: Tree::Agctl }, &paths, &env)
+        .expect("agctl's own tree is not the live one and never was");
 }
 
 #[test]
@@ -2468,7 +2468,7 @@ fn mode_of(path: &Path) -> u32 {
 
 // ---------------------------------------------------------------------------
 // A completed break survives every failing way out of `acquire_with`
-// (`agentctl-nq3`, invariant I16)
+// (`agctl-nq3`, invariant I16)
 // ---------------------------------------------------------------------------
 
 /// Does what `status.rs` `refresh_in_place` owes a break, and reads the log
@@ -2503,7 +2503,7 @@ fn assert_one_broken_line(records: &[LockBreakRecord], fixture: &Fixture, path: 
     assert_eq!(record.reason, None, "{at}: a clean break records no reason");
     assert_eq!(record.path, path, "{at}: naming the directory that was removed");
     assert_eq!(record.store_dir, fixture.store, "{at}: and the store it guards");
-    assert_eq!(record.tree, Tree::Agentctl, "{at}: and which tree that store is in");
+    assert_eq!(record.tree, Tree::Agctl, "{at}: and which tree that store is in");
     assert!(record.sample_b.is_some(), "{at}: Sample B survived the failure");
     assert!(record.sample_c.is_some(), "{at}: and Sample C, the one taken before the `rmdir`");
     assert_eq!(record.holder_evidence, HolderEvidence3::NoStoppedClaude, "{at}: and the evidence");
@@ -2586,10 +2586,10 @@ fn a_break_survives_a_cancellation_in_the_contention_wait() {
 
 #[test]
 fn a_break_survives_a_held_locks_directory_that_cannot_be_reached() {
-    // Err site 5 of six, and the one `agentctl-nq3` was filed for: after
+    // Err site 5 of six, and the one `agctl-nq3` was filed for: after
     // `1yj` a symbolic link at `<namespace_root>/held-locks` makes step 3
     // fail deterministically. Before this fix that gave anyone who could
-    // plant one link a repeatable way to have agentctl remove a peer's lock
+    // plant one link a repeatable way to have agctl remove a peer's lock
     // and write nothing about it.
     let fixture = Fixture::new();
     fixture.plant(&fixture.primary, stale_age());
@@ -2639,7 +2639,7 @@ fn a_break_survives_a_take_that_could_not_be_completed() {
 
     let failure = fixture
         .acquire(&seams, &cancel, &Fault::none())
-        .expect_err("a lock that cannot be re-stated is not a lock agentctl holds");
+        .expect_err("a lock that cannot be re-stated is not a lock agctl holds");
     assert!(
         matches!(failure.error, LockError::Io { .. }),
         "the refusal is unchanged: {:?}",
@@ -2665,7 +2665,7 @@ fn the_two_sampling_refusals_carry_no_break_because_they_decided_nothing() {
     // cancelled and a sampling that fails both return `record: None`, so the
     // uniform `break_record` they now pass is `None`. Asserted rather than
     // reasoned about, because "this arm cannot carry a draft" is exactly the
-    // claim `agentctl-ahh` got wrong for four of the six.
+    // claim `agctl-ahh` got wrong for four of the six.
     let fixture = Fixture::new();
     fixture.plant(&fixture.primary, stale_age());
     let clock = fixture.fake_clock();
@@ -2685,7 +2685,7 @@ fn the_two_sampling_refusals_carry_no_break_because_they_decided_nothing() {
 
 // ---------------------------------------------------------------------------
 // The held-locks directory is reached by a walk
-// (`agentctl-p2-held-locks-dir-through-symlink-1yj`)
+// (`agctl-p2-held-locks-dir-through-symlink-1yj`)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -2697,7 +2697,7 @@ fn a_symlink_at_the_held_locks_directory_refuses_the_hold_before_anything_is_tak
     // after it, into a directory of somebody else's choosing. The record is
     // what `doctor` and `--remove-stale` read to decide whether a lock
     // *outside* the namespace root may be removed, so a record an attacker can
-    // place is a record that can name paths agentctl would then act on.
+    // place is a record that can name paths agctl would then act on.
     let fixture = Fixture::new();
     let elsewhere = fixture.scratch("elsewhere");
     fs::create_dir(&elsewhere).expect("the decoy should be creatable");

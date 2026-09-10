@@ -77,8 +77,8 @@ fn stall_until_returns_at_the_deadline() {
 #[cfg(feature = "testing")]
 #[test]
 fn from_env_reads_the_documented_variable_names() {
-    assert_eq!(FAULT_ENV, "AGENTCTL_FAULT");
-    assert_eq!(FAULT_RESUME_ENV, "AGENTCTL_FAULT_RESUME");
+    assert_eq!(FAULT_ENV, "AGCTL_FAULT");
+    assert_eq!(FAULT_RESUME_ENV, "AGCTL_FAULT_RESUME");
     assert_eq!(PAUSE_BUDGET, Duration::from_secs(10));
 
     // The variable is not set in a test run, so this is the "no faults"

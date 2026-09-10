@@ -33,7 +33,7 @@ fn ctx() -> PassCtx {
 
 fn store() -> (TempDir, Paths) {
     let dir = TempDir::new().expect("a temporary directory should be available");
-    let paths = Paths::with_config_dir(dir.path().join("agentctl"));
+    let paths = Paths::with_config_dir(dir.path().join("agctl"));
     (dir, paths)
 }
 
@@ -59,7 +59,7 @@ fn a_live_item_becomes_one_row_with_its_identity() {
     let env = env_in(dir.path());
     let reader = FakeReader::unlocked().with_item(namespace::LIVE_SERVICE, LIVE_BLOB);
 
-    let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
+    let discovery = discover(&AgctlConfig::default(), &paths, &reader, &env, &ctx());
     assert_eq!(discovery.preflight, KeychainStatus::Unlocked);
     assert_eq!(discovery.rows.len(), 1, "{:?}", ids(&discovery));
 
@@ -98,7 +98,7 @@ fn the_sibling_of_the_live_directory_is_hidden_and_never_folded() {
         .with_item(namespace::LIVE_SERVICE, LIVE_BLOB)
         .with_item(&sibling_service, OTHER_BLOB);
 
-    let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
+    let discovery = discover(&AgctlConfig::default(), &paths, &reader, &env, &ctx());
     assert_eq!(discovery.rows.len(), 2, "{:?}", ids(&discovery));
 
     let sibling = row(&discovery, "33333333-3333-4333-8333-333333333333");
@@ -123,7 +123,7 @@ fn an_identical_blob_under_a_second_name_folds_into_the_live_row() {
         .with_item(namespace::LIVE_SERVICE, LIVE_BLOB)
         .with_item(&format!("{}-{sibling_sha8}", namespace::LIVE_SERVICE), LIVE_BLOB);
 
-    let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
+    let discovery = discover(&AgctlConfig::default(), &paths, &reader, &env, &ctx());
     assert_eq!(discovery.rows.len(), 1, "{:?}", ids(&discovery));
 }
 
@@ -138,7 +138,7 @@ fn an_unclaimed_item_is_shown_and_a_legacy_key_is_ignored() {
         .with_item("Claude Code-credentials-6cdd6b98", OTHER_BLOB)
         .with_entry("Claude Code-86c75be7");
 
-    let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
+    let discovery = discover(&AgctlConfig::default(), &paths, &reader, &env, &ctx());
     assert_eq!(discovery.rows.len(), 2, "{:?}", ids(&discovery));
 
     let unclaimed = row(&discovery, "33333333-3333-4333-8333-333333333333");
@@ -162,7 +162,7 @@ fn an_old_blob_in_a_foreign_directory_is_identity_unknown_and_shown() {
         .with_item(namespace::LIVE_SERVICE, LIVE_BLOB)
         .with_item("Claude Code-credentials-6cdd6b98", OLD_BLOB);
 
-    let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
+    let discovery = discover(&AgctlConfig::default(), &paths, &reader, &env, &ctx());
     let unknown = row(&discovery, "Claude Code-credentials-6cdd6b98");
     assert_eq!(unknown.state, AccountState::IdentityUnknown);
     assert!(unknown.visible_by_default);
@@ -172,19 +172,19 @@ fn an_old_blob_in_a_foreign_directory_is_identity_unknown_and_shown() {
 #[test]
 fn a_switcher_item_is_listed_hidden_and_never_read() {
     // Fact F10: `claude-account-switcher` rewrites the live item on every
-    // switch. agentctl reports its items exist and touches nothing.
+    // switch. agctl reports its items exist and touches nothing.
     let (dir, paths) = store();
     let env = env_in(dir.path());
     let reader = FakeReader::unlocked()
         .with_item(namespace::LIVE_SERVICE, LIVE_BLOB)
         .with_entry("claude-switcher:alice@example.com");
 
-    let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
+    let discovery = discover(&AgctlConfig::default(), &paths, &reader, &env, &ctx());
     let foreign = row(&discovery, "claude-switcher:alice@example.com");
     assert_eq!(
         foreign.state.name(),
         "foreign",
-        "a switcher item is not `unclaimed`: nothing here is agentctl's to adopt"
+        "a switcher item is not `unclaimed`: nothing here is agctl's to adopt"
     );
     assert!(!foreign.visible_by_default);
     assert_eq!(foreign.source, Source::None);
@@ -210,7 +210,7 @@ fn the_live_row_falls_back_to_claude_json_for_its_identity() {
     .expect("the file should be writable");
 
     let reader = FakeReader::unlocked().with_item(namespace::LIVE_SERVICE, OLD_BLOB);
-    let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
+    let discovery = discover(&AgctlConfig::default(), &paths, &reader, &env, &ctx());
 
     let live = &discovery.rows[0];
     assert_eq!(live.id, "55555555-5555-4555-8555-555555555555");
@@ -234,7 +234,7 @@ fn claude_json_is_not_consulted_for_any_other_row() {
     let reader = FakeReader::unlocked()
         .with_item(namespace::LIVE_SERVICE, LIVE_BLOB)
         .with_item("Claude Code-credentials-6cdd6b98", OLD_BLOB);
-    let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
+    let discovery = discover(&AgctlConfig::default(), &paths, &reader, &env, &ctx());
 
     let foreign = row(&discovery, "Claude Code-credentials-6cdd6b98");
     assert_eq!(foreign.state, AccountState::IdentityUnknown);
@@ -250,7 +250,7 @@ fn a_locked_keychain_locks_the_keychain_backed_rows_and_reads_nothing() {
         .with_preflight(KeychainStatus::Locked)
         .with_item(namespace::LIVE_SERVICE, LIVE_BLOB);
 
-    let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
+    let discovery = discover(&AgctlConfig::default(), &paths, &reader, &env, &ctx());
     assert_eq!(discovery.preflight, KeychainStatus::Locked);
     assert_eq!(discovery.rows[0].state, AccountState::KeychainLocked { detail: String::new() });
     assert!(discovery.rows[0].state.is_failure(), "exit 2");
@@ -266,7 +266,7 @@ fn a_timed_out_keychain_is_transient_not_needs_login() {
     let env = env_in(dir.path());
     let reader = FakeReader::unlocked().with_preflight(KeychainStatus::Timeout);
 
-    let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
+    let discovery = discover(&AgctlConfig::default(), &paths, &reader, &env, &ctx());
     assert_eq!(discovery.rows[0].state, AccountState::KeychainTimeout);
 }
 
@@ -279,7 +279,7 @@ fn an_owned_row_reads_its_file() {
     std::fs::write(ns_dir.join(crate::secret::file_store::CREDENTIALS_FILE), OTHER_BLOB)
         .expect("writable");
 
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(
         new_record(
             "acct-1".to_owned(),
@@ -305,7 +305,7 @@ fn an_owned_row_reads_its_file() {
 fn an_owned_row_with_no_file_needs_a_login() {
     let (dir, paths) = store();
     let env = env_in(dir.path());
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(
         new_record(
             "acct-1".to_owned(),
@@ -335,7 +335,7 @@ fn an_owned_namespace_with_a_claude_lock_reports_the_session() {
     std::fs::write(ns_dir.join(crate::secret::foreign_activity::REFRESH_LOCK), b"")
         .expect("writable");
 
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(
         new_record(
             "acct-1".to_owned(),
@@ -371,7 +371,7 @@ fn a_migrated_owned_namespace_is_displayed_from_the_keychain() {
 
     let export_sha8 = namespace::sha8(&namespace::export_spelling(&ns_dir));
     let service = format!("{}-{export_sha8}", namespace::LIVE_SERVICE);
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(
         new_record(
             "acct-1".to_owned(),
@@ -412,7 +412,7 @@ fn an_owned_row_says_when_the_migration_probe_could_not_run() {
     std::fs::write(ns_dir.join(crate::secret::file_store::CREDENTIALS_FILE), OTHER_BLOB)
         .expect("writable");
 
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(
         new_record(
             "acct-1".to_owned(),
@@ -448,7 +448,7 @@ fn a_forgotten_record_is_hidden() {
     )
     .expect("valid");
     record.forgotten = true;
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(record);
 
     let discovery = discover(&config, &paths, &FakeReader::unlocked(), &env, &ctx());
@@ -463,10 +463,10 @@ fn a_foreign_record_says_whose_it_is() {
     // A credential that belongs to something else is never read (fact F10),
     // so the state says exactly that rather than `needs login` — which would
     // invite the user to fix a row that is not theirs to fix — or `unclaimed`,
-    // which is a Claude Code item agentctl could adopt and this is not.
+    // which is a Claude Code item agctl could adopt and this is not.
     let (dir, paths) = store();
     let env = env_in(dir.path());
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(
         new_record(
             "acct-1".to_owned(),
@@ -488,7 +488,7 @@ fn a_foreign_record_says_whose_it_is() {
 fn a_config_dir_record_claims_its_service_so_it_is_not_also_unclaimed() {
     let (dir, paths) = store();
     let env = env_in(dir.path());
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(
         new_record(
             "acct-9".to_owned(),
@@ -517,7 +517,7 @@ fn a_config_dir_record_claims_its_service_so_it_is_not_also_unclaimed() {
 fn a_config_dir_record_that_shares_the_live_directory_is_a_stale_sibling() {
     let (dir, paths) = store();
     let env = env_in(dir.path());
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(
         new_record(
             "acct-9".to_owned(),
@@ -545,7 +545,7 @@ fn a_config_dir_record_that_shares_the_live_directory_is_a_stale_sibling() {
 fn a_config_dir_record_with_a_failed_read_is_not_needs_login() {
     let (dir, paths) = store();
     let env = env_in(dir.path());
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(
         new_record(
             "acct-9".to_owned(),
@@ -575,7 +575,7 @@ fn an_env_token_adds_its_own_row() {
     env.oauth_token_set = true;
 
     let discovery =
-        discover(&AgentctlConfig::default(), &paths, &FakeReader::unlocked(), &env, &ctx());
+        discover(&AgctlConfig::default(), &paths, &FakeReader::unlocked(), &env, &ctx());
     let env_row = row(&discovery, "env");
     assert_eq!(env_row.state, AccountState::EnvToken);
     assert_eq!(env_row.source, Source::Env);
@@ -588,7 +588,7 @@ fn an_env_token_adds_its_own_row() {
 fn a_cancelled_pass_returns_what_it_has_so_far() {
     let (dir, paths) = store();
     let env = env_in(dir.path());
-    let mut config = AgentctlConfig::default();
+    let mut config = AgctlConfig::default();
     config.upsert(
         new_record(
             "acct-1".to_owned(),
@@ -623,7 +623,7 @@ fn an_oversized_claude_json_leaves_the_live_row_visible_without_an_identity() {
     );
 
     let reader = FakeReader::unlocked().with_item(namespace::LIVE_SERVICE, OLD_BLOB);
-    let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
+    let discovery = discover(&AgctlConfig::default(), &paths, &reader, &env, &ctx());
 
     let live = &discovery.rows[0];
     assert_eq!(live.id, "live", "no identity was found");
@@ -651,7 +651,7 @@ fn a_symlinked_claude_json_is_followed_for_the_live_row() {
         .expect("the symlink should be creatable");
 
     let reader = FakeReader::unlocked().with_item(namespace::LIVE_SERVICE, OLD_BLOB);
-    let discovery = discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx());
+    let discovery = discover(&AgctlConfig::default(), &paths, &reader, &env, &ctx());
 
     let live = &discovery.rows[0];
     assert_eq!(live.id, "99999999-9999-4999-8999-999999999999", "the identity behind the link");

@@ -1,6 +1,6 @@
 //! Where `tracing` output goes while the TUI owns the terminal.
 //!
-//! `agentctl claude watch` puts the terminal into raw mode on the alternate
+//! `agctl claude watch` puts the terminal into raw mode on the alternate
 //! screen and then draws a full frame several times a second. A log line
 //! written to standard error in the middle of that lands *inside* the frame:
 //! it is painted over by the next draw, so the user sees a flicker of text
@@ -21,7 +21,7 @@
 //!
 //! # The buffer is capped
 //!
-//! A `watch` under `RUST_LOG=agentctl=trace` can run for hours, and a buffer
+//! A `watch` under `RUST_LOG=agctl=trace` can run for hours, and a buffer
 //! that grew for all of it would be a leak. Past [`BUFFER_LIMIT`] the *first*
 //! bytes are kept and later ones counted but dropped: the beginning of a
 //! failure is what explains it, and the flush ends with a single line saying
@@ -138,7 +138,7 @@ fn release_terminal_to<W: Write>(sink: &mut W) {
     if dropped > 0 {
         let _ = writeln!(
             sink,
-            "agentctl: {dropped} further bytes of log output were dropped while the \
+            "agctl: {dropped} further bytes of log output were dropped while the \
              watch display held the terminal"
         );
     }

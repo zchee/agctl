@@ -109,10 +109,10 @@ fn invalid_grant_tells_the_user_how_to_recover() {
 
 #[test]
 fn not_implemented_names_the_command_and_is_fatal() {
-    let err = AppError::not_implemented("agentctl claude status");
+    let err = AppError::not_implemented("agctl claude status");
     assert_eq!(err.exit_code(), EXIT_FATAL, "an unbuilt command must not exit 0 or 2");
     let rendered = err.to_string();
-    assert!(rendered.contains("agentctl claude status"), "name the command: {rendered}");
+    assert!(rendered.contains("agctl claude status"), "name the command: {rendered}");
     assert!(rendered.contains("not implemented"), "say why: {rendered}");
 }
 

@@ -127,7 +127,7 @@ fn duration_parser_overflow_returns_an_error_rather_than_a_wrapped_value() {
 
 #[test]
 fn watch_interval_defaults_to_300_seconds() {
-    let cli = parse(&["agentctl", "claude", "watch"]);
+    let cli = parse(&["agctl", "claude", "watch"]);
     match claude_of(&cli) {
         ClaudeCommand::Watch(args) => {
             assert_eq!(args.interval, Duration::from_secs(300), "AC13: default interval");
@@ -140,11 +140,11 @@ fn watch_interval_defaults_to_300_seconds() {
 fn watch_interval_below_the_floor_is_rejected_naming_the_floor() {
     // AC13: the message must tell the user what the limit is, not merely that
     // their value was refused.
-    let message = parse_err(&["agentctl", "claude", "watch", "--interval", "30s"]);
+    let message = parse_err(&["agctl", "claude", "watch", "--interval", "30s"]);
     assert!(message.contains("60"), "the error must name the 60s floor, got: {message}");
 
     for below in ["0", "1s", "59s", "59"] {
-        let message = parse_err(&["agentctl", "claude", "watch", "--interval", below]);
+        let message = parse_err(&["agctl", "claude", "watch", "--interval", below]);
         assert!(message.contains("60"), "`{below}` must be refused naming 60: {message}");
     }
 }
@@ -159,7 +159,7 @@ fn watch_interval_at_or_above_the_floor_is_accepted() {
     ];
 
     for (name, input, expected) in tests {
-        let cli = parse(&["agentctl", "claude", "watch", "--interval", input]);
+        let cli = parse(&["agctl", "claude", "watch", "--interval", input]);
         match claude_of(&cli) {
             ClaudeCommand::Watch(args) => assert_eq!(args.interval, expected, "{name}"),
             other => panic!("{name}: expected `watch`, got {other:?}"),
@@ -169,7 +169,7 @@ fn watch_interval_at_or_above_the_floor_is_accepted() {
 
 #[test]
 fn status_defaults_are_the_documented_ones() {
-    let cli = parse(&["agentctl", "claude", "status"]);
+    let cli = parse(&["agctl", "claude", "status"]);
     match claude_of(&cli) {
         ClaudeCommand::Status(args) => {
             assert!(!args.json, "json defaults off");
@@ -188,7 +188,7 @@ fn status_defaults_are_the_documented_ones() {
 #[test]
 fn status_accepts_every_flag_and_repeats_account() {
     let cli = parse(&[
-        "agentctl",
+        "agctl",
         "claude",
         "status",
         "--json",
@@ -217,13 +217,13 @@ fn status_accepts_every_flag_and_repeats_account() {
 
 #[test]
 fn status_rejects_an_unparseable_timeout() {
-    let message = parse_err(&["agentctl", "claude", "status", "--timeout", "10 fortnights"]);
+    let message = parse_err(&["agctl", "claude", "status", "--timeout", "10 fortnights"]);
     assert!(!message.is_empty(), "clap should explain the rejection");
 }
 
 #[test]
 fn login_parses_both_flags() {
-    let bare = parse(&["agentctl", "claude", "login"]);
+    let bare = parse(&["agctl", "claude", "login"]);
     match claude_of(&bare) {
         ClaudeCommand::Login(args) => {
             assert!(!args.manual);
@@ -234,7 +234,7 @@ fn login_parses_both_flags() {
     }
 
     let full =
-        parse(&["agentctl", "claude", "login", "--manual", "--label", "work", "--no-duplicate"]);
+        parse(&["agctl", "claude", "login", "--manual", "--label", "work", "--no-duplicate"]);
     match claude_of(&full) {
         ClaudeCommand::Login(args) => {
             assert!(args.manual);
@@ -247,13 +247,13 @@ fn login_parses_both_flags() {
 
 #[test]
 fn accounts_subcommands_all_parse() {
-    let list = parse(&["agentctl", "claude", "accounts", "list", "--all"]);
+    let list = parse(&["agctl", "claude", "accounts", "list", "--all"]);
     match claude_of(&list) {
         ClaudeCommand::Accounts { command: AccountsCommand::List { all } } => assert!(*all),
         other => panic!("expected `accounts list`, got {other:?}"),
     }
 
-    let show = parse(&["agentctl", "claude", "accounts", "show", "acct-1"]);
+    let show = parse(&["agctl", "claude", "accounts", "show", "acct-1"]);
     match claude_of(&show) {
         ClaudeCommand::Accounts { command: AccountsCommand::Show { id } } => {
             assert_eq!(id, "acct-1");
@@ -262,7 +262,7 @@ fn accounts_subcommands_all_parse() {
     }
 
     let remove =
-        parse(&["agentctl", "claude", "accounts", "remove", "acct-1", "--delete-secret", "--yes"]);
+        parse(&["agctl", "claude", "accounts", "remove", "acct-1", "--delete-secret", "--yes"]);
     match claude_of(&remove) {
         ClaudeCommand::Accounts { command: AccountsCommand::Remove { id, delete_secret, yes } } => {
             assert_eq!(id, "acct-1");
@@ -272,7 +272,7 @@ fn accounts_subcommands_all_parse() {
         other => panic!("expected `accounts remove`, got {other:?}"),
     }
 
-    let remove_bare = parse(&["agentctl", "claude", "accounts", "remove", "acct-1"]);
+    let remove_bare = parse(&["agctl", "claude", "accounts", "remove", "acct-1"]);
     match claude_of(&remove_bare) {
         ClaudeCommand::Accounts { command: AccountsCommand::Remove { delete_secret, yes, .. } } => {
             assert!(!*delete_secret, "delete_secret must be opt-in");
@@ -281,7 +281,7 @@ fn accounts_subcommands_all_parse() {
         other => panic!("expected `accounts remove`, got {other:?}"),
     }
 
-    let relocate = parse(&["agentctl", "claude", "accounts", "relocate", "acct-1", "--yes"]);
+    let relocate = parse(&["agctl", "claude", "accounts", "relocate", "acct-1", "--yes"]);
     match claude_of(&relocate) {
         ClaudeCommand::Accounts { command: AccountsCommand::Relocate { id, yes } } => {
             assert_eq!(id, "acct-1");
@@ -290,7 +290,7 @@ fn accounts_subcommands_all_parse() {
         other => panic!("expected `accounts relocate`, got {other:?}"),
     }
 
-    let forget = parse(&["agentctl", "claude", "accounts", "forget", "Claude Code-credentials"]);
+    let forget = parse(&["agctl", "claude", "accounts", "forget", "Claude Code-credentials"]);
     match claude_of(&forget) {
         ClaudeCommand::Accounts { command: AccountsCommand::Forget { service } } => {
             assert_eq!(service, "Claude Code-credentials");
@@ -298,8 +298,7 @@ fn accounts_subcommands_all_parse() {
         other => panic!("expected `accounts forget`, got {other:?}"),
     }
 
-    let unforget =
-        parse(&["agentctl", "claude", "accounts", "unforget", "Claude Code-credentials"]);
+    let unforget = parse(&["agctl", "claude", "accounts", "unforget", "Claude Code-credentials"]);
     match claude_of(&unforget) {
         ClaudeCommand::Accounts { command: AccountsCommand::Unforget { service } } => {
             assert_eq!(service, "Claude Code-credentials");
@@ -310,7 +309,7 @@ fn accounts_subcommands_all_parse() {
 
 #[test]
 fn import_parses_its_source_and_repeats_config_dir() {
-    let dry_run = parse(&["agentctl", "claude", "import", "--from", "keychain", "--dry-run"]);
+    let dry_run = parse(&["agctl", "claude", "import", "--from", "keychain", "--dry-run"]);
     match claude_of(&dry_run) {
         ClaudeCommand::Import(args) => {
             assert_eq!(args.from, ImportSource::Keychain);
@@ -321,7 +320,7 @@ fn import_parses_its_source_and_repeats_config_dir() {
     }
 
     let keychain = parse(&[
-        "agentctl",
+        "agctl",
         "claude",
         "import",
         "--from",
@@ -343,19 +342,19 @@ fn import_parses_its_source_and_repeats_config_dir() {
 
 #[test]
 fn import_requires_a_source() {
-    let message = parse_err(&["agentctl", "claude", "import"]);
+    let message = parse_err(&["agctl", "claude", "import"]);
     assert!(message.contains("--from"), "the error should name the missing flag: {message}");
 }
 
 #[test]
 fn import_rejects_an_unknown_source() {
-    let message = parse_err(&["agentctl", "claude", "import", "--from", "sqlite"]);
+    let message = parse_err(&["agctl", "claude", "import", "--from", "sqlite"]);
     assert!(!message.is_empty(), "clap should explain the rejection");
 }
 
 #[test]
 fn doctor_parses_its_flags() {
-    let bare = parse(&["agentctl", "claude", "doctor"]);
+    let bare = parse(&["agctl", "claude", "doctor"]);
     match claude_of(&bare) {
         ClaudeCommand::Doctor(args) => {
             assert_eq!(args.remove_stale, None);
@@ -365,7 +364,7 @@ fn doctor_parses_its_flags() {
     }
 
     let removing = parse(&[
-        "agentctl",
+        "agctl",
         "claude",
         "doctor",
         "--remove-stale",
@@ -383,7 +382,7 @@ fn doctor_parses_its_flags() {
 
 #[test]
 fn use_bare_id_parses_with_every_default_off() {
-    let cli = parse(&["agentctl", "claude", "use", "acct-1"]);
+    let cli = parse(&["agctl", "claude", "use", "acct-1"]);
     match claude_of(&cli) {
         ClaudeCommand::Use(args) => {
             assert_eq!(args.id.as_deref(), Some("acct-1"));
@@ -400,7 +399,7 @@ fn use_bare_id_parses_with_every_default_off() {
 #[test]
 fn use_accepts_every_flag_together_with_an_id() {
     let cli = parse(&[
-        "agentctl",
+        "agctl",
         "claude",
         "use",
         "acct-1",
@@ -423,7 +422,7 @@ fn use_accepts_every_flag_together_with_an_id() {
 
 #[test]
 fn use_undo_and_forget_parse_without_an_id() {
-    let undo = parse(&["agentctl", "claude", "use", "--undo", "--yes"]);
+    let undo = parse(&["agctl", "claude", "use", "--undo", "--yes"]);
     match claude_of(&undo) {
         ClaudeCommand::Use(args) => {
             assert_eq!(args.id, None);
@@ -433,7 +432,7 @@ fn use_undo_and_forget_parse_without_an_id() {
         other => panic!("expected `use`, got {other:?}"),
     }
 
-    let forget = parse(&["agentctl", "claude", "use", "--forget", "acct-1"]);
+    let forget = parse(&["agctl", "claude", "use", "--forget", "acct-1"]);
     match claude_of(&forget) {
         ClaudeCommand::Use(args) => {
             assert_eq!(args.id, None);
@@ -446,9 +445,9 @@ fn use_undo_and_forget_parse_without_an_id() {
 #[test]
 fn use_live_conflicts_with_new_only_undo_and_forget() {
     for argv in [
-        vec!["agentctl", "claude", "use", "acct-1", "--live", "--new-only"],
-        vec!["agentctl", "claude", "use", "--live", "--undo"],
-        vec!["agentctl", "claude", "use", "--live", "--forget", "acct-1"],
+        vec!["agctl", "claude", "use", "acct-1", "--live", "--new-only"],
+        vec!["agctl", "claude", "use", "--live", "--undo"],
+        vec!["agctl", "claude", "use", "--live", "--forget", "acct-1"],
     ] {
         let message = parse_err(&argv);
         assert!(!message.is_empty(), "`{}` should be rejected", argv.join(" "));
@@ -458,9 +457,9 @@ fn use_live_conflicts_with_new_only_undo_and_forget() {
 #[test]
 fn use_undo_and_forget_conflict_with_an_id_and_with_each_other() {
     for argv in [
-        vec!["agentctl", "claude", "use", "acct-1", "--undo"],
-        vec!["agentctl", "claude", "use", "acct-1", "--forget", "acct-1"],
-        vec!["agentctl", "claude", "use", "--undo", "--forget", "acct-1"],
+        vec!["agctl", "claude", "use", "acct-1", "--undo"],
+        vec!["agctl", "claude", "use", "acct-1", "--forget", "acct-1"],
+        vec!["agctl", "claude", "use", "--undo", "--forget", "acct-1"],
     ] {
         let message = parse_err(&argv);
         assert!(!message.is_empty(), "`{}` should be rejected", argv.join(" "));
@@ -469,14 +468,14 @@ fn use_undo_and_forget_conflict_with_an_id_and_with_each_other() {
 
 #[test]
 fn exec_requires_a_trailing_command() {
-    let message = parse_err(&["agentctl", "claude", "exec", "acct-1"]);
+    let message = parse_err(&["agctl", "claude", "exec", "acct-1"]);
     assert!(!message.is_empty(), "a missing `-- <command>` should be rejected");
 }
 
 #[test]
 fn exec_parses_the_id_and_the_trailing_command() {
     let cli = parse(&[
-        "agentctl",
+        "agctl",
         "claude",
         "exec",
         "acct-1",
@@ -504,7 +503,7 @@ fn exec_parses_the_id_and_the_trailing_command() {
 
 #[test]
 fn env_defaults_to_zsh() {
-    let cli = parse(&["agentctl", "claude", "env", "acct-1"]);
+    let cli = parse(&["agctl", "claude", "env", "acct-1"]);
     match claude_of(&cli) {
         ClaudeCommand::Env(args) => {
             assert_eq!(args.id, "acct-1");
@@ -518,7 +517,7 @@ fn env_defaults_to_zsh() {
 #[test]
 fn env_accepts_every_documented_shell() {
     for (flag, expected) in [("zsh", Shell::Zsh), ("bash", Shell::Bash), ("fish", Shell::Fish)] {
-        let cli = parse(&["agentctl", "claude", "env", "acct-1", "--shell", flag]);
+        let cli = parse(&["agctl", "claude", "env", "acct-1", "--shell", flag]);
         match claude_of(&cli) {
             ClaudeCommand::Env(args) => assert_eq!(args.shell, expected, "--shell {flag}"),
             other => panic!("expected `env`, got {other:?}"),
@@ -528,23 +527,22 @@ fn env_accepts_every_documented_shell() {
 
 #[test]
 fn env_rejects_an_unknown_shell() {
-    let message = parse_err(&["agentctl", "claude", "env", "acct-1", "--shell", "powershell"]);
+    let message = parse_err(&["agctl", "claude", "env", "acct-1", "--shell", "powershell"]);
     assert!(!message.is_empty(), "clap should explain the rejection");
 }
 
 #[test]
 fn top_level_config_dir_is_accepted_before_the_subcommand() {
-    let cli = parse(&["agentctl", "--config-dir", "/custom/store", "claude", "status"]);
+    let cli = parse(&["agctl", "--config-dir", "/custom/store", "claude", "status"]);
     assert_eq!(cli.config_dir, Some(PathBuf::from("/custom/store")));
 }
 
 #[test]
 fn config_dir_is_global_and_accepted_after_the_subcommand() {
-    let cli = parse(&["agentctl", "claude", "status", "--config-dir", "/custom/store"]);
+    let cli = parse(&["agctl", "claude", "status", "--config-dir", "/custom/store"]);
     assert_eq!(cli.config_dir, Some(PathBuf::from("/custom/store")));
 
-    let nested =
-        parse(&["agentctl", "claude", "accounts", "list", "--config-dir", "/custom/store"]);
+    let nested = parse(&["agctl", "claude", "accounts", "list", "--config-dir", "/custom/store"]);
     assert_eq!(nested.config_dir, Some(PathBuf::from("/custom/store")));
 }
 
@@ -553,8 +551,8 @@ fn top_level_config_dir_defaults_to_none() {
     // The environment variable is read by clap when set; the default with no
     // flag and no variable is `None`, which lets `config::paths` apply its own
     // precedence rules rather than having a default baked in here.
-    let cli = parse(&["agentctl", "claude", "doctor"]);
-    let from_env = std::env::var_os("AGENTCTL_CONFIG_DIR");
+    let cli = parse(&["agctl", "claude", "doctor"]);
+    let from_env = std::env::var_os("AGCTL_CONFIG_DIR");
     if from_env.is_none() {
         assert_eq!(cli.config_dir, None);
     }
@@ -563,9 +561,9 @@ fn top_level_config_dir_defaults_to_none() {
 #[test]
 fn unknown_subcommands_are_rejected() {
     for argv in [
-        vec!["agentctl", "claude", "bogus"],
-        vec!["agentctl", "bogus"],
-        vec!["agentctl", "claude", "accounts", "bogus"],
+        vec!["agctl", "claude", "bogus"],
+        vec!["agctl", "bogus"],
+        vec!["agctl", "claude", "accounts", "bogus"],
     ] {
         let message = parse_err(&argv);
         assert!(!message.is_empty(), "`{}` should be rejected", argv.join(" "));
@@ -574,6 +572,6 @@ fn unknown_subcommands_are_rejected() {
 
 #[test]
 fn a_subcommand_is_required() {
-    let message = parse_err(&["agentctl"]);
-    assert!(!message.is_empty(), "bare `agentctl` should not parse as a runnable command");
+    let message = parse_err(&["agctl"]);
+    assert!(!message.is_empty(), "bare `agctl` should not parse as a runnable command");
 }

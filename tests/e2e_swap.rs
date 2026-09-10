@@ -2,7 +2,7 @@
 
 //! `claude use --live` through the real binary (plan section 3.4, W4a).
 //!
-//! Every test here drives the shipped `agentctl` against the fake `security`
+//! Every test here drives the shipped `agctl` against the fake `security`
 //! stand-in and, where a POST happens, an `httpmock` server. That is the only
 //! way to answer the questions W4a is actually about: how many times the
 //! keychain was touched, which item was named, what was left on disk when the
@@ -115,7 +115,7 @@ fn two_accounts(server: &MockServer, t_expires_at: i64) -> (Fixture, String) {
     // writes, and every test here that reaches Phase C asserts it: that is
     // what pins the **driver's** ordering rather than `swap.rs`'s annotation
     // of it (plan AC70).
-    fixture.set("RUST_LOG", "agentctl=debug");
+    fixture.set("RUST_LOG", "agctl=debug");
     (fixture, service)
 }
 
@@ -284,7 +284,7 @@ fn no_plaintext_store(fixture: &Fixture, when: &str) {
     );
 }
 
-/// The `hold_ms` the release line carries, under `RUST_LOG=agentctl=debug`.
+/// The `hold_ms` the release line carries, under `RUST_LOG=agctl=debug`.
 ///
 /// The hold's duration is only observable through this line, and invariant
 /// I17's number is worth asserting rather than assuming — the position tests
@@ -500,22 +500,22 @@ fn ac67_the_w4b_scope_gate_refuses_before_anything_is_read() {
 }
 
 #[test]
-fn ac67_the_oq1_precondition_refuses_a_store_agentctl_does_not_own() {
+fn ac67_the_oq1_precondition_refuses_a_store_agctl_does_not_own() {
     // Ruling OQ1: the inherited spelling is matched byte for byte against an
     // owned record. A path no record names is refused *before* Phase A, with
     // its own exit code and no `refusal` letter.
     let server = MockServer::start();
     let (mut fixture, _service) = two_accounts(&server, common::fresh_at());
-    fixture.set("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/tmp/not-a-store-agentctl-owns");
+    fixture.set("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/tmp/not-a-store-agctl-owns");
 
     no_plaintext_store(&fixture, "before the pass");
     let (code, stdout, _stderr) = swap(&fixture, &[]);
     assert_eq!(code, 15, "SWAP_EXIT_PRECONDITION");
     assert!(
-        stdout.contains("not a store agentctl owns"),
+        stdout.contains("not a store agctl owns"),
         "the message names the path and says why: {stdout}"
     );
-    assert!(stdout.contains("/tmp/not-a-store-agentctl-owns"), "{stdout}");
+    assert!(stdout.contains("/tmp/not-a-store-agctl-owns"), "{stdout}");
 
     assert_eq!(reads(&fixture).len(), 0, "decided before Phase A reads anything");
     assert_eq!(writes(&fixture).len(), 0);
@@ -539,9 +539,9 @@ fn ac67_the_oq1_precondition_refuses_a_store_agentctl_does_not_own() {
 
 #[test]
 fn ac67_refusal_c_names_whose_environment_was_inspected() {
-    // Decision D-020 narrowed refusal C to agentctl's **own** environment,
+    // Decision D-020 narrowed refusal C to agctl's **own** environment,
     // and the message has to say so — otherwise a user reads it as a claim
-    // about the session being swapped, which agentctl cannot inspect.
+    // about the session being swapped, which agctl cannot inspect.
     let server = MockServer::start();
     let (mut fixture, _service) = two_accounts(&server, common::fresh_at());
     fixture.set("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-from-the-environment");
@@ -549,7 +549,7 @@ fn ac67_refusal_c_names_whose_environment_was_inspected() {
     no_plaintext_store(&fixture, "before the pass");
     let (code, stdout, _stderr) = swap(&fixture, &[]);
     assert_eq!(code, 11, "SWAP_EXIT_REFUSED_C");
-    assert!(stdout.contains("agentctl's own environment"), "{stdout}");
+    assert!(stdout.contains("agctl's own environment"), "{stdout}");
 
     assert_eq!(writes(&fixture).len(), 0, "nothing written");
     // Decided from the environment alone, so the keychain is never opened.
@@ -619,9 +619,9 @@ fn ac67_refusal_f_when_the_outgoing_credential_cannot_be_read() {
     // item is present but unreadable: the fake reports a locked keychain.
     let server = MockServer::start();
     let (mut fixture, service) = two_accounts(&server, common::fresh_at());
-    fixture.set("AGENTCTL_FAKE_SECURITY_FIND_EXIT", "36");
+    fixture.set("AGCTL_FAKE_SECURITY_FIND_EXIT", "36");
     fixture.set(
-        "AGENTCTL_FAKE_SECURITY_STDERR",
+        "AGCTL_FAKE_SECURITY_STDERR",
         "The user name or passphrase you entered is not correct.",
     );
 
@@ -914,7 +914,7 @@ fn ac71_an_item_that_changes_before_the_hold_discards_the_swap() {
     let (mut fixture, service) = two_accounts(&server, common::fresh_at());
     let resume = fixture.scratch("resume");
     fixture.fault("pause_before_swap_write");
-    fixture.set("AGENTCTL_FAULT_RESUME", &resume.to_string_lossy());
+    fixture.set("AGCTL_FAULT_RESUME", &resume.to_string_lossy());
 
     let item = fixture.keychain_item_path_for(common::KEYCHAIN_ACCOUNT, &service);
     let peer = common::identified_blob(
@@ -988,7 +988,7 @@ fn ac81_a_swap_touches_nothing_outside_the_namespace_root() {
     assert_eq!(writes(&fixture).len(), 1, "one write reached the item");
     let after: std::collections::BTreeSet<_> = tree(&fixture).into_keys().collect();
     let root = fixture.config_dir().join("claude");
-    // `Paths::ensure_dirs` makes agentctl's own cache directories on every
+    // `Paths::ensure_dirs` makes agctl's own cache directories on every
     // pass, and invariant I1 names `cache_dir()` alongside `config_dir()` as
     // the two places this binary may write at all. They are allowed **by
     // name** rather than by widening the bound, and each is asserted to be a
@@ -998,7 +998,7 @@ fn ac81_a_swap_touches_nothing_outside_the_namespace_root() {
         [fixture.config_dir().join("cache"), fixture.config_dir().join("cache").join("claude")];
     for path in after.symmetric_difference(&before) {
         if allowed.contains(path) {
-            assert!(path.is_dir(), "`{}` is agentctl's own cache directory", path.display());
+            assert!(path.is_dir(), "`{}` is agctl's own cache directory", path.display());
             continue;
         }
         assert!(
@@ -1048,13 +1048,13 @@ fn walk(root: &Path) -> std::collections::BTreeSet<std::path::PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// agentctl-i9o — a broken stale lock followed by an acquire failure
+// agctl-i9o — a broken stale lock followed by an acquire failure
 // ---------------------------------------------------------------------------
 
 #[test]
 fn i9o_a_break_is_audited_even_when_the_acquire_then_fails() {
-    // `agentctl-i9o` (no caller-side e2e proves the break record is appended
-    // on acquire's failing path). After `agentctl-nq3` the draft rides an
+    // `agctl-i9o` (no caller-side e2e proves the break record is appended
+    // on acquire's failing path). After `agctl-nq3` the draft rides an
     // `AcquireFailure` and the caller appends it once, unconditionally,
     // before every mapping arm — but until now that was proven by
     // construction and by unit tests, never by driving the real binary.
@@ -1076,7 +1076,7 @@ fn i9o_a_break_is_audited_even_when_the_acquire_then_fails() {
     age(&primary);
 
     // A symlink where the held-lock record must go, so the acquire refuses
-    // *after* the break (`agentctl-p2-held-locks-dir-through-symlink-1yj`).
+    // *after* the break (`agctl-p2-held-locks-dir-through-symlink-1yj`).
     let held = fixture.held_locks_dir();
     let decoy = fixture.scratch("decoy");
     fs::create_dir_all(&decoy).expect("the decoy is creatable");
@@ -1099,7 +1099,7 @@ fn i9o_a_break_is_audited_even_when_the_acquire_then_fails() {
         "exactly one break is recorded, on a path that then failed: {lines:?}"
     );
     assert!(
-        broken[0].contains("\"tree\":\"agentctl\""),
+        broken[0].contains("\"tree\":\"agctl\""),
         "and it names the tree the lock was in: {}",
         broken[0]
     );
@@ -1296,7 +1296,7 @@ fn undo_of_a_live_target_entry_is_s23s_and_says_so() {
     let entry = json!({
         "ts": "2026-09-10T00:00:00Z",
         "monotonic_ms": 0,
-        "agentctl_pid": 1,
+        "agctl_pid": 1,
         "event": "write",
         "target": "live",
         "from_digest8": "deadbeef",
@@ -1476,7 +1476,7 @@ fn ac67_refusal_d_on_the_refreshed_blob_is_decided_before_any_child_exists() {
 }
 
 // ---------------------------------------------------------------------------
-// AC67 refusal A — an artefact moved under a lock agentctl was holding
+// AC67 refusal A — an artefact moved under a lock agctl was holding
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1495,7 +1495,7 @@ fn ac67_refusal_a_when_an_artefact_moves_under_the_hold() {
     let (mut fixture, _service) = two_accounts(&server, common::fresh_at());
     let resume = fixture.scratch("resume");
     fixture.fault("swap_pause_in_locks");
-    fixture.set("AGENTCTL_FAULT_RESUME", &resume.to_string_lossy());
+    fixture.set("AGCTL_FAULT_RESUME", &resume.to_string_lossy());
 
     let artefacts = fixture.hold_artefacts(ACCT, ORG);
     let watch = ArtefactWatch::start(artefacts.clone());
@@ -1517,7 +1517,7 @@ fn ac67_refusal_a_when_an_artefact_moves_under_the_hold() {
     // the pause's position: with the pause below the second drift check, the
     // check has long since run by the time this fires, and the swap applies.
     std::thread::sleep(Duration::from_millis(300));
-    // `utimes` on an artefact agentctl is holding: the peer's protocol says
+    // `utimes` on an artefact agctl is holding: the peer's protocol says
     // the holder owns that modification time, so a change to it is a
     // violation whoever made it.
     age(&primary);
@@ -1535,7 +1535,7 @@ fn ac67_refusal_a_when_an_artefact_moves_under_the_hold() {
     assert_eq!(
         doc["refusal"],
         json!("A"),
-        "the one letter that means somebody moved a lock agentctl was holding: {doc}"
+        "the one letter that means somebody moved a lock agctl was holding: {doc}"
     );
     assert!(doc["lock"]["hold_ms"].is_u64(), "the hold it was holding is reported: {doc}");
     assert!(!stdout.contains("sk-ant-"), "{stdout}");
@@ -1559,7 +1559,7 @@ fn ac67_refusal_a_when_an_artefact_moves_under_the_hold() {
 fn ac68_a_fresh_refresh_lock_is_waited_out_with_nothing_held() {
     // Plan AC68. A Claude Code session is refreshing: its `.oauth_refresh.lock`
     // is present and **fresh**, so it is not stale and nothing may break it.
-    // agentctl waits on fact F36's own schedule — holding nothing — and when
+    // agctl waits on fact F36's own schedule — holding nothing — and when
     // the session releases, the swap completes. The evidence that the wait
     // happened outside the hold is the pair of numbers: seconds of wall clock
     // against a hold of milliseconds.
@@ -1623,7 +1623,7 @@ fn ac70_an_eexist_at_the_third_lock_restarts_without_waiting_inside_the_hold() {
     // Two numbers say so. The whole pass finishes far inside
     // `STALE_SAMPLE_INTERVAL` (12 s), which is what a single sampling window
     // would cost; and the two locks that *were* taken are gone afterwards,
-    // while the planted one — which agentctl never owned — is untouched.
+    // while the planted one — which agctl never owned — is untouched.
     let server = MockServer::start();
     let token = token_ok(&server);
     let (fixture, _service) = two_accounts(&server, common::fresh_at());
@@ -1641,9 +1641,9 @@ fn ac70_an_eexist_at_the_third_lock_restarts_without_waiting_inside_the_hold() {
         elapsed < Duration::from_secs(12),
         "a restart that waited would have cost a 12 s sampling window: {elapsed:?}"
     );
-    assert!(!primary.exists(), "the primary agentctl took was released on the EEXIST");
+    assert!(!primary.exists(), "the primary agctl took was released on the EEXIST");
     assert!(!legacy.exists(), "and so was the legacy lock beneath it");
-    assert!(storage.exists(), "while the lock agentctl never owned is untouched");
+    assert!(storage.exists(), "while the lock agctl never owned is untouched");
     assert!(hold_ms(&stderr).is_none(), "no hold ever completed, so no release line: {stderr}");
     assert!(
         !audit_lines(&fixture).iter().any(|line| line.contains("\"event\":\"lock_break\"")),
@@ -1707,7 +1707,7 @@ fn unmigrated_store(server: &MockServer) -> (Fixture, String) {
         "CLAUDE_SECURESTORAGE_CONFIG_DIR",
         &common::export_spelling(&fixture.ns_dir(ACCT, ORG)),
     );
-    fixture.set("RUST_LOG", "agentctl=debug");
+    fixture.set("RUST_LOG", "agctl=debug");
     (fixture, service)
 }
 
@@ -1923,14 +1923,14 @@ fn a_first_write_whose_outcome_is_unknown_keeps_the_plaintext_store_and_says_so(
     let note = doc["note"].as_str().unwrap_or_default();
     assert!(note.contains(".credentials.json"), "and the note names the file it left: {note}");
     assert!(note.contains("displaced"), "saying what is in it: {note}");
-    // Finding N-9. The note used to end at "re-run `agentctl claude status`",
+    // Finding N-9. The note used to end at "re-run `agctl claude status`",
     // which names a command that cannot remove the file — nothing in
     // `status`, `doctor` or `accounts` unlinks a `.credentials.json` — so the
     // advice read as "this will be cleaned up" when nothing ever cleans it
     // up. `status` answers the question the removal turns on: what the item
     // holds. The rest is the operator's, and the note says so.
     assert!(
-        note.contains("agentctl claude status"),
+        note.contains("agctl claude status"),
         "it still points at the command that can answer what the item holds: {note}"
     );
     assert!(
@@ -2136,7 +2136,7 @@ fn ac74_a_write_that_hangs_is_unknown_with_its_audit_id_and_a_released_hold() {
 fn the_swap_refuses_when_the_store_has_moved_since_its_item_was_named() {
     // The precondition's other half. The record still carries the spelling
     // the session inherited — so the byte-for-byte match succeeds — but the
-    // namespace agentctl derives *now* is somewhere else. The service names
+    // namespace agctl derives *now* is somewhere else. The service names
     // the item the session reads; the directory names a store whose
     // `.oauth_refresh.lock` the peer never takes. Writing under those locks
     // would defeat invariant I3' for the one command that writes under the
@@ -2192,7 +2192,7 @@ fn the_undo_refuses_when_the_store_has_moved_since_its_item_was_named() {
     // by construction and had no test. A reversal has no session to inherit a
     // spelling from, so it takes the one the **record** carries; the guard
     // then asserts the same predicate the forward path does, that the
-    // namespace agentctl derives now is the namespace the item was made for.
+    // namespace agctl derives now is the namespace the item was made for.
     //
     // The shape: a real swap happens, and only then does the record's
     // recorded spelling stop describing where its namespace is. `export_sha8`
@@ -2624,7 +2624,7 @@ fn a_swap_discarded_after_the_refresh_still_leaves_the_refreshed_pair_saved() {
     let (mut fixture, service) = two_accounts(&server, common::expired_at());
     let resume = fixture.scratch("resume");
     fixture.fault("pause_before_swap_write");
-    fixture.set("AGENTCTL_FAULT_RESUME", &resume.to_string_lossy());
+    fixture.set("AGCTL_FAULT_RESUME", &resume.to_string_lossy());
 
     let item = fixture.keychain_item_path_for(common::KEYCHAIN_ACCOUNT, &service);
     let peer = common::identified_blob(
@@ -2710,7 +2710,7 @@ fn an_expired_incoming_credential_in_a_migrated_store_is_refused_before_the_post
     assert_eq!(doc["outcome"], json!("needs_refresh"), "{doc}");
     assert_eq!(doc["refusal"], Value::Null, "nothing about the store is wrong: {doc}");
     let note = doc["note"].as_str().unwrap_or_default();
-    assert!(note.contains("agentctl claude status"), "the note names the remedy: {note}");
+    assert!(note.contains("agctl claude status"), "the note names the remedy: {note}");
     assert!(!stdout.contains("sk-ant-"), "never a token: {stdout}");
 
     assert_eq!(writes(&fixture).len(), 0, "and nothing was written: {:?}", writes(&fixture));
@@ -2731,7 +2731,7 @@ fn a_migrated_incoming_store_says_why_instead_of_sending_the_user_to_login() {
     // W4a reads the incoming credential from a plaintext store and only from
     // there, so an incoming namespace that has migrated into the keychain
     // cannot be swapped in yet. That refusal is right; its **sentence** was
-    // not. It said "no readable credential to swap in; run `agentctl claude
+    // not. It said "no readable credential to swap in; run `agctl claude
     // login` for it", which is false twice over: the credential is there, and
     // a fresh login would rotate a working refresh token away to fix nothing.
     //
@@ -2950,7 +2950,7 @@ fn use_live_json_carries_the_lock_timings_and_never_a_token() {
 #[test]
 fn a_failed_write_has_its_own_outcome_and_exit_code_and_the_audit_agrees() {
     // Refusal letters are security signals: **A** means somebody moved a lock
-    // agentctl was holding. A `security(1)` that exits non-zero is not that,
+    // agctl was holding. A `security(1)` that exits non-zero is not that,
     // and reporting it as **A** made the exit code contradict the audit line
     // the same pass had just written.
     let server = MockServer::start();
@@ -3069,7 +3069,7 @@ fn an_undo_discarded_by_a_peer_write_leaves_the_restored_credential_in_the_copy(
 
     let resume = fixture.scratch("resume");
     fixture.fault("pause_before_swap_write");
-    fixture.set("AGENTCTL_FAULT_RESUME", &resume.to_string_lossy());
+    fixture.set("AGCTL_FAULT_RESUME", &resume.to_string_lossy());
 
     let peer = common::identified_blob(
         "sk-ant-oat01-peer",
@@ -3122,7 +3122,7 @@ fn an_undo_refused_by_a_compromised_hold_leaves_the_restored_credential_in_the_c
 
     let resume = fixture.scratch("resume");
     fixture.fault("swap_pause_in_locks");
-    fixture.set("AGENTCTL_FAULT_RESUME", &resume.to_string_lossy());
+    fixture.set("AGCTL_FAULT_RESUME", &resume.to_string_lossy());
     let [primary, _legacy, _storage] = fixture.hold_artefacts(ACCT, ORG);
 
     let child = undo_raw(&fixture);
@@ -3153,7 +3153,7 @@ fn an_undo_refused_by_a_compromised_hold_leaves_the_restored_credential_in_the_c
 #[test]
 fn an_undo_that_finds_the_store_busy_leaves_the_restored_credential_in_the_copy() {
     // The `Busy` exit. A Claude Code session holds a fresh refresh lock and
-    // never lets go, so agentctl waits out fact F36's schedule and then
+    // never lets go, so agctl waits out fact F36's schedule and then
     // reports the store busy — having written nothing and, crucially, having
     // left the copy holding P.
     let server = MockServer::start();
@@ -3209,7 +3209,7 @@ fn an_undo_whose_write_fails_leaves_the_restored_credential_in_the_copy() {
         "the reverse direction's own wording: {stdout}"
     );
     assert!(
-        !stdout.contains("recoverable with `agentctl claude use --undo`"),
+        !stdout.contains("recoverable with `agctl claude use --undo`"),
         "which is what `--undo` must not tell a user who is already running it: {stdout}"
     );
     copy_still_holds_p(&fixture);
@@ -3388,10 +3388,10 @@ fn an_occupant_arriving_during_the_post_is_not_adopted_as_this_rows_credential()
     let child = fixture
         .raw()
         .args(["claude", "status", "--json", "--refresh", "--timeout", "30s", "--account", EMAIL])
-        .env("AGENTCTL_FAULT", "pause_before_migrated_reread")
-        .env("AGENTCTL_FAULT_RESUME", &resume)
+        .env("AGCTL_FAULT", "pause_before_migrated_reread")
+        .env("AGCTL_FAULT_RESUME", &resume)
         .spawn()
-        .expect("agentctl should start");
+        .expect("agctl should start");
 
     assert!(
         common::wait_until(Duration::from_secs(20), || finds_for(&fixture, &service) >= 3),
@@ -3476,10 +3476,10 @@ fn an_occupant_arriving_after_an_invalid_grant_is_not_adopted_either() {
     let child = fixture
         .raw()
         .args(["claude", "status", "--json", "--refresh", "--timeout", "30s", "--account", EMAIL])
-        .env("AGENTCTL_FAULT", "pause_before_invalid_grant_reread")
-        .env("AGENTCTL_FAULT_RESUME", &resume)
+        .env("AGCTL_FAULT", "pause_before_invalid_grant_reread")
+        .env("AGCTL_FAULT_RESUME", &resume)
         .spawn()
-        .expect("agentctl should start");
+        .expect("agctl should start");
 
     assert!(
         common::wait_until(Duration::from_secs(20), || token.calls() == 1),
@@ -3536,7 +3536,7 @@ fn an_undo_whose_write_outcome_is_unknown_leaves_the_restored_credential_in_the_
     assert_eq!(code, 18, "SWAP_EXIT_UNKNOWN: {stdout}{stderr}");
     hold_within_budget(&stderr);
     assert!(
-        stdout.contains("re-run `agentctl claude status`"),
+        stdout.contains("re-run `agctl claude status`"),
         "the user is told the write is unconfirmed: {stdout}"
     );
     assert!(

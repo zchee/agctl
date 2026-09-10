@@ -175,8 +175,8 @@ fn current_account_is_a_string_even_with_nothing_set() {
 #[cfg(feature = "testing")]
 #[test]
 fn the_test_only_environment_variable_names_are_the_documented_ones() {
-    assert_eq!(KEYCHAIN_BACKEND_ENV, "AGENTCTL_KEYCHAIN_BACKEND");
-    assert_eq!(SECURITY_BIN_ENV, "AGENTCTL_SECURITY_BIN");
+    assert_eq!(KEYCHAIN_BACKEND_ENV, "AGCTL_KEYCHAIN_BACKEND");
+    assert_eq!(SECURITY_BIN_ENV, "AGCTL_SECURITY_BIN");
 }
 
 #[test]
@@ -190,7 +190,7 @@ fn default_reader_builds_without_touching_the_keychain() {
     );
     let reader = default_reader(&ctx);
     // And, under the `testing` feature with no stand-in wired, it is not even
-    // a reader that *could* spawn one: an unset `AGENTCTL_SECURITY_BIN` fails
+    // a reader that *could* spawn one: an unset `AGCTL_SECURITY_BIN` fails
     // closed to `DisabledReader` rather than defaulting to the real
     // `security(1)`. Calling `preflight` is therefore safe here, and is the
     // assertion — a test that only dropped the reader would still pass if the

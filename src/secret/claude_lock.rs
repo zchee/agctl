@@ -69,7 +69,7 @@
 //! Claude Code's **live** lock, `rmdir` removes one, and the lexical
 //! containment check that invariant I11′ rests on still says the path is inside
 //! `namespace_root()`, because as a *spelling* it is. The held-lock record and
-//! the audit entry would both say `tree: agentctl` while the break landed in
+//! the audit entry would both say `tree: agctl` while the break landed in
 //! the live store — simultaneously "break a live lock" and "escape the root".
 //!
 //! A descriptor closes it in both directions: the walk refuses the link before
@@ -124,7 +124,7 @@ pub use crate::secret::held_locks::HeldLockRecord;
 
 /// The peer's heartbeat period (fact F45's `update`).
 ///
-/// agentctl runs no heartbeat of its own — a 3 000 ms hold can never reach
+/// agctl runs no heartbeat of its own — a 3 000 ms hold can never reach
 /// 5 s, so one could only ever be dead code pretending to be a safety net
 /// (architect NEW-2). The number still governs [`STALE_SAMPLE_INTERVAL`]'s
 /// margin, which is why it stays a named constant.
@@ -203,7 +203,7 @@ pub struct LockProfile {
     pub stale: Duration,
     /// The peer's heartbeat period for this family.
     pub update: Duration,
-    /// How many times agentctl retries a blocked `mkdir`. Always zero: a
+    /// How many times agctl retries a blocked `mkdir`. Always zero: a
     /// retry is a wait, and a wait belongs outside the hold.
     pub retries: u32,
     /// The longest a hold of this family may last.
@@ -254,10 +254,10 @@ pub struct LockSubject<'a> {
 /// Why a lock could not be taken, held or trusted.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LockError {
-    /// **Refusal A**: a lock agentctl holds had its modification time moved
+    /// **Refusal A**: a lock agctl holds had its modification time moved
     /// under it, so the protocol has already been violated and nothing may be
     /// written.
-    #[error("`{0}` was modified while agentctl held it; the lock is compromised")]
+    #[error("`{0}` was modified while agctl held it; the lock is compromised")]
     Compromised(PathBuf),
     /// The hold outlived its profile's budget, which would make the peer's
     /// own refresh throw (fact F53).
@@ -274,7 +274,7 @@ pub enum LockError {
     /// **Containment**: the store directory is not in the tree the caller
     /// named, so the hold — and any break inside it — would land somewhere
     /// invariant I11′ does not allow.
-    #[error("`{}` is not {}, so agentctl will not lock it as one", .store_dir.display(), .tree.label())]
+    #[error("`{}` is not {}, so agctl will not lock it as one", .store_dir.display(), .tree.label())]
     WrongTree {
         /// The store directory as the caller spelled it.
         store_dir: PathBuf,
@@ -473,7 +473,7 @@ impl LockFs for RealFs {
 
     fn rmdir(&self, at: LockSlot<'_>) -> Result<(), FsError> {
         // `AT_REMOVEDIR` is the whole point: `unlink` and `remove_file`
-        // cannot remove a directory, which is the defect `agentctl-nz5`
+        // cannot remove a directory, which is the defect `agctl-nz5`
         // records one module over. It also refuses anything that is not a
         // directory, so a regular file or a symbolic link at the artefact's
         // name is never removed.
@@ -540,7 +540,7 @@ struct Artefact {
 /// The two directory descriptors every lock of one hold is addressed through.
 ///
 /// Opened by a single `O_NOFOLLOW` component walk from the anchor the *tree*
-/// permits — [`Paths::namespace_root`] for [`Tree::Agentctl`], the *resolved*
+/// permits — [`Paths::namespace_root`] for [`Tree::Agctl`], the *resolved*
 /// live store's parent for [`Tree::Live`] — and kept for the life of the hold.
 /// Two consequences, and both are the point:
 ///
@@ -559,7 +559,7 @@ pub struct LockAnchor {
     store_name: OsString,
     /// The store directory the walk actually reached, for records and messages.
     ///
-    /// For [`Tree::Agentctl`] that is the caller's own spelling, which is
+    /// For [`Tree::Agctl`] that is the caller's own spelling, which is
     /// already a path below [`Paths::namespace_root`] with no link in it. For
     /// [`Tree::Live`] it is the *resolved* store (see [`LockAnchor::open`]),
     /// because the live store is reached through a symbolic link on a normal
@@ -578,7 +578,7 @@ impl LockAnchor {
     /// # Errors
     ///
     /// [`LockError::WrongTree`] when the store directory is neither under
-    /// [`Paths::namespace_root`] (for [`Tree::Agentctl`]) nor the live store
+    /// [`Paths::namespace_root`] (for [`Tree::Agctl`]) nor the live store
     /// itself (for [`Tree::Live`]), and [`LockError::Unreachable`] when the
     /// walk refuses a component or cannot find one. For [`Tree::Live`] that
     /// same variant also carries the two refusals that come *before* the walk:
@@ -596,12 +596,12 @@ impl LockAnchor {
         // reached from it at all (`strip_prefix` fails inside the walk), and one
         // that is below it is reached one `O_NOFOLLOW` component at a time.
         let (anchor, store_path) = match subject.tree {
-            Tree::Agentctl => {
+            Tree::Agctl => {
                 if !paths.is_under_namespace_root(store_dir) {
                     return Err(wrong_tree());
                 }
                 // Nothing is resolved here, and that is the difference between
-                // the two trees: agentctl owns every component below its own
+                // the two trees: agctl owns every component below its own
                 // root, so a symbolic link at one of them is an attack rather
                 // than a configuration, and the walk below refuses it.
                 (paths.namespace_root(), store_dir.to_path_buf())
@@ -643,7 +643,7 @@ impl LockAnchor {
                 // - `store_name` — and therefore the legacy lock — is the
                 //   resolved last component, which is the entry the peer creates
                 //   (`realpath(dir) + ".lock"`, fact F17). Following the link but
-                //   keeping the caller's lexical parent would put agentctl's
+                //   keeping the caller's lexical parent would put agctl's
                 //   legacy lock at `$HOME/.claude.lock` while a Claude Code
                 //   session held `<target>.lock`: two different entries, and the
                 //   F54/F55 race the legacy lock exists to lose would be back.
@@ -960,7 +960,7 @@ pub struct Acquisition {
 /// back a [`BreakDraft`]; every way out of [`acquire_with`] after that moment
 /// owes that draft to the audit log, and six of those ways are `Err`. Before
 /// this type they returned a bare [`LockError`], the draft died with the stack
-/// frame, and agentctl had removed another process's lock with nothing durable
+/// frame, and agctl had removed another process's lock with nothing durable
 /// to say so — invariant I16's exact prohibition.
 ///
 /// So the draft is carried rather than dropped, and it is carried in a struct
@@ -1057,7 +1057,7 @@ impl HeldLocks {
     /// Section 3.4 step 8: one `stat` triple immediately before the write.
     ///
     /// Any modification time differing from the value recorded at its
-    /// `mkdir` means a third party has touched a lock agentctl holds, which
+    /// `mkdir` means a third party has touched a lock agctl holds, which
     /// is **refusal A** — the protocol has been violated and nothing may be
     /// written. The budget is checked in the same place, because this is the
     /// last moment at which abandoning still costs nothing.
@@ -1217,7 +1217,7 @@ fn plan(anchor: &LockAnchor) -> [LockPlan; 3] {
 /// 1. **With nothing held**, `stat` all three; for any that exists and is
 ///    stale by its own profile, run [`resolve_stale`]'s full rule — including
 ///    its 12-second sampling wait. At most **one** break per acquire, so
-///    agentctl cannot loop against a peer that recreates a lock.
+///    agctl cannot loop against a peer that recreates a lock.
 /// 2. **With nothing held**, wait out a primary that is present and not
 ///    stale on fact F36's schedule. If it is released during the schedule the
 ///    acquisition proceeds; if it is still there, the store is busy.
@@ -1354,7 +1354,7 @@ pub fn acquire_with(
         // A lock that was broken and is already back is section 3.8's
         // `retaken`, and it ends the acquire: at most one break, so there is
         // no second one to attempt, and waiting out the new holder would be
-        // waiting out a lock agentctl itself just freed.
+        // waiting out a lock agctl itself just freed.
         if let Some(artefact) = broken.as_ref()
             && seams.fs.mtime(anchor.slot(artefact)).is_some()
         {
@@ -1380,7 +1380,7 @@ pub fn acquire_with(
 
         // --- Step 3: the record, before the first mkdir -------------------
         //
-        // Site 5, and the one `agentctl-nq3` was filed for: after `1yj` a
+        // Site 5, and the one `agctl-nq3` was filed for: after `1yj` a
         // symbolic link at `<namespace_root>/held-locks` makes this fail
         // deterministically, so a peer's lock could be removed and the only
         // durable evidence of it discarded, on demand. `?` would do that
@@ -1439,7 +1439,7 @@ pub fn acquire_with(
                 let _ = std::fs::remove_file(&record_path);
                 // Site 6, and after `axs` it is reachable with no `mkdir`
                 // failure at all — an unreadable modification time straight
-                // after agentctl's own `mkdirat`. It can carry a completed
+                // after agctl's own `mkdirat`. It can carry a completed
                 // *removal* draft, which is the most valuable one to lose.
                 return Err(AcquireFailure {
                     error: LockError::Io {
@@ -1483,7 +1483,7 @@ enum TakeFailure {
 ///
 /// A directory whose modification time cannot be read immediately after its
 /// own `mkdir` is a [`TakeFailure::Io`], not a hold. Refusal A is the only
-/// thing that tells agentctl a third party touched a lock it holds, and it
+/// thing that tells agctl a third party touched a lock it holds, and it
 /// compares against the reading taken here; without one there is nothing to
 /// compare against, so the lock would be held with that check switched off.
 /// The directory exists by then, so it joins `held` on the way out and is
@@ -1858,7 +1858,7 @@ const RECORD_NAME_ATTEMPTS: u32 = 8;
 /// was integrity and not disclosure, but the record is what `doctor` and
 /// `--remove-stale` read to decide whether a lock outside the namespace root
 /// may be removed, and a record an attacker can place is a record that can
-/// name paths agentctl would then act on.
+/// name paths agctl would then act on.
 ///
 /// So the directory is resolved once, from [`Paths::namespace_root`] down,
 /// one `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` component at a time
@@ -1884,13 +1884,13 @@ fn write_held_record(
         .map_err(|err| LockError::Unreachable { path: dir.clone(), message: err.to_string() })?;
 
     let record = HeldLockRecord {
-        agentctl_pid: std::process::id(),
+        agctl_pid: std::process::id(),
         // Read here rather than at the removal, because the point of the field
         // is to say which process this was: a `doctor` run months later can
         // only compare a recorded start time against the one the id carries
         // now, and a recycled id then reads as recycled instead of as the
         // holder.
-        agentctl_start_time: proc::self_start_time(&Cancel::new()),
+        agctl_start_time: proc::self_start_time(&Cancel::new()),
         tree: anchor.tree(),
         store_dir: anchor.store_dir().to_path_buf(),
         paths: plans.iter().map(|lock| lock.artefact.path.clone()).collect(),
@@ -1901,7 +1901,7 @@ fn write_held_record(
         message: err.to_string(),
     })?;
 
-    let pid = record.agentctl_pid;
+    let pid = record.agctl_pid;
     let base = monotonic_ms(clock);
     for attempt in 0..RECORD_NAME_ATTEMPTS {
         let stamp = base.saturating_add(u64::from(attempt));

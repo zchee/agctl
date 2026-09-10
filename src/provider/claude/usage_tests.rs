@@ -58,7 +58,7 @@ fn credentials(access: &str) -> Credentials {
 }
 
 fn client(server: &MockServer) -> UsageClient {
-    UsageClient::new(&server.base_url(), "agentctl/test", Duration::from_secs(5))
+    UsageClient::new(&server.base_url(), "agctl/test", Duration::from_secs(5))
 }
 
 #[test]
@@ -633,7 +633,7 @@ fn the_request_carries_exactly_the_headers_the_endpoint_needs() {
             .header("authorization", "Bearer sk-ant-oat01-observed")
             .header(BETA_HEADER, BETA_VALUE)
             .header("accept", "application/json")
-            .header("user-agent", "agentctl/test");
+            .header("user-agent", "agctl/test");
         then.status(200).body(CAPTURED);
     });
 
@@ -763,10 +763,10 @@ fn a_cancelled_pass_makes_no_request_at_all() {
 #[test]
 fn the_usage_url_is_the_base_plus_the_path_with_no_double_slash() {
     let with_slash =
-        UsageClient::new("https://example.test/", "agentctl/test", Duration::from_secs(1));
+        UsageClient::new("https://example.test/", "agctl/test", Duration::from_secs(1));
     assert_eq!(with_slash.usage_url(), "https://example.test/api/oauth/usage");
 
-    let without = UsageClient::new("https://example.test", "agentctl/test", Duration::from_secs(1));
+    let without = UsageClient::new("https://example.test", "agctl/test", Duration::from_secs(1));
     assert_eq!(without.usage_url(), "https://example.test/api/oauth/usage");
 }
 

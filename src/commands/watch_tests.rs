@@ -126,7 +126,7 @@ fn write_owned_registry(store: &Store) {
     record.email = Some("owner@example.com".to_owned());
     record.org_name = Some("Acme".to_owned());
 
-    AgentctlConfig::update(&store.paths, |config| config.upsert(record))
+    AgctlConfig::update(&store.paths, |config| config.upsert(record))
         .expect("the registry should be writable");
 }
 
@@ -204,7 +204,7 @@ impl EventSource for ScriptedEvents {
 }
 
 /// A pass that blocks the way a real one blocks when another process is
-/// holding the namespace lock (`AGENTCTL_FAULT=hold_lock`).
+/// holding the namespace lock (`AGCTL_FAULT=hold_lock`).
 struct HeldPass {
     paths: Arc<Paths>,
     hold: Duration,
@@ -442,7 +442,7 @@ fn an_interval_below_the_floor_is_refused_naming_the_floor() {
     // The parser rejects it too (`cli_tests.rs`), but `WatchArgs` is an
     // ordinary struct: the floor is a promise to the usage API, not a nicety
     // of the command line, so the command refuses one as well.
-    let cli = Cli::parse_from(["agentctl", "claude", "watch"]);
+    let cli = Cli::parse_from(["agctl", "claude", "watch"]);
     let args = WatchArgs { interval: Duration::from_secs(30) };
 
     let err = run(&cli, &args, &Cancel::new()).expect_err("30s is below the 60s floor");
@@ -828,7 +828,7 @@ fn a_pass_whose_registry_cannot_be_read_reports_nothing_rather_than_no_accounts(
         }),
         // Unroutable: this pass must fail long before anything is fetched.
         client_factory: Arc::new(|| {
-            UsageClient::new("http://127.0.0.1:1", "agentctl/test", Duration::from_secs(1))
+            UsageClient::new("http://127.0.0.1:1", "agctl/test", Duration::from_secs(1))
         }),
         refresher: Arc::new(NeverRefresher),
         fault: Fault::none(),
@@ -925,7 +925,7 @@ fn a_keychain_that_locks_between_passes_is_reported_on_the_next_one() {
         env: EnvView::with_home(store.home.clone()),
         reader_factory: readers,
         client_factory: Arc::new(move || {
-            UsageClient::new(&base_url, "agentctl/test", Duration::from_secs(5))
+            UsageClient::new(&base_url, "agctl/test", Duration::from_secs(5))
         }),
         refresher: Arc::new(NeverRefresher),
         fault: Fault::none(),

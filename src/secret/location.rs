@@ -9,7 +9,7 @@
 //! `.credentials.json`. That is right for Claude Code, which must start a
 //! session somehow.
 //!
-//! agentctl does not do that (invariant I10). For a keychain-backed row a
+//! agctl does not do that (invariant I10). For a keychain-backed row a
 //! keychain failure is [`Resolved::Transient`], and the file is not consulted
 //! at all. The reason is that the two stores can hold *different*
 //! credentials: on the machine this was developed against, the live keychain
@@ -77,7 +77,7 @@ pub fn resolve(
             let ns_dir = paths.namespace_dir(&record.account_uuid, &record.organization_uuid);
             from_file(&ns_dir)
         }
-        // Somebody else's credential: agentctl never reads it, so as far as
+        // Somebody else's credential: agctl never reads it, so as far as
         // this store is concerned there is nothing there.
         AccountKind::Foreign { .. } => Resolved::Absent,
     }

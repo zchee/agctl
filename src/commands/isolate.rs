@@ -1,10 +1,10 @@
-//! Isolated Claude Code sessions (`agentctl claude use`/`exec`/`env`).
+//! Isolated Claude Code sessions (`agctl claude use`/`exec`/`env`).
 //!
 //! [`ensure_session`] builds one session directory: the directory itself at
 //! mode 0700, the D-019 MCP symlink, the tier 1/tier 2 symlinks into the live
 //! Claude Code configuration, and the one-time `.claude.json` seed (plan
 //! section 3.3, AC53–AC57). Every placement is idempotent and refuses,
-//! naming the path, when something agentctl did not put there already
+//! naming the path, when something agctl did not put there already
 //! occupies an allowlisted path (invariant I19, AC56). [`forget_session`] is
 //! `use --forget`'s teardown (AC79). The constants below are the allowlists
 //! this module, `export.rs` and `doctor` (S17) all read.
@@ -182,8 +182,8 @@ pub fn ensure_session(
         AccountKind::Owned { .. } => (rec.account_uuid.as_str(), rec.organization_uuid.as_str()),
         other => {
             return Err(AppError::Config(format!(
-                "only an account agentctl owns can be isolated into a session; `{}` is `{}`, whose \
-                 credentials live outside agentctl's own store",
+                "only an account agctl owns can be isolated into a session; `{}` is `{}`, whose \
+                 credentials live outside agctl's own store",
                 rec.account_uuid,
                 other.name()
             )));
@@ -334,7 +334,7 @@ fn create_session_dir_seamed(path: &Path, before_create: impl FnOnce()) -> Resul
         Ok(meta) if meta.is_dir() => return Ok(()),
         Ok(_) => {
             return Err(AppError::Config(format!(
-                "`{}` already exists and is not the plain directory agentctl would create \
+                "`{}` already exists and is not the plain directory agctl would create \
                  there; move or remove it before starting this session",
                 path.display()
             )));
@@ -367,7 +367,7 @@ fn create_session_dir_seamed(path: &Path, before_create: impl FnOnce()) -> Resul
             match std::fs::symlink_metadata(path) {
                 Ok(meta) if meta.is_dir() => Ok(()),
                 Ok(_) => Err(AppError::Config(format!(
-                    "`{}` already exists and is not the plain directory agentctl would create \
+                    "`{}` already exists and is not the plain directory agctl would create \
                  there; move or remove it before starting this session",
                     path.display()
                 ))),
@@ -450,7 +450,7 @@ fn link_tiers(
                     continue;
                 }
                 return Err(AppError::Config(format!(
-                    "`{}` already exists and points at `{}`, not `{}`; agentctl will not \
+                    "`{}` already exists and points at `{}`, not `{}`; agctl will not \
                      replace a symlink it did not place there",
                     link.display(),
                     existing.display(),
@@ -459,7 +459,7 @@ fn link_tiers(
             }
             Ok(_) => {
                 return Err(AppError::Config(format!(
-                    "`{}` already exists and is not the symlink agentctl would place there; \
+                    "`{}` already exists and is not the symlink agctl would place there; \
                      move or remove it before starting this session",
                     link.display()
                 )));
@@ -486,7 +486,7 @@ fn link_tiers(
 /// Places (or verifies) the D-019 `mcp.json` symlink inside `session_dir`.
 ///
 /// The target is `canonical(claude_json_path(env))` — the live
-/// `.claude.json` agentctl's own environment names, not the session's own.
+/// `.claude.json` agctl's own environment names, not the session's own.
 /// Idempotent: a symlink already pointing at the same target is left alone.
 /// Anything else already at that path is invariant I19's refusal, naming the
 /// path.
@@ -508,7 +508,7 @@ fn link_mcp_config(session_dir: &Path, env: &EnvView) -> Result<PathBuf, AppErro
                 return Ok(link);
             }
             Err(AppError::Config(format!(
-                "`{}` already exists and points at `{}`, not `{}`; agentctl will not replace a \
+                "`{}` already exists and points at `{}`, not `{}`; agctl will not replace a \
                  symlink it did not place there",
                 link.display(),
                 existing.display(),
@@ -516,7 +516,7 @@ fn link_mcp_config(session_dir: &Path, env: &EnvView) -> Result<PathBuf, AppErro
             )))
         }
         Ok(_) => Err(AppError::Config(format!(
-            "`{}` already exists and is not the symlink agentctl would place there; move or \
+            "`{}` already exists and is not the symlink agctl would place there; move or \
              remove it before starting this session",
             link.display()
         ))),
@@ -554,7 +554,7 @@ fn seed_claude_json(session_dir: &Path, env: &EnvView, ctx: &PassCtx) -> Result<
         Ok(meta) if meta.is_file() => return Ok(()),
         Ok(_) => {
             return Err(AppError::Config(format!(
-                "`{}` already exists and is not the plain file agentctl would seed there; move \
+                "`{}` already exists and is not the plain file agctl would seed there; move \
                  or remove it before starting this session",
                 seed_path.display()
             )));
@@ -636,7 +636,7 @@ fn write_seed_file(path: &Path, text: &str) -> Result<(), AppError> {
                 return match std::fs::symlink_metadata(path) {
                     Ok(meta) if meta.is_file() => Ok(()),
                     Ok(_) => Err(AppError::Config(format!(
-                        "`{}` already exists and is not the plain file agentctl would seed \
+                        "`{}` already exists and is not the plain file agctl would seed \
                          there; move or remove it before starting this session",
                         path.display()
                     ))),
@@ -748,7 +748,7 @@ pub fn forget_session(
         AccountKind::Owned { .. } => (rec.account_uuid.as_str(), rec.organization_uuid.as_str()),
         other => {
             return Err(AppError::Config(format!(
-                "only an account agentctl owns can have an isolated session; `{}` is `{}`, which \
+                "only an account agctl owns can have an isolated session; `{}` is `{}`, which \
                  has none",
                 rec.account_uuid,
                 other.name()

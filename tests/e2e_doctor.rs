@@ -50,7 +50,7 @@ fn ac58_the_isolation_section_reports_a_minimal_session() {
         "the seed carries only the floor key when the live file has none:\n{stdout}"
     );
     assert!(stdout.contains("leaked keys      none"), "{stdout}");
-    assert!(stdout.contains("agentctl claude use --forget"), "{stdout}");
+    assert!(stdout.contains("agctl claude use --forget"), "{stdout}");
     assert!(stdout.contains("policySettings.disableSideloadFlags"), "{stdout}");
     assert!(stdout.contains("secure-storage backend"), "{stdout}");
 }
@@ -61,7 +61,7 @@ fn ac58_the_isolation_section_flags_a_hand_seeded_leak_and_an_occupied_path() {
     let session_dir = fixture.session_dir(ACCT, ORG);
 
     // Hand-build a partially seeded state: one tier1 symlink placed
-    // correctly, one occupied by something agentctl did not put there, and a
+    // correctly, one occupied by something agctl did not put there, and a
     // seed file carrying a key that must never be seeded (plan AC54's leak
     // vocabulary, also `doctor`'s).
     let live_settings = fixture.home().join(".claude").join("settings.json");
@@ -70,7 +70,7 @@ fn ac58_the_isolation_section_flags_a_hand_seeded_leak_and_an_occupied_path() {
     fs::write(&live_settings, "{}").expect("the live settings file should be writable");
     symlink(&live_settings, session_dir.join("settings.json"))
         .expect("the tier1 symlink should be creatable");
-    fs::write(session_dir.join("CLAUDE.md"), "not agentctl's")
+    fs::write(session_dir.join("CLAUDE.md"), "not agctl's")
         .expect("the occupying file should be writable");
 
     fs::write(
@@ -85,7 +85,7 @@ fn ac58_the_isolation_section_flags_a_hand_seeded_leak_and_an_occupied_path() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(stdout.contains("settings.json"), "{stdout}");
-    assert!(stdout.contains("occupied"), "CLAUDE.md is not agentctl's symlink:\n{stdout}");
+    assert!(stdout.contains("occupied"), "CLAUDE.md is not agctl's symlink:\n{stdout}");
     assert!(stdout.contains("oauthAccount"), "the leaked key is named:\n{stdout}");
     assert!(stdout.contains("leaked keys"), "{stdout}");
     assert!(

@@ -1,4 +1,4 @@
-//! `doctor`, and the one path in agentctl that deletes a lock (plan AC45,
+//! `doctor`, and the one path in agctl that deletes a lock (plan AC45,
 //! invariant I11).
 //!
 //! # Why these tests do not take twelve seconds
@@ -161,7 +161,7 @@ fn record_owned(store: &Store, org: &str, spelling: Option<&str>) {
     )
     .expect("the fixture identifiers are valid path segments");
     record.email = Some("owner@example.com".to_owned());
-    AgentctlConfig::update(&store.paths, |config| config.upsert(record))
+    AgctlConfig::update(&store.paths, |config| config.upsert(record))
         .expect("the registry should be writable");
 }
 
@@ -199,7 +199,7 @@ fn beat(path: &Path) {
 /// lock artefacts is acquired with `mkdir` and released with `rmdir` (fact
 /// F45). Phase 1's fixture wrote a regular file, which is why AC45 passed
 /// against a `doctor` that could not have removed a real artefact at all
-/// (`agentctl-nz5`, premortem PM13′).
+/// (`agctl-nz5`, premortem PM13′).
 fn plant_artefact(store: &Store, org: &str, name: &str, age: Duration) -> PathBuf {
     let ns_dir = store.ns_dir(org);
     fs::create_dir_all(&ns_dir).expect("the namespace directory should be creatable");
@@ -355,7 +355,7 @@ fn the_report_flags_siblings_forgotten_rows_duplicates_and_unknown_orgs() {
         .with_item(&first, shared.as_bytes())
         .with_item(&second, shared.as_bytes());
 
-    AgentctlConfig::update(&store.paths, |config| {
+    AgctlConfig::update(&store.paths, |config| {
         config.forgotten_services.push(forgotten.clone());
     })
     .expect("the registry should be writable");
@@ -420,7 +420,7 @@ fn remove_stale_removes_a_lapsed_artefact_after_stating_the_risk() {
 
     assert!(!artefact.exists(), "the artefact is gone");
     let text = io.text();
-    assert!(text.contains("This is Claude Code's lock, not agentctl's"), "{text}");
+    assert!(text.contains("This is Claude Code's lock, not agctl's"), "{text}");
     assert!(text.contains("a login lost"), "the risk is stated in full:\n{text}");
     assert!(
         text.find("About to remove").unwrap_or(usize::MAX) < text.find("Removed `").unwrap_or(0),
@@ -520,7 +520,7 @@ fn remove_stale_refuses_a_path_outside_the_namespace_root() {
 
     let mut io = Recorder::default();
     let err = remove_stale(&store.doctor(), &outside, true, &mut io)
-        .expect_err("the live store is not agentctl's to tidy");
+        .expect_err("the live store is not agctl's to tidy");
 
     assert!(err.to_string().contains("not inside"), "{err}");
     assert!(outside.exists(), "the live store's lock is untouched");
@@ -543,7 +543,7 @@ fn remove_stale_refuses_a_name_that_is_not_an_artefact() {
 }
 
 #[test]
-fn remove_stale_refuses_agentctls_own_namespace_lock() {
+fn remove_stale_refuses_agctls_own_namespace_lock() {
     // The lock file is never unlinked by anything, including this: `flock`
     // locks an inode, and a recreated lock file is a second inode.
     let store = store();
@@ -564,7 +564,7 @@ fn remove_stale_refuses_agentctls_own_namespace_lock() {
 
     let mut io = Recorder::default();
     let err = remove_stale(&store.doctor(), &lock_path, true, &mut io)
-        .expect_err("agentctl's own locks are not removable");
+        .expect_err("agctl's own locks are not removable");
 
     assert!(err.to_string().contains("never unlinked"), "{err}");
     assert!(lock_path.exists());
@@ -580,7 +580,7 @@ fn remove_stale_refuses_a_symbolic_link() {
 
     let mut io = Recorder::default();
     let err = remove_stale(&store.doctor(), &link, true, &mut io)
-        .expect_err("agentctl never deletes through a link");
+        .expect_err("agctl never deletes through a link");
 
     assert!(err.to_string().contains("symbolic link"), "{err}");
     assert!(fs::symlink_metadata(&link).is_ok(), "the link is still there");
@@ -589,7 +589,7 @@ fn remove_stale_refuses_a_symbolic_link() {
 
 #[test]
 fn remove_stale_removes_the_directory_claude_code_actually_makes() {
-    // `agentctl-nz5`, the first half of AC73. This test asserted the opposite
+    // `agctl-nz5`, the first half of AC73. This test asserted the opposite
     // in phase 1 — a directory refused as "not a regular file" — which is how
     // a shipped `--remove-stale` that could never remove anything real passed
     // its own suite. Every Claude Code lock artefact is a directory (fact F45).
@@ -610,7 +610,7 @@ fn remove_stale_removes_the_directory_claude_code_actually_makes() {
 #[test]
 fn remove_stale_refuses_a_regular_file_at_an_artefact_name() {
     // Claude Code never writes a file at one of those names, so a file there
-    // was made by something else and is not agentctl's to delete — reported,
+    // was made by something else and is not agctl's to delete — reported,
     // never removed.
     let store = store();
     record_owned(&store, ORG, None);
@@ -662,11 +662,11 @@ fn plant_record(store: &Store, pid: u32, store_dir: &Path, held: &[&Path]) -> Pa
     let dir = held_locks::dir(&store.paths);
     fs::create_dir_all(&dir).expect("the held-locks directory should be creatable");
     let record = held_locks::HeldLockRecord {
-        agentctl_pid: pid,
+        agctl_pid: pid,
         // Left unknown deliberately: a record that names no start time is what
         // a build before the field wrote, and it must still be actionable — the
         // process id alone is then the whole evidence, exactly as in phase 1.
-        agentctl_start_time: None,
+        agctl_start_time: None,
         tree: held_locks::Tree::Live,
         store_dir: store_dir.to_path_buf(),
         paths: held.iter().map(|path| path.to_path_buf()).collect(),
@@ -678,7 +678,7 @@ fn plant_record(store: &Store, pid: u32, store_dir: &Path, held: &[&Path]) -> Pa
     file
 }
 
-/// A lock directory in a store agentctl does not own, aged past the threshold.
+/// A lock directory in a store agctl does not own, aged past the threshold.
 fn plant_leak(store: &Store) -> (PathBuf, PathBuf) {
     let live = store.home.join(".claude");
     let leaked = live.join(REFRESH_LOCK);
@@ -720,7 +720,7 @@ fn remove_stale_refuses_an_outside_path_whose_record_is_still_held() {
 
     let mut io = Recorder::default();
     let err = remove_stale(&store.doctor(), &leaked, true, &mut io)
-        .expect_err("a lock a live agentctl holds is not stale");
+        .expect_err("a lock a live agctl holds is not stale");
 
     assert!(err.to_string().contains("is being held, not leaked"), "{err}");
     assert!(leaked.exists(), "the lock directory survives");
@@ -893,9 +893,9 @@ fn now_ms() -> i64 {
 #[test]
 fn the_report_lists_foreign_items_and_says_they_are_never_read() {
     // A `claude-switcher:*` item (fact F10) and `CLAUDE_CODE_OAUTH_TOKEN`
-    // (fact F19). Both exist on real machines, neither is agentctl's, and a
+    // (fact F19). Both exist on real machines, neither is agctl's, and a
     // user comparing `security dump-keychain` against this report should not
-    // have to guess whether agentctl is quietly using them.
+    // have to guess whether agctl is quietly using them.
     let store = store();
     let switcher = format!("{}someone@example.com", crate::secret::SWITCHER_SERVICE_PREFIX);
     let reader = FakeReader::unlocked().with_entry(&switcher);
@@ -926,7 +926,7 @@ fn the_report_lists_foreign_items_and_says_they_are_never_read() {
 #[test]
 fn the_foreign_section_says_none_when_there_is_nothing_foreign() {
     // The section is always present, so its absence is never mistaken for
-    // "agentctl did not look".
+    // "agctl did not look".
     let store = store();
     let mut io = Recorder::default();
     report(&store.doctor(), &FakeReader::unlocked(), &store.ctx(), &mut io)
@@ -1071,7 +1071,7 @@ fn the_report_hides_forgotten_services_behind_one_line() {
     let forgotten = format!("{LIVE_SERVICE}-6cdd6b98");
     let reader = FakeReader::unlocked()
         .with_item(&forgotten, blob("sk-ant-oat01-other", now_ms() + 3_600_000).as_bytes());
-    AgentctlConfig::update(&store.paths, |config| {
+    AgctlConfig::update(&store.paths, |config| {
         config.forgotten_services.push(forgotten.clone());
     })
     .expect("the registry should be writable");
@@ -1112,7 +1112,7 @@ fn the_report_does_not_offer_relocate_for_a_row_that_cannot_be_relocated() {
         forgotten: false,
         created_at: jiff::Timestamp::now().to_string(),
     };
-    AgentctlConfig::update(&store.paths, |config| config.upsert(record))
+    AgctlConfig::update(&store.paths, |config| config.upsert(record))
         .expect("the registry should be writable");
 
     let mut io = Recorder::default();
@@ -1148,8 +1148,7 @@ fn link_entry_reports_every_state() {
     symlink(&live_settings, &session_dir.join("settings.json"));
 
     // occupied (not a symlink at all): something else was written there.
-    fs::write(session_dir.join("CLAUDE.md"), "not agentctl's")
-        .expect("the file should be writable");
+    fs::write(session_dir.join("CLAUDE.md"), "not agctl's").expect("the file should be writable");
 
     // absent: nothing there — `skills` is never created.
 
@@ -1157,7 +1156,7 @@ fn link_entry_reports_every_state() {
     symlink(&live.join("projects"), &session_dir.join("projects"));
 
     // occupied (a symlink, but to the wrong place): points at something real,
-    // just not what agentctl would have placed.
+    // just not what agctl would have placed.
     let elsewhere = store.home.join("elsewhere");
     fs::create_dir_all(&elsewhere).expect("the decoy directory should be creatable");
     symlink(&elsewhere, &session_dir.join("shell-snapshots"));
@@ -1286,7 +1285,7 @@ fn mcp_credential_entries_counts_only_servers_carrying_env_or_headers() {
 
     let row = isolation_row(
         &store.paths,
-        &AgentctlConfig::default(),
+        &AgctlConfig::default(),
         &store.env,
         ACCT,
         ORG,
@@ -1324,7 +1323,7 @@ fn mcp_credential_entries_is_unreadable_on_a_parse_failure() {
 
     let row = isolation_row(
         &store.paths,
-        &AgentctlConfig::default(),
+        &AgctlConfig::default(),
         &store.env,
         ACCT,
         ORG,
@@ -1349,7 +1348,7 @@ fn isolation_row_reports_migrated_when_a_keychain_item_exists_for_the_namespace(
     let session_dir = store.session_dir(ORG);
     fs::create_dir_all(&session_dir).expect("the session directory should be creatable");
 
-    let config = AgentctlConfig::load(&store.paths).expect("the registry should load");
+    let config = AgctlConfig::load(&store.paths).expect("the registry should load");
     let record = config.get(ACCT, ORG).expect("record_owned just recorded this account");
     let AccountKind::Owned { export_sha8, .. } = &record.kind else {
         panic!("record_owned always creates an Owned account");
@@ -1427,7 +1426,7 @@ fn disable_sideload_flags_reports_true_false_or_not_set() {
 #[test]
 fn the_isolation_section_says_the_root_is_empty_when_there_are_no_sessions() {
     let store = store();
-    let data = collect_isolation(&store.doctor(), &AgentctlConfig::default(), &[]);
+    let data = collect_isolation(&store.doctor(), &AgctlConfig::default(), &[]);
     assert!(data.rows.is_empty());
 
     let text = isolation_section(&data, &store.paths.session_root()).join("\n");
@@ -1468,7 +1467,7 @@ fn the_report_includes_the_isolation_section_for_a_registered_session() {
     assert!(text.contains("sha8_match=true"), "{text}");
     assert!(text.contains("settings.json"), "{text}");
     assert!(text.contains("linked"), "{text}");
-    assert!(text.contains("agentctl claude use --forget"), "{text}");
+    assert!(text.contains("agctl claude use --forget"), "{text}");
     assert!(text.contains("policySettings.disableSideloadFlags"), "{text}");
     assert!(text.contains("secure-storage backend"), "{text}");
 }
@@ -1486,7 +1485,7 @@ fn the_report_reports_unregistered_for_a_session_with_no_matching_record() {
 
     assert!(text.contains("id=unregistered"), "{text}");
     assert!(
-        text.contains(&format!("agentctl claude use --forget {}", session_dir.display())),
+        text.contains(&format!("agctl claude use --forget {}", session_dir.display())),
         "an unregistered session is forgotten by path:\n{text}"
     );
 }

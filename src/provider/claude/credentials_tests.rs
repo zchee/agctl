@@ -248,7 +248,7 @@ fn a_wrong_typed_known_key_keeps_its_place_among_the_unknown_ones() {
     // A blob whose `subscriptionType` is a number rather than a string is not
     // something to lose, and not something to reorder either: `extra` is an
     // index-backed map, so a remove-then-reinsert would move the key to the
-    // end and change the bytes agentctl writes back for a file it did not
+    // end and change the bytes agctl writes back for a file it did not
     // author.
     let blob = br#"{"claudeAiOauth":{"accessToken":"a","expiresAt":5,"alpha":1,"subscriptionType":7,"omega":2}}"#;
     let credentials = Credentials::parse_blob(blob).expect("the blob should parse");
@@ -354,7 +354,7 @@ fn the_limit_counts_the_trailing_newline() {
     assert_eq!(
         refused,
         KeychainWriteError::LineTooLong { len: 4033, limit: SECURITY_STDIN_LIMIT },
-        "refusal D: agentctl has no argv fallback (invariant I15)"
+        "refusal D: agctl has no argv fallback (invariant I15)"
     );
 }
 

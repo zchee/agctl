@@ -1,4 +1,4 @@
-//! `agentctl claude accounts` — inspecting and editing what agentctl knows.
+//! `agctl claude accounts` — inspecting and editing what agctl knows.
 //!
 //! Six subcommands, and what separates them is how much they are allowed to
 //! touch:
@@ -11,13 +11,13 @@
 //!   The keychain item they hide is never read, never written, never removed
 //!   (plan AC47, invariant I1).
 //! - `remove` and `relocate` mutate a namespace, so both hold that namespace's
-//!   lock for the whole mutation (invariant I3) and both refuse a row agentctl
+//!   lock for the whole mutation (invariant I3) and both refuse a row agctl
 //!   does not own (invariant I9).
 //!
 //! # What `remove` will not do
 //!
 //! The live credential and the per-configuration-directory keychain items are
-//! somebody else's (decision D-001). agentctl cannot delete a keychain item at
+//! somebody else's (decision D-001). agctl cannot delete a keychain item at
 //! all — there is no code path, and that is the point of invariant I1 — so a
 //! `remove` aimed at one of those rows would either do nothing or delete a
 //! registry record while leaving the credential exactly where it was. Both are
@@ -47,7 +47,7 @@ use crate::commands::Tty;
 use crate::commands::login;
 use crate::config::AccountKind;
 use crate::config::AccountRecord;
-use crate::config::AgentctlConfig;
+use crate::config::AgctlConfig;
 use crate::config::paths::Paths;
 use crate::config::paths::UNKNOWN_ORG;
 use crate::config::paths::validate_segment;
@@ -78,7 +78,7 @@ pub const HEADINGS: [&str; 7] = ["Id", "Account", "Org", "Kind", "Source", "Stat
 /// What an unavailable cell looks like, matching the `status` table.
 const EMPTY_CELL: &str = crate::render::table::EMPTY_CELL;
 
-/// Runs `agentctl claude accounts …`.
+/// Runs `agctl claude accounts …`.
 ///
 /// # Errors
 ///
@@ -158,8 +158,8 @@ impl Accounts<'_> {
     }
 
     /// The registry as it is on disk right now.
-    fn config(&self) -> Result<AgentctlConfig, AppError> {
-        AgentctlConfig::load(self.paths)
+    fn config(&self) -> Result<AgctlConfig, AppError> {
+        AgctlConfig::load(self.paths)
     }
 }
 
@@ -248,7 +248,7 @@ fn location(record: &AccountRecord, live_service: &str) -> String {
 /// Resolved against the *discovered* rows rather than against the registry
 /// alone, so every row `status` prints can be inspected — including the live
 /// entry and an unclaimed keychain item, neither of which has a registry
-/// record. When the row is one agentctl owns, the namespace's on-disk state is
+/// record. When the row is one agctl owns, the namespace's on-disk state is
 /// reported too: the directory, the lock file and its holder, and whether a
 /// pending or stray temporary file is sitting there.
 ///
@@ -399,7 +399,7 @@ fn resolve_row<'a>(rows: &'a [AccountRow], id: &str) -> Result<&'a AccountRow, A
 
     match matches.as_slice() {
         [] => Err(AppError::Config(format!(
-            "no account matches `{id}`; `agentctl claude accounts list --all` shows every row"
+            "no account matches `{id}`; `agctl claude accounts list --all` shows every row"
         ))),
         [only] => Ok(only),
         many => {
@@ -437,7 +437,7 @@ pub struct Removal<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`AppError::Config`] when the row is not one agentctl owns and when
+/// Returns [`AppError::Config`] when the row is not one agctl owns and when
 /// `id` names no record; [`AppError::Refused`] when the confirmation is
 /// declined or the namespace lock could not be taken inside
 /// [`COMMAND_LOCK_TIMEOUT`]; [`AppError::Io`] when the removal itself fails.
@@ -457,11 +457,11 @@ pub fn remove(
         // and says the truthful thing if that ever changes.
         AccountKind::Foreign { source } => {
             return Err(AppError::Config(format!(
-                "`{id}` belongs to {source}; agentctl never reads or writes it, so there is \
+                "`{id}` belongs to {source}; agctl never reads or writes it, so there is \
                  nothing to remove"
             )));
         }
-        // Invariant I9. Neither of these is agentctl's to delete: the
+        // Invariant I9. Neither of these is agctl's to delete: the
         // credentials are in the keychain, which phase 1 never writes.
         AccountKind::Live | AccountKind::ConfigDirReadOnly { .. } => {
             // Named by its keychain service where it has one. A record for an
@@ -476,7 +476,7 @@ pub fn remove(
             };
             return Err(AppError::Config(format!(
                 "{named} is a read-only row (kind `{}`): its credentials live in the login \
-                 keychain, which agentctl never writes or deletes. Use `agentctl claude accounts \
+                 keychain, which agctl never writes or deletes. Use `agctl claude accounts \
                  forget` to stop reporting it, or remove the item with Keychain Access.",
                 record.kind.name()
             )));
@@ -488,7 +488,7 @@ pub fn remove(
     }
 
     let key = (record.account_uuid.clone(), record.organization_uuid.clone());
-    AgentctlConfig::update(accounts.paths, |config| {
+    AgctlConfig::update(accounts.paths, |config| {
         config.accounts.retain(|rec| rec.key() != (key.0.as_str(), key.1.as_str()));
     })?;
 
@@ -516,7 +516,7 @@ fn delete_namespace(
     if !yes {
         io.tell(&format!(
             "This deletes `{}`, including any pending write and any leftover temporary file.\n\
-             The refresh token in it is the only copy agentctl holds: logging in again is the \
+             The refresh token in it is the only copy agctl holds: logging in again is the \
              only way back. Nothing in the login keychain is touched.",
             ns_dir.display()
         ));
@@ -620,7 +620,7 @@ pub fn relocate(
 
     if !matches!(record.kind, AccountKind::Owned { .. }) {
         return Err(AppError::Config(format!(
-            "`{spelling}` is not a namespace agentctl created, so there is nothing to move"
+            "`{spelling}` is not a namespace agctl created, so there is nothing to move"
         )));
     }
     if record.organization_uuid != UNKNOWN_ORG {
@@ -766,7 +766,7 @@ fn move_namespace(accounts: &Accounts<'_>, plan: &Relocation<'_>) -> Result<bool
         kind: AccountKind::Owned { export_spelling, export_sha8 },
         ..plan.record.clone()
     };
-    AgentctlConfig::update(accounts.paths, |config| {
+    AgctlConfig::update(accounts.paths, |config| {
         config.accounts.retain(|rec| rec.key() != (account_uuid.as_str(), UNKNOWN_ORG));
         config.upsert(moved);
     })?;
@@ -805,7 +805,7 @@ fn under_lock_read(ns_dir: &Path) -> Result<Option<Credentials>, AppError> {
 fn changed(source: &Path) -> AppError {
     AppError::Config(format!(
         "`{}` changed during relocate; nothing was moved. Something refreshed or removed the \
-         credential while this command was deciding — re-run `agentctl claude accounts relocate` \
+         credential while this command was deciding — re-run `agctl claude accounts relocate` \
          and it will work from what is there now.",
         source.display()
     ))
@@ -828,7 +828,7 @@ fn read_namespace(ns_dir: &Path) -> Result<Credentials, AppError> {
             AppError::Config(format!("`{}` could not be read: {err}", ns_dir.display()))
         }),
         Ok(ReadOutcome::Absent) => Err(AppError::Config(format!(
-            "`{}` holds no credentials; run `agentctl claude login` instead",
+            "`{}` holds no credentials; run `agctl claude login` instead",
             ns_dir.display()
         ))),
         Err(err) => {
@@ -917,7 +917,7 @@ fn lock(
 /// A service that has a registry record gets [`AccountRecord::forgotten`]; an
 /// unclaimed one, which by definition has no record and may have no account
 /// identifier to key one by, is remembered by name in
-/// [`AgentctlConfig::forgotten_services`].
+/// [`AgctlConfig::forgotten_services`].
 ///
 /// # Errors
 ///
@@ -939,28 +939,28 @@ pub fn forget(
         )));
     }
 
-    // Anything agentctl cannot classify is not a row this flag governs. A
+    // Anything agctl cannot classify is not a row this flag governs. A
     // `claude-switcher:*` item is hidden by default already and is never read
     // (fact F10), and `forgotten_services` is consulted only where an
     // unclaimed `Claude Code-credentials-<sha8>` item is being decided about
     // — so recording one here would change nothing while telling the user
-    // agentctl had done something to another tool's credential.
+    // agctl had done something to another tool's credential.
     if namespace::classify(service).is_none() {
         let whose = if service.starts_with(SWITCHER_SERVICE_PREFIX) {
             format!("`{service}` belongs to claude-switcher")
         } else {
             format!(
-                "`{service}` is not an item agentctl reports — only `{live}` and \
+                "`{service}` is not an item agctl reports — only `{live}` and \
                  `{live}-<8 hex>` are",
                 live = namespace::LIVE_SERVICE
             )
         };
         return Err(AppError::Config(format!(
-            "{whose}; agentctl never reads or writes it, so there is nothing to hide or report"
+            "{whose}; agctl never reads or writes it, so there is nothing to hide or report"
         )));
     }
 
-    let changed = AgentctlConfig::update(accounts.paths, |config| {
+    let changed = AgctlConfig::update(accounts.paths, |config| {
         let recorded = config.accounts.iter_mut().find(|rec| names_service(rec, service));
         if let Some(record) = recorded {
             let changed = record.forgotten != hide;
@@ -1035,7 +1035,7 @@ fn opt(value: Option<&str>) -> String {
 fn present(path: &PathBuf) -> String {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
-            format!("{} (a symbolic link — agentctl refuses to read it)", path.display())
+            format!("{} (a symbolic link — agctl refuses to read it)", path.display())
         }
         Ok(_) => format!("{} (present)", path.display()),
         Err(_) => format!("{} (absent)", path.display()),

@@ -10,7 +10,7 @@
 //!
 //! **Two percentages are kept, not one.** [`LimitWindow::percent`] is what the
 //! server said; [`LimitWindow::percent_floor`] is that value floored to a whole
-//! number. The table shows the floor so that agentctl and the web UI agree to
+//! number. The table shows the floor so that agctl and the web UI agree to
 //! the point (fact F21, plan AC1) — rounding half-up would show `36%` where
 //! the site shows `35%`.
 //!
@@ -254,7 +254,7 @@ pub fn percent_floor(value: f64) -> Option<u8> {
 ///
 /// Rounding, not flooring, and the difference from [`percent_floor`] is
 /// deliberate. A window percentage is floored because the web UI floors it
-/// and agentctl must never read a point above the site (fact F21). The
+/// and agctl must never read a point above the site (fact F21). The
 /// credits figure is `extra_usage.utilization`, which plan section 3.8
 /// specifies as rounded; whether the site floors it too has not been
 /// observed, so the two helpers sit side by side and a later edit has to

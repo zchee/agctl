@@ -100,7 +100,7 @@ pub struct JsonRow {
     pub email: Option<String>,
     /// The organization's display name, when it is known.
     pub org_name: Option<String>,
-    /// Where the credentials live and whether agentctl may write them, from
+    /// Where the credentials live and whether agctl may write them, from
     /// [`AccountKind::name`](crate::config::AccountKind::name).
     pub kind: &'static str,
     /// Where this row's credentials were read from, from
@@ -497,7 +497,7 @@ pub struct IsolationDrift {
     /// The seeded `.claude.json`'s modification time, same units.
     pub seed_mtime_ms: Option<i64>,
     /// Whether the live file is newer than the seed — informational, not an
-    /// error: agentctl never rewrites the seed (invariant I18).
+    /// error: agctl never rewrites the seed (invariant I18).
     pub changed_since_seed: bool,
 }
 
@@ -508,7 +508,7 @@ pub struct IsolationPolicy {
     /// `settings.json` and the managed profile. `None` when neither file sets
     /// it.
     pub disable_sideload_flags: Option<bool>,
-    /// Always `false`: agentctl cannot observe which secure-storage backend a
+    /// Always `false`: agctl cannot observe which secure-storage backend a
     /// session activates from outside it (decision D-020).
     pub backend_observable: bool,
 }

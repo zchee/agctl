@@ -60,7 +60,7 @@ fn a_warning_raised_while_the_terminal_is_held_lands_in_the_buffer() {
 
     hold_terminal();
     tracing::subscriber::with_default(subscriber, || {
-        warn!(target: "agentctl", "the account registry could not be read this pass");
+        warn!(target: "agctl", "the account registry could not be read this pass");
     });
 
     let flushed = release_into_string();
@@ -112,7 +112,7 @@ fn nothing_is_buffered_while_the_terminal_is_free() {
 
 #[test]
 fn a_buffer_that_fills_keeps_the_beginning_and_says_what_it_dropped() {
-    // A `watch` left running overnight under `RUST_LOG=agentctl=trace` is the
+    // A `watch` left running overnight under `RUST_LOG=agctl=trace` is the
     // case this bounds. The first bytes are the ones that explain a failure,
     // so they are the ones kept.
     hold_terminal();

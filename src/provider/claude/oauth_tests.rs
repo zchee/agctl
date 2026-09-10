@@ -31,7 +31,7 @@ fn client_for(server: &MockServer) -> OauthClient {
         &server.url("/cai/oauth/authorize"),
         &server.url("/v1/oauth/token"),
         &server.url("/api/oauth/profile"),
-        "agentctl/test",
+        "agctl/test",
     )
     .expect("the mock endpoints should parse")
 }
@@ -49,7 +49,7 @@ fn stored_credentials() -> Credentials {
     Credentials::parse_blob(blob.to_string().as_bytes()).expect("the blob should parse")
 }
 
-/// The five scopes agentctl asks for.
+/// The five scopes agctl asks for.
 fn default_scopes() -> Vec<String> {
     DEFAULT_SCOPES.iter().map(|scope| (*scope).to_owned()).collect()
 }
@@ -186,13 +186,9 @@ fn the_pkce_debug_output_never_shows_the_verifier() {
 
 #[test]
 fn the_authorize_url_carries_claude_codes_parameters_in_order() {
-    let client = OauthClient::with_endpoints(
-        AUTHORIZE_URL_CLAUDE_AI,
-        TOKEN_URL,
-        PROFILE_URL,
-        "agentctl/test",
-    )
-    .expect("the real endpoints should parse");
+    let client =
+        OauthClient::with_endpoints(AUTHORIZE_URL_CLAUDE_AI, TOKEN_URL, PROFILE_URL, "agctl/test")
+            .expect("the real endpoints should parse");
     let material =
         Pkce { verifier: "v".to_owned(), challenge: "chal".to_owned(), state: "st".to_owned() };
 
@@ -254,7 +250,7 @@ fn the_exchange_sends_the_documented_body_and_parses_the_response() {
         when.method(Method::POST)
             .path("/v1/oauth/token")
             .header("content-type", "application/json")
-            .header("user-agent", "agentctl/test")
+            .header("user-agent", "agctl/test")
             .json_body_includes(
                 serde_json::json!({
                     "grant_type": "authorization_code",

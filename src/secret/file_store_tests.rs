@@ -19,7 +19,7 @@ struct Store {
 
 fn store() -> Store {
     let dir = TempDir::new().expect("a temporary directory should be available");
-    let paths = Paths::with_config_dir(dir.path().join("agentctl"));
+    let paths = Paths::with_config_dir(dir.path().join("agctl"));
     let ns_dir = paths.namespace_dir("acct", "org");
     Store { _dir: dir, paths, ns_dir }
 }
@@ -126,7 +126,7 @@ fn a_directory_named_credentials_json_is_a_failure_not_an_absence() {
 #[test]
 fn a_symlinked_credentials_file_is_a_failure_not_an_absence() {
     // Plan AC46. "Absent" would lead to writing a new file over that path,
-    // and the link points somewhere agentctl has not checked.
+    // and the link points somewhere agctl has not checked.
     let store = store();
     std::fs::create_dir_all(&store.ns_dir).expect("directories should be creatable");
     let target = store.ns_dir.join("elsewhere.json");
@@ -220,7 +220,7 @@ fn a_write_outside_the_namespace_root_is_refused() {
     let store = store();
     let outside = store.paths.config_dir().to_path_buf();
     let escaping = store.paths.namespace_root().join("..").join("..").join("elsewhere");
-    for ns_dir in [outside, escaping, PathBuf::from("/tmp/agentctl-should-never-be-written")] {
+    for ns_dir in [outside, escaping, PathBuf::from("/tmp/agctl-should-never-be-written")] {
         let json = blob("a", None);
         let request = WriteRequest {
             paths: &store.paths,
@@ -630,7 +630,7 @@ fn an_unarmed_pause_point_does_not_delay_a_write() {
 fn plant_directory_link(dir: &TempDir, link: &Path) -> PathBuf {
     let elsewhere = dir.path().join("someone-elses-store");
     std::fs::create_dir_all(&elsewhere).expect("directories should be creatable");
-    std::fs::write(elsewhere.join(CREDENTIALS_FILE), b"not agentctl's").expect("writable");
+    std::fs::write(elsewhere.join(CREDENTIALS_FILE), b"not agctl's").expect("writable");
     std::fs::create_dir_all(link.parent().expect("the link has a parent"))
         .expect("directories should be creatable");
     std::os::unix::fs::symlink(&elsewhere, link).expect("the symlink should be creatable");
@@ -640,7 +640,7 @@ fn plant_directory_link(dir: &TempDir, link: &Path) -> PathBuf {
 fn assert_untouched(elsewhere: &Path) {
     assert_eq!(
         std::fs::read_to_string(elsewhere.join(CREDENTIALS_FILE)).expect("readable"),
-        "not agentctl's",
+        "not agctl's",
         "the link's target was written through"
     );
     let strays: Vec<_> = std::fs::read_dir(elsewhere)
@@ -721,7 +721,7 @@ fn resolve_pending_refuses_a_symlinked_component() {
     assert!(matches!(err, FileStoreError::RefusedSymlink(_)), "got {err:?}");
     assert_eq!(
         std::fs::read_to_string(elsewhere.join(CREDENTIALS_FILE)).expect("readable"),
-        "not agentctl's",
+        "not agctl's",
         "nothing was replayed through the link"
     );
     assert!(elsewhere.join(PENDING_FILE).exists(), "and nothing was deleted through it either");
@@ -907,7 +907,7 @@ fn remove_dir_under_refuses_a_symlinked_store_directory() {
 }
 
 // ---------------------------------------------------------------------------
-// `create_dir_under` (`agentctl-p2-held-locks-dir-through-symlink-1yj`)
+// `create_dir_under` (`agctl-p2-held-locks-dir-through-symlink-1yj`)
 // ---------------------------------------------------------------------------
 
 /// The mode bits of a path, without following links.

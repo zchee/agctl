@@ -34,7 +34,7 @@ pub const SAME_IDENTITY_NOTE: &str = "same identity as live";
 ///
 /// A composition of two [`AccountKind::name`](crate::config::AccountKind::name)
 /// values, in the order the reader meets them: the live credential first,
-/// because that is the one already in use, then the store agentctl owns.
+/// because that is the one already in use, then the store agctl owns.
 pub const LIVE_AND_OWNED_KIND: &str = "live+owned";
 
 /// One account, ready to render.

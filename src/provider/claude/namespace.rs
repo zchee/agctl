@@ -2,10 +2,10 @@
 //!
 //! Everything in this module exists to answer one question: *which keychain
 //! item holds the credentials for a given configuration directory?* Claude
-//! Code answers it by hashing an environment variable, and agentctl has to
+//! Code answers it by hashing an environment variable, and agctl has to
 //! answer it the same way — not approximately — because the consequences of
-//! disagreeing are asymmetric. Guess a name that is not in use and agentctl
-//! shows an account as absent. Guess the name of a *live* item and agentctl
+//! disagreeing are asymmetric. Guess a name that is not in use and agctl
+//! shows an account as absent. Guess the name of a *live* item and agctl
 //! could show one account's usage under another account's row, or decide a
 //! namespace is free when a running session owns it.
 //!
@@ -102,7 +102,7 @@ impl EnvView {
     ///
     /// Values are taken through `var_os` and converted lossily, so a path
     /// that is not valid UTF-8 is still *present* — treating it as unset
-    /// would silently change which keychain item agentctl looks for.
+    /// would silently change which keychain item agctl looks for.
     pub fn from_process() -> Self {
         let read =
             |name: &str| std::env::var_os(name).map(|value| value.to_string_lossy().into_owned());
@@ -154,7 +154,7 @@ pub fn service_name(env: &EnvView) -> String {
 /// Returns `None` for anything that is not a Claude Code *credentials* item,
 /// which deliberately includes the legacy `Claude Code-<sha8>` API-key items
 /// (fact F5) and `claude-switcher:*` items belonging to a third-party tool
-/// (fact F10). Both exist on real machines; neither is a credential agentctl
+/// (fact F10). Both exist on real machines; neither is a credential agctl
 /// can read or reason about.
 pub fn classify(service: &str) -> Option<ServiceKind> {
     if service == LIVE_SERVICE {
@@ -223,7 +223,7 @@ pub(crate) fn securestorage_namespace(env: &EnvView) -> Option<&str> {
 ///
 /// One deliberate divergence: Claude Code's `be()` uses `??`, so
 /// `CLAUDE_CONFIG_DIR=""` yields the empty string and a *relative*
-/// `.credentials.json` in the process's working directory. agentctl treats
+/// `.credentials.json` in the process's working directory. agctl treats
 /// that as `~/.claude` instead. Reading a file called `.credentials.json`
 /// out of whatever directory the user happened to `cd` into, and then
 /// presenting it as their live credentials, is not a behaviour worth

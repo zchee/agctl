@@ -1,6 +1,6 @@
 //! "Is somebody else using this namespace?" — asked before every write.
 //!
-//! agentctl owns the namespaces it creates, but ownership is a claim, not a
+//! agctl owns the namespaces it creates, but ownership is a claim, not a
 //! guarantee. A Claude Code session can be pointed at one of them at any time
 //! (that is the whole point of decision D-009's file shape), and once it is,
 //! it will take a refresh lock, rewrite the store, and eventually migrate the
@@ -15,7 +15,7 @@
 //! residual race is the rename syscall itself, which is documented and
 //! accepted (risk R23).
 //!
-//! Everything here is read-only. agentctl never removes a lock artefact —
+//! Everything here is read-only. agctl never removes a lock artefact —
 //! `doctor --remove-stale` is the single, interactive, heavily-qualified
 //! exception (invariant I11).
 
@@ -35,7 +35,7 @@ pub const STORAGE_WRITE_LOCK: &str = ".storage-write";
 /// What somebody else is doing with a namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForeignActivity {
-    /// Nothing. agentctl may proceed.
+    /// Nothing. agctl may proceed.
     None,
     /// A Claude Code lock artefact is present.
     ClaudeLock {
@@ -43,12 +43,12 @@ pub enum ForeignActivity {
         name: String,
         /// How long ago it was last touched. Claude Code's holders heartbeat
         /// every 5 s and self-lapse after 60 s (facts F31, F36), so the age
-        /// is what tells a live session from a crashed one — though agentctl
+        /// is what tells a live session from a crashed one — though agctl
         /// refuses either way.
         age_ms: u64,
     },
     /// A keychain item exists for this namespace: a session has migrated the
-    /// credentials out of the file and agentctl must stop writing it
+    /// credentials out of the file and agctl must stop writing it
     /// (fact F35, invariant I2).
     MigratedToKeychain {
         /// The service name that was found.
@@ -64,13 +64,13 @@ pub enum ForeignActivity {
 /// differently and names a second possible item. Both are checked, because
 /// missing either one means writing into a migrated namespace.
 pub struct OwnedMeta<'a> {
-    /// `sha8` of the namespace directory as agentctl spelled it at login.
+    /// `sha8` of the namespace directory as agctl spelled it at login.
     pub export_sha8: &'a str,
     /// `sha8` of the same directory after symlink resolution, when it differs.
     pub canonical_sha8: Option<&'a str>,
 }
 
-/// Looks for signs that something other than agentctl owns this namespace.
+/// Looks for signs that something other than agctl owns this namespace.
 ///
 /// The keychain is only consulted when `listing` — the `dump-keychain`
 /// attribute listing from this pass — actually contains the service name.
@@ -114,7 +114,7 @@ pub fn detect(
             Ok(None) => {}
             // Listed but unreadable — locked, timed out, refused. The listing
             // is evidence enough: an item under this namespace's name exists,
-            // so agentctl stops writing. Failing closed here costs a refresh;
+            // so agctl stops writing. Failing closed here costs a refresh;
             // failing open costs the user's session.
             Err(_) => return ForeignActivity::MigratedToKeychain { service },
         }

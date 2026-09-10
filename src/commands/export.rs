@@ -1,4 +1,4 @@
-//! `agentctl claude exec`/`env` — an isolated session's credentials, as an
+//! `agctl claude exec`/`env` — an isolated session's credentials, as an
 //! environment delta or as a child process.
 //!
 //! Two variables carry the whole isolation (plan section 3.3): the
@@ -26,7 +26,7 @@ use crate::commands::isolate::SessionDir;
 use crate::commands::isolate::SessionOptions;
 use crate::config::AccountKind;
 use crate::config::AccountRecord;
-use crate::config::AgentctlConfig;
+use crate::config::AgctlConfig;
 use crate::config::paths::Paths;
 use crate::error::AppError;
 use crate::provider::claude::namespace;
@@ -80,8 +80,8 @@ pub fn spec_for(
         AccountKind::Owned { export_spelling, export_sha8 } => (export_spelling, export_sha8),
         other => {
             return Err(AppError::Config(format!(
-                "only an account agentctl owns can be exported into a session; `{}` is `{}`, whose \
-                 credentials live outside agentctl's own store",
+                "only an account agctl owns can be exported into a session; `{}` is `{}`, whose \
+                 credentials live outside agctl's own store",
                 rec.account_uuid,
                 other.name()
             )));
@@ -91,7 +91,7 @@ pub fn spec_for(
     if export_spelling.is_empty() || export_sha8.is_empty() {
         return Err(AppError::Config(format!(
             "`{}`'s registry record has an empty export spelling or hash, so no keychain service \
-             can be derived for it; run `agentctl claude login` again",
+             can be derived for it; run `agctl claude login` again",
             rec.account_uuid
         )));
     }
@@ -100,7 +100,7 @@ pub fn spec_for(
     if recomputed != *export_sha8 {
         return Err(AppError::Config(format!(
             "`{}`'s export spelling `{export_spelling}` hashes to `{recomputed}`, not the \
-             recorded `{export_sha8}`; the namespace may have moved — see `agentctl claude \
+             recorded `{export_sha8}`; the namespace may have moved — see `agctl claude \
              accounts show {}`",
             rec.account_uuid, rec.account_uuid
         )));
@@ -119,7 +119,7 @@ pub fn spec_for(
 /// `alias`; `fish` uses `set -gx`/`set -e` and a `function`. Every value is
 /// single-quoted (already absolute and NFC, since [`ExportSpec::securestorage_dir`]
 /// is `export_spelling` verbatim and [`ExportSpec::config_dir`] is a
-/// directory agentctl created); each [`UNSET_VARS`] entry is preceded by a
+/// directory agctl created); each [`UNSET_VARS`] entry is preceded by a
 /// one-line comment stating why, and the `claude` alias — when
 /// [`ExportSpec::mcp_config`] is `Some` — is followed by a one-line caveat
 /// that an alias (or fish function) reaches only interactive shells (fact
@@ -135,7 +135,7 @@ pub fn spec_for(
 /// contains a `quote_posix`-quoted path — means the stored macro text is
 /// single-quoted at the position that matters, so the second parse expands
 /// nothing (plan AC51's "single-quoted" clause, invariant-equivalent to
-/// I19's "never re-interpret what agentctl places").
+/// I19's "never re-interpret what agctl places").
 #[must_use]
 pub fn render_env(spec: &ExportSpec, shell: Shell) -> String {
     let mut lines = Vec::new();
@@ -232,7 +232,7 @@ fn quote_fish(value: &str) -> String {
 
 /// Runs `argv` with `spec`'s environment delta, without a shell (plan AC52).
 ///
-/// The child inherits agentctl's own environment except for exactly the
+/// The child inherits agctl's own environment except for exactly the
 /// delta: [`ExportSpec::securestorage_dir`] and [`ExportSpec::config_dir`]
 /// are set, and every [`UNSET_VARS`] entry is removed. `--mcp-config
 /// <path>` is appended to `argv` only when `argv[0]`'s basename is exactly
@@ -332,7 +332,7 @@ pub(crate) fn prepare(
 ) -> Result<(SessionDir, ExportSpec, PassCtx), AppError> {
     let paths = Paths::resolve(config_dir)?;
     paths.ensure_dirs()?;
-    let config = AgentctlConfig::load(&paths)?;
+    let config = AgctlConfig::load(&paths)?;
     let record = config.resolve_id(id)?.clone();
     let env = EnvView::from_process();
     let opts = SessionOptions { claude_config_dir, fresh_context, no_mcp };
@@ -343,9 +343,9 @@ pub(crate) fn prepare(
     Ok((session, spec, ctx))
 }
 
-/// `agentctl claude exec <id> -- <command> [args...]`.
+/// `agctl claude exec <id> -- <command> [args...]`.
 ///
-/// Returns the child's own exit code (plan AC52) rather than agentctl's
+/// Returns the child's own exit code (plan AC52) rather than agctl's
 /// usual 0/1/2 contract, which is why `main`'s dispatch treats this arm
 /// differently from every other command.
 ///
@@ -370,7 +370,7 @@ pub fn run_exec(
     Ok(exit_code_of(status))
 }
 
-/// `agentctl claude env <id>`.
+/// `agctl claude env <id>`.
 ///
 /// # Errors
 ///

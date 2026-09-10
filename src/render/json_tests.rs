@@ -15,7 +15,7 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::config::AccountKind;
-use crate::config::AgentctlConfig;
+use crate::config::AgctlConfig;
 use crate::config::paths::Paths;
 use crate::provider::claude::account::AccountRow;
 use crate::provider::claude::account::AccountState;
@@ -135,7 +135,7 @@ fn schema_enum(member: &str) -> Vec<String> {
 /// The document member for one discovered row, as `status --json` builds it.
 ///
 /// The usage members are the ones a row that fetched nothing carries, which is
-/// what every foreign row is: agentctl never reads such a credential, so there
+/// what every foreign row is: agctl never reads such a credential, so there
 /// is nothing to fetch usage with.
 fn json_row_of(row: &AccountRow) -> JsonRow {
     JsonRow {
@@ -190,7 +190,7 @@ fn windows_carry_the_kind_the_label_and_both_percentages() {
     let scoped = &row.windows[2];
     assert_eq!(scoped.label, "Fable (weekly)", "the scope survives in the label");
     assert_eq!(scoped.percent, Some(56.9));
-    assert_eq!(scoped.percent_floor, Some(56), "floored, so agentctl never reads above the site");
+    assert_eq!(scoped.percent_floor, Some(56), "floored, so agctl never reads above the site");
     assert!(scoped.is_active);
 
     assert_eq!(
@@ -382,7 +382,7 @@ fn an_unknown_lock_state_is_rejected_by_the_schema() {
 
 #[test]
 fn same_identity_as_is_live_or_null_and_the_schema_refuses_anything_else() {
-    // `agentctl-p3-login-live-identity-warning-b90`: the member is additive
+    // `agctl-p3-login-live-identity-warning-b90`: the member is additive
     // and present on every row, so a consumer reads an answer rather than
     // having to tell an absent member from a null one — the same contract
     // `credits` keeps. The schema pins the vocabulary, which is what stops a
@@ -542,7 +542,7 @@ fn the_foreign_rows_discovery_synthesizes_validate() {
     let cancel = Cancel::new();
     let ctx = PassCtx::standalone(cancel.clone(), Instant::now() + Duration::from_secs(30));
 
-    let found = discovery::discover(&AgentctlConfig::default(), &paths, &reader, &env, &ctx);
+    let found = discovery::discover(&AgctlConfig::default(), &paths, &reader, &env, &ctx);
 
     let foreign: Vec<&AccountRow> = found
         .rows
@@ -621,7 +621,7 @@ fn isolation_row() -> IsolationRow {
             changed_since_seed: true,
         },
         migrated: false,
-        forget_command: "agentctl claude use --forget acct-1".to_owned(),
+        forget_command: "agctl claude use --forget acct-1".to_owned(),
     }
 }
 

@@ -1,6 +1,6 @@
 ---
 name: check
-description: Run the full local gate for agentctl — rustfmt, clippy with warnings denied, and the nextest suite — through direnv with the shared dev target-dir this repo requires. Use before declaring any change complete, before committing, or when asked to verify that the tree is clean.
+description: Run the full local gate for agctl — rustfmt, clippy with warnings denied, and the nextest suite — through direnv with the shared dev target-dir this repo requires. Use before declaring any change complete, before committing, or when asked to verify that the tree is clean.
 ---
 
 # Local gate
@@ -25,7 +25,7 @@ keychain backend, the endpoint URL overrides, the fault-injection switch — and
 omits the flag does not quietly skip the e2e suite.
 
 Tests that spawn the binary — `tests/cli_smoke.rs` and every `tests/e2e_*.rs` — must reach
-it through `env!("CARGO_BIN_EXE_agentctl")`. Never `assert_cmd::Command::cargo_bin`: that
+it through `env!("CARGO_BIN_EXE_agctl")`. Never `assert_cmd::Command::cargo_bin`: that
 resolves to `./target/debug`, and with `--config ~/.config/rust/config.dev.toml` redirecting
 the build to the shared dev target dir (then `/Volumes/tmpfs/target`, now `~/.cache/rust/target`),
 it has already found a **stale artifact** on this
@@ -58,29 +58,29 @@ It builds `cargo build --release` (default features, no `--config`, into a scrat
 `--target-dir` that is never `./target` and never the shared `~/.cache/rust/target`) and
 greps the artifact for two lists. The ten seam names are one representative name per
 seam-owning module, not the whole test-only surface — `fixtures/fake-security.sh` alone
-defines ten `AGENTCTL_FAKE_SECURITY_*` names on its own. The fake's **write** knob is the
+defines ten `AGCTL_FAKE_SECURITY_*` names on its own. The fake's **write** knob is the
 one exception to "one per owner": the keychain write path is the only seam that can change
 a keychain, so it is gated by name rather than by family. **Ten seam names, every one of
 which must be absent:**
 
 | name | owner |
 |------|-------|
-| `AGENTCTL_FAULT` | `src/runtime/fault.rs` |
-| `AGENTCTL_FAULT_RESUME` | `src/runtime/fault.rs` |
-| `AGENTCTL_KEYCHAIN_BACKEND` | `src/secret/mod.rs` |
-| `AGENTCTL_SECURITY_BIN` | `src/secret/mod.rs` |
-| `AGENTCTL_CLAUDE_USAGE_URL` | `src/provider/claude/usage.rs` |
-| `AGENTCTL_CLAUDE_TOKEN_URL` | `src/provider/claude/oauth.rs` |
-| `AGENTCTL_CLAUDE_AUTHORIZE_URL` | `src/provider/claude/oauth.rs` |
-| `AGENTCTL_FAKE_SECURITY_LOG` | `fixtures/fake-security.sh` |
-| `AGENTCTL_FAKE_SECURITY_WRITE_EXIT` | `fixtures/fake-security.sh` (the `-i` write path) |
-| `AGENTCTL_NO_BROWSER` | `src/commands/login.rs` |
+| `AGCTL_FAULT` | `src/runtime/fault.rs` |
+| `AGCTL_FAULT_RESUME` | `src/runtime/fault.rs` |
+| `AGCTL_KEYCHAIN_BACKEND` | `src/secret/mod.rs` |
+| `AGCTL_SECURITY_BIN` | `src/secret/mod.rs` |
+| `AGCTL_CLAUDE_USAGE_URL` | `src/provider/claude/usage.rs` |
+| `AGCTL_CLAUDE_TOKEN_URL` | `src/provider/claude/oauth.rs` |
+| `AGCTL_CLAUDE_AUTHORIZE_URL` | `src/provider/claude/oauth.rs` |
+| `AGCTL_FAKE_SECURITY_LOG` | `fixtures/fake-security.sh` |
+| `AGCTL_FAKE_SECURITY_WRITE_EXIT` | `fixtures/fake-security.sh` (the `-i` write path) |
+| `AGCTL_NO_BROWSER` | `src/commands/login.rs` |
 
-**Three production names, every one of which must be present:** `AGENTCTL_CONFIG_DIR`,
-`AGENTCTL_CLAUDE_USER_AGENT`, `AGENTCTL_CLAUDE_OAUTH_SCOPES`. (The presence half is there so
+**Three production names, every one of which must be present:** `AGCTL_CONFIG_DIR`,
+`AGCTL_CLAUDE_USER_AGENT`, `AGCTL_CLAUDE_OAUTH_SCOPES`. (The presence half is there so
 a build that somehow embedded no strings at all cannot pass by accident.)
 
-A seam in a release artifact is not a style problem. `AGENTCTL_CLAUDE_TOKEN_URL` in a
+A seam in a release artifact is not a style problem. `AGCTL_CLAUDE_TOKEN_URL` in a
 production binary means a refresh token goes wherever an environment variable points it.
 If the gate fails, the build enabled `testing` — never `cargo build --release
 --all-features`, never `cargo install --all-features`.
