@@ -692,3 +692,72 @@ fn the_bytes_on_disk_are_the_entry_and_one_newline() {
     assert_eq!(mode_of(&log_path(&paths)), 0o600);
     assert_eq!(log_state(&paths), LogState::Present);
 }
+
+// ---------------------------------------------------------------------------
+// W4b §D6: the descriptor a live swap holds from Phase B through Phase C
+// ---------------------------------------------------------------------------
+
+#[test]
+fn append_through_writes_to_the_log_the_gate_opened_not_to_what_its_name_became() {
+    // Ruling G2's property, and the reason a live swap gates on a descriptor
+    // rather than on `log_state`. Between the Phase B gate and the append after
+    // Phase C, whoever can write the namespace root can rename the log away and
+    // plant a symbolic link at its name. An append by name meets the link and
+    // refuses — which proves the name really is hostile — while the append
+    // through the held descriptor still lands in the file the gate opened, and
+    // nothing reaches the file the link points at.
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, paths) = store_with_root();
+    let path = log_path(&paths);
+    let held = open_log(&paths, &path).expect("a healthy log opens");
+
+    let moved = dir.path().join("moved-aside.jsonl");
+    std::fs::rename(&path, &moved).expect("the log can be renamed away under the descriptor");
+    let elsewhere = dir.path().join("somebody-elses.jsonl");
+    std::fs::write(&elsewhere, "planted\n").expect("the target should be writable");
+    // 0600, so the only thing refusing the append by name is `O_NOFOLLOW`.
+    std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o600))
+        .expect("the target's mode should be settable");
+    std::os::unix::fs::symlink(&elsewhere, &path).expect("the link should be plantable");
+
+    let entry = AuditEntry::new(write_event("aabbccdd", Some("11223344")));
+    let by_name = append(&paths, &entry).expect_err("an append by name meets the planted link");
+    assert!(by_name.to_string().contains("symbolic link"), "{by_name}");
+
+    let id = append_through(&held, &path, &entry).expect("the held descriptor is still the log");
+    assert_eq!(id, entry.id(), "the id names the entry that landed");
+    let expected = format!("{}\n", serde_json::to_string(&entry).expect("serializable"));
+    assert_eq!(
+        std::fs::read_to_string(&moved).expect("readable"),
+        expected,
+        "exactly one line, in the file the gate opened"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&elsewhere).expect("readable"),
+        "planted\n",
+        "and not a byte through the planted name"
+    );
+}
+
+#[test]
+fn append_through_refuses_what_append_refuses_before_writing_a_byte() {
+    // One serialisation and one digest check behind both entry points, so an
+    // entry `append` refuses cannot reach the log through the held descriptor
+    // instead (risk R34's guard, shared rather than restated).
+    let (_dir, paths) = store_with_root();
+    let path = log_path(&paths);
+    let held = open_log(&paths, &path).expect("a healthy log opens");
+    let whole = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+
+    for event in [write_event(whole, None), write_event("aabbccdd", Some(whole))] {
+        let refused = append_through(&held, &path, &AuditEntry::new(event))
+            .expect_err("a whole digest is not a digest prefix");
+        assert!(refused.to_string().contains("digest prefixes only"), "{refused}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the gate's open created the log"),
+        "",
+        "and nothing was written to it"
+    );
+}

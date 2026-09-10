@@ -27,17 +27,40 @@
 //!   [`claude_lock::HOLD_BUDGET`], and a write that cannot finish inside what
 //!   is left of the budget is not started at all.
 //!
-//! ## The two things this file must never do
+//! # `--live` against the live `~/.claude` (W4b)
 //!
-//! It never constructs [`WriteTarget::live`] — the live `~/.claude` store is
-//! W4b's, and the scope gate in Phase A turns that case into
-//! `not_implemented` before anything is read. And it never writes the
-//! displaced credential to `.credentials.json`: decision D-024 puts it in the
-//! adopted copy, because fact F35's composed read falls through to that file
-//! on any keychain hiccup and would serve the credential the user just
-//! swapped *away* from.
+//! Phase A's scope gate **partitions** the two stores on one variable: a
+//! non-empty `CLAUDE_SECURESTORAGE_CONFIG_DIR` selects a namespace agctl
+//! owns (W4a's path), an unset or empty one selects the live store. Both arms
+//! read the **same** [`EnvView`], which is why refusal **E** — the pass was
+//! asked for the live item but the shell names a namespace — cannot arise on
+//! the forward path at all, and arises only in `use --undo`, whose target
+//! comes from the audit log rather than from the environment.
+//!
+//! The live target is the same procedure with four extra refusals and one
+//! narrower containment rule. **Nothing under the live store is ever written
+//! or removed**: invariant I11′'s W4b relaxation is exactly *the three lock
+//! artefacts plus the keychain item*, so
+//!
+//! - an absent live item ([`Refusal::LiveItemAbsent`]) refuses rather than
+//!   taking W4a's first-write path, which would remove
+//!   `~/.claude/.credentials.json`;
+//! - the displaced credential goes to **its own account's namespace** under
+//!   `namespace_root()`, never to a `.credentials.adopted.json` beside the
+//!   live store;
+//! - a refused audit log ([`Refusal::AuditRefused`]) refuses the swap, because
+//!   the log is the only durable evidence a live-store lock break leaves.
+//!
+//! ## The one thing this file must never do
+//!
+//! It never writes the displaced credential to a `.credentials.json` it did
+//! not compare against first: decision D-024 puts a same-namespace copy in
+//! the adopted sibling, because fact F35's composed read falls through to
+//! `.credentials.json` on any keychain hiccup and would serve the credential
+//! the user just swapped *away* from.
 
 use std::ffi::OsString;
+use std::fs::File;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -60,6 +83,7 @@ use crate::provider::claude::credentials::Credentials;
 use crate::provider::claude::credentials::Digests;
 use crate::provider::claude::credentials::KeychainStdinLine;
 use crate::provider::claude::credentials::REFRESH_MARGIN_MS;
+use crate::provider::claude::namespace;
 use crate::provider::claude::namespace::EnvView;
 use crate::provider::claude::swap;
 use crate::provider::claude::swap::Outcome;
@@ -107,10 +131,9 @@ const SWAP_DEADLINE: Duration = Duration::from_secs(120);
 ///
 /// # Errors
 ///
-/// Returns [`AppError::not_implemented`] for `--live` against the live store
-/// (W4b) and for `--undo`; [`AppError::Config`] when no id was given and none
-/// of `--undo`/`--forget` was either, or when the account cannot be resolved;
-/// and whatever [`export::prepare`], [`export::exec_command`] or
+/// Returns [`AppError::Config`] when no id was given and none of
+/// `--undo`/`--forget` was either, or when the account cannot be resolved; and
+/// whatever [`export::prepare`], [`export::exec_command`], [`run_undo`] or
 /// [`isolate::forget_session`] return otherwise.
 pub fn run(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Result<i32, AppError> {
     if args.live {
@@ -300,38 +323,51 @@ fn run_live(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
     // readings of a variable that changed in between (risk R42).
     let env = EnvView::from_process();
 
-    // Step 3: the scope gate. An unset or empty variable means the target is
-    // the live Claude Code store, which is W4b's — refused before anything is
-    // read, and never through `WriteTarget::live`, which this lane does not
-    // construct at all.
-    let inherited = match env.securestorage_dir.as_deref() {
-        Some(value) if !value.is_empty() => value.to_owned(),
-        _ => {
-            return Err(AppError::not_implemented(
-                "claude use --live against the live Claude Code store",
-            ));
+    // Step 3: the scope gate, and it **partitions** rather than filters. One
+    // reading of one variable decides which of the two stores this pass is
+    // about, so the store directory, the service name, the lock tree and the
+    // audit target cannot come from two different answers to that question
+    // (risk R42). A truthy value names a namespace; an unset or empty one is
+    // falsy to Claude Code (fact F14) and names the live store.
+    //
+    // Because both arms read this same `EnvView`, refusal **E** — "the live
+    // item is not what this environment names" — is unreachable from here by
+    // construction: the live arm is the arm in which the variable is falsy.
+    // `use --undo` is where the two can disagree, because its target comes
+    // from the audit log.
+    let (which, inherited, store) = match namespace::securestorage_namespace(&env) {
+        Some(value) => {
+            let inherited = value.to_owned();
+            // Step 4: the precondition (ruling OQ1). The inherited spelling is
+            // matched **byte for byte** against an owned record's
+            // `export_spelling` — not canonicalized, not resolved — because
+            // that string is what Claude Code hashes into a service name
+            // (fact F14), and two spellings of one directory name two
+            // different items.
+            let Some(store) = owned_by_spelling(&config, &inherited).cloned() else {
+                // Through `emit` like every other refusal, so `--json` gets
+                // the document the contract specifies (`outcome: "refused"`
+                // with `reason: "not_owned"`) rather than a sentence it cannot
+                // parse.
+                let report = Report::refused(
+                    Refusal::NotOwned,
+                    "",
+                    format!(
+                        "`{inherited}` is not a store agctl owns, so there is no record saying \
+                         whose credentials are in it or where the displaced one should go"
+                    ),
+                );
+                emit(&report, args.json)?;
+                return Ok(report.outcome.exit_code());
+            };
+            (Which::Namespace, inherited, Some(store))
         }
-    };
-
-    // Step 4: the precondition (ruling OQ1). The inherited spelling is matched
-    // **byte for byte** against an owned record's `export_spelling` — not
-    // canonicalized, not resolved — because that string is what Claude Code
-    // hashes into a service name (fact F14), and two spellings of one
-    // directory name two different items.
-    let Some(store) = owned_by_spelling(&config, &inherited).cloned() else {
-        // Through `emit` like every other refusal, so `--json` gets the
-        // document the contract specifies (`outcome: "refused"` with
-        // `reason: "not_owned"`) rather than a sentence it cannot parse.
-        let report = Report::refused(
-            Refusal::NotOwned,
-            "",
-            format!(
-                "`{inherited}` is not a store agctl owns, so there is no record saying whose \
-                 credentials are in it or where the displaced one should go"
-            ),
-        );
-        emit(&report, args.json)?;
-        return Ok(report.outcome.exit_code());
+        // The live store is not a registry row, so there is no record to
+        // resolve and no spelling to match: `WriteTarget::live` derives both
+        // halves of the target from the view above, and whose the displaced
+        // credential is, is a question about the credential rather than about
+        // a record (see `decide_adoption`).
+        None => (Which::Live, String::new(), None),
     };
 
     let ctx = PassCtx::standalone(cancel.clone(), Instant::now() + SWAP_DEADLINE);
@@ -340,15 +376,200 @@ fn run_live(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
         paths: &paths,
         config: &config,
         env: &env,
+        which,
         inherited: &inherited,
         ctx: &ctx,
         fault: &fault,
     };
     let incoming =
         Incoming { record: &incoming, direction: Direction::Forward, source: Source::OwnStore };
-    let report = swap_in(&swap, &incoming, &store, args);
+    let report = swap_in(&swap, &incoming, store.as_ref(), args);
     emit(&report, args.json)?;
     Ok(report.outcome.exit_code())
+}
+
+/// Which of the two credential stores a pass is about.
+///
+/// The scope gate's partition as a value, carried rather than re-derived: the
+/// write target, the lock tree, the audit target, the adoption's destination
+/// and four of the nine refusals all turn on it, and asking the environment
+/// again at each of them is how two halves of one swap come to disagree about
+/// what "live" means (risk R42).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Which {
+    /// A namespace agctl owns, named by the inherited
+    /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` and backed by an `Owned` record.
+    Namespace,
+    /// The live Claude Code store — `~/.claude`, or `CLAUDE_CONFIG_DIR` — and
+    /// the unsuffixed `Claude Code-credentials` item.
+    Live,
+}
+
+/// The item a swap writes, the tree whose locks guard it, and how the audit
+/// log names it — all derived from **one** [`EnvView`].
+///
+/// Plan AC82 in one value. [`WriteTarget`] is the only derivation of the pair
+/// *(store directory, service name)*, and the lock subject is built from that
+/// same value rather than from a second reading, so the hold cannot be taken
+/// in one directory while the write names the item of another.
+///
+/// `Debug` is safe and is what lets a test say which subject it got: a service
+/// name, a directory and a tree token are not secrets.
+#[derive(Debug)]
+struct Subject {
+    /// The directory and the service, derived together.
+    target: WriteTarget,
+    /// Which tree the store directory is in, for `LockSubject` and for the
+    /// held-lock record `doctor --remove-stale` reads.
+    tree: Tree,
+    /// How the audit log and `--json`'s `target` member name the item.
+    audit: Target,
+}
+
+impl Subject {
+    /// The directory whose lock artefacts guard the item.
+    ///
+    /// The **unresolved** spelling for the live tree, deliberately: invariant
+    /// I13 keeps identity out of path resolution, so `WriteTarget::live`
+    /// derives the directory from the environment's characters and the service
+    /// from the same characters. `LockAnchor::open` resolves it itself and
+    /// accepts this spelling by identity, which is what makes the two name one
+    /// directory without either having to be the other's string.
+    fn store_dir(&self) -> &Path {
+        self.target.store_dir()
+    }
+
+    /// The keychain service name.
+    fn service(&self) -> &str {
+        self.target.service()
+    }
+}
+
+/// Derives the subject, or the Phase A refusal that says why it cannot be.
+///
+/// The **single** statement that constructs [`WriteTarget::live`], which is
+/// where refusal **E** is decided (W4b §D1). Deciding it anywhere else — in
+/// particular at `LockAnchor::open`, which refuses the same environment — would
+/// decide it with the locks being taken, breaking the property
+/// [`swap::DECISION_ORDER`] asserts.
+///
+/// `WriteTarget::live`'s own `AppError::Refused` and `LockAnchor::open`'s
+/// `Tree::Live` arm are **backstops**, documented as such: they exist so no
+/// other caller can reach the case by accident, and neither is the
+/// user-facing gate.
+fn build_subject(
+    paths: &Paths,
+    env: &EnvView,
+    which: Which,
+    store: Option<&AccountRecord>,
+    inherited: &str,
+) -> Result<Subject, Box<Report>> {
+    match which {
+        Which::Namespace => {
+            // `from_record` refuses a store outside the namespace root, which
+            // is half of AC81's containment and is structural rather than a
+            // check written here.
+            let Some(record) = store else {
+                return Err(Box::new(Report::refused(
+                    Refusal::NotOwned,
+                    "",
+                    "a namespaced swap needs the record that owns the store".to_owned(),
+                )));
+            };
+            let Some(sha8) = OwnedSha8::from_record(paths, record) else {
+                return Err(Box::new(Report::refused(
+                    Refusal::NotOwned,
+                    "",
+                    "the store's recorded export spelling does not name a namespace agctl owns"
+                        .to_owned(),
+                )));
+            };
+            let audit = Target::Namespace(sha8.sha8().to_owned());
+            let target = WriteTarget::migrated(sha8);
+
+            // The precondition's other half, and the one the OQ1 match alone
+            // does not give: the item and the directory must name the *same*
+            // store.
+            //
+            // The service comes from the record's **stored** `export_sha8`,
+            // which is what Claude Code hashed when the session started; the
+            // store directory comes from the registry as it stands **now**.
+            // When the namespace has moved, those disagree — the item is still
+            // the one the session reads, but `store_dir` names somewhere else,
+            // so the three Claude Code locks, the adopted copy and the
+            // containment walk would all be about a directory whose
+            // `.oauth_refresh.lock` the peer never takes. Invariant I3' would
+            // be defeated for exactly the one command that writes under the
+            // peer's locks. `doctor` already reports this state (risk R25) and
+            // `export` already refuses it; so does this.
+            let spelled = namespace::export_spelling(target.store_dir());
+            if spelled != inherited {
+                return Err(Box::new(Report::refused(
+                    Refusal::NotOwned,
+                    target.service(),
+                    format!(
+                        "this store is named `{inherited}`, but `{}`'s namespace now spells \
+                         `{spelled}`; the store moved, so agctl would take the Claude Code \
+                         locks in a different directory than the session reads — see `agctl \
+                         claude doctor`",
+                        record.account_uuid
+                    ),
+                )));
+            }
+            Ok(Subject { target, tree: Tree::Agctl, audit })
+        }
+        Which::Live => {
+            // Refusal **E**, decided here and nowhere else. The value is
+            // escaped before it is printed: it comes from the environment, and
+            // a refusal that reproduces control characters verbatim lets
+            // whoever set the variable rewrite the line that reports it.
+            let target = WriteTarget::live(env).map_err(|_| {
+                let value = namespace::securestorage_namespace(env).unwrap_or_default();
+                Box::new(Report::refused(
+                    Refusal::LiveNamespaceEnv,
+                    "",
+                    format!(
+                        "`{}` is set to `{}` in this shell, so this environment names a \
+                         namespace rather than the live store; run without it, or target that \
+                         namespace instead",
+                        namespace::SECURESTORAGE_ENV,
+                        printable(value)
+                    ),
+                ))
+            })?;
+
+            // The Phase A resolution, and it is a **diagnosis rather than a
+            // guard**. `LockAnchor::open` resolves the live store again in
+            // Phase C and that resolution stays authoritative, so this one
+            // widens no window and may never be relied on for safety. Its only
+            // job is to produce the right refusal, with the right exit code,
+            // before anything is held — rather than letting a dangling
+            // `~/.claude` arrive at the acquire and be reported as refusal
+            // **A**, which means *somebody moved a lock agctl was holding*.
+            if let Err(err) = namespace::canonical(target.store_dir()) {
+                return Err(Box::new(Report::refused(
+                    Refusal::LiveUnreachable,
+                    target.service(),
+                    format!(
+                        "the live store `{}` could not be resolved: {err}",
+                        target.store_dir().display()
+                    ),
+                )));
+            }
+            Ok(Subject { target, tree: Tree::Live, audit: Target::Live })
+        }
+    }
+}
+
+/// A value out of the environment, rendered safe to print.
+///
+/// Control characters become their escaped spelling, so a crafted
+/// `CLAUDE_SECURESTORAGE_CONFIG_DIR` cannot rewrite the terminal line that
+/// reports it, move the cursor, or hide the rest of the refusal (r4v F8). The
+/// landed messages elsewhere interpolate such values verbatim; S23's own do
+/// not, and this is the one spelling of the escape.
+fn printable(value: &str) -> String {
+    value.chars().flat_map(char::escape_debug).collect()
 }
 
 /// The active fault set, which is empty in every build without the `testing`
@@ -394,7 +615,7 @@ fn owned_by_spelling<'a>(config: &'a AgctlConfig, inherited: &str) -> Option<&'a
 fn swap_in(
     swap: &Swap<'_>,
     incoming: &Incoming<'_>,
-    store: &AccountRecord,
+    store: Option<&AccountRecord>,
     args: &UseArgs,
 ) -> Report {
     let mut pass = Pass::default();
@@ -428,56 +649,25 @@ struct Pass {
 fn swap_phases(
     env: &Swap<'_>,
     incoming: &Incoming<'_>,
-    store: &AccountRecord,
+    store: Option<&AccountRecord>,
     args: &UseArgs,
     pass: &mut Pass,
 ) -> Report {
-    let Swap { paths, config, env, inherited, ctx, fault } = env;
-    let (paths, config, env, inherited, ctx, fault) =
-        (*paths, *config, *env, *inherited, *ctx, *fault);
+    let Swap { paths, config, env, which, inherited, ctx, fault } = env;
+    let (paths, config, env, which, inherited, ctx, fault) =
+        (*paths, *config, *env, *which, *inherited, *ctx, *fault);
     let direction = incoming.direction;
-    // Step 5: derive the store directory and the service name **together**,
-    // through the registry. `from_record` refuses a store outside the
-    // namespace root, which is half of AC81's containment and is structural
-    // rather than a check written here.
-    let Some(sha8) = OwnedSha8::from_record(paths, store) else {
-        return Report::refused(
-            Refusal::NotOwned,
-            "",
-            "the store's recorded export spelling does not name a namespace agctl owns".to_owned(),
-        );
+    // Step 5: derive the store directory and the service name **together**
+    // from the one `EnvView` above — and, for a namespace, through the
+    // registry. Refusals **E** and `LiveUnreachable` are decided in here; see
+    // `build_subject`.
+    let subject = match build_subject(paths, env, which, store, inherited) {
+        Ok(subject) => subject,
+        Err(report) => return *report,
     };
-    let target = WriteTarget::migrated(sha8.clone());
-    let store_dir = target.store_dir().to_path_buf();
-    let service = target.service().to_owned();
-    pass.target = Some(Target::Namespace(sha8.sha8().to_owned()).to_string());
-
-    // The precondition's other half, and the one the OQ1 match alone does not
-    // give: the item and the directory must name the *same* store.
-    //
-    // The service comes from the record's **stored** `export_sha8`, which is
-    // what Claude Code hashed when the session started; the store directory
-    // comes from the registry as it stands **now**. When the namespace has
-    // moved, those disagree — the item is still the one the session reads,
-    // but `store_dir` names somewhere else, so the three Claude Code locks,
-    // the adopted copy and the containment walk would all be about a
-    // directory whose `.oauth_refresh.lock` the peer never takes. Invariant
-    // I3' would be defeated for exactly the one command that writes under the
-    // peer's locks. `doctor` already reports this state (risk R25) and
-    // `export` already refuses it; so does this.
-    let spelled = crate::provider::claude::namespace::export_spelling(&store_dir);
-    if spelled != inherited {
-        return Report::refused(
-            Refusal::NotOwned,
-            &service,
-            format!(
-                "this store is named `{inherited}`, but `{}`'s namespace now spells `{spelled}`; \
-                 the store moved, so agctl would take the Claude Code locks in a different \
-                 directory than the session reads — see `agctl claude doctor`",
-                store.account_uuid
-            ),
-        );
-    }
+    let store_dir = subject.store_dir().to_path_buf();
+    let service = subject.service().to_owned();
+    pass.target = Some(subject.audit.to_string());
 
     // Step 6, refusal C: agctl's **own** environment only (decision
     // D-020). agctl cannot read another process's environment and will not
@@ -508,7 +698,28 @@ fn swap_phases(
     // outgoing credential comes from here.
     let (displaced, item_present) = match location::from_keychain(reader.as_ref(), &service) {
         Resolved::Credentials(credentials) => (Some(*credentials), true),
-        // The store has not migrated yet: the plaintext file is the
+        // An absent **live** item means the live store has not migrated, so
+        // its credential is in `~/.claude/.credentials.json` and W4a's
+        // first-write path would *remove* that file once the write applied
+        // (finding N-2) — a deletion inside the user's own live store, which
+        // invariant I11′ does not price. Refused instead (ruling G4), so no
+        // file under the live store is ever written or removed and the
+        // relaxation stays exactly "three lock artefacts plus the item". The
+        // condition is transient and self-healing: one `claude` session
+        // migrates the store.
+        Resolved::Absent if which == Which::Live => {
+            return Report::refused(
+                Refusal::LiveItemAbsent,
+                &service,
+                format!(
+                    "the live store `{}` has not migrated into the keychain, so there is no \
+                     `{service}` item to swap and its credential is still in the plaintext \
+                     store; run `claude` once to migrate it, then run this again",
+                    store_dir.display()
+                ),
+            );
+        }
+        // A namespace that has not migrated yet: the plaintext file is the
         // authoritative source, and the item write below is a first write.
         Resolved::Absent => match location::from_file(&store_dir) {
             Resolved::Credentials(credentials) => (Some(*credentials), false),
@@ -595,11 +806,31 @@ fn swap_phases(
     // A reversal never reaches it: `adopt::decide_undo` parks the occupant in
     // this store's own adopted copy whoever it belongs to, so there is no
     // third namespace to write and none to lock.
-    let third = match direction {
-        Direction::Forward => {
-            displaced.as_ref().and_then(|p| third_namespace(config, store, incoming.record, p))
+    //
+    // The **live** target resolves it in both directions, and that is §D5's
+    // re-cut rather than an oversight. `decide_undo`'s fixed destination is the
+    // store's own `.credentials.adopted.json`, which for a live target is
+    // `~/.claude/.credentials.adopted.json` — outside `namespace_root()` and
+    // forbidden by I11′. So a live reversal parks what the item holds in *that
+    // credential's* own namespace too, exactly as the forward direction does,
+    // and the operation stays its own inverse because each credential goes
+    // home rather than into a shared sibling.
+    //
+    // For the live target only an **`Owned`** record's namespace can receive
+    // the displaced credential (§D5). Any other kind — an imported
+    // `CLAUDE_CONFIG_DIR` item, a read-only live row — keeps its credentials
+    // outside agctl's store, so a `.credentials.json` under `namespace_root()`
+    // for it would be a namespace nobody created, and `use --undo`, which looks
+    // for the displaced credential only in owned namespaces, could never read it
+    // back. So `third_namespace` selects among `Owned` records only, by account
+    // **and** organisation, and exactly one (review F1): none is the no-record
+    // case `decide_adoption` refuses, and two refuse at step 11. The namespace
+    // target keeps W4a's account-only selection (`agctl-m08`).
+    let third = match displaced.as_ref() {
+        Some(p) if which == Which::Live || direction == Direction::Forward => {
+            third_namespace(config, store, incoming.record, p, which)
         }
-        Direction::Reverse => None,
+        _ => Ok(None),
     };
 
     // Step 10: the namespace locks, in ascending namespace-key order so two
@@ -608,8 +839,9 @@ fn swap_phases(
     // across Phase B *and* Phase C. These are agctl's own locks; Claude
     // Code neither takes nor waits for them.
     let deadline = Instant::now() + SWAP_DEADLINE;
-    let mut locked: Vec<&AccountRecord> = vec![incoming.record, store];
-    locked.extend(third.as_ref());
+    let mut locked: Vec<&AccountRecord> = vec![incoming.record];
+    locked.extend(store);
+    locked.extend(third.as_ref().ok().and_then(Option::as_ref));
     let mut guards = Vec::new();
     for (acct, org) in lock_order(&locked) {
         match namespace_lock::acquire(paths, &acct, &org, deadline, ctx.cancel(), fault.clone()) {
@@ -623,6 +855,46 @@ fn swap_phases(
             }
         }
     }
+
+    // Step 10b, the live store only: the audit log, proved appendable by a
+    // **held descriptor** and held from here through Phase C (ruling G2).
+    //
+    // Invariant I16 makes the audit line the only durable evidence that agctl
+    // broke a lock in the user's own `~/.claude`, and the failure is
+    // attacker-selectable: one `ln -s` at the log's name, or one `chmod 0644`.
+    // A control whose only failure mode is *the adversary switches it off and
+    // the privileged action proceeds* is not a control, so the swap stops.
+    //
+    // Gated on the descriptor rather than on `audit::log_state`, which is a
+    // report: a report leaves the whole width between the look and the write
+    // to whoever can plant a name in that directory. Taken **here** — before
+    // the live store is touched, before the adoption write, before the POST
+    // and before the prompt, with nothing of Claude Code's held — so a refusal
+    // costs nobody anything.
+    //
+    // The *message* is the refusal `open_log` itself returned, which names the
+    // log and carries `LogState::note()`'s sentence verbatim for a wrong mode
+    // or a link at its name — the one sentence `doctor`'s `audit log` row
+    // prints. Not a second look through `audit::log_state`: that would be a
+    // second walk after the one that refused, and could describe a state other
+    // than the one the gate actually met.
+    //
+    // A namespace swap keeps W4a's behaviour: `audit::append` returns an
+    // error, the append is logged, and the swap carries on.
+    let log_path = audit::log_path(paths);
+    let live_log = match which {
+        Which::Live => match audit::open_log(paths, &log_path) {
+            Ok(file) => Some(file),
+            Err(err) => {
+                return Report::refused(
+                    Refusal::AuditRefused,
+                    &service,
+                    format!("a swap of the live store will not proceed unrecorded: {err}"),
+                );
+            }
+        },
+        Which::Namespace => None,
+    };
 
     // Step 11: **decide** what becomes of the displaced credential, or refuse
     // (decision D-017). Under D's namespace lock, which is ruling OQ2's
@@ -639,6 +911,27 @@ fn swap_phases(
     // **different** account's `.credentials.json`. Refusal **F** still has to
     // be decided in front of the prompt, because a swap that cannot adopt is
     // not a swap worth asking about; only the write moves.
+    // Two `Owned` records are the displaced credential's account (review F1):
+    // which namespace is its own cannot be told without guessing, so this
+    // refuses beside the no-record case — under the same reason, in the same
+    // phase, and after the audit gate, as `DECISION_ORDER` lists them.
+    let third = match third {
+        Ok(third) => third,
+        Err(pair) => {
+            let [first, second] = *pair;
+            return Report::refused(
+                Refusal::CannotAdopt(adopt::Refusal::IdentityMismatch),
+                &service,
+                format!(
+                    "the outgoing credential cannot be adopted: its account is both `{}` and `{}` \
+                     in agctl's registry, and nothing says which of the two namespaces is its \
+                     own; agctl will not guess",
+                    first.display_id(&config.accounts),
+                    second.display_id(&config.accounts)
+                ),
+            );
+        }
+    };
     let plan = match displaced.as_ref() {
         Some(displaced) => {
             let parties = Parties {
@@ -648,9 +941,9 @@ fn swap_phases(
                 incoming_credentials: &incoming_credentials,
                 third: third.as_ref(),
             };
-            match decide_adoption(paths, &parties, displaced, ctx, direction) {
+            match decide_adoption(paths, &parties, displaced, ctx, direction, which, &service) {
                 Ok(plan) => plan,
-                Err(reason) => return Report::cannot_adopt(reason, &service),
+                Err(report) => return *report,
             }
         }
         None => AdoptionPlan::Nothing,
@@ -799,7 +1092,17 @@ fn swap_phases(
     // Step 16: `acquire` creates nothing, so a namespace directory that does
     // not exist yet is `Unreachable` rather than a lock. Opening it the way
     // the file writer does is what makes a first swap work.
-    if let Err(err) = file_store::open_namespace_dir(paths, &store_dir) {
+    //
+    // **Only for a namespace.** `open_namespace_dir` creates what is missing
+    // under `namespace_root()`, and for the live target the store directory is
+    // outside it — so this would both refuse (it is not agctl's to create)
+    // and, if it did not, be a write into the user's own `~/.claude` that
+    // invariant I11′ does not price. The live store needs no such step: Phase A
+    // already resolved it, so it exists, and `LiveUnreachable` is what says so
+    // when it does not.
+    if which == Which::Namespace
+        && let Err(err) = file_store::open_namespace_dir(paths, &store_dir)
+    {
         return Report::refused(
             Refusal::CannotAdopt(adopt::Refusal::Unreadable),
             &service,
@@ -814,8 +1117,11 @@ fn swap_phases(
     phase_c(
         paths,
         PhaseC {
-            target: &target,
-            sha8: sha8.sha8(),
+            target: &subject.target,
+            tree: subject.tree,
+            audit: &subject.audit,
+            log: live_log.as_ref(),
+            log_path: &log_path,
             service: &service,
             account: &account,
             store_dir: &store_dir,
@@ -832,6 +1138,12 @@ fn swap_phases(
             // already parked elsewhere (finding N-2). Both halves matter: an
             // absent item with no file at all displaces nothing and leaves
             // nothing to remove.
+            //
+            // Always `false` for the live target: an absent live item refuses
+            // in Phase A (`LiveItemAbsent`), so `item_present` is true by the
+            // time this is reached — which is what makes "no file under the
+            // live store is ever written or removed" structural rather than a
+            // promise.
             shadowing_store: !item_present && displaced.is_some(),
         },
         line,
@@ -862,19 +1174,71 @@ fn swap_phases(
 /// agctl's own write, blaming a concurrent writer that did not exist, and
 /// every later run refused `NewerCopy`, wedging the store. What becomes of
 /// that copy is [`adopt::Adoption::Discarded`]'s row, not this function's.
+/// `store` is `None` for the **live** target, which is not a registry row:
+/// there is no account the live item's credential belongs to *by default*, so
+/// every identified credential in it is a third party's and the store-identity
+/// test simply does not apply. What an **un**identified one means is
+/// [`decide_adoption`]'s to decide, and for the live target it refuses rather
+/// than attributing the credential to anybody.
+///
+/// # Selecting the third party, and why the two targets differ (review F1)
+///
+/// For the **live** target the record is chosen the way §D5 names the
+/// destination — `namespace(P.identity)`, account **and** organisation — with
+/// the crate's one identity predicate, among `Owned` records only, and it must
+/// be the only one ([`exactly_one`]). One account registered in two
+/// organisations is a supported shape, and choosing by account alone found the
+/// *incoming* organisation's record and filed the other organisation's
+/// credential over its store. Two candidates — an organisation-less credential,
+/// or a record whose organisation is unknown — come back as `Err`, and the swap
+/// refuses at step 11 rather than guessing between them.
+///
+/// The **namespace** target keeps W4a's selection, the first record naming the
+/// account, which the frozen W4b contract may not change. The same mistake is
+/// reachable there and is `agctl-m08`'s follow-up.
 fn third_namespace(
     config: &AgctlConfig,
-    store: &AccountRecord,
+    store: Option<&AccountRecord>,
     incoming: &AccountRecord,
     displaced: &Credentials,
-) -> Option<AccountRecord> {
-    if swap::same_identity(displaced, store) || swap::same_identity(displaced, incoming) {
-        return None;
+    which: Which,
+) -> Result<Option<AccountRecord>, Box<[AccountRecord; 2]>> {
+    if store.is_some_and(|store| swap::same_identity(displaced, store))
+        || swap::same_identity(displaced, incoming)
+    {
+        return Ok(None);
     }
-    displaced
-        .identity()
-        .and_then(|id| config.accounts.iter().find(|r| r.account_uuid == id.account_uuid))
-        .cloned()
+    let Some(identity) = displaced.identity() else { return Ok(None) };
+    match which {
+        Which::Namespace => Ok(config
+            .accounts
+            .iter()
+            .find(|record| record.account_uuid == identity.account_uuid)
+            .cloned()),
+        Which::Live => exactly_one(config.accounts.iter().filter(|record| {
+            matches!(record.kind, AccountKind::Owned { .. })
+                && swap::same_identity(displaced, record)
+        }))
+        .map(|found| found.cloned())
+        .map_err(|[first, second]| Box::new([first.clone(), second.clone()])),
+    }
+}
+
+/// The one item `items` yields: `Ok(None)` when there is none, `Ok(Some(_))`
+/// when there is exactly one, and the first two when there are more.
+///
+/// The live target's "exactly one or refuse" rule, written once for its two
+/// selections — which owned namespace holds the credential an undo puts back
+/// ([`live_reversal`]), and which owned record a displaced credential belongs
+/// to ([`third_namespace`]). Both refuse on two rather than taking the first,
+/// because the order of the registry is not evidence of anything.
+fn exactly_one<T>(items: impl IntoIterator<Item = T>) -> Result<Option<T>, [T; 2]> {
+    let mut items = items.into_iter();
+    let Some(first) = items.next() else { return Ok(None) };
+    match items.next() {
+        Some(second) => Err([first, second]),
+        None => Ok(Some(first)),
+    }
 }
 
 /// Which way round the swap is running.
@@ -885,8 +1249,8 @@ fn third_namespace(
 ///
 /// | | `Forward` | `Reverse` |
 /// |---|---|---|
-/// | where the incoming credential is read | the incoming account's own namespace store | the store's adopted copy, which is where the swap being undone parked it |
-/// | where the displaced credential is parked | decision D-017's matrix (`adopt::decide`) | always the store's adopted copy (`adopt::decide_undo`) |
+/// | where the incoming credential is read | the incoming account's own namespace store | where the swap being undone parked it: the store's adopted copy for a namespace, and for the live store whichever owned namespace holds the digest the entry names ([`live_reversal`]) |
+/// | where the displaced credential is parked | decision D-017's matrix (`adopt::decide`) | the store's adopted copy for a namespace (`adopt::decide_undo`); the matrix again for the live store, whose adopted copy would be inside `~/.claude` (W4b §D5) |
 ///
 /// Nothing else branches on this, which is the point: a rollback that took a
 /// different path through the locks would be a second protocol to get right.
@@ -908,6 +1272,9 @@ struct Swap<'a> {
     paths: &'a Paths,
     config: &'a AgctlConfig,
     env: &'a EnvView,
+    /// Which of the two stores this pass is about, as the scope gate decided
+    /// it (forward) or as the audit entry named it (a reversal).
+    which: Which,
     /// The spelling the store is named by: the inherited
     /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` on the forward path, and the same
     /// string as the record recorded it on a reversal, which has no session
@@ -921,7 +1288,29 @@ struct Swap<'a> {
 /// Everything Phase C needs, gathered so the signature stays readable.
 struct PhaseC<'a> {
     target: &'a WriteTarget,
-    sha8: &'a str,
+    /// Which tree the hold is in, so the live pass supplies [`Tree::Live`] and
+    /// the namespace pass keeps [`Tree::Agctl`].
+    ///
+    /// A field rather than a constant because the two trees are **not**
+    /// unified: `Tree::Agctl` stays strict, since below `namespace_root()`
+    /// agctl owns every component and a symbolic link at one of them is an
+    /// attack rather than a configuration. `Tree::Live` resolves the store
+    /// once, because on a normal machine `~/.claude` *is* a symbolic link
+    /// (fact F41).
+    tree: Tree,
+    /// How the audit log names the item: `live`, or `namespace:<sha8>`.
+    audit: &'a Target,
+    /// The audit log descriptor a **live** pass is holding, opened in Phase B
+    /// before anything was touched (ruling G2).
+    ///
+    /// Every append this phase makes — the lock-break record as much as the
+    /// write entry — goes through it, so neither can be redirected by a name
+    /// planted after the gate proved the log appendable. `None` for a
+    /// namespace pass, which keeps W4a's behaviour of logging a refused append
+    /// and carrying on.
+    log: Option<&'a File>,
+    /// Where that log is, for the sentences an append failure produces.
+    log_path: &'a Path,
     service: &'a str,
     account: &'a str,
     store_dir: &'a Path,
@@ -997,7 +1386,12 @@ fn phase_c(
     };
 
     let clock = Clock::system();
-    let subject = LockSubject { store_dir: c.store_dir, tree: Tree::Agctl };
+    // The one production site of `Tree::Live`. The subject's store directory is
+    // the **same value** `WriteTarget` derived the service name from (plan
+    // AC82), and `acquire` is handed the **same** `EnvView` — so the hold and
+    // the write cannot be about two different readings of the environment
+    // (risk R42).
+    let subject = LockSubject { store_dir: c.store_dir, tree: c.tree };
 
     // Split the acquire into the draft and the rest **before** either is
     // looked at, so the append below is one unconditional statement. An
@@ -1013,13 +1407,35 @@ fn phase_c(
     // ONE append, unconditional, before the error mapping and before the
     // held/busy split — so a state added to either cannot be added without it.
     if let Some(draft) = break_record {
-        let record = draft.complete(c.service.to_owned(), Target::Namespace(c.sha8.to_owned()));
+        let record = draft.complete(c.service.to_owned(), c.audit.clone());
         lock.broke = Some(break_summary(&record));
-        audit_append(paths, AuditEvent::LockBreak(record));
+        // Through the held descriptor for a live break, because this line is
+        // the **only** durable evidence that agctl removed a lock in the
+        // user's own `~/.claude` (invariant I16).
+        audit_append_through(paths, c.log, c.log_path, AuditEvent::LockBreak(record));
     }
 
     let outcome = match resolved {
         Ok(outcome) => outcome,
+        // Ruling G3: `LockError::Unreachable` against the **live** tree is not
+        // refusal **A**. **A** means *somebody moved a lock agctl was
+        // holding* — a security signal — and a `~/.claude` that is not there,
+        // or whose final component was swapped for a link, is a configuration
+        // fact. Collapsing both into one letter is `agctl-git`; this closes its
+        // live half and leaves the rest open.
+        //
+        // Reaching here at all means the Phase A resolution succeeded and the
+        // store went away during the window, so this is the race's backstop
+        // rather than the decision site — and the acquire failed, so nothing is
+        // held when it fires and `DECISION_ORDER`'s "decided before the locks
+        // are held" property holds as written.
+        Err(claude_lock::LockError::Unreachable { path, message }) if c.tree == Tree::Live => {
+            return ended(
+                Outcome::Refused(Refusal::LiveUnreachable),
+                format!("the live store `{}` could not be resolved: {message}", path.display()),
+                lock,
+            );
+        }
         Err(err) => {
             return ended(
                 Outcome::Refused(Refusal::CompromisedHold),
@@ -1161,20 +1577,29 @@ fn phase_c(
             warnings: Vec::new(),
             note: Some(format!(
                 "the credential could not be stored: {err}. {}",
-                match c.direction {
-                    // Forward: P sits in the adopted copy, written in Phase B and
-                    // committed there, and the item still holds it too.
-                    Direction::Forward => {
+                match (c.direction, c.tree) {
+                    // Forward: P sits where the adoption filed it in Phase B,
+                    // and the item still holds it too.
+                    (Direction::Forward, _) => {
                         "The outgoing credential is still recoverable with `agctl claude use \
-                     --undo`"
+                         --undo`"
                     }
                     // Reverse: the staged copy was never committed, so the copy
                     // still holds the credential this rollback was putting back.
                     // Saying "recoverable with `--undo`" here would be advising
                     // the user to re-run the command that just failed.
-                    Direction::Reverse => {
+                    (Direction::Reverse, Tree::Agctl) => {
                         "The credential this rollback was restoring is untouched in the adopted \
-                     copy; nothing was lost and the rollback can be run again"
+                         copy; nothing was lost and the rollback can be run again"
+                    }
+                    // A live reversal stages nothing and has no adopted copy of
+                    // the store's own: the credential it was restoring was read
+                    // from where the forward pass filed it, inside agctl's own
+                    // namespaces, and a write that did not happen moved nothing.
+                    (Direction::Reverse, Tree::Live) => {
+                        "The credential this rollback was restoring is untouched where the swap \
+                         being undone filed it, inside agctl's own namespaces; nothing was lost \
+                         and the rollback can be run again"
                     }
                 }
             )),
@@ -1203,9 +1628,12 @@ fn phase_c(
     // *undetermined*: if it did not land, the item still holds the occupant,
     // and committing would put the occupant over the only remaining home of
     // the credential this rollback was restoring. Dropping the staging
-    // instead costs nothing — the occupant that goes unparked is still in its
-    // own namespace store, where the forward swap read it and left it — and
-    // it costs only the ability to undo *this* undo, which the note says.
+    // instead costs little — the occupant that goes unparked came from its own
+    // namespace store, where the forward swap read it and left it, and that
+    // store *may* still hold a usable copy; "may", because a peer that has
+    // since refreshed that namespace's item has rotated the copy's refresh
+    // token away (`agctl-npu`) — and it costs the ability to undo *this* undo,
+    // which the note says without promising more.
     // Every refusing exit above dropped `c.staged` for the same reason.
     let mut adopted_to = c.adopted_to;
     let mut note = None;
@@ -1231,7 +1659,8 @@ fn phase_c(
                 "the write could not be confirmed; re-run `agctl claude status`. The \
                  credential this rollback was restoring is untouched in the adopted copy, and \
                  the one it displaced was deliberately not parked there — so this reversal \
-                 cannot itself be undone; that credential is still in its own namespace store"
+                 cannot itself be undone; that credential was not parked; its own store may still \
+                 hold a usable copy"
                     .to_owned(),
             );
         }
@@ -1367,11 +1796,15 @@ fn refresh_incoming(
 /// that reason; this one does too, through the same tmp-fsync-rename writer,
 /// under the namespace lock step 10 already holds for this record.
 ///
-/// Only for [`Source::OwnStore`] — the forward direction, whose source is a
-/// plaintext `.credentials.json`. A reversal reads the store's adopted copy,
-/// which is the file the staging protocol protects and whose contents a later
-/// `--undo`'s digest guard compares against; writing a refreshed credential
-/// there needs its own ruling and is filed as `agctl-bk5`.
+/// Only for [`Source::OwnStore`], whose source is a plaintext
+/// `.credentials.json`: the forward direction, and a **live** reversal whose
+/// credential the forward pass filed in its own namespace's store (W4b §D5,
+/// ruling G9 — `agctl-bk5`'s live half, a change of target rather than a new
+/// path). A namespaced reversal reads the store's adopted copy, which is the
+/// file the staging protocol protects and whose contents a later `--undo`'s
+/// digest guard compares against, and a live reversal of task 4's keep arm
+/// reads the incoming namespace's adopted copy; writing a refreshed credential
+/// to either still needs its own ruling.
 ///
 /// A failure here does not fail the swap: the item write is what the operator
 /// asked for, and a saved refresh is a repair, not a precondition. It is
@@ -1641,8 +2074,9 @@ fn cancelled(service: &str, note: String) -> Report {
 ///
 /// A forward swap reads the incoming account's own namespace store. A
 /// reversal cannot: the credential it is putting back is the one the swap
-/// displaced, which by decision D-024 lives in the store's adopted copy and
-/// nowhere else. So the caller supplies it and this carries it, rather than
+/// displaced, which by decision D-024 lives in the store's adopted copy — or,
+/// for the live store, wherever §D5 filed it inside agctl's own namespaces.
+/// So the caller supplies it and this carries it, rather than
 /// `swap_in` growing a second read path it would have to choose between.
 struct Incoming<'a> {
     /// The account the credential belongs to, for the locks and the prompt.
@@ -1660,10 +2094,13 @@ struct Incoming<'a> {
 
 /// Where the incoming credential is read from.
 enum Source {
-    /// The incoming account's own namespace store, `.credentials.json`.
+    /// The record's own namespace store, `.credentials.json`: the incoming
+    /// account's on the forward path, and on a live reversal the displaced
+    /// credential's own account's, where §D5's ordinary row filed it.
     OwnStore,
-    /// The store's adopted copy, where the swap being undone parked the
-    /// credential now being put back (decision D-024).
+    /// An adopted copy in the directory given: the store's own for a
+    /// namespaced reversal (decision D-024), and the incoming namespace's for a
+    /// live reversal of task 4's keep arm (§D5's re-cut of `agctl-r3h`).
     AdoptedCopy(std::path::PathBuf),
 }
 
@@ -1763,13 +2200,6 @@ enum AdoptionPlan {
     },
 }
 
-/// Decision D-017's adoption, **decided**: every read, every refusal, no write.
-///
-/// The matrix itself is [`adopt::decide`], which is pure; this reads what that
-/// needs and turns its answer into an [`AdoptionPlan`]. It runs in Phase B
-/// under the namespace lock (ruling OQ2, condition (c)) and **before** the
-/// confirmation prompt, so refusal **F** keeps the position plan section
-/// 3.4 gives it: a swap that cannot adopt is refused without asking about it.
 /// Who one adoption is between, and where the store it displaces from is.
 ///
 /// Grouped rather than passed one by one because the three records have to
@@ -1779,8 +2209,16 @@ enum AdoptionPlan {
 /// it. Since `agctl-5gs` the second of those is not decoration: whose the
 /// displaced credential is decides whether there is an adoption target at all.
 struct Parties<'a> {
-    /// The account that owns the store being swapped.
-    store: &'a AccountRecord,
+    /// The account that owns the store being swapped, or `None` for the
+    /// **live** store, which is not a registry row.
+    ///
+    /// Its absence is the whole of §D5's reduction: with no account the store
+    /// belongs to, `same_namespace` is false by construction, so decision
+    /// D-024's sibling file — whose destination is `<D>/…`, and for the live
+    /// target `~/.claude/…` — is unreachable, and every identified credential
+    /// in the live item is a third party's to be filed in its own namespace
+    /// under `namespace_root()`.
+    store: Option<&'a AccountRecord>,
     /// That store's namespace directory.
     store_dir: &'a Path,
     /// The account being swapped in.
@@ -1797,15 +2235,43 @@ struct Parties<'a> {
     third: Option<&'a AccountRecord>,
 }
 
+/// Decision D-017's adoption, **decided**: every read, every refusal, no write.
+///
+/// The matrix itself is [`adopt::decide`], which is pure; this reads what that
+/// needs and turns its answer into an [`AdoptionPlan`]. It runs in Phase B
+/// under the namespace lock (ruling OQ2, condition (c)) and **before** the
+/// confirmation prompt, so refusal **F** keeps the position plan section
+/// 3.4 gives it: a swap that cannot adopt is refused without asking about it.
+///
+/// A refusal comes back as the whole [`Report`] rather than as the matrix's
+/// reason alone, because the live target has two refusals of its own whose
+/// matrix reason carries a sentence that would be false for them (W4b §D5):
+/// the live item's credential names no account, and it names one no `Owned`
+/// record claims. Both are still refusal **F** with the matrix's reason — only
+/// the sentence is theirs.
 fn decide_adoption(
     paths: &Paths,
     parties: &Parties<'_>,
     displaced: &Credentials,
     ctx: &PassCtx,
     direction: Direction,
-) -> Result<AdoptionPlan, adopt::Refusal> {
+    which: Which,
+    service: &str,
+) -> Result<AdoptionPlan, Box<Report>> {
     let Parties { store, store_dir, incoming, incoming_credentials, third } = *parties;
-    // A reversal parks the occupant in the store's own adopted copy, whoever
+    let refused = |reason: adopt::Refusal| Box::new(Report::cannot_adopt(reason, service));
+    // A **live** reversal does not take the staging path at all, and that is
+    // §D5's re-cut rather than an omission: `adopt::decide_undo`'s destination
+    // is fixed at `<D>/.credentials.adopted.json`, and for a live target `D` is
+    // `~/.claude` — outside `namespace_root()`, forbidden by invariant I11′, and
+    // the one write that would make AC81's live containment assertion false. So
+    // both live directions take the reduction below, which sends each credential
+    // to its **own** namespace: forward, the displaced live credential to
+    // `namespace(P)`; in reverse, what the item holds to `namespace(T)`. Each
+    // goes home, so the operation is still its own inverse, and both
+    // destinations are inside `namespace_root()`.
+    //
+    // A namespace reversal parks the occupant in the store's own adopted copy, whoever
     // it belongs to: see `adopt::decide_undo` for why the identity condition
     // and the matrix's namespace choice both fall away in that direction.
     //
@@ -1817,7 +2283,7 @@ fn decide_adoption(
     // peer refresh during the prompt, a busy store, a compromised hold, a
     // budget refusal, a `security(1)` that exits non-zero. Phase C commits it
     // once the item may hold what the copy held.
-    if direction == Direction::Reverse {
+    if direction == Direction::Reverse && which == Which::Namespace {
         let existing = classify(location::from_adopted(store_dir), displaced);
         let decision = adopt::decide_undo(&adopt::Input {
             // A reversal reads the store's own adopted copy, never the
@@ -1836,7 +2302,7 @@ fn decide_adoption(
         });
         return match decision {
             adopt::Adoption::AlreadyPresent => Ok(AdoptionPlan::Nothing),
-            adopt::Adoption::Refused(refusal) => Err(refusal),
+            adopt::Adoption::Refused(refusal) => Err(refused(refusal)),
             _ => Ok(AdoptionPlan::StagedCopy(store_dir.to_path_buf())),
         };
     }
@@ -1845,8 +2311,43 @@ fn decide_adoption(
     // `tokenAccount` is an older blob (fact F4), not a different identity, so
     // `same_identity` passes it — and a credential agctl cannot identify
     // belongs to the store it was found in, which is the same conclusion.
-    let identity_matches = swap::same_identity(displaced, store);
-    let same_namespace = identity_matches;
+    //
+    // **The live target has no such record, and that is §D5's whole
+    // reduction.** Refusal **E** guarantees `CLAUDE_SECURESTORAGE_CONFIG_DIR`
+    // is falsy, so `D` is `~/.claude` (or `CLAUDE_CONFIG_DIR`) — and
+    // `Paths::is_under_namespace_root` refuses every agctl namespace outside
+    // `namespace_root()`, so no agctl namespace can *be* the live store.
+    // `same_namespace` is therefore false by construction, decision D-024's
+    // sibling row is unreachable, and `identity_matches` — which
+    // `adopt::decide` consults only under `same_namespace` — is never asked.
+    let (identity_matches, same_namespace) = match store {
+        Some(store) => {
+            let matches = swap::same_identity(displaced, store);
+            (matches, matches)
+        }
+        None => (false, false),
+    };
+    // An unidentified credential in the **live** item is refused rather than
+    // attributed. Everywhere there is a record to attribute it to, fact F4's
+    // identity-less blob passes the guard: it is an older blob, not evidence of
+    // a different account. Here there is no such record. Attributing it to the
+    // incoming account would let task 4's row discard what may be somebody's
+    // only copy; attributing it to nobody would lose it outright. Decision
+    // D-017 is categorical — adopt the displaced credential or refuse the swap
+    // — so this refuses, under refusal **F**'s `Unreadable` reason (a
+    // credential that could not be read, identified or parsed) and with a
+    // sentence of its own: `Unreadable`'s speaks of "the copy already stored",
+    // and this credential was read perfectly well and simply names nobody.
+    if store.is_none() && displaced.identity().is_none() {
+        return Err(Box::new(Report::refused(
+            Refusal::CannotAdopt(adopt::Refusal::Unreadable),
+            service,
+            "the outgoing credential cannot be adopted: the credential in the live item does not \
+             say which account it belongs to, and the live store is no account's own, so there \
+             is no namespace agctl could file it in without guessing"
+                .to_owned(),
+        )));
+    }
     // `agctl-5gs`: whose the displaced credential is, asked of the incoming
     // record as well as of the store's. It selects the row that decides
     // whether that copy is worth keeping at all — see [`third_namespace`] for
@@ -1861,7 +2362,22 @@ fn decide_adoption(
         // the sibling it is: a blind rename over that name destroys whatever
         // the previous swap adopted there (review F1). No keychain probe: the
         // row's own question is answered from Phase A's credential.
-        let read = location::from_adopted(store_dir);
+        //
+        // For the **live** target the sibling is the **incoming namespace's**,
+        // and the substitution is §D5's live re-cut of `agctl-r3h`. `<D>` is
+        // `~/.claude`: a `.credentials.adopted.json` there is outside
+        // `namespace_root()`, is the write invariant I11′ forbids, and is what
+        // would make AC81's live containment assertion false. The incoming
+        // namespace's sibling is inside `namespace_root()` and is still **not**
+        // a `.credentials.json`, so neither the write-back's compare-and-swap
+        // nor the incoming store is touched — which is the property the row
+        // exists to preserve. The live `--undo` reads it back from there,
+        // through the `PathBuf` `Source::AdoptedCopy` already carries.
+        let sibling = match which {
+            Which::Namespace => store_dir.to_path_buf(),
+            Which::Live => paths.namespace_dir(&incoming.account_uuid, &incoming.organization_uuid),
+        };
+        let read = location::from_adopted(&sibling);
         // Condition (a) for that file: whose credential is already there. The
         // crate's one identity predicate, against the incoming record —
         // which is the displaced credential's own account by this row's
@@ -1872,7 +2388,7 @@ fn decide_adoption(
             Resolved::Credentials(found) => !swap::same_identity(found, incoming),
             _ => false,
         };
-        (store_dir.to_path_buf(), classify(read, displaced), None)
+        (sibling, classify(read, displaced), None)
     } else if same_namespace {
         // Decision D-024: the adopted copy, never `.credentials.json`.
         let read = location::from_adopted(store_dir);
@@ -1883,8 +2399,30 @@ fn decide_adoption(
         // that record, resolved in Phase A so its namespace lock is in the
         // set taken at step 10. Resolving it here instead would write a
         // namespace whose lock nobody took.
+        //
+        // For the live target a missing `third` is §D5's **no-record** case:
+        // the credential names an account and no `Owned` record is that
+        // account (`swap_phases` drops a record of any other kind). Refused
+        // rather than filed, because filing it would mean manufacturing a
+        // namespace — under condition (a)'s reason, but not its sentence, which
+        // speaks of "the account that owns this store" and the live store has
+        // none. The uuid comes out of the item, so it is escaped like every
+        // other value this file prints from outside.
         let Some(record) = third else {
-            return Err(adopt::Refusal::IdentityMismatch);
+            return Err(match (which, displaced.identity()) {
+                (Which::Live, Some(identity)) => Box::new(Report::refused(
+                    Refusal::CannotAdopt(adopt::Refusal::IdentityMismatch),
+                    service,
+                    format!(
+                        "the outgoing credential cannot be adopted: the live item holds a \
+                         credential of `{}`, and no account agctl owns is that one, so there is \
+                         no namespace to file it in; log that account in with `agctl claude \
+                         login` first",
+                        printable(&identity.account_uuid)
+                    ),
+                )),
+                _ => refused(adopt::Refusal::IdentityMismatch),
+            });
         };
         let dir = paths.namespace_dir(&record.account_uuid, &record.organization_uuid);
         // The digests are kept as well as the classification: they are what
@@ -1919,7 +2457,7 @@ fn decide_adoption(
         // say about *why*: the target already held it, or the credential was
         // a duplicate of — or older than — the one being installed.
         adopt::Adoption::AlreadyPresent | adopt::Adoption::Discarded => Ok(AdoptionPlan::Nothing),
-        adopt::Adoption::Refused(refusal) => Err(refusal),
+        adopt::Adoption::Refused(refusal) => Err(refused(refusal)),
         adopt::Adoption::ToAdoptedCopy => Ok(AdoptionPlan::AdoptedCopy(ns_dir)),
         adopt::Adoption::ToStore => Ok(AdoptionPlan::ThirdStore { ns_dir, prior }),
     }
@@ -2094,9 +2632,32 @@ fn line_too_long_note() -> String {
     )
 }
 
-/// Appends one audit entry, reporting a failure rather than failing the swap.
-fn audit_append(paths: &Paths, event: AuditEvent) -> Option<String> {
-    match audit::append(paths, &AuditEntry::new(event)) {
+/// Appends one audit entry, through a descriptor the pass is already holding
+/// when it has one.
+///
+/// The live-store half of ruling G2. A live swap proved the log appendable in
+/// Phase B by **opening** it, and keeps that descriptor across Phase C — so
+/// every entry this phase writes goes to the file the gate checked, and a name
+/// replaced in between changes nothing. A namespace pass passes `None` and
+/// keeps W4a's behaviour: `append` resolves the name itself, and a refused log
+/// is logged and survived rather than fatal.
+///
+/// Either way a failure does not fail the swap. The entry is the record of a
+/// write, not a precondition for one — invariant I16's precondition is checked
+/// before the write, which for the live target is exactly what the Phase B gate
+/// is.
+fn audit_append_through(
+    paths: &Paths,
+    log: Option<&File>,
+    log_path: &Path,
+    event: AuditEvent,
+) -> Option<String> {
+    let entry = AuditEntry::new(event);
+    let appended = match log {
+        Some(file) => audit::append_through(file, log_path, &entry),
+        None => audit::append(paths, &entry),
+    };
+    match appended {
         Ok(id) => Some(id.to_string()),
         Err(err) => {
             tracing::error!(error = %err, "an audit entry could not be appended");
@@ -2105,12 +2666,14 @@ fn audit_append(paths: &Paths, event: AuditEvent) -> Option<String> {
     }
 }
 
-/// Appends the audit entry for one write of a namespaced item.
+/// Appends the audit entry for one write of the item this pass is about.
 fn audit_write(paths: &Paths, c: &PhaseC<'_>, outcome: audit::WriteOutcome) -> Option<String> {
-    audit_append(
+    audit_append_through(
         paths,
+        c.log,
+        c.log_path,
         AuditEvent::Write {
-            target: Target::Namespace(c.sha8.to_owned()),
+            target: c.audit.clone(),
             from_digest8: c.from_digest8.clone(),
             to_digest8: c.to_digest8.clone(),
             outcome,
@@ -2136,6 +2699,13 @@ fn now_ms() -> i64 {
 fn emit(report: &Report, as_json: bool) -> Result<(), AppError> {
     if as_json {
         let mut doc = serde_json::json!({
+            // Beside `emit_plan`'s `"kind": "plan"`, so a consumer reading the
+            // stream can tell the two documents apart by a member rather than
+            // by counting them (`agctl-npu`). A run that reaches the prompt
+            // prints both; one refused before it prints only this. Read the
+            // stream with a streaming parser and take the **last** document
+            // rather than indexing `[1]`.
+            "kind": "outcome",
             "outcome": report.outcome.word(),
             "target": report.target,
             "service": report.service,
@@ -2160,12 +2730,17 @@ fn emit(report: &Report, as_json: bool) -> Result<(), AppError> {
             // ordinary write failure.
             "refusal": serde_json::Value::Null,
         });
-        match &report.outcome {
-            // The OQ1 precondition is not lettered: it carries a reason
-            // instead, because it is decided before Phase A begins.
-            Outcome::Refused(Refusal::NotOwned) => doc["reason"] = serde_json::json!("not_owned"),
-            Outcome::Refused(refusal) => doc["refusal"] = serde_json::json!(refusal.letter()),
-            _ => {}
+        // A refusal carries a **letter** or a **reason**, never both and never
+        // neither: `Refusal::reason` is the exact complement of
+        // `Refusal::letter`, and `swap_tests.rs` pins that. The unlettered four
+        // are the OQ1 precondition, which is decided before Phase A's work
+        // begins, and W4b's three, which sit outside plan section 3.4's
+        // canonical **A**–**F** because those letters were already spoken for.
+        if let Outcome::Refused(refusal) = &report.outcome {
+            match refusal.reason() {
+                Some(reason) => doc["reason"] = serde_json::json!(reason),
+                None => doc["refusal"] = serde_json::json!(refusal.letter()),
+            }
         }
         let text = serde_json::to_string_pretty(&doc)
             .map_err(|err| AppError::Config(format!("could not render the swap as JSON: {err}")))?;
@@ -2236,11 +2811,25 @@ pub(crate) enum Undoable {
         /// a first write is matched against instead.
         to_digest8: String,
     },
-    /// The newest reversible write targets the **live** item, which is S23's
-    /// (W4b). Reported rather than skipped: `--undo` reverses the most recent
-    /// swap, so silently reaching past a live-store swap to an older
-    /// namespaced one would reverse a swap the user did not mean.
-    Live,
+    /// The newest reversible write targets the **live** item.
+    ///
+    /// Carried rather than skipped, and that is load-bearing: `--undo`
+    /// reverses the most recent reversible swap, so stepping past a live-store
+    /// entry to reach an older namespaced one would reverse a swap the user did
+    /// not mean. **Two live entries in a row need no guard** — the second is
+    /// simply the newest, and the same rule picks it — and this says so
+    /// explicitly so a later reader does not add one.
+    Live {
+        /// The digest prefix of the credential that was displaced.
+        ///
+        /// Never `None` for a live entry in practice: an absent live item
+        /// refuses in Phase A ([`Refusal::LiveItemAbsent`]), so a live write
+        /// always displaced something. A `None` here means a hand-edited log,
+        /// and [`run_undo`] refuses rather than guessing.
+        from_digest8: Option<String>,
+        /// The digest prefix of the credential the swap wrote.
+        to_digest8: String,
+    },
     /// There is no write to undo.
     Nothing,
     /// A line between the tail's end and the entry could not be read, so the
@@ -2290,7 +2879,13 @@ pub(crate) fn select_undo(tail: &audit::Tail) -> Undoable {
                     to_digest8: to_digest8.clone(),
                 },
             ),
-            Target::Live => (index, Undoable::Live),
+            Target::Live => (
+                index,
+                Undoable::Live {
+                    from_digest8: from_digest8.clone(),
+                    to_digest8: to_digest8.clone(),
+                },
+            ),
         })
     });
 
@@ -2322,22 +2917,31 @@ pub(crate) fn select_undo(tail: &audit::Tail) -> Undoable {
 /// becomes the new displaced one and is parked in that same copy in turn, so
 /// the operation is its own inverse.
 ///
-/// Refusal **E** does not arise: the store is one agctl owns and sits
-/// inside `namespace_root()`, and nothing on this path touches the live
-/// store. A reversal of a **live** swap is S23's, and is the one case that
-/// still reports `not_implemented`.
+/// A reversal of a **live** swap runs the same way, against `Tree::Live` and
+/// with §D5's live adoption rules. It is the one path on which refusal **E**
+/// is reachable: the target comes from the **audit log**, not from
+/// `CLAUDE_SECURESTORAGE_CONFIG_DIR`, so the two can disagree — and a run whose
+/// shell names a namespace while the entry names the live item would take the
+/// locks in one place and write the other, which is what **E** refuses.
 ///
 /// # Errors
 ///
 /// Returns [`AppError::Config`] when the audit log's tail is not a complete
-/// account of what happened, when the entry names a store no record claims,
-/// or when the adopted copy does not hold the credential the entry says was
-/// displaced; and [`AppError::not_implemented`] for a live-target entry.
+/// account of what happened, when the entry names a store no record claims, and
+/// when the credential the entry says was displaced cannot be found, cannot be
+/// matched to that entry, or is found in more than one place.
 fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Result<i32, AppError> {
     let paths = Paths::resolve(config_dir)?;
     paths.ensure_dirs()?;
     let tail = audit::tail(&paths, UNDO_TAIL)?;
-    let (sha8, from_digest8, to_digest8) = match select_undo(&tail) {
+    // The registry is loaded before the match so each arm can build its
+    // reversal in place. Splitting the match in two — choose, then resolve —
+    // would leave the two exhausted arms to be spelled again, and the only
+    // honest way to spell them in the second match is a panic; this crate has
+    // no `unreachable!` in production and is not getting its first one on the
+    // credential path.
+    let config = AgctlConfig::load(&paths)?;
+    let reversal = match select_undo(&tail) {
         Undoable::Unreadable(line) => {
             return Err(AppError::Config(format!(
                 "the audit log's line {line} could not be read, and it may be the entry \
@@ -2348,15 +2952,66 @@ fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
             Tty.tell("there is no swap to undo: the audit log records no reversible write");
             return Ok(EXIT_OK);
         }
-        Undoable::Live => {
-            return Err(AppError::not_implemented(
-                "claude use --undo of a swap against the live Claude Code store",
-            ));
+        Undoable::Found { sha8, from_digest8, to_digest8 } => {
+            namespaced_reversal(&paths, &config, &sha8, from_digest8.as_deref(), &to_digest8)?
         }
-        Undoable::Found { sha8, from_digest8, to_digest8 } => (sha8, from_digest8, to_digest8),
+        Undoable::Live { from_digest8, to_digest8 } => {
+            live_reversal(&paths, &config, from_digest8.as_deref(), &to_digest8)?
+        }
     };
 
-    let config = AgctlConfig::load(&paths)?;
+    let env = EnvView::from_process();
+    let ctx = PassCtx::standalone(cancel.clone(), Instant::now() + SWAP_DEADLINE);
+    let fault = fault_from_env();
+    let swap = Swap {
+        paths: &paths,
+        config: &config,
+        env: &env,
+        which: reversal.which,
+        inherited: &reversal.inherited,
+        ctx: &ctx,
+        fault: &fault,
+    };
+    let incoming = Incoming {
+        record: &reversal.owner,
+        direction: Direction::Reverse,
+        source: reversal.source,
+    };
+    let report = swap_in(&swap, &incoming, reversal.store.as_ref(), args);
+    emit(&report, args.json)?;
+    Ok(report.outcome.exit_code())
+}
+
+/// One audit entry resolved to the places on disk a reversal needs.
+///
+/// Built by one function per target class so the two differ in exactly the
+/// things that differ — which store, and where the credential being put back
+/// was parked — and share the Phase A–C run that follows.
+struct Reversal {
+    /// Which of the two stores the item is in.
+    which: Which,
+    /// The record that owns the store, or `None` for the live store, which is
+    /// not a registry row.
+    store: Option<AccountRecord>,
+    /// The spelling the store is named by; empty for the live store, which has
+    /// no recorded spelling to check a derived directory against.
+    inherited: String,
+    /// The account the credential being put back belongs to, for the namespace
+    /// lock and the prompt.
+    owner: AccountRecord,
+    /// Where that credential is read from.
+    source: Source,
+}
+
+/// A reversal of a swap against a namespace agctl owns (W4a's path,
+/// unchanged).
+fn namespaced_reversal(
+    paths: &Paths,
+    config: &AgctlConfig,
+    sha8: &str,
+    from_digest8: Option<&str>,
+    to_digest8: &str,
+) -> Result<Reversal, AppError> {
     // The entry names the item by its suffix; the store is whichever owned
     // record still derives that suffix. "Still" is the operative word — a
     // record that has been removed or relocated since the swap leaves an
@@ -2366,7 +3021,7 @@ fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
         .accounts
         .iter()
         .find(|record| {
-            OwnedSha8::from_record(&paths, record).is_some_and(|owned| owned.sha8() == sha8)
+            OwnedSha8::from_record(paths, record).is_some_and(|owned| owned.sha8() == sha8)
         })
         .cloned()
     else {
@@ -2392,9 +3047,9 @@ fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
         }
     };
     let found8 = audit::digest8(&displaced.digests().access_sha256);
-    match &from_digest8 {
+    match from_digest8 {
         Some(from_digest8) => {
-            if found8.as_deref() != Some(from_digest8.as_str()) {
+            if found8.as_deref() != Some(from_digest8) {
                 return Err(AppError::Config(format!(
                     "the adopted copy in `{}` holds `{}`, but the swap being undone displaced \
                      `{}`; agctl will not put back a credential it cannot match to that swap",
@@ -2412,7 +3067,7 @@ fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
         // likely — and putting it back would reinstate the credential the
         // user swapped in while claiming to undo the swap that brought it.
         None => {
-            if found8.as_deref() == Some(to_digest8.as_str()) {
+            if found8.as_deref() == Some(to_digest8) {
                 return Err(AppError::Config(format!(
                     "the adopted copy in `{}` holds `{}`, which is the credential that swap \
                      wrote rather than the one it displaced; agctl will not put back a \
@@ -2433,31 +3088,119 @@ fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
         .and_then(|id| config.accounts.iter().find(|r| r.account_uuid == id.account_uuid).cloned())
         .unwrap_or_else(|| store.clone());
 
-    let env = EnvView::from_process();
-    let ctx = PassCtx::standalone(cancel.clone(), Instant::now() + SWAP_DEADLINE);
-    let fault = fault_from_env();
     // A reversal has no session to inherit a spelling from, so it uses the one
     // the record itself carries — which is byte-for-byte the string the
     // forward swap matched against, because that is how the record was chosen
     // in the first place. The guard it feeds is the same one: the namespace
     // agctl derives now must be the namespace the item was made for.
     let inherited = recorded_spelling(&store).to_owned();
-    let swap = Swap {
-        paths: &paths,
-        config: &config,
-        env: &env,
-        inherited: &inherited,
-        ctx: &ctx,
-        fault: &fault,
-    };
-    let incoming = Incoming {
-        record: &owner,
-        direction: Direction::Reverse,
+    Ok(Reversal {
+        which: Which::Namespace,
+        store: Some(store),
+        inherited,
+        owner,
         source: Source::AdoptedCopy(store_dir),
+    })
+}
+
+/// A reversal of a swap against the **live** store (W4b §D4, §D5).
+///
+/// # Where the credential to put back is, and why it is found by digest
+///
+/// A live swap files the credential it displaces in **that credential's own
+/// account's** namespace and nowhere else (§D5):
+/// `<namespace(P)>/.credentials.json` for the ordinary row, and
+/// `<namespace(T)>/.credentials.adopted.json` for task 4's keep arm, whose
+/// displaced credential *is* the incoming account T's. The contract names the
+/// second as `Source::AdoptedCopy(namespace(T))`; this finds both, because
+/// neither account can be derived from the entry:
+///
+/// - `AuditEvent::Write` carries the target and two digest prefixes and no
+///   account, and `audit.rs` is not this lane's to widen beyond its two ruled
+///   edits;
+/// - the only other witness, the live item (which holds T), would have to be
+///   read **before** Phase A — a `security` child spawned ahead of refusal
+///   **E**, which §D1 says spawns none, and a second item read ahead of Phase
+///   A's single one.
+///
+/// So it looks for the credential by the one key the entry does carry, the
+/// displaced digest prefix, in exactly the places §D5 can have filed it: the
+/// `.credentials.json` and the adopted copy of every namespace an `Owned`
+/// record claims, **counting a copy only when the credential belongs to that
+/// record** (`swap::same_identity`). That condition is what "its own account's
+/// namespace" means, and it keeps a copy parked anywhere else — a namespace
+/// swap's D-024 sibling holding somebody else's credential — from being taken
+/// for this swap's. Exactly one match proceeds, with that record as the owner;
+/// none refuses, because there is nothing to put back; two refuse and name
+/// both, because agctl will not guess which of them to write into the live
+/// item. For task 4's keep arm the one match *is* the contract's
+/// `Source::AdoptedCopy(namespace(T))`.
+///
+/// The namespaced path's `to_digest8` guard is subsumed rather than dropped:
+/// matching `from_digest8` exactly is a stronger statement than "not
+/// `to_digest8`".
+fn live_reversal(
+    paths: &Paths,
+    config: &AgctlConfig,
+    from_digest8: Option<&str>,
+    to_digest8: &str,
+) -> Result<Reversal, AppError> {
+    let Some(from_digest8) = from_digest8 else {
+        // Unreachable through agctl's own writes: an absent live item refuses
+        // in Phase A, so a live write always displaced something and always
+        // records its prefix. A log that says otherwise has been edited, and
+        // there is nothing to match a candidate against.
+        return Err(AppError::Config(format!(
+            "the live swap to undo recorded no displaced credential (it wrote `{to_digest8}`), \
+             so agctl cannot tell which credential to put back"
+        )));
     };
-    let report = swap_in(&swap, &incoming, &store, args);
-    emit(&report, args.json)?;
-    Ok(report.outcome.exit_code())
+
+    let mut found: Vec<(AccountRecord, Source, PathBuf)> = Vec::new();
+    for record in &config.accounts {
+        if !matches!(record.kind, AccountKind::Owned { .. }) {
+            continue;
+        }
+        let ns_dir = paths.namespace_dir(&record.account_uuid, &record.organization_uuid);
+        let candidates = [
+            (location::from_file(&ns_dir), Source::OwnStore, file_store::CREDENTIALS_FILE),
+            (
+                location::from_adopted(&ns_dir),
+                Source::AdoptedCopy(ns_dir.clone()),
+                file_store::ADOPTED_FILE,
+            ),
+        ];
+        for (read, source, name) in candidates {
+            let Resolved::Credentials(credentials) = read else { continue };
+            let digest8 = audit::digest8(&credentials.digests().access_sha256);
+            // Its own account's namespace and only that — see above.
+            if digest8.as_deref() == Some(from_digest8) && swap::same_identity(&credentials, record)
+            {
+                found.push((record.clone(), source, ns_dir.join(name)));
+            }
+        }
+    }
+
+    let (owner, source) = match exactly_one(found) {
+        Ok(Some((owner, source, _))) => (owner, source),
+        Ok(None) => {
+            return Err(AppError::Config(format!(
+                "the credential that live swap displaced (`{from_digest8}`) is not in its own \
+                 account's namespace in any store agctl owns, so there is nothing to put back; \
+                 `agctl claude doctor` reports what each namespace holds"
+            )));
+        }
+        Err([(_, _, where_it_is), (_, _, also)]) => {
+            return Err(AppError::Config(format!(
+                "the credential that live swap displaced (`{from_digest8}`) is in both `{}` and \
+                 `{}`; agctl will not guess which of them to put back into the live item",
+                where_it_is.display(),
+                also.display()
+            )));
+        }
+    };
+
+    Ok(Reversal { which: Which::Live, store: None, inherited: String::new(), owner, source })
 }
 
 /// How many audit entries `--undo` looks back through.

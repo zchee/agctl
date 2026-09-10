@@ -232,6 +232,55 @@ impl Fixture {
         self.home().join(".claude")
     }
 
+    /// Plants the live store as a **symbolic link**, the shape a real machine
+    /// has, and returns the resolved directory it points at.
+    ///
+    /// `$HOME/.claude` → `$HOME/.claude-real`. On the machine this was
+    /// developed against `~/.claude` is a link (fact F41), and `Tree::Live`'s
+    /// whole anchor logic exists for that: the store is resolved once, the walk
+    /// starts at the **resolved parent**, and the legacy lock is named after the
+    /// resolved last component — `realpath(D) + ".lock"`, the entry the peer
+    /// itself creates (fact F17). A live-store test against a real directory
+    /// exercises none of it and would pass on a build that put the legacy lock
+    /// at `$HOME/.claude.lock`, restoring the F54/F55 race that lock exists to
+    /// lose.
+    ///
+    /// The result is `canonicalize`d rather than spelled, because the temporary
+    /// root itself usually sits behind a link (`/var` → `/private/var` on
+    /// macOS), and the artefacts land under the resolved spelling.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the link or its target cannot be created, or when the
+    /// planted link does not resolve — the test cannot run at all in either
+    /// case.
+    pub fn live_through_link(&self) -> PathBuf {
+        let link = self.live_store_dir();
+        let target = self.home().join(".claude-real");
+        fs::create_dir_all(&target).expect("the live store's link target should be creatable");
+        std::os::unix::fs::symlink(&target, &link)
+            .expect("the live store link should be plantable");
+        fs::canonicalize(&link).expect("the planted live store link should resolve")
+    }
+
+    /// The three Claude Code lock artefacts one hold of the **live** store
+    /// creates, at the paths the resolved store puts them (ory ruling 9 item 4).
+    ///
+    /// `resolved` is what [`Fixture::live_through_link`] returned. The legacy
+    /// lock is the resolved store's **sibling**, named after its own last
+    /// component, so for a store reached through a link it is *not* beside the
+    /// link: `$HOME/.claude.lock` is the path that must stay absent.
+    #[must_use]
+    pub fn live_hold_artefacts(resolved: &Path) -> [PathBuf; 3] {
+        let mut legacy = resolved.as_os_str().to_os_string();
+        legacy.push(".lock");
+        [
+            resolved.join(".oauth_refresh.lock"),
+            PathBuf::from(legacy),
+            resolved.join(".storage-write"),
+        ]
+    }
+
     /// Sets one environment variable for every command this fixture builds.
     pub fn set(&mut self, key: &str, value: &str) -> &mut Self {
         self.env.retain(|(existing, _)| existing != key);
@@ -1068,7 +1117,7 @@ pub fn finish(child: Child) -> Output {
 /// write lines in it is a failure, not a pass, because "the write path did
 /// nothing" is exactly the way this criterion could otherwise be satisfied
 /// (critic M8).
-pub const KEYCHAIN_WRITE_TESTS: [&str; 26] = [
+pub const KEYCHAIN_WRITE_TESTS: [&str; 36] = [
     "ac59_the_write_transport_reads_one_line_from_stdin_and_redacts_the_hex",
     "ac60_a_service_no_test_registered_is_refused_and_stores_nothing",
     "ac61_what_the_write_path_stores_is_what_the_binary_reads",
@@ -1113,6 +1162,25 @@ pub const KEYCHAIN_WRITE_TESTS: [&str; 26] = [
     "an_applied_swap_saves_the_refreshed_credential_back_to_the_incoming_store",
     "a_fresh_credential_in_a_migrated_incoming_store_needs_no_refresh_and_proceeds",
     "an_applied_swap_whose_cleanup_failed_warns_on_stderr_and_in_json",
+    // W4b's live-store swaps. Each completes at least one `use --live` against
+    // the **live** item and therefore writes `Claude Code-credentials` — the
+    // unsuffixed name, which no W4a test was ever allowed to name. The three
+    // that reverse as well write twice, once each way, which is why the
+    // aggregate is the list's length and not a per-test count; each still pins
+    // its own number against its own log.
+    "ac82_a_live_swap_writes_the_unsuffixed_item_and_locks_the_resolved_store",
+    "ac81_a_live_swap_touches_nothing_outside_the_namespace_root_but_the_three_artefacts",
+    "ac76_a_live_swap_is_reversed_by_undo_and_the_item_holds_p_again",
+    "ac67_e_an_undo_of_a_live_entry_from_a_namespaced_shell_refuses_e",
+    "the_live_r3h_row_parks_the_displaced_copy_in_the_incoming_namespace",
+    "a_live_swap_creates_ps_namespace_only_under_the_namespace_root",
+    "a_live_undo_refreshes_an_expired_credential_and_persists_it",
+    "a_live_undo_whose_refreshed_credential_cannot_be_saved_warns_on_stderr_and_in_json",
+    "a_live_swap_between_two_orgs_of_one_account_files_the_displaced_credential_in_its_own_org",
+    // The namespace-target control for ruling G2's scope: it proves W4a's
+    // behaviour over a refused audit log is unchanged, which means it completes
+    // a swap and writes the namespaced item once.
+    "a_refused_audit_log_does_not_refuse_a_namespaced_swap",
 ];
 
 /// Fact F42's keychain update line, for a test that means to write one.

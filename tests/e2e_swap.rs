@@ -474,28 +474,43 @@ fn no_new_credential_at_rest(
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ac67_the_w4b_scope_gate_refuses_before_anything_is_read() {
-    // An unset `CLAUDE_SECURESTORAGE_CONFIG_DIR` means the target is the live
-    // store, which is W4b's. Refused as `not_implemented`, exit 1, and — the
-    // load-bearing half — with the keychain never touched at all.
+fn the_scope_gate_sends_an_empty_securestorage_variable_to_the_live_store() {
+    // The W4a form of this test asserted the **opposite**: an unset or empty
+    // `CLAUDE_SECURESTORAGE_CONFIG_DIR` was refused as `not_implemented`,
+    // exit 1. W4b removes that arm, so the claim inverts — and the half worth
+    // keeping is *which* store the empty value selects.
+    //
+    // Empty, not unset, because that is fact F14's corner: `""` is falsy to
+    // Claude Code, so it names the **unsuffixed live item** exactly as an unset
+    // variable would, even with `CLAUDE_CONFIG_DIR` set. A gate that tested
+    // presence rather than truthiness would route this run at a namespace and
+    // pass every assertion about the refusal it then produced.
+    //
+    // This fixture's live store does not exist, so the pass refuses
+    // `LiveUnreachable` in Phase A — which is exactly the evidence wanted: the
+    // refusal is about the **live** store, and nothing was read to reach it.
     let server = MockServer::start();
     let (mut fixture, _service) = two_accounts(&server, common::fresh_at());
     fixture.set("CLAUDE_SECURESTORAGE_CONFIG_DIR", "");
 
     no_plaintext_store(&fixture, "before the pass");
-    let (code, _stdout, stderr) = swap(&fixture, &[]);
-    assert_eq!(code, 1, "the scope gate is an `AppError::Config`, which exits EXIT_FATAL");
-    assert!(
-        stderr.contains("not implemented") || stderr.contains("live Claude Code store"),
-        "{stderr}"
+    let (code, stdout, _stderr) = swap(&fixture, &["--json"]);
+    assert_eq!(code, 23, "SWAP_EXIT_LIVE_UNREACHABLE: the live arm was taken");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["reason"], json!("live_unreachable"), "{doc}");
+    assert_eq!(
+        doc["service"],
+        json!(LIVE_SERVICE),
+        "and the item it was about is the unsuffixed one, not the namespace's: {doc}"
     );
+    assert_ne!(doc["reason"], json!("not_owned"), "an empty value is not a namespace: {doc}");
 
     assert_eq!(reads(&fixture).len(), 0, "nothing was read: {:?}", reads(&fixture));
     assert_eq!(writes(&fixture).len(), 0, "and nothing was written");
     assert_security(&fixture, &[]);
-    assert!(audit_lines(&fixture).is_empty(), "no audit entry for a gate that read nothing");
+    assert!(audit_lines(&fixture).is_empty(), "no audit entry for a Phase A refusal");
     artefacts_released(&fixture);
-    no_plaintext_store(&fixture, "after a gate that read nothing");
+    no_plaintext_store(&fixture, "after a refusal that read nothing");
     audit_carries_no_token(&fixture);
 }
 
@@ -1286,7 +1301,7 @@ fn undo_with_no_reversible_entry_says_so_and_writes_nothing() {
 }
 
 #[test]
-fn undo_of_a_live_target_entry_is_s23s_and_says_so() {
+fn undo_of_a_live_target_entry_refuses_when_nothing_holds_the_credential_it_names() {
     // Constructed directly in the fixture, because W4a never writes a live
     // item — which is exactly why this case needs a hand-built entry to be
     // reachable at all.
@@ -1310,10 +1325,15 @@ fn undo_of_a_live_target_entry_is_s23s_and_says_so() {
 
     no_plaintext_store(&fixture, "before the pass");
     let (code, _stdout, stderr) = undo(&fixture);
-    assert_eq!(code, 1, "`not_implemented` is an `AppError::Config`, which exits EXIT_FATAL");
+    // W4a refused this as `not_implemented`. W4b acts on a live entry — but a
+    // hand-built one names a credential (`deadbeef`) that no namespace holds,
+    // and a reversal that cannot find what the entry displaced will not guess.
+    // The sentence names the digest so an operator can look for it.
+    assert_eq!(code, 1, "an unresolvable entry is an `AppError::Config`, which exits EXIT_FATAL");
+    assert!(stderr.contains("deadbeef"), "it names the credential it could not find: {stderr}");
     assert!(
-        stderr.contains("live Claude Code store"),
-        "and it names the store W4b covers: {stderr}"
+        stderr.contains("nothing to put back") || stderr.contains("not in any namespace"),
+        "and says why: {stderr}"
     );
     assert_eq!(writes(&fixture).len(), 0, "nothing was written");
     assert_security(&fixture, &[]);
@@ -3528,9 +3548,12 @@ fn an_undo_whose_write_outcome_is_unknown_leaves_the_restored_credential_in_the_
     // destroy the only remaining home of the credential this rollback exists
     // to put back. So `unknown` does not commit.
     //
-    // Nothing is lost by that. The occupant that goes unparked is still in
-    // its own namespace store, where the forward swap read it and left it.
-    // What *is* given up is undoing this undo, and the note says so — and the
+    // Little is lost by that. The occupant that goes unparked came from its
+    // own namespace store, where the forward swap read it and left it — and
+    // that store *may* still hold a usable copy, which is all the note may
+    // claim: a peer that refreshed that namespace's item since has rotated the
+    // copy's refresh token away (`agctl-npu`). What *is* given up is undoing
+    // this undo, and the note says so — and the
     // second `--undo` below proves it, refusing rather than restoring the
     // occupant on the strength of an entry whose copy does not match it.
     let server = MockServer::start();
@@ -3552,8 +3575,12 @@ fn an_undo_whose_write_outcome_is_unknown_leaves_the_restored_credential_in_the_
         "and that this reversal is not reversible, because the occupant was not parked: {stdout}"
     );
     assert!(
-        stdout.contains("still in its own namespace store"),
-        "with where that credential actually is: {stdout}"
+        stdout.contains("was not parked; its own store may still hold a usable copy"),
+        "with where a usable copy may be, and no more than that: {stdout}"
+    );
+    assert!(
+        !stdout.contains("still in its own namespace store"),
+        "never the old promise, which a peer refresh makes false (`agctl-npu`): {stdout}"
     );
 
     // The copy still holds the credential the rollback was restoring, and the
@@ -4117,4 +4144,1358 @@ fn a_kept_copy_refuses_an_older_sibling_of_another_account_rather_than_replacing
     );
     assert_eq!(token.calls(), 0, "no refresh POST ran");
     assert_eq!(writes(&fixture).len(), 0, "nothing reached the item: {:?}", writes(&fixture));
+}
+
+// ---------------------------------------------------------------------------
+// W4b — `use --live` against the LIVE store
+// ---------------------------------------------------------------------------
+
+/// A registry holding **P**'s owner and the incoming account **T**, and a live
+/// store reached through a **symbolic link** whose item holds P.
+///
+/// Three things about the shape, each load-bearing:
+///
+/// - **No `CLAUDE_SECURESTORAGE_CONFIG_DIR`**, which is what selects the live
+///   arm of the scope gate's partition.
+/// - **The live store is a link** (ory ruling 9 item 6). On a real machine
+///   `~/.claude` is one (fact F41), and `Tree::Live`'s anchor logic exists for
+///   exactly that: the store is resolved once, the walk starts at the resolved
+///   parent, and the legacy lock is named after the resolved last component. A
+///   test against a real directory exercises none of it.
+/// - **The live item is present**, so the store counts as migrated. An absent
+///   one refuses (`LiveItemAbsent`, exit 24) and has its own test.
+///
+/// Returns the fixture and the **resolved** live store, which is where every
+/// artefact assertion points.
+fn live_accounts(server: &MockServer, t_expires_at: i64) -> (Fixture, std::path::PathBuf) {
+    let mut fixture = Fixture::new();
+    fixture.with_keychain().endpoints(&server.base_url());
+    fixture.write_registry(vec![
+        fixture.owned_record(ACCT, ORG),
+        owned_record_for(&fixture, ACCT_T, ORG_T, EMAIL_T),
+    ]);
+
+    // T's own credential, plaintext, in its own namespace.
+    fixture.write_credentials(
+        ACCT_T,
+        ORG_T,
+        &common::identified_blob(
+            "sk-ant-oat01-incoming",
+            "sk-ant-ort01-incoming",
+            t_expires_at,
+            ACCT_T,
+            Some(ORG_T),
+        ),
+    );
+
+    let resolved = fixture.live_through_link();
+
+    // P: the live item, identified as the account that owns namespace ACCT/ORG
+    // — so the adoption has somewhere inside `namespace_root()` to file it.
+    fixture.dump(&[LIVE_SERVICE]);
+    fixture.keychain_item(
+        LIVE_SERVICE,
+        &common::identified_blob(
+            "sk-ant-oat01-outgoing",
+            "sk-ant-ort01-outgoing",
+            common::fresh_at(),
+            ACCT,
+            Some(ORG),
+        ),
+    );
+    fixture.allow_write(LIVE_SERVICE);
+    fixture.set("RUST_LOG", "agctl=debug");
+    (fixture, resolved)
+}
+
+/// Asserts the live store's three lock artefacts are gone, and that the naive
+/// `$HOME/.claude.lock` was never the legacy lock's name.
+fn live_artefacts_released(fixture: &Fixture, resolved: &Path) {
+    for path in Fixture::live_hold_artefacts(resolved) {
+        assert!(!path.exists(), "`{}` should have been released", path.display());
+    }
+    let naive = fixture.home().join(".claude.lock");
+    assert!(
+        !naive.exists(),
+        "`{}` must never exist: the legacy lock is `realpath(D) + \".lock\"` (fact F17), and \
+         putting it beside the *link* instead would restore the F54/F55 race that lock exists \
+         to lose",
+        naive.display()
+    );
+}
+
+/// P's credential as `live_accounts` plants it in the live item.
+fn p_blob() -> String {
+    common::identified_blob(
+        "sk-ant-oat01-outgoing",
+        "sk-ant-ort01-outgoing",
+        common::fresh_at(),
+        ACCT,
+        Some(ORG),
+    )
+}
+
+/// The bytes the fake keychain holds for the live item, or `None`.
+fn live_item(fixture: &Fixture) -> Option<String> {
+    fs::read_to_string(fixture.keychain_item_path(LIVE_SERVICE)).ok()
+}
+
+#[test]
+fn ac82_a_live_swap_writes_the_unsuffixed_item_and_locks_the_resolved_store() {
+    // Plan AC82's e2e half: the item the write named and the directory the
+    // locks were taken in have to be the pair one `EnvView` derived. The
+    // unit rows in `use_tests.rs` prove the derivation; this proves the
+    // *effect*, and it proves it through a **link**, where a build that kept
+    // the caller's lexical parent would put the legacy lock in the wrong place
+    // and still pass every outcome assertion.
+    let server = MockServer::start();
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+    assert!(
+        fs::symlink_metadata(fixture.live_store_dir()).expect("planted").file_type().is_symlink(),
+        "the fixture really does reach the live store through a link"
+    );
+    assert_ne!(resolved, fixture.live_store_dir(), "and the two spellings differ");
+
+    let watch = ArtefactWatch::start(Fixture::live_hold_artefacts(&resolved));
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+    let (seen, windows) = watch.finish();
+
+    assert_eq!(code, 0, "a live swap applies: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["kind"], json!("outcome"), "the outcome document says which it is: {doc}");
+    assert_eq!(doc["outcome"], json!("applied"), "{doc}");
+    assert_eq!(doc["target"], json!("live"), "and names the live item as the audit log does");
+    assert_eq!(doc["service"], json!(LIVE_SERVICE), "unsuffixed: {doc}");
+
+    // The item, at the account-and-service path a write with the right `-a`
+    // creates (invariant I1′'s sibling).
+    let item = fixture.keychain_item_path_for(common::KEYCHAIN_ACCOUNT, LIVE_SERVICE);
+    let stored = fs::read_to_string(&item).expect("the live item should hold the incoming blob");
+    assert!(stored.contains("sk-ant-oat01-incoming"), "the item now holds T: {stored}");
+
+    // The three artefacts, created under the **resolved** store and released.
+    assert_eq!(seen, 3, "all three lock artefacts were held at once");
+    assert_eq!(windows, 1, "in exactly one hold window");
+    live_artefacts_released(&fixture, &resolved);
+    hold_within_budget(&stderr);
+
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 4), ("-i", 1), ("add-generic-password", 1)],
+    );
+    audit_carries_no_token(&fixture);
+    let lines = audit_lines(&fixture);
+    assert_eq!(lines.len(), 1, "one write entry: {lines:?}");
+    assert!(lines[0].contains("\"target\":\"live\""), "and it names the live item: {}", lines[0]);
+}
+
+#[test]
+fn ac81_a_live_swap_touches_nothing_outside_the_namespace_root_but_the_three_artefacts() {
+    // Invariant I11′'s W4b relaxation, asserted **by path** rather than by
+    // inspection. The relaxation is exactly *the three lock artefacts plus the
+    // keychain item*, so a whole-tree walk before and after must differ, outside
+    // `namespace_root()`, by nothing at all — the artefacts are created and
+    // released inside the pass — and the transient creations must be only those
+    // three, at the **resolved** store.
+    //
+    // A forced break is included because a break is the one thing W4b does
+    // outside the namespace root that W4a never could: `lock_stale` makes the
+    // rule remove a planted peer lock, so the break path runs for real.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (mut fixture, resolved) = live_accounts(&server, common::fresh_at());
+    fixture.fault("lock_stale");
+
+    // The peer's stale primary lock, inside the **resolved** store, genuinely
+    // old rather than merely declared stale.
+    let [primary, legacy, storage] = Fixture::live_hold_artefacts(&resolved);
+    fs::create_dir_all(&primary).expect("the stale lock is plantable");
+    age(&primary);
+
+    let before = tree(&fixture);
+    let ns_root = fixture.config_dir().join("claude");
+    let watch = ArtefactWatch::start([primary.clone(), legacy.clone(), storage.clone()]);
+    let (code, stdout, stderr) = swap(&fixture, &[]);
+    let (seen, _windows) = watch.finish();
+    let after = tree(&fixture);
+
+    assert_eq!(code, 0, "the swap applies over a broken stale lock: {stdout}{stderr}");
+    assert_eq!(seen, 3, "all three artefacts were held at once, at the resolved store");
+
+    // `Paths::ensure_dirs` makes agctl's own cache directories on every pass,
+    // and invariant I1 names `cache_dir()` beside `config_dir()` as the two
+    // places this binary may write at all. Allowed **by name** rather than by
+    // widening the bound, exactly as W4a's own AC81 test does it: anything else
+    // appearing under `cache/` is not in this list and fails below.
+    let allowed =
+        [fixture.config_dir().join("cache"), fixture.config_dir().join("cache").join("claude")];
+    let exempt = |path: &Path| path.starts_with(&ns_root) || allowed.contains(&path.to_path_buf());
+
+    // The three artefacts, in **both** spellings of the resolved store. The walk
+    // reaches them through the fixture's own `$HOME` (`/var/folders/…` on
+    // macOS) and `fs::canonicalize` names the same directory through
+    // `/private/var/folders/…`: one file, two paths, and a comparison that
+    // looked at only one of them would read a removal as unaccounted for.
+    let walked = fixture.home().join(".claude-real");
+    let artefacts: Vec<std::path::PathBuf> = Fixture::live_hold_artefacts(&resolved)
+        .into_iter()
+        .chain(Fixture::live_hold_artefacts(&walked))
+        .collect();
+
+    // The load-bearing assertion: outside the namespace root, the two walks are
+    // the same set. The three artefacts are created *and released* inside the
+    // pass, so they are in neither — and the `ArtefactWatch` above is what saw
+    // them while they existed, which is the other half of the claim.
+    for path in after.keys().filter(|path| !exempt(path)) {
+        assert!(
+            before.contains_key(path),
+            "`{}` was created outside the namespace root, and the W4b relaxation is only the \
+             three lock artefacts plus the item",
+            path.display()
+        );
+    }
+    for path in before.keys().filter(|path| !exempt(path)) {
+        assert!(
+            after.contains_key(path) || artefacts.contains(path),
+            "`{}` was removed outside the namespace root; only the three lock artefacts may be \
+             — which is the whole of invariant I11′'s W4b relaxation",
+            path.display()
+        );
+    }
+    // The contents half, scoped to outside the root. W4a's
+    // `no_new_credential_at_rest` forbids a new credential at rest **anywhere**,
+    // which is right for a namespace swap and wrong here: a live swap's
+    // adoption writes P into `namespace(P)/.credentials.json`, and that write
+    // is required by decision D-017 rather than a leak. What must not happen is
+    // a credential landing outside the root — where `use --undo`, `doctor` and
+    // `accounts remove` cannot see it, and where nothing would ever clean it
+    // up. A path-set diff alone is blind to a pre-existing file *rewritten*
+    // with token material (finding N-13a), so the bytes are compared too.
+    for (path, now) in &after {
+        if exempt(path) {
+            continue;
+        }
+        let Some(bytes) = now else { continue };
+        if before.get(path).is_some_and(|was| was.as_ref() == Some(bytes)) {
+            continue;
+        }
+        assert!(
+            !String::from_utf8_lossy(bytes).contains("sk-ant-"),
+            "`{}` was created or rewritten outside the namespace root and holds token material",
+            path.display()
+        );
+    }
+
+    // And specifically: nothing of the credential-at-rest kind anywhere under
+    // the live store, in either spelling.
+    for dir in [resolved.clone(), fixture.live_store_dir()] {
+        for name in [".credentials.json", ADOPTED, ".claude.json"] {
+            let path = dir.join(name);
+            assert!(
+                !path.exists(),
+                "`{}` must not exist: no file under the live store is ever written by S23, and \
+                 `.claude.json` is S24's entirely (decision D-021)",
+                path.display()
+            );
+        }
+    }
+    live_artefacts_released(&fixture, &resolved);
+    hold_within_budget(&stderr);
+    // The four reads and one write every applied live swap makes — Phase A's
+    // read of the item, the adoption's probe asking whether P's namespace has
+    // migrated, the re-read under the hold, the verifying read — and nothing
+    // for the break, which is a filesystem rule and never asks `security`.
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 4), ("-i", 1), ("add-generic-password", 1)],
+    );
+
+    // Every break line names the live tree, the live item and a path under the
+    // **resolved** store (ory ruling 9 item 4, contract §D3).
+    let lines = audit_lines(&fixture);
+    let broken: Vec<&String> =
+        lines.iter().filter(|line| line.contains("\"event\":\"lock_break\"")).collect();
+    assert!(!broken.is_empty(), "the forced break was recorded: {lines:?}");
+    let under_resolved = resolved.display().to_string();
+    for line in &broken {
+        assert!(line.contains("\"tree\":\"live\""), "the break names the live tree: {line}");
+        assert!(line.contains("\"target\":\"live\""), "and the live item: {line}");
+        assert!(line.contains("\"service\":\"Claude Code-credentials\""), "by name: {line}");
+        assert!(
+            field(line, "path").is_some_and(|path| path.starts_with(&under_resolved)),
+            "and a path under the resolved store, not the link's: {line}"
+        );
+    }
+    audit_carries_no_token(&fixture);
+    let _ = token;
+}
+
+#[test]
+fn ac76_a_live_swap_is_reversed_by_undo_and_the_item_holds_p_again() {
+    // AC76's half that can run under the fake `security`: the swap applies, the
+    // reversal puts P back **byte-identically**, and both audit entries name
+    // the live item. The other half — `cdat` unchanged, `mdat` moved, and the
+    // item count steady on the **real** keychain — is a user-operated manual
+    // check and is unrun here by construction.
+    //
+    // The reversal is where §D5's re-cut shows: the forward pass filed P in
+    // `namespace(P)/.credentials.json`, inside `namespace_root()`, and the
+    // reversal reads it back from there rather than from a
+    // `.credentials.adopted.json` beside `~/.claude` that I11′ forbids.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+    let planted = live_item(&fixture).expect("the live item is planted");
+    assert!(
+        planted.contains("sk-ant-oat01-outgoing") && planted.contains(ACCT),
+        "the premise: the live item holds P: {planted}"
+    );
+
+    let watch = ArtefactWatch::start(Fixture::live_hold_artefacts(&resolved));
+    let (code, stdout, stderr) = swap(&fixture, &[]);
+    let (seen, _windows) = watch.finish();
+    assert_eq!(code, 0, "the forward swap applies: {stdout}{stderr}");
+    assert_eq!(seen, 3, "the forward hold took all three artefacts under the resolved store");
+    hold_within_budget(&stderr);
+    let held = live_item(&fixture).expect("the live item is readable");
+    assert!(held.contains("sk-ant-oat01-incoming"), "the live item holds T's access token: {held}");
+    assert!(held.contains("sk-ant-ort01-incoming"), "and T's refresh token: {held}");
+    assert!(!held.contains("sk-ant-oat01-outgoing"), "and no longer P's: {held}");
+    // P went to its own namespace's `.credentials.json`, inside the root.
+    let ps_store = fixture.credentials_path(ACCT, ORG);
+    let parked = fs::read_to_string(&ps_store).expect("P is in its own namespace");
+    assert!(parked.contains("sk-ant-oat01-outgoing"), "and it is P: {parked}");
+    assert!(
+        !resolved.join(ADOPTED).exists() && !fixture.live_store_dir().join(ADOPTED).exists(),
+        "and never in an adopted copy beside the live store"
+    );
+
+    let watch = ArtefactWatch::start(Fixture::live_hold_artefacts(&resolved));
+    let (code, stdout, stderr) = undo(&fixture);
+    let (seen, _windows) = watch.finish();
+    assert_eq!(code, 0, "the reversal applies: {stdout}{stderr}");
+    assert_eq!(seen, 3, "the reversal took its own hold of all three, under the resolved store");
+    // **The same credential, byte for byte** — as agctl serialises it. The
+    // planted fixture blob is not the comparison: the forward pass parsed it
+    // and filed `to_blob_json` in P's namespace (the serializer's own shape,
+    // with the `workspaceId`/`workspaceName` nulls it always emits), and the
+    // reversal wrote exactly those bytes back into the item. So the item must
+    // equal what was parked, byte for byte, and what was parked must be P.
+    let back = live_item(&fixture).expect("the live item is readable");
+    assert_eq!(back, parked, "the live item holds P again, byte-identical to the parked copy");
+    for field in ["sk-ant-oat01-outgoing", "sk-ant-ort01-outgoing", ACCT, ORG] {
+        assert!(back.contains(field), "and that copy is P (`{field}`): {back}");
+    }
+    assert!(!back.contains("sk-ant-oat01-incoming"), "and no longer T's: {back}");
+    // T went home in turn, which is what makes the operation its own inverse.
+    let ts_store = fs::read_to_string(fixture.credentials_path(ACCT_T, ORG_T))
+        .expect("T's own namespace still has a store");
+    assert!(ts_store.contains("sk-ant-oat01-incoming"), "T is back in its own store: {ts_store}");
+
+    let writes_seen: Vec<String> = write_lines(&fixture);
+    assert_eq!(writes_seen.len(), 2, "one write each way: {writes_seen:?}");
+    for line in &writes_seen {
+        assert!(line.contains("\"target\":\"live\""), "both entries name the live item: {line}");
+        assert_eq!(field(line, "outcome").as_deref(), Some("applied"), "both applied: {line}");
+    }
+    // The two entries are each other's inverse, which is what `--undo` means.
+    let forward_from = field(&writes_seen[0], "from_digest8");
+    assert!(forward_from.is_some(), "a live write always displaced something: {writes_seen:?}");
+    assert_eq!(
+        field(&writes_seen[1], "from_digest8"),
+        field(&writes_seen[0], "to_digest8"),
+        "the reversal displaced what the swap wrote"
+    );
+    assert_eq!(
+        field(&writes_seen[1], "to_digest8"),
+        forward_from,
+        "and wrote back what the swap displaced"
+    );
+    live_artefacts_released(&fixture, &resolved);
+    hold_within_budget(&stderr);
+    // Four reads and one write each way: Phase A's read of the item, the probe
+    // asking whether the third party's namespace has migrated (P's forward, T's
+    // in reverse), the re-read under the hold and the verifying read.
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 8), ("-i", 2), ("add-generic-password", 2)],
+    );
+    audit_carries_no_token(&fixture);
+    let _ = token;
+}
+
+#[test]
+fn ac67_e_an_undo_of_a_live_entry_from_a_namespaced_shell_refuses_e() {
+    // **The one reachable site of refusal E** (ruling G1). The forward scope
+    // gate partitions on `CLAUDE_SECURESTORAGE_CONFIG_DIR`, so a forward
+    // `use --live` can never reach the live subject build with it set. A
+    // reversal takes its target from the **audit log**, so the two can and do
+    // disagree — and that disagreement is the bug: locks in the namespace, a
+    // write to the live item.
+    //
+    // The variable is set to a namespace agctl **owns**, so `NotOwned` cannot
+    // fire and E is what is being tested.
+    let server = MockServer::start();
+    let (mut fixture, resolved) = live_accounts(&server, common::fresh_at());
+    let spelling = common::export_spelling(&fixture.ns_dir(ACCT, ORG));
+    fs::create_dir_all(fixture.ns_dir(ACCT, ORG)).expect("the namespace is creatable");
+
+    // A live swap to reverse, then a shell pointed at a namespace.
+    let (code, _stdout, _stderr) = swap(&fixture, &[]);
+    assert_eq!(code, 0, "the forward swap applies from a shell with no namespace set");
+    let writes_before = writes(&fixture).len();
+    let audit_before = audit_lines(&fixture).len();
+    assert_eq!(writes_before, 1, "the premise: the forward swap wrote the live item once");
+    assert_eq!(audit_before, 1, "and left one entry, the live write `--undo` selects");
+    fixture.set("CLAUDE_SECURESTORAGE_CONFIG_DIR", &spelling);
+
+    let watch = ArtefactWatch::start(Fixture::live_hold_artefacts(&resolved));
+    let (code, stdout, stderr) = undo(&fixture);
+    let (seen, _windows) = watch.finish();
+    assert_eq!(
+        code, 13,
+        "SWAP_EXIT_REFUSED_E — not refusal A's 10, not `live_unreachable`'s 23: {stdout}{stderr}"
+    );
+    assert_eq!(seen, 0, "no Claude Code lock artefact existed at any moment of the refused run");
+    assert!(stdout.contains("CLAUDE_SECURESTORAGE_CONFIG_DIR"), "names the variable: {stdout}");
+    assert!(stdout.contains(&spelling), "and its value: {stdout}");
+    assert!(
+        stdout.contains("run without it") && stdout.contains("target that namespace"),
+        "and offers both ways out: {stdout}"
+    );
+
+    // The negatives r4v ruling 7 item 3 asks for: E must not arrive dressed as
+    // refusal A, which means *somebody moved a lock agctl was holding*.
+    let said = format!("{stdout}{stderr}");
+    assert!(!said.contains("compromised"), "never the compromised-hold sentence: {said}");
+
+    let (code, stdout, _stderr) = undo_json(&fixture);
+    assert_eq!(code, 13, "SWAP_EXIT_REFUSED_E under --json too");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], json!("refused"), "{doc}");
+    assert_eq!(doc["refusal"], json!("E"), "the lettered refusal: {doc}");
+    assert_eq!(doc["reason"], Value::Null, "and no `reason`, because it has a letter: {doc}");
+
+    // Nothing locked, nothing written, nothing adopted, by either run.
+    assert_eq!(writes(&fixture).len(), writes_before, "zero further `add-generic-password` lines");
+    let lines = audit_lines(&fixture);
+    assert_eq!(lines.len(), audit_before, "and no further audit entry: {lines:?}");
+    assert_eq!(
+        lines.iter().filter(|line| line.contains("\"event\":\"write\"")).count(),
+        1,
+        "the forward swap's write entry is the only one: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("\"event\":\"lock_break\"")),
+        "and no lock was broken by anybody: {lines:?}"
+    );
+    live_artefacts_released(&fixture, &resolved);
+    for path in fixture.hold_artefacts(ACCT, ORG) {
+        assert!(!path.exists(), "`{}` was never created either", path.display());
+    }
+    // The whole conversation is the forward swap's — Phase A's read, the
+    // adoption's migration probe, the re-read under the hold, the verifying
+    // read and the one write — and **nothing** from either refused undo: E is
+    // decided where the live subject is built, before the item is read, so it
+    // spawns no child at all (§D1).
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 4), ("-i", 1), ("add-generic-password", 1)],
+    );
+    audit_carries_no_token(&fixture);
+}
+
+/// `claude use --undo --yes --json`.
+fn undo_json(fixture: &Fixture) -> (i32, String, String) {
+    let output = fixture
+        .cmd()
+        .args(["claude", "use", "--undo", "--yes", "--json"])
+        .output()
+        .expect("the binary should run");
+    (
+        output.status.code().expect("the process exited normally"),
+        String::from_utf8(output.stdout).expect("stdout is UTF-8"),
+        common::strip_ansi(&String::from_utf8(output.stderr).expect("stderr is UTF-8")),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The audit-log gate (ruling G2) — a refused log refuses the LIVE swap
+// ---------------------------------------------------------------------------
+
+/// Plants a log agctl refuses, and returns the sentence `doctor` prints for it.
+///
+/// Two shapes, because they are refused by two different mechanisms and a test
+/// that used only one would leave the other untested: a **wrong mode** is caught
+/// on the opened descriptor, and a **symbolic link** is caught by `O_NOFOLLOW`
+/// on the open itself.
+fn plant_refused_log(fixture: &Fixture, shape: &str) {
+    let log = fixture.audit_log_path();
+    fs::create_dir_all(log.parent().expect("the log has a parent"))
+        .expect("the namespace root is creatable");
+    let _ = fs::remove_file(&log);
+    match shape {
+        "mode" => {
+            fs::write(&log, b"").expect("the log is writable");
+            fs::set_permissions(&log, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+                .expect("the mode is settable");
+        }
+        "symlink" => {
+            let decoy = fixture.scratch("audit-decoy.jsonl");
+            fs::write(&decoy, b"").expect("the decoy is writable");
+            std::os::unix::fs::symlink(&decoy, &log).expect("the symlink is plantable");
+        }
+        other => panic!("unknown shape `{other}`"),
+    }
+}
+
+#[test]
+fn a_refused_audit_log_refuses_the_live_swap_and_writes_nothing() {
+    // Ruling G2. Invariant I16 makes the audit line the only durable evidence
+    // that agctl removed a lock in the user's own `~/.claude`, and the failure
+    // is attacker-selectable: one `chmod 0644`, or one `ln -s`. A control whose
+    // only failure mode is *the adversary switches it off and the privileged
+    // action proceeds* is not a control, so the swap stops.
+    //
+    // Both shapes, and the assertion that matters for each is the same: **zero**
+    // `add-generic-password` lines and no artefact created, so the refusal
+    // really is in front of the mutation rather than after it.
+    for shape in ["mode", "symlink"] {
+        let server = MockServer::start();
+        // An **expired** incoming credential and a live token endpoint: were the
+        // gate after step 13's refresh POST, this run would spend the incoming
+        // account's refresh token before refusing.
+        let token = token_ok(&server);
+        let (fixture, resolved) = live_accounts(&server, common::expired_at());
+        plant_refused_log(&fixture, shape);
+
+        let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+        assert_eq!(code, 22, "SWAP_EXIT_AUDIT_REFUSED for the `{shape}` shape: {stdout}{stderr}");
+        let doc = outcome_doc(&stdout);
+        assert_eq!(doc["outcome"], json!("refused"), "{doc}");
+        assert_eq!(doc["reason"], json!("audit_refused"), "unlettered, with its own reason: {doc}");
+        assert_eq!(doc["refusal"], Value::Null, "and no letter, because A–F is canonical: {doc}");
+
+        // The sentence is `LogState::note()`'s, which is the one `doctor`'s
+        // `audit log` row prints — so the CLI refusal and the diagnosis cannot
+        // drift into two descriptions of one state.
+        let note = doc["note"].as_str().unwrap_or_default();
+        let sentence = match shape {
+            "mode" => {
+                "present, but its mode is 0644 and not 0600: agctl refuses the log and will not \
+                 change it"
+            }
+            _ => "a symbolic link, which agctl will not append through",
+        };
+        assert!(
+            note.contains(sentence),
+            "`LogState::note()`'s sentence for the `{shape}` shape, verbatim: {note}"
+        );
+        assert!(
+            note.contains(&fixture.audit_log_path().display().to_string()),
+            "and it names the log: {note}"
+        );
+        // Refused, never repaired: what agctl will not append to, it also leaves
+        // exactly as it found it.
+        match shape {
+            "mode" => {
+                assert_eq!(common::mode_of(&fixture.audit_log_path()) & 0o7777, 0o644);
+                assert_eq!(fs::read_to_string(fixture.audit_log_path()).expect("readable"), "");
+            }
+            _ => {
+                let meta = fs::symlink_metadata(fixture.audit_log_path()).expect("stat-able");
+                assert!(meta.file_type().is_symlink(), "the planted link is left where it was");
+                let decoy = fs::read_to_string(fixture.scratch("audit-decoy.jsonl"));
+                assert_eq!(decoy.expect("readable"), "", "and nothing reached its target");
+            }
+        }
+
+        assert_eq!(writes(&fixture).len(), 0, "zero writes for the `{shape}` shape");
+        // **One** read: Phase A's of the live item, and nothing else. That count
+        // is itself an ordering assertion — the gate sits after the namespace
+        // locks and *before* `decide_adoption`, so the adoption's own migration
+        // probe (a second `find-generic-password` on every swap that gets that
+        // far) has not happened. A gate that had drifted below the adoption
+        // would show up here as two.
+        assert_security(&fixture, &[("find-generic-password", 1)]);
+        assert_eq!(token.calls(), 0, "no refresh POST for the `{shape}` shape: the gate is first");
+        live_artefacts_released(&fixture, &resolved);
+        for path in Fixture::live_hold_artefacts(&resolved) {
+            assert!(!path.exists(), "`{}` was never created", path.display());
+        }
+        assert!(
+            !fixture.credentials_path(ACCT, ORG).exists(),
+            "and the adoption — itself a mutation — never ran either"
+        );
+    }
+}
+
+#[test]
+fn a_refused_audit_log_does_not_refuse_a_namespaced_swap() {
+    // The other half of ruling G2's scope: W4a's behaviour is **unchanged**. A
+    // namespace swap logs the failed append and carries on, so the `broken`
+    // line is ABSENT rather than redirected — fail-closed in the sense that
+    // matters, and not a denial of service on a store whose blast radius is one
+    // namespace agctl owns rather than the user's live session.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (fixture, service) = two_accounts(&server, common::fresh_at());
+    plant_refused_log(&fixture, "mode");
+
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+    assert_eq!(code, 0, "a namespaced swap still applies over a refused log: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], json!("applied"), "{doc}");
+    assert_eq!(doc["audit"]["id"], Value::Null, "and records no audit id, because it could not");
+    assert_eq!(writes(&fixture).len(), 1, "the item was written");
+    let stored = fs::read_to_string(fixture.keychain_item_path(&service)).expect("readable");
+    assert!(stored.contains("sk-ant-oat01-incoming"), "with the incoming credential: {stored}");
+    // The log itself is untouched: refused, never repaired.
+    assert_eq!(
+        common::mode_of(&fixture.audit_log_path()) & 0o7777,
+        0o644,
+        "agctl does not chmod the log back, because that would erase the evidence that \
+         somebody else can read this machine's swap history"
+    );
+    assert_eq!(fs::read_to_string(fixture.audit_log_path()).expect("readable"), "");
+    // A namespace swap's ordinary conversation, unchanged by the refused log:
+    // Phase A's read, the re-read under the hold, the verifying read, one write.
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 3), ("-i", 1), ("add-generic-password", 1)],
+    );
+    let _ = token;
+}
+
+// ---------------------------------------------------------------------------
+// The live store's own three refusals
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_dangling_live_store_is_unreachable_rather_than_a_compromised_hold() {
+    // Ruling G3. Every `LockError` used to collapse into refusal **A**, which
+    // means *somebody moved a lock agctl was holding* — a security signal. A
+    // `~/.claude` whose target has been removed is a configuration fact, and
+    // spending **A** on it sends the user looking for an attacker.
+    let server = MockServer::start();
+    let (fixture, _resolved) = live_accounts(&server, common::fresh_at());
+    // Replace the planted link's target with nothing, so the link dangles.
+    fs::remove_dir_all(fixture.home().join(".claude-real")).expect("the target is removable");
+
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+    assert_eq!(code, 23, "SWAP_EXIT_LIVE_UNREACHABLE: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], json!("refused"), "{doc}");
+    assert_eq!(doc["reason"], json!("live_unreachable"), "{doc}");
+    assert_eq!(doc["refusal"], Value::Null, "never a letter: {doc}");
+    let note = doc["note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains(&fixture.live_store_dir().display().to_string()),
+        "it names the spelling the environment gave: {note}"
+    );
+    assert!(note.contains("could not be resolved"), "and the failure: {note}");
+    assert!(!note.contains("compromised"), "and never the compromised-hold sentence: {note}");
+
+    // Decided in Phase A: nothing read, nothing locked, nothing written.
+    assert_security(&fixture, &[]);
+    assert!(audit_lines(&fixture).is_empty(), "and nothing audited");
+    assert!(!fixture.home().join(".claude.lock").exists(), "no artefact anywhere");
+}
+
+#[test]
+fn an_unmigrated_live_store_is_refused_and_its_plaintext_file_is_untouched() {
+    // Ruling G4, and the reason the whole containment claim is exactly "three
+    // artefacts plus the item". W4a's first-write path **removes**
+    // `<D>/.credentials.json` once the write applies (finding N-2); for a live
+    // target that is a deletion inside the user's own `~/.claude`, which
+    // invariant I11′ does not price. So an absent live item refuses.
+    let server = MockServer::start();
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+    // Un-migrate: remove the item and put P in the plaintext store instead,
+    // which is what a live store that has never been opened by a recent
+    // `claude` looks like.
+    fs::remove_file(fixture.keychain_item_path(LIVE_SERVICE)).expect("the item is removable");
+    let plaintext = resolved.join(".credentials.json");
+    fs::write(&plaintext, p_blob()).expect("the live plaintext store is writable");
+    let before = fs::read(&plaintext).expect("readable");
+
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+    assert_eq!(code, 24, "SWAP_EXIT_LIVE_ITEM_ABSENT: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["reason"], json!("live_item_absent"), "{doc}");
+    assert_eq!(doc["refusal"], Value::Null, "unlettered: {doc}");
+    let note = doc["note"].as_str().unwrap_or_default();
+    assert!(note.contains(&resolved.display().to_string()) || note.contains(".claude"), "{note}");
+    assert!(
+        note.contains("run `claude` once"),
+        "the condition is transient and self-healing, so the message says so: {note}"
+    );
+
+    // The load-bearing assertion: the file is **byte-identical**, present
+    // before and after. A claim that the pass did not remove it is only worth
+    // making against a file that was there to remove.
+    assert_eq!(
+        fs::read(&plaintext).expect("readable"),
+        before,
+        "the live store's plaintext credential is untouched, which is the whole of ruling G4"
+    );
+    assert_eq!(writes(&fixture).len(), 0, "zero writes");
+    // One read: Phase A's, which is what found the item absent.
+    assert_security(&fixture, &[("find-generic-password", 1)]);
+    live_artefacts_released(&fixture, &resolved);
+    assert!(audit_lines(&fixture).is_empty(), "nothing was audited");
+}
+
+// ---------------------------------------------------------------------------
+// D-017 against a live target (§D5) — where the displaced credential goes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_live_r3h_row_parks_the_displaced_copy_in_the_incoming_namespace() {
+    // `agctl-r3h`'s **live re-cut**, and the one row whose destination the
+    // contract had to move rather than inherit. Task 4's keep arm writes
+    // `<D>/.credentials.adopted.json` — correct for a namespace target, where
+    // `D` is itself under `namespace_root()` and where `use --undo` reads it
+    // back. For a live target `D` is `~/.claude`, so the same decision would
+    // write a live access **and** refresh token into the user's own store,
+    // outside `namespace_root()`, where nothing agctl has would ever clean it
+    // up. §D5 substitutes `<namespace(T)>/.credentials.adopted.json`: inside the
+    // root, and still not a `.credentials.json`, so neither the write-back's
+    // compare-and-swap nor T's own store is touched.
+    //
+    // The shape: the live item holds a credential of **T** (what one earlier
+    // `use --live T` leaves) that is *strictly newer* than what T's own store
+    // holds — the state a Claude Code session produces by refreshing after that
+    // swap.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+    let newer = common::identified_blob(
+        "sk-ant-oat01-t-newer",
+        "sk-ant-ort01-t-newer",
+        common::fresh_at() + 3_600_000,
+        ACCT_T,
+        Some(ORG_T),
+    );
+    fixture.keychain_item(LIVE_SERVICE, &newer);
+
+    let watch = ArtefactWatch::start(Fixture::live_hold_artefacts(&resolved));
+    let (code, stdout, stderr) = swap(&fixture, &[]);
+    let (seen, _windows) = watch.finish();
+    assert_eq!(code, 0, "the swap applies: {stdout}{stderr}");
+    assert_eq!(seen, 3, "the hold took all three artefacts under the resolved store");
+    hold_within_budget(&stderr);
+
+    // The load-bearing pair of assertions.
+    let kept = fixture.ns_dir(ACCT_T, ORG_T).join(ADOPTED);
+    let parked = fs::read_to_string(&kept).expect("the displaced copy is in T's own namespace");
+    assert!(parked.contains("sk-ant-oat01-t-newer"), "and it is the newer copy: {parked}");
+    for dir in [resolved.clone(), fixture.live_store_dir()] {
+        assert!(
+            !dir.join(ADOPTED).exists(),
+            "`{}` must not exist: `ToAdoptedCopy` against a live target would write inside the \\
+             user's own store, which invariant I11′ forbids",
+            dir.join(ADOPTED).display()
+        );
+    }
+    // And the property the row exists to preserve: T's own `.credentials.json`
+    // is what the write-back writes, so the adoption must not have touched it.
+    let ts_store =
+        fs::read_to_string(fixture.credentials_path(ACCT_T, ORG_T)).expect("T's store is readable");
+    assert!(
+        ts_store.contains("sk-ant-oat01-incoming") && !ts_store.contains("sk-ant-oat01-t-newer"),
+        "T's own store still holds what it held: {ts_store}"
+    );
+
+    // And `use --undo` reads it back **from there** — through the `PathBuf`
+    // `Source::AdoptedCopy` already carries, so no type had to widen.
+    let (code, stdout, stderr) = undo(&fixture);
+    assert_eq!(code, 0, "the reversal applies: {stdout}{stderr}");
+    let back = live_item(&fixture).expect("the live item is readable");
+    assert!(back.contains("sk-ant-oat01-t-newer"), "the newer copy is back in the item: {back}");
+    hold_within_budget(&stderr);
+    live_artefacts_released(&fixture, &resolved);
+    // Two passes of three reads and one write — Phase A's read, the re-read
+    // under the hold, the verifying read — and **no** migration probe in
+    // either: this row names no third namespace, forward or back.
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 6), ("-i", 2), ("add-generic-password", 2)],
+    );
+    audit_carries_no_token(&fixture);
+    let _ = token;
+}
+
+#[test]
+fn a_live_credential_no_record_claims_is_refused_rather_than_adopted_anywhere() {
+    // Decision D-017 is categorical: adopt the displaced credential or refuse
+    // the swap. There is no third answer in which the swap proceeds and the
+    // credential is dropped — and for a live target there is no store record to
+    // fall back on, so a credential agctl cannot attribute to an account it
+    // **owns** has nowhere to go. Refusal **F**, before the prompt and before
+    // any mutation, in three shapes, each with the sentence that is true of it
+    // (§D5): an account agctl has never heard of, an account agctl knows only as
+    // a read-only row (whose credentials live outside agctl's store, so a
+    // namespace for it would be manufactured), and no account at all.
+    const STRANGER_ACCT: &str = "cccccccc-dddd-eeee-ffff-000000000000";
+    const STRANGER_ORG: &str = "11112222-3333-4444-5555-666677778888";
+    let stranger = occupant_blob(
+        "sk-ant-oat01-stranger",
+        common::fresh_at(),
+        STRANGER_ACCT,
+        STRANGER_ORG,
+        "stranger@example.com",
+    );
+    let anonymous = json!({
+        "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-anonymous",
+            "refreshToken": "sk-ant-ort01-anonymous",
+            "expiresAt": common::fresh_at(),
+            "scopes": ["user:inference"],
+            "subscriptionType": "max",
+        }
+    })
+    .to_string();
+    let no_record = "no account agctl owns is that one";
+    let shapes = [
+        ("an account agctl has never heard of", stranger.clone(), false, no_record),
+        ("an account agctl knows only as a read-only row", stranger, true, no_record),
+        ("no account at all", anonymous, false, "does not say which account it belongs to"),
+    ];
+
+    for (shape, item, read_only_row, sentence) in shapes {
+        let server = MockServer::start();
+        let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+        if read_only_row {
+            fixture.write_registry(vec![
+                fixture.owned_record(ACCT, ORG),
+                owned_record_for(&fixture, ACCT_T, ORG_T, EMAIL_T),
+                fixture.config_dir_record(
+                    STRANGER_ACCT,
+                    STRANGER_ORG,
+                    "Claude Code-credentials-0badc0de",
+                ),
+            ]);
+        }
+        fixture.keychain_item(LIVE_SERVICE, &item);
+
+        let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+        assert_eq!(code, 14, "SWAP_EXIT_REFUSED_F for {shape}: {stdout}{stderr}");
+        let doc = outcome_doc(&stdout);
+        assert_eq!(doc["refusal"], json!("F"), "{shape}: {doc}");
+        let note = doc["note"].as_str().unwrap_or_default();
+        assert!(note.contains(sentence), "{shape}: the sentence true of it: {note}");
+        assert!(
+            !note.contains("the account that owns this store"),
+            "{shape}: never the namespace target's sentence, whose owner the live store lacks"
+        );
+
+        // Phase A's read of the item and nothing else: refused before the
+        // adoption's migration probe, before the prompt and before the hold.
+        assert_security(&fixture, &[("find-generic-password", 1)]);
+        live_artefacts_released(&fixture, &resolved);
+        assert!(audit_lines(&fixture).is_empty(), "{shape}: nothing audited");
+        // Nothing was filed anywhere, in either tree — including a namespace
+        // for the stranger, which is what a manufactured filing would create.
+        for (acct, org) in [(ACCT, ORG), (ACCT_T, ORG_T)] {
+            assert!(!adopted_path(&fixture, acct, org).exists(), "{shape}: no copy for {acct}");
+        }
+        assert!(!fixture.credentials_path(ACCT, ORG).exists(), "{shape}: no store for P's owner");
+        assert!(
+            !fixture.ns_dir(STRANGER_ACCT, STRANGER_ORG).exists(),
+            "{shape}: and no namespace manufactured for the stranger"
+        );
+        audit_carries_no_token(&fixture);
+    }
+}
+
+#[test]
+fn a_live_swap_between_two_orgs_of_one_account_files_the_displaced_credential_in_its_own_org() {
+    // Review F1. The registry is keyed by (account, organisation), and one
+    // account in two organisations is a supported shape. Here the live item
+    // holds account A's **org2** credential and the swap brings in A's
+    // **org1**. Choosing the third party by account alone found org1's record
+    // — the incoming one, listed first — and filed org2's credential over
+    // org1's own `.credentials.json` whenever it was the newer of the two: the
+    // undo could not find it afterwards, and org1's store was gone. §D5 names
+    // the destination `namespace(P.identity)`: account **and** organisation.
+    const ORG_1: &str = "12121212-1111-4111-8111-121212121212";
+    const ORG_2: &str = "23232323-2222-4222-8222-232323232323";
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let mut fixture = Fixture::new();
+    fixture.with_keychain().endpoints(&server.base_url());
+    // org1 first, so an account-only search meets the incoming record before
+    // the credential's own.
+    fixture.write_registry(vec![
+        owned_record_for(&fixture, ACCT_T, ORG_1, "a-org1@example.com"),
+        owned_record_for(&fixture, ACCT_T, ORG_2, "a-org2@example.com"),
+    ]);
+    let org1_store = fixture.write_credentials(
+        ACCT_T,
+        ORG_1,
+        &common::identified_blob(
+            "sk-ant-oat01-org1",
+            "sk-ant-ort01-org1",
+            common::fresh_at(),
+            ACCT_T,
+            Some(ORG_1),
+        ),
+    );
+    let org1_before = fs::read(&org1_store).expect("org1's store is readable");
+    let resolved = fixture.live_through_link();
+    fixture.dump(&[LIVE_SERVICE]);
+    // A's org2 credential, an hour **newer** than org1's store copy: the shape
+    // in which the account-only selection overwrote org1's store rather than
+    // refusing `NewerCopy`.
+    fixture.keychain_item(
+        LIVE_SERVICE,
+        &common::identified_blob(
+            "sk-ant-oat01-org2",
+            "sk-ant-ort01-org2",
+            common::fresh_at() + 3_600_000,
+            ACCT_T,
+            Some(ORG_2),
+        ),
+    );
+    fixture.allow_write(LIVE_SERVICE);
+    fixture.set("RUST_LOG", "agctl=debug");
+
+    let id = format!("{ACCT_T}/{ORG_1}");
+    let watch = ArtefactWatch::start(Fixture::live_hold_artefacts(&resolved));
+    let output = fixture
+        .cmd()
+        .args(["claude", "use", "--live", id.as_str(), "--yes"])
+        .output()
+        .expect("the binary should run");
+    let (seen, _windows) = watch.finish();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = common::strip_ansi(&String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.status.code(), Some(0), "the org switch applies: {stdout}{stderr}");
+    assert_eq!(seen, 3, "under a real hold of all three artefacts at the resolved store");
+    hold_within_budget(&stderr);
+
+    // The load-bearing pair, by path.
+    let org2_store = fixture.credentials_path(ACCT_T, ORG_2);
+    let parked =
+        fs::read_to_string(&org2_store).expect("org2's credential is in org2's own namespace");
+    assert!(parked.contains("sk-ant-oat01-org2"), "and it is org2's: {parked}");
+    assert_eq!(
+        fs::read(&org1_store).expect("readable"),
+        org1_before,
+        "org1's own store is byte-identical: the displaced org2 credential was not filed over it"
+    );
+    let item = live_item(&fixture).expect("the live item is readable");
+    assert!(item.contains("sk-ant-oat01-org1"), "the item holds org1's credential: {item}");
+
+    // And `--undo` finds org2's credential where it was filed.
+    let (code, stdout, stderr) = undo(&fixture);
+    assert_eq!(code, 0, "the reversal finds the org2 credential and applies: {stdout}{stderr}");
+    let back = live_item(&fixture).expect("the live item is readable");
+    assert_eq!(back, parked, "the live item holds org2's credential again, byte for byte");
+    assert_eq!(
+        fs::read(&org1_store).expect("readable"),
+        org1_before,
+        "org1's store still untouched"
+    );
+    hold_within_budget(&stderr);
+    live_artefacts_released(&fixture, &resolved);
+    // Each way: Phase A's read, the probe of the third party's namespace (org2
+    // forward, org1 in reverse), the re-read under the hold, the verifying read
+    // and the write.
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 8), ("-i", 2), ("add-generic-password", 2)],
+    );
+    audit_carries_no_token(&fixture);
+    let _ = token;
+}
+
+#[test]
+fn a_live_swap_creates_ps_namespace_only_under_the_namespace_root() {
+    // The ordinary live row, in the state that exercises the creation: P's
+    // namespace does not exist yet, because P has only ever lived in the live
+    // item. It is created through `file_store`'s `O_NOFOLLOW` walk under
+    // `namespace_root()` and nowhere else — no new artefact class (invariant
+    // I5′), and never a path derived from anything but `Paths::namespace_dir`.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+    let ns = fixture.ns_dir(ACCT, ORG);
+    assert!(!ns.exists(), "P's namespace does not exist before the pass");
+
+    let watch = ArtefactWatch::start(Fixture::live_hold_artefacts(&resolved));
+    let (code, stdout, stderr) = swap(&fixture, &[]);
+    let (seen, _windows) = watch.finish();
+    assert_eq!(code, 0, "the swap applies: {stdout}{stderr}");
+    assert_eq!(seen, 3, "all three artefacts were held, under the resolved store");
+    hold_within_budget(&stderr);
+    assert!(ns.is_dir(), "P's namespace was created");
+    assert!(
+        ns.starts_with(fixture.config_dir().join("claude")),
+        "under the namespace root and nowhere else: {}",
+        ns.display()
+    );
+    assert_eq!(
+        common::mode_of(&ns) & 0o777,
+        0o700,
+        "and at 0700, like every other directory this binary creates"
+    );
+    let entries = fixture.namespace_entries(ACCT, ORG);
+    assert_eq!(
+        entries,
+        vec![".credentials.json".to_owned()],
+        "exactly the adoption's own file, and no new artefact class: {entries:?}"
+    );
+    let parked = fs::read_to_string(fixture.credentials_path(ACCT, ORG)).expect("readable");
+    assert!(parked.contains("sk-ant-oat01-outgoing"), "and that file is P: {parked}");
+    assert_eq!(common::mode_of(&fixture.credentials_path(ACCT, ORG)) & 0o777, 0o600, "at 0600");
+    live_artefacts_released(&fixture, &resolved);
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 4), ("-i", 1), ("add-generic-password", 1)],
+    );
+    let _ = token;
+}
+
+#[test]
+fn a_live_undo_refreshes_an_expired_credential_and_persists_it() {
+    // `agctl-bk5` (a reversal discarded a refreshed credential) under §D5's
+    // reversal rule. For a live target both directions reduce to `ToStore`
+    // against the credential's own namespace, so the credential being put back
+    // is read from `namespace(P)/.credentials.json` — which makes the reverse
+    // write-back a **change of target** rather than a new path: it goes through
+    // `guarded_write_back`, with task 3's five guards including
+    // `detect_unlisted`.
+    //
+    // Without it the POST would rotate the server's refresh token away from the
+    // copy in P's own store and throw the result away, costing P an interactive
+    // `login` — which is finding N-8, in the one direction W4a could not reach.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+
+    let (code, stdout, stderr) = swap(&fixture, &[]);
+    assert_eq!(code, 0, "the forward swap applies: {stdout}{stderr}");
+
+    // Age P where the forward pass parked it, so the reversal has to refresh it.
+    let ps_store = fixture.credentials_path(ACCT, ORG);
+    fs::write(
+        &ps_store,
+        common::identified_blob(
+            "sk-ant-oat01-outgoing",
+            "sk-ant-ort01-outgoing",
+            common::expired_at(),
+            ACCT,
+            Some(ORG),
+        ),
+    )
+    .expect("P's store is writable");
+
+    let watch = ArtefactWatch::start(Fixture::live_hold_artefacts(&resolved));
+    let (code, stdout, stderr) = undo(&fixture);
+    let (seen, _windows) = watch.finish();
+    assert_eq!(code, 0, "the reversal applies over a refreshed credential: {stdout}{stderr}");
+    assert_eq!(seen, 3, "the reversal's hold took all three artefacts under the resolved store");
+
+    // The item holds the **rotation**, not the expired pair.
+    let back = live_item(&fixture).expect("the live item is readable");
+    assert!(back.contains("sk-ant-oat01-rotated"), "the item holds the refreshed access: {back}");
+    // And the refreshed pair was saved back where it was read from, which is
+    // the whole of `bk5`: the refresh token the server has just rotated to is
+    // in P's own store rather than lost.
+    let saved = fs::read_to_string(&ps_store).expect("P's store is readable");
+    assert!(
+        saved.contains("sk-ant-ort01-rotated"),
+        "the refreshed refresh token was persisted through `guarded_write_back`: {saved}"
+    );
+    assert!(!saved.contains("sk-ant-ort01-outgoing"), "and the spent one is gone: {saved}");
+    assert_eq!(token.calls(), 1, "exactly one refresh POST");
+    assert_eq!(
+        back, saved,
+        "one refresh, two homes: the item and P's own store hold the same credential, byte for byte"
+    );
+    hold_within_budget(&stderr);
+    live_artefacts_released(&fixture, &resolved);
+    // The forward swap's four reads and one write, then the reversal's: Phase
+    // A's read, the probe asking whether T's namespace has migrated (T is the
+    // third party now), the pre-POST probe asking the same of P's, the
+    // write-back gate's two — `detect_unlisted`, one per candidate service name
+    // (`agctl-r9w` review F1) — the re-read under the hold, the verifying read.
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 11), ("-i", 2), ("add-generic-password", 2)],
+    );
+    audit_carries_no_token(&fixture);
+}
+
+#[test]
+fn a_live_undo_whose_refreshed_credential_cannot_be_saved_warns_on_stderr_and_in_json() {
+    // `agctl-bk5`'s refusal half, through `guarded_write_back`'s own guard
+    // rather than a stand-in for it. P's namespace is planted as **migrated**
+    // under its *canonical* spelling's service — a name `detect_unlisted` asks
+    // about and the pre-POST probe (which reads only the recorded spelling's)
+    // does not — so the refresh runs and its write-back is refused: a
+    // plaintext write there would land where nobody reads it (invariant I5′).
+    // The empty-listing `detect` would see no item under either name and write
+    // the file anyway, which is the substitution this test exists to catch.
+    //
+    // A refused write-back does not fail the reversal — the item write is what
+    // was asked for — but it is not silent either: a `note:` on stderr for a
+    // person, and the same sentence in `--json`'s `warnings` for a machine.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+    let (code, stdout, stderr) = swap(&fixture, &[]);
+    assert_eq!(code, 0, "the forward swap applies: {stdout}{stderr}");
+
+    let ps_store = fixture.credentials_path(ACCT, ORG);
+    let expired = common::identified_blob(
+        "sk-ant-oat01-outgoing",
+        "sk-ant-ort01-outgoing",
+        common::expired_at(),
+        ACCT,
+        Some(ORG),
+    );
+    fs::write(&ps_store, &expired).expect("P's store is writable");
+    let migrated = common::canonical_migration_service(&fixture.ns_dir(ACCT, ORG));
+    assert_ne!(
+        migrated,
+        common::migration_service(&fixture.ns_dir(ACCT, ORG)),
+        "the premise: two spellings, two services, so only the write-back gate asks about this one"
+    );
+    fixture.keychain_item(
+        &migrated,
+        &common::identified_blob(
+            "sk-ant-oat01-migrated",
+            "sk-ant-ort01-migrated",
+            common::fresh_at(),
+            ACCT,
+            Some(ORG),
+        ),
+    );
+
+    let (code, stdout, stderr) = undo_json(&fixture);
+    assert_eq!(code, 0, "the reversal still applies: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], json!("applied"), "{doc}");
+    let warnings = doc["warnings"].as_array().expect("the document carries a warnings array");
+    let refused: Vec<&str> = warnings
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|warning| warning.contains("was not saved back to its own store"))
+        .collect();
+    assert_eq!(refused.len(), 1, "exactly one write-back warning in `--json`: {doc}");
+    assert!(refused[0].contains("migrated into the keychain item"), "why: {}", refused[0]);
+    assert!(refused[0].contains(&migrated), "and which item: {}", refused[0]);
+    assert!(
+        stderr.contains(&format!("note: {}", refused[0])),
+        "the same sentence reaches stderr as a note: {stderr}"
+    );
+    assert!(!stdout.contains("sk-ant-"), "{stdout}");
+
+    // The refusal is real: the refreshed pair reached the item and nothing else.
+    assert_eq!(token.calls(), 1, "the refresh POST ran");
+    let back = live_item(&fixture).expect("the live item is readable");
+    assert!(back.contains("sk-ant-oat01-rotated"), "the item holds the rotation: {back}");
+    assert_eq!(
+        fs::read_to_string(&ps_store).expect("readable"),
+        expired,
+        "and P's plaintext store was not written: the write-back refused"
+    );
+    hold_within_budget(&stderr);
+    live_artefacts_released(&fixture, &resolved);
+    // Forward: four reads and one write. Reversal: Phase A's read, T's
+    // migration probe, P's pre-POST probe, the write-back gate's two (the
+    // recorded spelling's item absent, the canonical spelling's present), the
+    // re-read under the hold, the verifying read, and the write.
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 11), ("-i", 2), ("add-generic-password", 2)],
+    );
+    audit_carries_no_token(&fixture);
+}
+
+// ---------------------------------------------------------------------------
+// AC71 / AC72 / AC74 against the live store
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ac72_a_live_swap_to_the_credential_already_in_the_item_is_already_active() {
+    // Plan AC72 against the live item: nothing adopted, nothing written, and —
+    // the assertion that makes it load-bearing — **zero** `-i` lines and zero
+    // audit lines, because `already_active` is decided in Phase A before any
+    // lock exists.
+    let server = MockServer::start();
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+    let t = common::identified_blob(
+        "sk-ant-oat01-incoming",
+        "sk-ant-ort01-incoming",
+        common::fresh_at(),
+        ACCT_T,
+        Some(ORG_T),
+    );
+    fixture.write_credentials(ACCT_T, ORG_T, &t);
+    fixture.keychain_item(LIVE_SERVICE, &t);
+
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+    assert_eq!(code, 0, "already active is exit 0: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], json!("already_active"), "{doc}");
+    assert_eq!(doc["adopted_to"], Value::Null, "nothing was adopted: {doc}");
+    assert_eq!(doc["lock"]["hold_ms"], Value::Null, "and no hold was taken: {doc}");
+    assert_eq!(writes(&fixture).len(), 0, "zero `-i` lines");
+    assert!(audit_lines(&fixture).is_empty(), "and zero audit lines");
+    assert_security(&fixture, &[("find-generic-password", 1)]);
+    live_artefacts_released(&fixture, &resolved);
+}
+
+#[test]
+fn ac74_a_live_write_that_hangs_is_unknown_with_its_audit_id_and_a_released_hold() {
+    // Plan AC74 against the live item. A child killed at the hold timeout
+    // leaves the write's outcome **undetermined**, which is what `unknown`
+    // means — "re-run `status`", not "failed" — and the verifying read after the
+    // release is what would have settled it.
+    //
+    // Three things are asserted beyond the outcome, each because a weaker test
+    // passed on a build that got one wrong: the hold is **released** (all three
+    // artefacts gone), the audit id is in the completion line so an operator can
+    // find the entry, and `--json` carries no token material and no long hex.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (mut fixture, resolved) = live_accounts(&server, common::fresh_at());
+    fixture.fault("keychain_write_hang");
+    let before = live_item(&fixture).expect("the live item is readable");
+
+    let watch = ArtefactWatch::start(Fixture::live_hold_artefacts(&resolved));
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+    let (seen, _windows) = watch.finish();
+    assert_eq!(code, 18, "SWAP_EXIT_UNKNOWN: {stdout}{stderr}");
+    assert_eq!(seen, 3, "the write was attempted inside a real hold of all three artefacts");
+    hold_within_budget(&stderr);
+
+    let doc = outcome_doc(&stdout);
+    // The exact key set, so nothing can be added to the outcome document —
+    // a digest, a path, a sample — without this test saying so.
+    let keys: std::collections::BTreeSet<&str> =
+        doc.as_object().expect("the document is an object").keys().map(String::as_str).collect();
+    let expected: std::collections::BTreeSet<&str> = [
+        "adopted_to",
+        "audit",
+        "from",
+        "kind",
+        "lock",
+        "note",
+        "outcome",
+        "refusal",
+        "service",
+        "target",
+        "to",
+        "warnings",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(keys, expected, "the outcome document's key set: {doc}");
+    assert_eq!(doc["kind"], json!("outcome"), "{doc}");
+    assert_eq!(doc["outcome"], json!("unknown"), "{doc}");
+    assert_eq!(doc["refusal"], Value::Null, "`unknown` is not a lettered refusal: {doc}");
+    assert_eq!(doc["target"], json!("live"), "{doc}");
+    assert_eq!(doc["service"], json!(LIVE_SERVICE), "{doc}");
+    assert!(doc["from"]["digest8"].is_string() && doc["to"]["digest8"].is_string(), "{doc}");
+    assert!(doc["lock"]["hold_ms"].is_u64(), "the lock timings the contract names: {doc}");
+    assert_eq!(doc["lock"]["budget_ms"], json!(3000), "{doc}");
+    let id = doc["audit"]["id"].as_str().expect("the audit id is in the document");
+    assert!(!id.is_empty(), "and it is not empty");
+    let note = doc["note"].as_str().unwrap_or_default();
+    assert!(note.contains("re-run"), "the note says what to do: {note}");
+
+    // No token material, and no hex string long enough to be a whole digest,
+    // anywhere in the document — nested members included.
+    assert!(!stdout.contains("sk-ant-"), "{stdout}");
+    let mut stack = vec![&doc];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::String(text) => assert!(
+                text.len() <= 32 || !text.chars().all(|c| c.is_ascii_hexdigit()),
+                "a raw hash rather than a digest prefix: {text}"
+            ),
+            Value::Array(items) => stack.extend(items),
+            Value::Object(members) => stack.extend(members.values()),
+            _ => {}
+        }
+    }
+
+    let lines = write_lines(&fixture);
+    assert_eq!(lines.len(), 1, "one entry: {lines:?}");
+    assert_eq!(field(&lines[0], "outcome").as_deref(), Some("unknown"), "{}", lines[0]);
+    assert_eq!(field(&lines[0], "target").as_deref(), Some("live"), "{}", lines[0]);
+    // The child was killed before it could touch the item.
+    assert_eq!(live_item(&fixture).expect("readable"), before, "the live item still holds P");
+    live_artefacts_released(&fixture, &resolved);
+    audit_carries_no_token(&fixture);
+    // Phase A's read, the adoption's migration probe, the re-read under the
+    // hold and the verifying read that settles the question — and no `-i`,
+    // because the hang is injected where the child would have been spawned.
+    assert_security(&fixture, &[("find-generic-password", 4)]);
+    let _ = token;
+}
+
+#[test]
+fn ac71_a_live_item_that_changes_before_the_hold_discards_the_swap() {
+    // Plan AC71 against the live item, invariant I2′'s window. The pause point
+    // is **outside** the hold — a pause inside one would violate invariant I17
+    // even under a fault — so the peer's write lands where a real session's
+    // would, and the re-read under the hold finds a digest Phase A never saw.
+    //
+    // Thrown away rather than written over: the credential now in the item may
+    // hold a refresh token the server has already rotated away from the one
+    // this pass was going to install.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (mut fixture, resolved) = live_accounts(&server, common::fresh_at());
+    let resume = fixture.scratch("resume");
+    fixture.fault("pause_before_swap_write");
+    fixture.set("AGCTL_FAULT_RESUME", &resume.to_string_lossy());
+
+    let item = fixture.keychain_item_path_for(common::KEYCHAIN_ACCOUNT, LIVE_SERVICE);
+    let peer = common::identified_blob(
+        "sk-ant-oat01-peer",
+        "sk-ant-ort01-peer",
+        common::fresh_at(),
+        ACCT,
+        Some(ORG),
+    );
+
+    let watch = ArtefactWatch::start(Fixture::live_hold_artefacts(&resolved));
+    let child = fixture
+        .raw()
+        .args(["claude", "use", "--live", EMAIL_T, "--yes", "--json"])
+        .spawn()
+        .expect("the binary should start");
+    common::wait_until(Duration::from_secs(20), || {
+        fs::read_to_string(&item).is_ok_and(|text| text.contains("sk-ant-oat01-outgoing"))
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    fs::write(&item, &peer).expect("the peer writes the live item");
+    fs::write(&resume, b"go").expect("the resume file is writable");
+
+    let output = child.wait_with_output().expect("the swap finishes");
+    let (seen, _windows) = watch.finish();
+    assert_eq!(output.status.code(), Some(17), "SWAP_EXIT_DISCARDED");
+    assert_eq!(seen, 3, "the change was found under a real hold of all three artefacts");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], json!("discarded"), "{doc}");
+    assert_eq!(doc["refusal"], Value::Null, "a discard is not a lettered refusal: {doc}");
+    assert!(!stdout.contains("sk-ant-"), "{stdout}");
+
+    assert_eq!(writes(&fixture).len(), 0, "zero `-i` lines: {:?}", writes(&fixture));
+    let after = fs::read_to_string(&item).expect("readable");
+    assert!(after.contains("sk-ant-oat01-peer"), "the live item still holds the peer's blob");
+    live_artefacts_released(&fixture, &resolved);
+    // Phase A's read, the adoption's migration probe, and the re-read under
+    // the hold that found the change — no write and no verifying read.
+    assert_security(&fixture, &[("find-generic-password", 3)]);
+    audit_carries_no_token(&fixture);
+    let _ = token;
 }

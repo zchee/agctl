@@ -191,14 +191,20 @@ fn live_write(from: &str) -> AuditEntry {
     })
 }
 
+/// The [`Undoable::Live`] [`live_write`] produces.
+fn live_undoable(from: &str) -> Undoable {
+    Undoable::Live { from_digest8: Some(from.to_owned()), to_digest8: "cafebabe".to_owned() }
+}
+
 #[test]
 fn undo_reports_a_live_target_rather_than_reaching_past_it() {
     // The newest reversible swap is the one `--undo` means, whatever it
     // targeted. Stepping over a live-store swap to reverse an older
     // namespaced one would undo a swap the user did not ask about — so a live
-    // target is named (and refused as S23's) rather than skipped.
+    // target is named, and carries the digests the reversal matches the
+    // displaced credential against, rather than being skipped.
     let tail = Tail { entries: vec![live_write("ffffffff")], unreadable: Vec::new() };
-    assert_eq!(select_undo(&tail), Undoable::Live);
+    assert_eq!(select_undo(&tail), live_undoable("ffffffff"));
 }
 
 #[test]
@@ -234,7 +240,7 @@ fn undo_picks_the_newest_even_when_an_older_namespaced_swap_exists() {
         ],
         unreadable: Vec::new(),
     };
-    assert_eq!(select_undo(&tail), Undoable::Live, "the live swap is the newer one");
+    assert_eq!(select_undo(&tail), live_undoable("aaaabbbb"), "the live swap is the newer one");
 }
 
 // ---------------------------------------------------------------------------
@@ -898,4 +904,442 @@ fn the_write_back_refuses_exactly_what_status_refuses_at_the_same_write_site() {
     }
     assert_eq!(proceeded, 2, "two states both sides write");
     assert_eq!(refused, 3, "and three both sides refuse");
+}
+
+// ---------------------------------------------------------------------------
+// W4b: the live store's subject (plan AC82) and the scope gate's partition
+// ---------------------------------------------------------------------------
+
+/// A store tree and an `EnvView` whose live store is inside it.
+///
+/// The live store is created as a real directory here rather than planted as a
+/// link: what these tests are about is the **derivation** of the pair, and the
+/// link shape is what `tests/e2e_swap.rs` and `claude_lock_tests.rs` exercise.
+fn live_env() -> (tempfile::TempDir, Paths, EnvView) {
+    let dir = tempfile::TempDir::new().expect("a temporary directory");
+    let paths = Paths::with_config_dir(dir.path().join("config"));
+    paths.ensure_dirs().expect("the agctl store should be creatable");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(home.join(".claude")).expect("the live store should be creatable");
+    let env = EnvView::with_home(home);
+    (dir, paths, env)
+}
+
+#[test]
+fn ac82_the_live_store_directory_and_its_service_come_from_one_env_view() {
+    // Plan AC82 asks for "a test in which the two would otherwise disagree",
+    // and the last assertion is what makes this one that rather than a
+    // tautology: a **second** `EnvView`, read from the process, names a
+    // different directory entirely. A build that derived the store directory
+    // from one reading of the environment and the service name from another
+    // would pass every other assertion here.
+    let (_dir, paths, env) = live_env();
+
+    let subject =
+        build_subject(&paths, &env, Which::Live, None, "").expect("the live store resolves");
+    assert_eq!(subject.tree, Tree::Live, "the live store is locked as the live tree");
+    assert_eq!(subject.audit, Target::Live, "and the audit log names it `live`");
+
+    // The lock subject is built from the write target's own value, which is
+    // the whole of AC82: one derivation, consumed twice.
+    let lock = LockSubject { store_dir: subject.store_dir(), tree: subject.tree };
+    assert_eq!(lock.store_dir, env.home.join(".claude"));
+    assert_eq!(
+        subject.service(),
+        crate::provider::claude::namespace::LIVE_SERVICE,
+        "an unset CLAUDE_SECURESTORAGE_CONFIG_DIR and an unset CLAUDE_CONFIG_DIR name the \
+         unsuffixed live item"
+    );
+
+    // The row that makes the test load-bearing.
+    let second = EnvView::from_process();
+    assert_ne!(
+        namespace::live_store_dir(&second),
+        lock.store_dir.to_path_buf(),
+        "a second EnvView WOULD name a different store, so deriving the two halves from two \
+         readings is a reachable mistake rather than a hypothetical one"
+    );
+}
+
+#[test]
+fn ac82_a_config_dir_moves_the_store_and_the_service_together() {
+    // The second row: `CLAUDE_CONFIG_DIR` is both the store and the hash
+    // input, so the suffixed service and the moved directory have to arrive
+    // together. They are allowed to differ **as strings** — the lock resolves
+    // its store and the service name never does (invariant I13) — and are
+    // required to name **one directory**, which is the last assertion.
+    let (dir, paths, base) = live_env();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("the config dir should be creatable");
+    let spelling = elsewhere.to_string_lossy().into_owned();
+    let env = EnvView { config_dir: Some(spelling.clone()), ..base };
+
+    let subject =
+        build_subject(&paths, &env, Which::Live, None, "").expect("the live store resolves");
+    assert_eq!(subject.store_dir(), elsewhere, "the store moved with the variable");
+    assert_eq!(
+        subject.service(),
+        format!("{}-{}", namespace::LIVE_SERVICE, namespace::sha8(&spelling)),
+        "and so did the service, hashed from the same characters"
+    );
+    assert_eq!(
+        namespace::canonical(subject.store_dir()).expect("the store resolves"),
+        namespace::canonical(&elsewhere).expect("the store resolves"),
+        "the lock's resolved store and the service's spelling name one directory"
+    );
+}
+
+#[test]
+fn the_scope_gate_partitions_the_two_targets_in_both_directions() {
+    // Ruling G1's proof that refusal **E** is unreachable on the forward path,
+    // and it is a proof rather than a gap: the gate and the live subject build
+    // ask the **same function** — `namespace::securestorage_namespace` — of the
+    // **same** `EnvView`, so "the variable is truthy" and "the live arm was
+    // taken" cannot both hold.
+    //
+    // Both directions are asserted, because each is half of the partition: a
+    // truthy value must never reach the live subject build, and a falsy one
+    // must never be treated as naming a namespace.
+    let (dir, paths, base) = live_env();
+
+    for value in ["/tmp/some-namespace", dir.path().to_string_lossy().as_ref()] {
+        let env = EnvView { securestorage_dir: Some(value.to_owned()), ..base.clone() };
+        assert_eq!(
+            namespace::securestorage_namespace(&env),
+            Some(value),
+            "a truthy value selects the namespace arm, so the live subject is never built"
+        );
+        // And if it somehow were, it refuses **E** rather than naming the live
+        // item: the backstop, asserted as a backstop.
+        let report = *build_subject(&paths, &env, Which::Live, None, value)
+            .expect_err("a shell pointed at a namespace has no live store to name");
+        assert_eq!(report.outcome, Outcome::Refused(Refusal::LiveNamespaceEnv));
+        assert_eq!(report.outcome.exit_code(), 13);
+        let note = report.note.expect("refusal E says why");
+        assert!(note.contains(namespace::SECURESTORAGE_ENV), "it names the variable: {note}");
+        assert!(note.contains(value), "and its value: {note}");
+    }
+
+    for falsy in [None, Some(String::new())] {
+        let env = EnvView { securestorage_dir: falsy.clone(), ..base.clone() };
+        assert_eq!(
+            namespace::securestorage_namespace(&env),
+            None,
+            "unset and empty are both falsy (fact F14), so both select the live arm"
+        );
+        let subject = build_subject(&paths, &env, Which::Live, None, "")
+            .unwrap_or_else(|_| panic!("the live arm builds for {falsy:?}"));
+        assert_eq!(subject.audit, Target::Live, "and `NotOwned` cannot fire on it");
+        assert_eq!(subject.service(), namespace::LIVE_SERVICE);
+    }
+}
+
+#[test]
+fn a_live_store_that_does_not_resolve_is_unreachable_rather_than_refusal_a() {
+    // Ruling G3, at its decision site. A dangling `~/.claude` is a
+    // configuration fact, and reporting it as refusal **A** — *somebody moved
+    // a lock agctl was holding* — spends a security signal on it and sends
+    // the user looking for an attacker. Decided in Phase A, before anything is
+    // locked, so it is also not the acquire's error to map.
+    let dir = tempfile::TempDir::new().expect("a temporary directory");
+    let paths = Paths::with_config_dir(dir.path().join("config"));
+    paths.ensure_dirs().expect("the agctl store should be creatable");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).expect("the home should be creatable");
+    // A link to nothing, which is what a store whose target was removed looks
+    // like — and which `canonicalize` refuses rather than following.
+    std::os::unix::fs::symlink(home.join("gone"), home.join(".claude"))
+        .expect("the dangling link should be plantable");
+    let env = EnvView::with_home(home.clone());
+
+    let report = *build_subject(&paths, &env, Which::Live, None, "")
+        .expect_err("a dangling live store cannot be locked");
+    assert_eq!(report.outcome, Outcome::Refused(Refusal::LiveUnreachable));
+    assert_eq!(report.outcome.exit_code(), 23, "its own code, not refusal A's 10");
+    let note = report.note.expect("it says why");
+    assert!(
+        note.contains(&home.join(".claude").display().to_string()),
+        "the message names the spelling the environment gave: {note}"
+    );
+    assert!(note.contains("could not be resolved"), "and the failure: {note}");
+    assert!(!note.contains("compromised"), "and never the compromised-hold sentence: {note}");
+}
+
+#[test]
+fn undo_refuses_an_unreadable_line_after_a_live_entry_too() {
+    // The unreadable-line refusal is about *which* entry is newest, so it must
+    // not depend on what that entry targets. A live entry followed by a
+    // truncated line is exactly the crash-mid-append shape, and reversing the
+    // live swap before the one the user meant would put a credential back into
+    // the user's own live item.
+    let tail = Tail {
+        entries: vec![live_write("ffffffff")],
+        unreadable: vec![(3, "unexpected end of input".to_owned())],
+    };
+    assert_eq!(select_undo(&tail), Undoable::Unreadable(3));
+}
+
+// ---------------------------------------------------------------------------
+// W4b: where a live `--undo` finds the credential to put back
+// ---------------------------------------------------------------------------
+
+/// A store with P's and T's owned namespaces, both empty.
+fn reversal_store() -> (tempfile::TempDir, Paths, AgctlConfig) {
+    let dir = tempfile::TempDir::new().expect("a temporary directory");
+    let paths = Paths::with_config_dir(dir.path().to_path_buf());
+    paths.ensure_dirs().expect("the store directories are creatable");
+    let config = AgctlConfig {
+        accounts: vec![keyed("acct-p", "org-p"), keyed("acct-t", "org-t")],
+        ..AgctlConfig::default()
+    };
+    (dir, paths, config)
+}
+
+/// A credential of `acct`/`org` whose access token is `access`.
+fn owned_by(access: &str, acct: &str, org: &str) -> String {
+    serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": access,
+            "refreshToken": "sk-ant-ort01-reversal",
+            "expiresAt": 1_800_000_000_000_i64,
+            "scopes": ["user:inference"],
+            "subscriptionType": "max",
+            "tokenAccount": { "uuid": acct, "organizationUuid": org },
+        }
+    })
+    .to_string()
+}
+
+/// Writes `blob` as `name` in the namespace `acct`/`org`, at the modes agctl's
+/// own writer leaves.
+fn park(paths: &Paths, (acct, org): (&str, &str), name: &str, blob: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let ns_dir = paths.namespace_dir(acct, org);
+    std::fs::create_dir_all(&ns_dir).expect("the namespace is creatable");
+    std::fs::set_permissions(&ns_dir, std::fs::Permissions::from_mode(0o700)).expect("0700");
+    let path = ns_dir.join(name);
+    std::fs::write(&path, blob).expect("the fixture is writable");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("0600");
+}
+
+/// The digest prefix an audit entry records for the credential `blob` holds.
+fn recorded(blob: &str) -> String {
+    let credentials = Credentials::parse_blob(blob.as_bytes()).expect("the fixture parses");
+    audit::digest8(&credentials.digests().access_sha256).expect("a digest prefix")
+}
+
+/// [`live_reversal`] for a row that must resolve.
+fn resolves(paths: &Paths, config: &AgctlConfig, from: &str) -> Reversal {
+    match live_reversal(paths, config, Some(from), "cafebabe") {
+        Ok(reversal) => reversal,
+        Err(err) => panic!("the live reversal should resolve: {err}"),
+    }
+}
+
+/// [`live_reversal`] for a row that must refuse, and what it said.
+fn refuses(paths: &Paths, config: &AgctlConfig, from: Option<&str>) -> String {
+    match live_reversal(paths, config, from, "cafebabe") {
+        Ok(found) => {
+            panic!("expected a refusal, got a reversal owned by `{}`", found.owner.account_uuid)
+        }
+        Err(err) => err.to_string(),
+    }
+}
+
+const P: (&str, &str) = ("acct-p", "org-p");
+const T: (&str, &str) = ("acct-t", "org-t");
+
+#[test]
+fn a_live_undo_puts_back_the_credential_its_own_accounts_store_holds() {
+    // §D5's ordinary row: the forward pass filed P in
+    // `namespace(P)/.credentials.json`. The entry names P only by digest, so
+    // that is how it is found — and the owner, the source and the target class
+    // all follow from where it was found.
+    let (_dir, paths, config) = reversal_store();
+    let p = owned_by("sk-ant-oat01-p", P.0, P.1);
+    park(&paths, P, file_store::CREDENTIALS_FILE, &p);
+    park(&paths, T, file_store::CREDENTIALS_FILE, &owned_by("sk-ant-oat01-t", T.0, T.1));
+
+    let found = resolves(&paths, &config, &recorded(&p));
+    assert_eq!(found.owner.account_uuid, P.0, "P's own record owns the reversal");
+    assert!(matches!(found.source, Source::OwnStore), "read from P's own store");
+    assert_eq!(found.which, Which::Live, "against the live target");
+    assert!(found.store.is_none(), "which is not a registry row");
+    assert!(found.inherited.is_empty(), "and has no recorded spelling to check");
+}
+
+#[test]
+fn a_live_undo_reads_task_fours_kept_copy_from_the_incoming_namespace() {
+    // §D5's re-cut of `agctl-r3h`, which is the contract's
+    // `Source::AdoptedCopy(namespace(T))`: T's own store holds the copy the
+    // forward swap installed, and the newer copy of T it displaced is parked
+    // beside it — never beside the live store.
+    let (_dir, paths, config) = reversal_store();
+    let kept = owned_by("sk-ant-oat01-t-newer", T.0, T.1);
+    park(&paths, T, file_store::CREDENTIALS_FILE, &owned_by("sk-ant-oat01-t", T.0, T.1));
+    park(&paths, T, file_store::ADOPTED_FILE, &kept);
+
+    let found = resolves(&paths, &config, &recorded(&kept));
+    assert_eq!(found.owner.account_uuid, T.0, "T's own record owns the reversal");
+    match &found.source {
+        Source::AdoptedCopy(dir) => {
+            assert_eq!(
+                dir,
+                &paths.namespace_dir(T.0, T.1),
+                "the incoming namespace's adopted copy"
+            );
+        }
+        Source::OwnStore => panic!("the kept copy is the adopted one, not T's store"),
+    }
+}
+
+#[test]
+fn a_live_third_party_is_the_one_owned_record_of_the_credentials_account_and_organisation() {
+    // Review F1. One account in two organisations is a supported registry
+    // shape, so the live target's third party is chosen by account **and**
+    // organisation (`swap::same_identity`), among `Owned` records, and only when
+    // it is the one match — never by account alone, which met the incoming
+    // record listed first.
+    let org1 = keyed("acct-a", "org-1");
+    let org2 = keyed("acct-a", "org-2");
+    let config =
+        AgctlConfig { accounts: vec![org1.clone(), org2.clone()], ..AgctlConfig::default() };
+    let displaced =
+        Credentials::parse_blob(owned_by("sk-ant-oat01-org2", "acct-a", "org-2").as_bytes())
+            .expect("the fixture parses");
+
+    // `use --live acct-a/org-1` with org2's credential in the live item.
+    match third_namespace(&config, None, &org1, &displaced, Which::Live) {
+        Ok(Some(third)) => assert_eq!(third.organization_uuid, "org-2", "the credential's own org"),
+        Ok(None) => panic!("org2's own record is a third party, not the no-record case"),
+        Err(_) => panic!("one exact match is not two candidates"),
+    }
+
+    // An organisation-less credential of that account matches both records:
+    // two candidates, which the swap refuses rather than picking the first.
+    let orgless = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-orgless",
+            "refreshToken": "sk-ant-ort01-orgless",
+            "expiresAt": 1_800_000_000_000_i64,
+            "scopes": ["user:inference"],
+            "subscriptionType": "max",
+            "tokenAccount": { "uuid": "acct-a" },
+        }
+    })
+    .to_string();
+    let orgless = Credentials::parse_blob(orgless.as_bytes()).expect("the fixture parses");
+    let elsewhere = keyed("acct-b", "org-b");
+    match third_namespace(&config, None, &elsewhere, &orgless, Which::Live) {
+        Err(pair) => assert_eq!(
+            (pair[0].organization_uuid.as_str(), pair[1].organization_uuid.as_str()),
+            ("org-1", "org-2"),
+            "both candidates come back, for the refusal to name"
+        ),
+        Ok(found) => panic!(
+            "two candidates must refuse, got {:?}",
+            found.map(|record| record.organization_uuid)
+        ),
+    }
+
+    // The exact identity under a record agctl does not own is no third party:
+    // that is the no-record case, which `decide_adoption` refuses.
+    let mut read_only = org2;
+    read_only.kind = AccountKind::ConfigDirReadOnly {
+        dir: PathBuf::new(),
+        service: "Claude Code-credentials-0badc0de".to_owned(),
+        shares_live_dir: false,
+    };
+    let config = AgctlConfig { accounts: vec![org1.clone(), read_only], ..AgctlConfig::default() };
+    assert!(
+        matches!(third_namespace(&config, None, &org1, &displaced, Which::Live), Ok(None)),
+        "only an `Owned` record can receive the displaced credential"
+    );
+}
+
+#[test]
+fn a_live_undo_refuses_a_digest_that_matches_in_two_accounts_namespaces() {
+    // The planted collision the "exactly one match" rule exists for, across two
+    // namespaces. An old-format credential names no account (fact F4), so
+    // `same_identity` lets it belong to either record: found in both P's and
+    // T's store it is two candidates, and nothing in an 8-hex prefix says which
+    // one the swap being undone parked.
+    let (_dir, paths, config) = reversal_store();
+    let old_format = cas_blob("sk-ant-oat01-old-format", 1_800_000_000_000);
+    park(&paths, P, file_store::CREDENTIALS_FILE, &old_format);
+    park(&paths, T, file_store::CREDENTIALS_FILE, &old_format);
+
+    let said = refuses(&paths, &config, Some(&recorded(&old_format)));
+    assert!(said.contains("in both"), "a cross-namespace match is ambiguous: {said}");
+    assert!(
+        said.contains(&paths.namespace_dir(P.0, P.1).display().to_string())
+            && said.contains(&paths.namespace_dir(T.0, T.1).display().to_string()),
+        "and both namespaces are named: {said}"
+    );
+}
+
+#[test]
+fn a_live_undo_refuses_to_guess_between_two_homes_of_one_credential() {
+    // Exactly one match or refuse. Two copies carrying the digest the entry
+    // names are two candidates for the live item, and nothing in the entry says
+    // which one the swap being undone produced.
+    let (_dir, paths, config) = reversal_store();
+    let p = owned_by("sk-ant-oat01-p", P.0, P.1);
+    park(&paths, P, file_store::CREDENTIALS_FILE, &p);
+    park(&paths, P, file_store::ADOPTED_FILE, &p);
+
+    let said = refuses(&paths, &config, Some(&recorded(&p)));
+    assert!(said.contains("in both"), "it names the ambiguity: {said}");
+    assert!(
+        said.contains(file_store::CREDENTIALS_FILE) && said.contains(file_store::ADOPTED_FILE),
+        "and both places: {said}"
+    );
+}
+
+#[test]
+fn a_live_undo_looks_only_in_the_credentials_own_accounts_namespace() {
+    // A copy of P parked in **T's** namespace — the shape a namespace swap's
+    // D-024 sibling can leave — is not where §D5 files a live swap's displaced
+    // credential. Alone it is not found; beside P's own copy it is not a second
+    // candidate, so it cannot turn a clean match into an ambiguity either.
+    let (_dir, paths, config) = reversal_store();
+    let p = owned_by("sk-ant-oat01-p", P.0, P.1);
+    park(&paths, T, file_store::ADOPTED_FILE, &p);
+
+    let said = refuses(&paths, &config, Some(&recorded(&p)));
+    assert!(
+        said.contains("nothing to put back"),
+        "a copy in another namespace is no match: {said}"
+    );
+
+    park(&paths, P, file_store::CREDENTIALS_FILE, &p);
+    let found = resolves(&paths, &config, &recorded(&p));
+    assert_eq!(found.owner.account_uuid, P.0, "P's own copy is the one match");
+    assert!(matches!(found.source, Source::OwnStore));
+}
+
+#[test]
+fn a_live_undo_skips_namespaces_no_owned_record_claims_and_entries_with_no_digest() {
+    // A read-only row whose namespace directory happens to hold the credential
+    // is not a place agctl filed anything: only `Owned` records are searched.
+    let (_dir, paths, mut config) = reversal_store();
+    let mut read_only = keyed("acct-x", "org-x");
+    read_only.kind = AccountKind::ConfigDirReadOnly {
+        dir: PathBuf::new(),
+        service: "Claude Code-credentials-0badc0de".to_owned(),
+        shares_live_dir: false,
+    };
+    config.accounts.push(read_only);
+    let x = owned_by("sk-ant-oat01-x", "acct-x", "org-x");
+    park(&paths, ("acct-x", "org-x"), file_store::CREDENTIALS_FILE, &x);
+    let said = refuses(&paths, &config, Some(&recorded(&x)));
+    assert!(said.contains("nothing to put back"), "{said}");
+
+    // A live entry recording no displaced digest can only be a hand-edited log:
+    // an absent live item refuses before any write, so there is nothing to
+    // match a candidate against.
+    let said = refuses(&paths, &config, None);
+    assert!(said.contains("recorded no displaced credential"), "{said}");
+    assert!(said.contains("cafebabe"), "and it names what the entry did record: {said}");
 }

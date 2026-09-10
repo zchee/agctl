@@ -425,6 +425,53 @@ impl fmt::Display for AuditId {
 /// [`AuditEvent::LockBreak`] exists to produce is absent — fail-closed, and
 /// the same shape as every other unwritable log.
 pub fn append(paths: &Paths, entry: &AuditEntry) -> Result<AuditId, AppError> {
+    // Serialized and checked before any I/O, so a malformed entry cannot
+    // create the log on its way to being refused.
+    let line = entry_line(entry)?;
+
+    paths.ensure_dirs()?;
+    let path = log_path(paths);
+    let file = open_log(paths, &path)?;
+    write_line(&file, &path, &line)?;
+    Ok(entry.id())
+}
+
+/// Appends one entry through a descriptor the caller is **already holding**.
+///
+/// The live-store half of invariant I16 (W4b §D6, ruling G2). A live swap
+/// gates on [`open_log`] in Phase B — a held descriptor, not a report — and
+/// keeps it across Phase C, so the entry that records the write is appended
+/// through the same file the gate proved appendable. Nothing between the two
+/// can redirect the log: an `ln -s` or a `chmod` after the open changes the
+/// *name*, and this writes to the descriptor.
+///
+/// Serialization and the digest checks are [`append`]'s own, shared rather
+/// than repeated, so the two entry points cannot disagree about what a valid
+/// entry is or about how it is spelled.
+///
+/// `path` is for the error sentences only; nothing is resolved through it.
+///
+/// # Errors
+///
+/// The same arms as [`append`] minus the ones about reaching the log:
+/// [`AppError::Config`] for a bad digest field or an entry that cannot be
+/// serialized, and [`AppError::Io`] when the write or the flush fails.
+pub(crate) fn append_through(
+    file: &File,
+    path: &Path,
+    entry: &AuditEntry,
+) -> Result<AuditId, AppError> {
+    let line = entry_line(entry)?;
+    write_line(file, path, &line)?;
+    Ok(entry.id())
+}
+
+/// One entry as the line the log holds, with risk R34's guard applied.
+///
+/// Both entry points go through this, which is what keeps one serialisation
+/// and one digest check: a second spelling of either would let an entry that
+/// [`append`] refuses reach the log through [`append_through`].
+fn entry_line(entry: &AuditEntry) -> Result<String, AppError> {
     if let AuditEvent::Write { from_digest8, to_digest8, .. } = &entry.event {
         if let Some(from) = from_digest8 {
             check_digest8("from_digest8", from)?;
@@ -436,10 +483,12 @@ pub fn append(paths: &Paths, entry: &AuditEntry) -> Result<AuditId, AppError> {
         AppError::Config(format!("an audit entry could not be serialized: {err}"))
     })?;
     line.push('\n');
+    Ok(line)
+}
 
-    paths.ensure_dirs()?;
-    let path = log_path(paths);
-    let mut file = open_log(paths, &path)?;
+/// One `write` and one `fsync`, because the point of the record is to survive
+/// the crash that happens next.
+fn write_line(mut file: &File, path: &Path, line: &str) -> Result<(), AppError> {
     file.write_all(line.as_bytes()).map_err(|err| AppError::Io {
         context: format!("could not append to the audit log `{}`", path.display()),
         source: err,
@@ -447,9 +496,7 @@ pub fn append(paths: &Paths, entry: &AuditEntry) -> Result<AuditId, AppError> {
     file.sync_all().map_err(|err| AppError::Io {
         context: format!("could not flush the audit log `{}`", path.display()),
         source: err,
-    })?;
-
-    Ok(entry.id())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -529,7 +576,20 @@ pub fn log_state(paths: &Paths) -> LogState {
 /// window between the check and the write. It is **refused, never repaired**:
 /// a `chmod` here would erase the evidence that somebody else can read this
 /// machine's swap history.
-fn open_log(paths: &Paths, path: &Path) -> Result<File, AppError> {
+///
+/// `pub(crate)` because a **live**-store swap gates on this descriptor rather
+/// than on [`log_state`] (W4b §D6, ruling G2). `log_state` is a report, and a
+/// report leaves the whole width between the look and the write to whoever can
+/// plant a name in this directory; a descriptor held from Phase B through
+/// Phase C leaves none. The write then goes through [`append_through`].
+///
+/// # Errors
+///
+/// Returns [`AppError::Config`] when the log is refused — a symbolic link or a
+/// FIFO at its name, a link on the way to it, something that is not a regular
+/// file, or a mode that is not 0600 — and [`AppError::Io`] when the opened
+/// descriptor cannot be `stat`ed.
+pub(crate) fn open_log(paths: &Paths, path: &Path) -> Result<File, AppError> {
     let dir = open_log_dir(paths)
         .map_err(|err| refused(path, &format!("its directory is unreachable: {err}")))?;
 

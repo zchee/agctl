@@ -108,10 +108,10 @@ fn the_cli_exit_table_is_total_and_has_no_duplicate_or_reserved_value() {
         assert!(!seen.contains(&code), "{name} reuses exit code {code}");
         seen.push(code);
     }
-    assert_eq!(seen.len(), 12, "every code in the block is listed in ALL");
+    assert_eq!(seen.len(), 15, "every code in the block is listed in ALL");
 
     // The table itself, spelled out. Counting the entries proved only that
-    // there were eleven of them: a renumbering, or a name moved onto another
+    // there were as many of them as expected: a renumbering, or a name moved onto another
     // account's code, left the count untouched and the test green. What a
     // caller acts on is the *pairing* — `cancelled` means 20 and nothing else
     // — so the pairing is what is pinned.
@@ -130,6 +130,9 @@ fn the_cli_exit_table_is_total_and_has_no_duplicate_or_reserved_value() {
             ("write_failed", 19),
             ("cancelled", 20),
             ("needs_refresh", 21),
+            ("audit_refused", 22),
+            ("live_unreachable", 23),
+            ("live_item_absent", 24),
         ],
         "the block is contiguous from 10 and each name keeps its own number"
     );
@@ -156,6 +159,10 @@ fn all_outcomes() -> Vec<Outcome> {
         Outcome::Refused(Refusal::LineTooLong),
         Outcome::Refused(Refusal::CannotAdopt(adopt::Refusal::NewerCopy)),
         Outcome::Refused(Refusal::NotOwned),
+        Outcome::Refused(Refusal::LiveNamespaceEnv),
+        Outcome::Refused(Refusal::LiveUnreachable),
+        Outcome::Refused(Refusal::LiveItemAbsent),
+        Outcome::Refused(Refusal::AuditRefused),
     ]
 }
 
@@ -179,12 +186,11 @@ fn every_code_the_swap_can_exit_with_is_named_in_the_cli_table() {
         );
     }
     // And the other way: nothing sits in the table that the driver cannot
-    // produce, except refusal **E**, which is reserved for S23 in so many
-    // words and has its own test saying so.
+    // produce — with no exemption any more. W4a carved `REFUSED_E` out of this
+    // loop because the code existed only to keep the block contiguous; W4b
+    // emits it, so every name in the table is reachable and the totality is
+    // total in both directions.
     for (name, code) in swap_exit::ALL {
-        if code == swap_exit::REFUSED_E {
-            continue;
-        }
         assert!(
             emitted.contains(&code),
             "`{name}` ({code}) is in the table but no outcome or refusal emits it"
@@ -193,17 +199,19 @@ fn every_code_the_swap_can_exit_with_is_named_in_the_cli_table() {
 }
 
 #[test]
-fn refusal_e_is_reserved_for_w4b_and_is_not_reachable_here() {
+fn refusal_e_is_emitted_by_exactly_one_refusal_and_keeps_its_reserved_code() {
     use crate::cli::swap_exit;
 
-    // The code exists so the block stays contiguous, but nothing in W4a's
-    // decision order can produce it: refusal E lives inside
-    // `WriteTarget::live`, which this lane never constructs.
-    assert_eq!(swap_exit::REFUSED_E, 13);
-    assert!(
-        !DECISION_ORDER.iter().any(|r| r.exit_code() == swap_exit::REFUSED_E),
-        "no W4a refusal may exit with refusal E's code"
-    );
+    // The W4a form of this test asserted the **opposite** — that nothing could
+    // produce code 13, because refusal E lived only inside `WriteTarget::live`
+    // and that lane never constructed it. W4b constructs it, so the claim
+    // inverts: exactly one refusal carries the reserved code, and it is the one
+    // that carries the letter.
+    assert_eq!(swap_exit::REFUSED_E, 13, "the number it was reserved as");
+    let carriers: Vec<Refusal> =
+        DECISION_ORDER.iter().copied().filter(|r| r.exit_code() == swap_exit::REFUSED_E).collect();
+    assert_eq!(carriers, vec![Refusal::LiveNamespaceEnv], "one refusal, and only one, exits 13");
+    assert_eq!(Refusal::LiveNamespaceEnv.letter(), Some("E"));
 }
 
 #[test]
@@ -407,4 +415,101 @@ fn busy_note_distinguishes_a_live_holder_from_a_lock_it_would_not_break() {
 fn busy_note_lists_every_stopped_pid() {
     let note = busy_note(false, &[41207, 41208]);
     assert!(note.contains("41207, 41208"), "{note}");
+}
+
+// ---------------------------------------------------------------------------
+// W4b's four refusals (the live store)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_live_refusals_carry_the_letter_code_and_phase_w4b_fixed_for_each() {
+    // The contract's §D9 table, asserted rather than described. Each of the
+    // three numbers is load-bearing for a different reason: the **letter** is
+    // what `--json` consumers switch on and AC67 wants one message per letter;
+    // the **code** is what a script sees; and the **phase** is the safety
+    // claim — a refusal decided a phase later than this says has taken
+    // something it did not need in order to find out.
+    let rows = [
+        (Refusal::LiveNamespaceEnv, Some("E"), None, swap_exit::REFUSED_E, Phase::A),
+        (
+            Refusal::LiveUnreachable,
+            None,
+            Some("live_unreachable"),
+            swap_exit::LIVE_UNREACHABLE,
+            Phase::A,
+        ),
+        (
+            Refusal::LiveItemAbsent,
+            None,
+            Some("live_item_absent"),
+            swap_exit::LIVE_ITEM_ABSENT,
+            Phase::A,
+        ),
+        (Refusal::AuditRefused, None, Some("audit_refused"), swap_exit::AUDIT_REFUSED, Phase::B),
+    ];
+    for (refusal, letter, reason, code, phase) in rows {
+        assert_eq!(refusal.letter(), letter, "{refusal:?}'s `--json` letter");
+        assert_eq!(refusal.reason(), reason, "{refusal:?}'s `--json` reason");
+        assert_eq!(refusal.exit_code(), code, "{refusal:?}'s exit code");
+        assert_eq!(refusal.decided_in(), phase, "{refusal:?} is decided in phase {}", phase.name());
+        assert!(DECISION_ORDER.contains(&refusal), "{refusal:?} is missing from DECISION_ORDER");
+    }
+}
+
+#[test]
+fn every_refusal_carries_a_letter_or_a_reason_and_never_both() {
+    // `Refusal::reason` is the exact complement of `Refusal::letter`, which is
+    // what lets `emit` branch on the pair instead of listing the unlettered
+    // ones by name — and what stops a refusal added later from reaching
+    // `--json` with neither member set, which would leave a consumer unable to
+    // tell *which* refusal it was looking at. Both directions are asserted,
+    // because the interesting failure is a new variant that answers `None` to
+    // both.
+    for refusal in DECISION_ORDER {
+        match (refusal.letter(), refusal.reason()) {
+            (Some(_), None) | (None, Some(_)) => {}
+            (letter, reason) => panic!(
+                "{refusal:?} carries letter {letter:?} and reason {reason:?}: exactly one of \
+                 the two is required"
+            ),
+        }
+    }
+}
+
+#[test]
+fn the_live_refusals_are_decided_before_the_locks_and_in_the_contracts_order() {
+    // A narrower restatement of the file's load-bearing property, aimed at the
+    // four W4b refusals specifically: every one of them is outside the hold.
+    // `LiveNamespaceEnv` is the one worth naming — `LockAnchor::open`'s
+    // `Tree::Live` arm refuses the very same environment, so deciding it there
+    // instead of at the `WriteTarget::live` call would still compile, still
+    // refuse, and still pass a test that only looked at the outcome.
+    for refusal in [
+        Refusal::LiveNamespaceEnv,
+        Refusal::LiveUnreachable,
+        Refusal::LiveItemAbsent,
+        Refusal::AuditRefused,
+    ] {
+        assert!(!refusal.decided_in().holds_locks(), "{refusal:?} must not need a hold");
+    }
+    // And their positions in the table, which is the order the driver is
+    // checked against. `NotOwned` is listed **before** `LiveNamespaceEnv`
+    // (r4v ruling 7 item 5): they are both Phase A preconditions but sit on
+    // different branches of the scope gate's partition, so they never compete
+    // and this is the documented order rather than a precedence claim.
+    let at = |refusal: Refusal| {
+        DECISION_ORDER
+            .iter()
+            .position(|listed| *listed == refusal)
+            .unwrap_or_else(|| panic!("{refusal:?} is missing from DECISION_ORDER"))
+    };
+    assert!(at(Refusal::NotOwned) < at(Refusal::LiveNamespaceEnv));
+    assert!(at(Refusal::LiveNamespaceEnv) < at(Refusal::LiveUnreachable));
+    assert!(at(Refusal::LiveUnreachable) < at(Refusal::EnvToken));
+    assert!(at(Refusal::EnvToken) < at(Refusal::LiveItemAbsent));
+    assert!(at(Refusal::LiveItemAbsent) < at(Refusal::LineTooLong));
+    assert!(at(Refusal::LineTooLong) < at(Refusal::AuditRefused));
+    assert!(at(Refusal::AuditRefused) < at(Refusal::CannotAdopt(adopt::Refusal::NewerCopy)));
+    assert!(at(Refusal::CannotAdopt(adopt::Refusal::NewerCopy)) < at(Refusal::CompromisedHold));
+    assert_eq!(DECISION_ORDER.len(), 9, "every refusal the driver can raise is in the table");
 }

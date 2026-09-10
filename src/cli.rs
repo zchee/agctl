@@ -49,8 +49,8 @@ pub const WATCH_INTERVAL_FLOOR: Duration = Duration::from_secs(60);
 /// | code | meaning |
 /// |---|---|
 /// | 0 | `applied`, `already_active`, and refusal **B**'s warning line |
-/// | 1 | the W4b scope gate (`not_implemented`) |
-/// | 10–18 | the refusals below |
+/// | 10–21 | plan section 3.4's refusals and outcomes |
+/// | 22–24 | the live store's own three, added by W4b |
 ///
 /// Refusal **B** — a secure-storage backend is active or of unknown kind — is
 /// deliberately **not** here: decision D-020 degraded it to a warning line
@@ -59,8 +59,8 @@ pub const WATCH_INTERVAL_FLOOR: Duration = Duration::from_secs(60);
     not(test),
     expect(
         dead_code,
-        reason = "`REFUSED_E` is reserved for S23 (W4b) and deliberately never emitted here, \
-                  and `ALL` is the totality the exit-code tests check"
+        reason = "`ALL` is the totality the exit-code tests check, and nothing in the shipped \
+                  binary reads the table as a table"
     )
 )]
 pub mod swap_exit {
@@ -74,12 +74,16 @@ pub mod swap_exit {
     /// Refusal **D**: the credential does not fit fact F42's 4 032-byte
     /// keychain stdin line.
     pub const REFUSED_D: i32 = 12;
-    /// Refusal **E**: the target is the live store under a containment rule
-    /// that forbids it.
+    /// Refusal **E**: `CLAUDE_SECURESTORAGE_CONFIG_DIR` holds a non-empty
+    /// value, so this shell names a **namespace** rather than the live store
+    /// — and the pass was asked for the live one.
     ///
-    /// **Reserved for S23 (W4b) and never emitted in W4a.** It is spelled out
-    /// here rather than left as a hole so the block stays contiguous and a
-    /// later step cannot reuse the number for something else.
+    /// Reachable only through `use --undo` of a live-target audit entry: the
+    /// forward path's scope gate *partitions* the two targets on the same
+    /// variable, so a forward `use --live` can never reach the live subject
+    /// build with it set (W4b §D1, ruling G1). A reversal takes its target
+    /// from the audit log instead, so the two can disagree — which is the
+    /// state this refuses.
     pub const REFUSED_E: i32 = 13;
     /// Refusal **F**: the outgoing credential cannot be adopted, so the swap
     /// would lose it.
@@ -133,9 +137,50 @@ pub mod swap_exit {
     /// `--json` gives this `outcome: "needs_refresh"` and **no** `refusal`
     /// member: nothing is wrong with the store, and nothing was written.
     pub const NEEDS_REFRESH: i32 = 21;
+    /// The audit log cannot be appended to, so a **live**-store swap is
+    /// refused rather than performed unrecorded (W4b §D6, ruling G2).
+    ///
+    /// Invariant I16 makes the audit line the only durable evidence that
+    /// agctl broke a lock in the user's own `~/.claude`, and the failure is
+    /// attacker-selectable: one `ln -s` at the log's name, or one `chmod
+    /// 0644`. A control whose only failure mode is *the adversary switches it
+    /// off and the privileged action proceeds* is not a control, so the live
+    /// swap stops instead. The denial of service that buys is loud, names
+    /// itself in `doctor`'s `audit log` row and is one `chmod` from fixed;
+    /// the alternative is a silent, unrecorded mutation of the live store.
+    ///
+    /// Unlettered: plan section 3.4's **A**–**F** is canonical and **E** is
+    /// spoken for, so `--json` carries `outcome: "refused"` with `reason:
+    /// "audit_refused"` and **no** `refusal` member. Namespace swaps keep
+    /// W4a's behaviour — a refused log is logged and the swap carries on.
+    pub const AUDIT_REFUSED: i32 = 22;
+    /// The live store could not be resolved: nothing is at the path this
+    /// environment names, or the symbolic link there dangles (W4b §D3,
+    /// ruling G3).
+    ///
+    /// Split out of refusal **A**, which every acquire error used to collapse
+    /// into. **A** means *somebody moved a lock agctl was holding* — a
+    /// security signal — and a `~/.claude` that is not there is a
+    /// configuration fact decided in Phase A with nothing held. `--json`
+    /// gives it `reason: "live_unreachable"` and no `refusal` member.
+    pub const LIVE_UNREACHABLE: i32 = 23;
+    /// The live keychain item is absent, so the live store has not migrated
+    /// and its credential is still in `~/.claude/.credentials.json` (W4b §D5,
+    /// ruling G4).
+    ///
+    /// W4a's first-write path *removes* that plaintext file once the write
+    /// applies (finding N-2), which against the live store would be a
+    /// deletion inside the user's own `~/.claude` — a write invariant I11′
+    /// does not price. So the swap refuses instead, and **no file under the
+    /// live store is ever written or removed**: the W4b relaxation stays
+    /// exactly "the three lock artefacts plus the item". The condition is
+    /// transient and self-healing — migration is the steady state — so the
+    /// message says to run `claude` once. `--json` gives it `reason:
+    /// "live_item_absent"` and no `refusal` member.
+    pub const LIVE_ITEM_ABSENT: i32 = 24;
 
     /// Every code above, for the exhaustiveness and uniqueness tests.
-    pub const ALL: [(&str, i32); 12] = [
+    pub const ALL: [(&str, i32); 15] = [
         ("refused_a", REFUSED_A),
         ("refused_c", REFUSED_C),
         ("refused_d", REFUSED_D),
@@ -148,6 +193,9 @@ pub mod swap_exit {
         ("write_failed", WRITE_FAILED),
         ("cancelled", CANCELLED),
         ("needs_refresh", NEEDS_REFRESH),
+        ("audit_refused", AUDIT_REFUSED),
+        ("live_unreachable", LIVE_UNREACHABLE),
+        ("live_item_absent", LIVE_ITEM_ABSENT),
     ];
 }
 

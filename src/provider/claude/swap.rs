@@ -107,18 +107,102 @@ pub enum Refusal {
     /// begins, and `--json` gives it `reason: "not_owned"` rather than a
     /// `refusal` member.
     NotOwned,
+    /// **E** — the pass was asked for the **live** store, but
+    /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` holds a non-empty value, so this
+    /// shell names a namespace instead (W4b §D1, ruling G1).
+    ///
+    /// # Why a forward `use --live` cannot reach it
+    ///
+    /// The scope gate *partitions* the two targets on that one variable: a
+    /// truthy value selects the namespace target, an unset or empty one
+    /// selects the live target, and both halves read the **same**
+    /// [`EnvView`](crate::provider::claude::namespace::EnvView). So on the
+    /// forward path the variable is falsy by the time the live subject is
+    /// built, and this refusal names the empty set there. It is reachable
+    /// through `use --undo` of a live-target audit entry, whose target comes
+    /// from the **log** rather than from the environment — so the two can
+    /// disagree, and that disagreement is the bug (locks taken in the
+    /// namespace, the live item written) this refuses.
+    ///
+    /// Decided at the single statement that constructs
+    /// [`WriteTarget::live`](crate::secret::keychain_write::WriteTarget::live)
+    /// and nowhere else. The refusals that same environment produces inside
+    /// `WriteTarget::live` and inside
+    /// [`LockAnchor::open`](crate::secret::claude_lock::LockAnchor) are
+    /// **backstops**: deciding it there would decide it at the lock, which is
+    /// after [`DECISION_ORDER`]'s Phase A.
+    LiveNamespaceEnv,
+    /// The live store could not be resolved — nothing is at the path this
+    /// environment names, or the symbolic link there dangles (W4b §D3,
+    /// ruling G3).
+    ///
+    /// Split out of [`Self::CompromisedHold`], which every `LockError` used
+    /// to collapse into: **A** means *somebody moved a lock agctl was
+    /// holding*, and a `~/.claude` that is not there is not that. Unlettered,
+    /// with `reason: "live_unreachable"`.
+    LiveUnreachable,
+    /// The live keychain item is absent, so the live store has not migrated
+    /// and its credential is still in `~/.claude/.credentials.json` (W4b §D5,
+    /// ruling G4).
+    ///
+    /// W4a's first-write path removes that plaintext file once the write
+    /// applies (finding N-2). Against the live store that is a deletion
+    /// inside the user's own `~/.claude`, which invariant I11′ does not
+    /// price — so the swap refuses instead and **no file under the live store
+    /// is ever written or removed**. Transient and self-healing: migration is
+    /// the steady state, so the message says to run `claude` once.
+    LiveItemAbsent,
+    /// The audit log cannot be appended to, so a **live** swap will not
+    /// proceed unrecorded (W4b §D6, ruling G2).
+    ///
+    /// Unlettered on purpose: plan section 3.4's **A**–**F** is canonical,
+    /// **E** is spoken for, and plan AC67 wants one message per letter. The
+    /// reason string is
+    /// [`LogState::note`](crate::secret::audit::LogState::note) verbatim, so
+    /// the CLI refusal, `doctor`'s `audit log` row and this carry one
+    /// sentence. Namespace swaps keep W4a's behaviour.
+    AuditRefused,
 }
 
 impl Refusal {
     /// The letter `--json`'s `refusal` member carries, or `None` for the
-    /// unlettered precondition.
+    /// unlettered refusals, each of which carries a [`Refusal::reason`]
+    /// instead.
     pub fn letter(self) -> Option<&'static str> {
         match self {
             Self::CompromisedHold => Some("A"),
             Self::EnvToken => Some("C"),
             Self::LineTooLong => Some("D"),
+            Self::LiveNamespaceEnv => Some("E"),
             Self::CannotAdopt(_) => Some("F"),
-            Self::NotOwned => None,
+            Self::NotOwned | Self::LiveUnreachable | Self::LiveItemAbsent | Self::AuditRefused => {
+                None
+            }
+        }
+    }
+
+    /// The stable token `--json`'s `reason` member carries for an unlettered
+    /// refusal, or `None` for a lettered one.
+    ///
+    /// Exactly the complement of [`Refusal::letter`], and `swap_tests.rs`
+    /// asserts that: every refusal carries one of the two and never both,
+    /// which is what lets a consumer branch on the pair rather than on a
+    /// list of special cases. The unlettered set is not a leftover — each of
+    /// its four members is deliberately outside plan section 3.4's canonical
+    /// **A**–**F**, either because it is decided before Phase A's work begins
+    /// (`not_owned`) or because it is W4b's and the letters were already
+    /// spoken for.
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::NotOwned => Some("not_owned"),
+            Self::LiveUnreachable => Some("live_unreachable"),
+            Self::LiveItemAbsent => Some("live_item_absent"),
+            Self::AuditRefused => Some("audit_refused"),
+            Self::CompromisedHold
+            | Self::EnvToken
+            | Self::LineTooLong
+            | Self::LiveNamespaceEnv
+            | Self::CannotAdopt(_) => None,
         }
     }
 
@@ -128,8 +212,12 @@ impl Refusal {
             Self::CompromisedHold => swap_exit::REFUSED_A,
             Self::EnvToken => swap_exit::REFUSED_C,
             Self::LineTooLong => swap_exit::REFUSED_D,
+            Self::LiveNamespaceEnv => swap_exit::REFUSED_E,
             Self::CannotAdopt(_) => swap_exit::REFUSED_F,
             Self::NotOwned => swap_exit::PRECONDITION,
+            Self::AuditRefused => swap_exit::AUDIT_REFUSED,
+            Self::LiveUnreachable => swap_exit::LIVE_UNREACHABLE,
+            Self::LiveItemAbsent => swap_exit::LIVE_ITEM_ABSENT,
         }
     }
 
@@ -142,11 +230,26 @@ impl Refusal {
         match self {
             // Before anything is read from the store at all.
             Self::NotOwned | Self::EnvToken => Phase::A,
+            // Where the live subject is built, and immediately after it. Both
+            // are read-only and both are before the item read, so neither has
+            // cost the caller anything. `LiveNamespaceEnv` in particular must
+            // **not** be decided at the lock — `LockAnchor::open` refuses the
+            // same environment, but that is Phase C and would break this
+            // table's "everything but `CompromisedHold` is decided before the
+            // locks are held" property.
+            Self::LiveNamespaceEnv | Self::LiveUnreachable => Phase::A,
+            // After Phase A's single read of the item, before any lock: an
+            // absent live item is what says the live store has not migrated.
+            Self::LiveItemAbsent => Phase::A,
             // First checked in Phase A against the stored blob, and again in
             // Phase B against the refreshed one — both before any child
             // exists (invariant I15). The later of the two is what this
             // names, because that is the constraint worth holding.
             Self::LineTooLong => Phase::B,
+            // The audit descriptor is taken in Phase B, before the live store
+            // is touched and before the adoption write — which is itself a
+            // mutation — and with nothing of Claude Code's held.
+            Self::AuditRefused => Phase::B,
             // The adoption runs under the namespace locks in Phase B, which
             // is where its refusal is decided (ruling OQ2, condition (c)).
             Self::CannotAdopt(_) => Phase::B,
@@ -166,10 +269,19 @@ impl Refusal {
 /// [`Refusal::CompromisedHold`] is decided **before** the locks are held, so
 /// a swap that is going to be refused has not taken anything Claude Code
 /// wants in order to find out.
-pub const DECISION_ORDER: [Refusal; 5] = [
+/// W4b's four additions sit where they are decided rather than at the end:
+/// [`Refusal::NotOwned`] and [`Refusal::LiveNamespaceEnv`] are both Phase A
+/// preconditions but on **different branches** of the scope gate's partition,
+/// so they never compete and the order between them is documentation rather
+/// than precedence.
+pub const DECISION_ORDER: [Refusal; 9] = [
     Refusal::NotOwned,
+    Refusal::LiveNamespaceEnv,
+    Refusal::LiveUnreachable,
     Refusal::EnvToken,
+    Refusal::LiveItemAbsent,
     Refusal::LineTooLong,
+    Refusal::AuditRefused,
     Refusal::CannotAdopt(adopt::Refusal::NewerCopy),
     Refusal::CompromisedHold,
 ];

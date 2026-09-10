@@ -417,3 +417,169 @@ mod undo {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// W4b §D5: the matrix under the LIVE target's input shape
+// ---------------------------------------------------------------------------
+
+/// The input shape a **live** target produces, whatever is at the adoption
+/// target.
+///
+/// Every field here is forced by §D5's reduction rather than chosen:
+///
+/// - `same_namespace` is **false by construction**. Refusal **E** guarantees
+///   `CLAUDE_SECURESTORAGE_CONFIG_DIR` is falsy, so the store being swapped is
+///   `~/.claude` (or `CLAUDE_CONFIG_DIR`) — and `Paths::is_under_namespace_root`
+///   refuses every agctl namespace outside `namespace_root()`, so no agctl
+///   namespace can *be* the live store. Decision D-024's sibling row is
+///   therefore unreachable, which is what keeps `.credentials.adopted.json` out
+///   of the user's live store.
+/// - `identity_matches` is consequently never read: `decide` consults it only
+///   under `same_namespace`. It is set `false` here to prove that — a build
+///   that started reading it would fail the rows below.
+fn live(existing: Existing) -> Input {
+    Input { same_namespace: false, identity_matches: false, ..input(existing) }
+}
+
+#[test]
+fn the_live_target_reduces_to_the_third_namespace_row_of_d_017() {
+    // The live item is not a registry row, so the displaced credential belongs
+    // to a third account by construction and goes to **that account's own
+    // namespace** — `<namespace(P)>/.credentials.json`, inside
+    // `namespace_root()`. `ToAdoptedCopy` must never come out of a live-shaped
+    // input, because that decision means `<D>/.credentials.adopted.json` and
+    // for a live target `D` is `~/.claude`.
+    let rows: Vec<(&str, Input, Adoption)> = vec![
+        ("absent: write it to P's own namespace", live(Existing::Absent), Adoption::ToStore),
+        ("the same credential: nothing to do", live(Existing::Same), Adoption::AlreadyPresent),
+        (
+            "older by expiresAt: overwrite it",
+            live(Existing::Different { expires_at_ms: NOW }),
+            Adoption::ToStore,
+        ),
+        (
+            "newer or equal by expiresAt: refuse (F)",
+            live(Existing::Different { expires_at_ms: NOW + 2 * HOUR }),
+            Adoption::Refused(Refusal::NewerCopy),
+        ),
+        (
+            "equal by expiresAt still refuses: nothing distinguishes the two",
+            live(Existing::Different { expires_at_ms: NOW + HOUR }),
+            Adoption::Refused(Refusal::NewerCopy),
+        ),
+        (
+            "unreadable: refuse (F)",
+            live(Existing::Unreadable),
+            Adoption::Refused(Refusal::Unreadable),
+        ),
+        (
+            "P's namespace has migrated: refuse (F)",
+            Input { target_migrated: true, ..live(Existing::Absent) },
+            Adoption::Refused(Refusal::Migrated),
+        ),
+        (
+            "a pending write is parked there: refuse (F), outranking everything",
+            Input { pending_present: true, ..live(Existing::Absent) },
+            Adoption::Refused(Refusal::PendingPresent),
+        ),
+    ];
+
+    for (name, input, expected) in rows {
+        let decided = decide(&input);
+        assert_eq!(decided, expected, "live-target row: {name}");
+        assert_ne!(
+            decided,
+            Adoption::ToAdoptedCopy,
+            "live-target row `{name}` reached `ToAdoptedCopy`, which means \
+             `<D>/.credentials.adopted.json` — and for a live target `D` is the user's own \
+             `~/.claude`, outside `namespace_root()` and forbidden by invariant I11′"
+        );
+    }
+}
+
+#[test]
+fn a_live_target_never_takes_the_same_namespace_row_however_the_identity_compares() {
+    // The reduction's own guard. `identity_matches` is the one field §D5 says
+    // is never consulted for a live target, so flipping it must change nothing:
+    // a build that derived `same_namespace` from it — or that consulted it
+    // outside the `same_namespace` branch — would show up here and nowhere
+    // else, because every other row in the file sets the two together.
+    for existing in [Existing::Absent, Existing::Same, Existing::Different { expires_at_ms: NOW }] {
+        let matched = Input { identity_matches: true, ..live(existing.clone()) };
+        let mismatched = Input { identity_matches: false, ..live(existing.clone()) };
+        assert_eq!(
+            decide(&matched),
+            decide(&mismatched),
+            "the identity condition belongs to the same-namespace row, which a live target \
+             cannot take: {existing:?}"
+        );
+        assert_ne!(
+            decide(&matched),
+            Adoption::Refused(Refusal::IdentityMismatch),
+            "and it never produces condition (a)'s refusal: {existing:?}"
+        );
+    }
+}
+
+#[test]
+fn task_fours_three_sub_rows_answer_the_same_for_a_live_target() {
+    // §D5's table, [dep:5gs]. The **destinations** differ for a live target —
+    // the keep arm writes `<namespace(T)>/.credentials.adopted.json` rather
+    // than the store's sibling, which `commands::use` substitutes and
+    // `tests/e2e_swap.rs` proves by path — but the *decisions* are the landed
+    // ones, because the row names no target and so no condition about a target
+    // bears on it.
+    //
+    // The fifth property the pre-S23 wave fixed is asserted here too: a target
+    // that can hold another account's credential answers condition (a)
+    // **before** the expiry comparison. Without that order a newer sibling
+    // belonging to somebody else would be compared as a worse copy of this
+    // credential, which is a question that means nothing across two accounts.
+    let row = |existing: Existing, stored: i64, duplicate: bool| Input {
+        displaced_is_incoming: true,
+        displaced_is_duplicate: duplicate,
+        incoming_expires_at_ms: stored,
+        ..live(existing)
+    };
+
+    // Strictly newer than what the incoming account's own store holds: kept.
+    assert_eq!(
+        decide(&row(Existing::Absent, NOW, false)),
+        Adoption::ToAdoptedCopy,
+        "a displaced copy newer than the incoming store's is kept, not discarded"
+    );
+    // **Equal expiries are kept, not discarded**, and that is the landed shape
+    // rather than the one the W4b contract's table describes. Expiry alone
+    // cannot tell two credentials of one account apart: a refresh inside the
+    // same expiry window produces an equal `expiresAt` and a *different*
+    // refresh token, so discarding on equality can kill the live chain. Only a
+    // **proven duplicate** — equal by digest — is dropped without weighing it.
+    assert_eq!(
+        decide(&row(Existing::Absent, NOW + HOUR, false)),
+        Adoption::ToAdoptedCopy,
+        "an equal-expiry copy that is not a proven duplicate is kept: only the digest can say          the two are the same credential"
+    );
+    // Strictly older than what the incoming store holds: discarded, with no
+    // target at all.
+    assert_eq!(
+        decide(&row(Existing::Absent, NOW + 2 * HOUR, false)),
+        Adoption::Discarded,
+        "a strictly older copy of the grant being installed is not worth a target"
+    );
+    assert_eq!(
+        decide(&row(Existing::Absent, NOW, true)),
+        Adoption::Discarded,
+        "and a proven duplicate is discarded whatever the expiries say"
+    );
+    // Condition (a) before the expiry comparison, which is the fifth property.
+    let occupied = Input {
+        existing_is_another_account: true,
+        ..row(Existing::Different { expires_at_ms: NOW + 2 * HOUR }, NOW, false)
+    };
+    assert_eq!(
+        decide(&occupied),
+        Adoption::Refused(Refusal::OccupiedByAnother),
+        "the sibling's occupant is answered before `place`'s expiry comparison, which would \
+         otherwise have said `NewerCopy` here"
+    );
+}
