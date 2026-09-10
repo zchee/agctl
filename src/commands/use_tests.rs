@@ -470,3 +470,432 @@ fn a_prompt_with_nobody_to_ask_is_cancelled_too() {
 fn a_confirmed_prompt_reports_nothing_and_lets_the_swap_proceed() {
     assert!(confirm_with(Ok(true)).is_none(), "`None` is what carries on to the adoption");
 }
+
+// ---------------------------------------------------------------------------
+// The write-back's guards (`agctl-r9w`, review4 N-15)
+// ---------------------------------------------------------------------------
+
+/// A store with one owned namespace, holding `access` as its credential.
+///
+/// The record is [`keyed`]'s, whose `Owned` kind is what makes
+/// [`status::detect`] look at the namespace at all — a record of any other
+/// kind short-circuits to [`ForeignActivity::None`] and would test nothing.
+fn write_back_store(access: &str) -> (tempfile::TempDir, Paths, AccountRecord, PathBuf) {
+    let dir = tempfile::TempDir::new().expect("a temporary directory");
+    let paths = Paths::with_config_dir(dir.path().to_path_buf());
+    paths.ensure_dirs().expect("the store directories are creatable");
+    let mut record = keyed("acct-write-back", "org-write-back");
+    // A real export `sha8`, because the migrated arm of the gate asks the
+    // keychain about the service name this spells.
+    record.kind = AccountKind::Owned {
+        export_spelling: String::new(),
+        export_sha8: WRITE_BACK_SHA8.to_owned(),
+    };
+    let ns_dir = paths.namespace_dir(&record.account_uuid, &record.organization_uuid);
+    std::fs::create_dir_all(&ns_dir).expect("the namespace is creatable");
+    std::fs::write(ns_dir.join(file_store::CREDENTIALS_FILE), cas_blob(access, 1_800_000_000_000))
+        .expect("the credential fixture is writable");
+    (dir, paths, record, ns_dir)
+}
+
+/// The export `sha8` [`write_back_store`]'s record carries.
+const WRITE_BACK_SHA8: &str = "0123abcd";
+
+/// The keychain item that namespace would have migrated into.
+fn migrated_service() -> String {
+    crate::secret::foreign_activity::service_name(WRITE_BACK_SHA8)
+}
+
+/// A scripted keychain, holding the migrated item when `migrated` is set.
+///
+/// The item's bytes are never parsed — [`crate::secret::foreign_activity`]
+/// asks only whether the read answers — so an opaque marker is honest about
+/// what the gate turns on.
+fn write_back_reader(migrated: bool) -> crate::secret::fake_reader::FakeReader {
+    let reader = crate::secret::fake_reader::FakeReader::unlocked();
+    if !migrated {
+        return reader;
+    }
+    let service = migrated_service();
+    reader.with_entry(&service).with_item(&service, b"{}")
+}
+
+/// The context the guard's write runs under.
+fn write_back_ctx() -> PassCtx {
+    PassCtx::standalone(Cancel::new(), std::time::Instant::now() + Duration::from_secs(30))
+}
+
+/// Runs the guard with a refreshed pair derived from `derived_from`.
+fn guard(
+    paths: &Paths,
+    record: &AccountRecord,
+    ns_dir: &Path,
+    derived_from: &Digests,
+) -> Result<(), String> {
+    guard_with(&write_back_reader(false), paths, record, ns_dir, derived_from)
+}
+
+/// [`guard`], against a keychain of the caller's choosing.
+fn guard_with(
+    reader: &dyn crate::secret::KeychainReader,
+    paths: &Paths,
+    record: &AccountRecord,
+    ns_dir: &Path,
+    derived_from: &Digests,
+) -> Result<(), String> {
+    let refreshed = cas_credentials("sk-ant-oat01-rotated", 1_900_000_000_000);
+    guarded_write_back(paths, record, ns_dir, &refreshed, derived_from, reader, &write_back_ctx())
+}
+
+/// Plants a `.pending` + `.pending.meta` derived from the namespace's current
+/// credential, in the shape `file_store::save_to_pending` writes.
+///
+/// The metadata names the digests of the file that is there, which is what
+/// makes `resolve_pending` **replay** it rather than discard it as
+/// `FileChanged`.
+fn plant_pending(ns_dir: &Path, replacement: &str, expires_at_ms: i64) {
+    let current = status::reread(ns_dir).expect("the namespace has a credential to derive from");
+    let digests = current.digests();
+    let meta = file_store::PendingMeta {
+        derived_from_access_sha256: Some(digests.access_sha256.clone()),
+        derived_from_refresh_sha256: digests.refresh_sha256.clone(),
+        created_at: "2026-09-11T00:00:00Z".to_owned(),
+        new_expires_at: expires_at_ms,
+    };
+    std::fs::write(
+        ns_dir.join(file_store::PENDING_META),
+        serde_json::to_string(&meta).expect("the metadata serializes"),
+    )
+    .expect("the pending metadata is writable");
+    std::fs::write(ns_dir.join(file_store::PENDING_FILE), replacement)
+        .expect("the pending file is writable");
+}
+
+fn stored(ns_dir: &Path) -> String {
+    std::fs::read_to_string(ns_dir.join(file_store::CREDENTIALS_FILE)).expect("readable")
+}
+
+#[test]
+fn the_write_back_writes_when_every_guard_passes() {
+    let (_dir, paths, record, ns_dir) = write_back_store("sk-ant-oat01-before");
+    let derived_from = cas_credentials("sk-ant-oat01-before", 1_800_000_000_000).digests();
+
+    guard(&paths, &record, &ns_dir, &derived_from).expect("an undisturbed namespace is written");
+
+    let saved = stored(&ns_dir);
+    assert!(saved.contains("sk-ant-oat01-rotated"), "the refreshed pair landed: {saved}");
+    assert!(
+        paths.is_under_namespace_root(&ns_dir.join(file_store::CREDENTIALS_FILE)),
+        "and the only path written is inside the namespace root"
+    );
+}
+
+#[test]
+fn the_write_back_refuses_a_credential_that_changed_under_the_lock() {
+    // Review4 N-15 (a): the credential was read in Phase A, *before* the
+    // locks, and the whole lock wait plus the refresh POST is the window. A
+    // second writer in that window means the pair in hand was derived from a
+    // credential that is no longer there, and writing it is a lost update
+    // that kills the other writer's refresh token.
+    let (_dir, paths, record, ns_dir) = write_back_store("sk-ant-oat01-before");
+    let derived_from = cas_credentials("sk-ant-oat01-before", 1_800_000_000_000).digests();
+
+    // Somebody else refreshed this namespace while the POST was in flight.
+    std::fs::write(
+        ns_dir.join(file_store::CREDENTIALS_FILE),
+        cas_blob("sk-ant-oat01-somebody-else", 1_850_000_000_000),
+    )
+    .expect("the racing write lands");
+
+    let refusal = guard(&paths, &record, &ns_dir, &derived_from).expect_err("refused");
+
+    assert!(refusal.contains("changed while this swap was preparing"), "{refusal}");
+    assert_eq!(
+        stored(&ns_dir),
+        cas_blob("sk-ant-oat01-somebody-else", 1_850_000_000_000),
+        "the other writer's credential is still there, byte for byte: nothing was overwritten"
+    );
+    assert!(
+        !ns_dir.join(file_store::PENDING_FILE).exists(),
+        "and nothing was parked beside it either"
+    );
+}
+
+#[test]
+fn the_write_back_refuses_a_namespace_a_claude_session_holds() {
+    // Review4 N-15 (b): the namespace lock excludes another agctl pass and
+    // excludes nothing else. Claude Code writes this same file under its own
+    // protocol, and its lock artefact is the only sign of it.
+    let (_dir, paths, record, ns_dir) = write_back_store("sk-ant-oat01-before");
+    let derived_from = cas_credentials("sk-ant-oat01-before", 1_800_000_000_000).digests();
+    std::fs::create_dir(ns_dir.join(crate::secret::foreign_activity::REFRESH_LOCK))
+        .expect("the artefact is plantable");
+
+    let refusal = guard(&paths, &record, &ns_dir, &derived_from).expect_err("refused");
+
+    assert!(refusal.contains("Claude Code session"), "{refusal}");
+    assert!(refusal.contains(crate::secret::foreign_activity::REFRESH_LOCK), "{refusal}");
+    assert_eq!(
+        stored(&ns_dir),
+        cas_blob("sk-ant-oat01-before", 1_800_000_000_000),
+        "the session's file is untouched"
+    );
+}
+
+#[test]
+fn the_write_back_refuses_a_credential_that_is_gone() {
+    let (_dir, paths, record, ns_dir) = write_back_store("sk-ant-oat01-before");
+    let derived_from = cas_credentials("sk-ant-oat01-before", 1_800_000_000_000).digests();
+    std::fs::remove_file(ns_dir.join(file_store::CREDENTIALS_FILE)).expect("removable");
+
+    let refusal = guard(&paths, &record, &ns_dir, &derived_from).expect_err("refused");
+
+    assert!(refusal.contains("is gone"), "{refusal}");
+    assert!(
+        !ns_dir.join(file_store::CREDENTIALS_FILE).exists(),
+        "a namespace whose credential was removed does not get one back from a swap"
+    );
+}
+
+/// A refresher that cannot be called, for the drift guard's `Shared`.
+///
+/// [`status::under_namespace_lock`] is driven with `may_refresh: false`, which
+/// returns before the POST, so a refresher that panics is the assertion that
+/// the comparison is over the *guards* and not over a network round trip.
+struct NeverRefreshes;
+
+impl crate::provider::claude::usage::TokenRefresher for NeverRefreshes {
+    fn refresh(
+        &self,
+        _credentials: &Credentials,
+        _cancel: &Cancel,
+    ) -> Result<
+        crate::provider::claude::oauth::TokenResponse,
+        crate::provider::claude::usage::RefreshError,
+    > {
+        panic!("the drift guard compares guards, not refreshes")
+    }
+}
+
+#[test]
+fn the_write_back_refuses_a_namespace_that_has_migrated_into_the_keychain() {
+    // Invariant I5': a plaintext credential written beside an item that
+    // shadows it lands where nobody reads it. `status` refuses such a
+    // namespace; before review F1 the write-back could not see the state at
+    // all, because it passed an empty listing and an empty listing read as
+    // "nothing has migrated" rather than "I did not look".
+    let (_dir, paths, record, ns_dir) = write_back_store("sk-ant-oat01-before");
+    let derived_from = cas_credentials("sk-ant-oat01-before", 1_800_000_000_000).digests();
+    let reader = write_back_reader(true);
+
+    let refusal =
+        guard_with(&reader, &paths, &record, &ns_dir, &derived_from).expect_err("refused");
+
+    assert!(refusal.contains("migrated into the keychain item"), "{refusal}");
+    assert!(refusal.contains(&migrated_service()), "the refusal names the item: {refusal}");
+    assert_eq!(
+        reader.reads(),
+        vec![migrated_service()],
+        "one `find-generic-password`, for the one service name this namespace could have \
+         migrated under"
+    );
+    assert_eq!(
+        stored(&ns_dir),
+        cas_blob("sk-ant-oat01-before", 1_800_000_000_000),
+        "and the shadowed file is left exactly as it was"
+    );
+}
+
+#[test]
+fn a_replayed_pending_file_is_not_reported_as_another_writer() {
+    // `resolve_pending` moves a pending file into place *inside* the guard,
+    // so the file legitimately differs from what Phase A read — but there is
+    // no second writer to blame, and blaming one would refuse a write-back
+    // that must happen (the POST has already spent the old refresh token).
+    // The baseline moves to the read that follows the replay.
+    let (_dir, paths, record, ns_dir) = write_back_store("sk-ant-oat01-before");
+    let derived_from = cas_credentials("sk-ant-oat01-before", 1_800_000_000_000).digests();
+    plant_pending(
+        &ns_dir,
+        &cas_blob("sk-ant-oat01-replayed", 1_850_000_000_000),
+        1_850_000_000_000,
+    );
+
+    guard(&paths, &record, &ns_dir, &derived_from).expect("a replay is not a refusal");
+
+    let saved = stored(&ns_dir);
+    assert!(
+        saved.contains("sk-ant-oat01-rotated"),
+        "the refreshed pair — the only one holding a live refresh token — is what is left: {saved}"
+    );
+    assert!(
+        !ns_dir.join(file_store::PENDING_FILE).exists()
+            && !ns_dir.join(file_store::PENDING_META).exists(),
+        "and the pending pair was consumed rather than left behind"
+    );
+}
+
+#[test]
+fn a_replayed_pending_file_does_not_blame_a_writer_that_does_not_exist() {
+    // The same state, asserted on the *sentence*: before this fix the compare
+    // ran against Phase A's digests, necessarily failed, and told the
+    // operator the store had changed under the swap.
+    let (_dir, paths, record, ns_dir) = write_back_store("sk-ant-oat01-before");
+    let derived_from = cas_credentials("sk-ant-oat01-before", 1_800_000_000_000).digests();
+    plant_pending(
+        &ns_dir,
+        &cas_blob("sk-ant-oat01-replayed", 1_850_000_000_000),
+        1_850_000_000_000,
+    );
+
+    let outcome = guard(&paths, &record, &ns_dir, &derived_from);
+
+    assert!(
+        !format!("{outcome:?}").contains("changed while this swap was preparing"),
+        "a replay is this store healing itself, not a racing writer: {outcome:?}"
+    );
+}
+
+#[test]
+fn the_write_back_refuses_exactly_what_status_refuses_at_the_same_write_site() {
+    // The drift guard the ruling asks for. `status::under_namespace_lock` and
+    // `guarded_write_back` write the same file by the same writer, and they
+    // cannot be one call: `status`'s acquires the namespace lock itself
+    // (`flock`, which a second descriptor in this same process conflicts
+    // with, so a nested call would wait out the deadline and report `busy`)
+    // and performs its own refresh POST, both of which the swap has already
+    // done by the time it reaches its write-back. So the two orderings are
+    // written twice and compared here, state by state.
+    //
+    // Each side gets its **own store, built from the same recipe**, rather
+    // than literally one directory: `resolve_pending` mutates, so whichever
+    // side ran first would heal the pending plant for the second and the
+    // comparison would be over two different states.
+    //
+    // `may_refresh: false` is `status`'s "resolve the pending file and tell
+    // me what is there" mode: it takes the lock, detects, resolves, re-reads,
+    // and returns — which is guards 1, 2, 3 and 5 and no network. Guard 4,
+    // the compare, has no counterpart reachable that way (`status`'s is a
+    // `FileSnapshot` identity check across its own POST, behind the
+    // `before_rename` fault seam), and is pinned by
+    // `the_write_back_refuses_a_credential_that_changed_under_the_lock`.
+    //
+    // `status` is given a **real listing** for the migrated plant, as a real
+    // pass would have; the swap is given none, which is the asymmetry review
+    // F1 is about and `detect_unlisted` closes.
+    struct Plant {
+        name: &'static str,
+        setup: fn(&Path),
+        migrated: bool,
+        proceeds: bool,
+    }
+    let plants = [
+        Plant { name: "an undisturbed namespace", setup: |_| {}, migrated: false, proceeds: true },
+        Plant {
+            name: "a live Claude Code session",
+            setup: |ns_dir| {
+                std::fs::create_dir(ns_dir.join(crate::secret::foreign_activity::REFRESH_LOCK))
+                    .expect("plantable");
+            },
+            migrated: false,
+            proceeds: false,
+        },
+        Plant {
+            name: "a credential that is gone",
+            setup: |ns_dir| {
+                std::fs::remove_file(ns_dir.join(file_store::CREDENTIALS_FILE)).expect("removable");
+            },
+            migrated: false,
+            proceeds: false,
+        },
+        Plant {
+            name: "a namespace that has migrated into the keychain",
+            setup: |_| {},
+            migrated: true,
+            proceeds: false,
+        },
+        Plant {
+            name: "a pending write left by an interrupted run",
+            setup: |ns_dir| {
+                plant_pending(
+                    ns_dir,
+                    &cas_blob("sk-ant-oat01-replayed", 1_850_000_000_000),
+                    1_850_000_000_000,
+                );
+            },
+            migrated: false,
+            proceeds: true,
+        },
+    ];
+
+    let mut proceeded = 0usize;
+    let mut refused = 0usize;
+    for plant in plants {
+        let derived_from = cas_credentials("sk-ant-oat01-before", 1_800_000_000_000).digests();
+
+        // `status`'s side, on its own copy of the state.
+        let (_dir, paths, record, ns_dir) = write_back_store("sk-ant-oat01-before");
+        (plant.setup)(&ns_dir);
+        let listing = if plant.migrated {
+            vec![crate::secret::ServiceEntry {
+                service: migrated_service(),
+                account: None,
+                cdat: None,
+                mdat: None,
+            }]
+        } else {
+            Vec::new()
+        };
+        let migrated = plant.migrated;
+        let shared = status::Shared {
+            paths: std::sync::Arc::new(paths.clone()),
+            env: crate::provider::claude::namespace::EnvView::with_home(
+                paths.config_dir().to_path_buf(),
+            ),
+            client: crate::provider::claude::usage::UsageClient::new(
+                "http://127.0.0.1:1",
+                "agctl/test",
+                Duration::from_secs(1),
+            ),
+            refresher: std::sync::Arc::new(NeverRefreshes),
+            reader_factory: std::sync::Arc::new(move |_ctx| Box::new(write_back_reader(migrated))),
+            listing,
+            fault: Fault::none(),
+            options: status::Options { refresh: false, no_cache: false },
+        };
+        let by_status =
+            status::under_namespace_lock(&write_back_ctx(), &shared, &record, &ns_dir, false)
+                .credentials;
+
+        // The swap's side, on an identically built one.
+        let (_dir, paths, record, ns_dir) = write_back_store("sk-ant-oat01-before");
+        (plant.setup)(&ns_dir);
+        let by_swap =
+            guard_with(&write_back_reader(plant.migrated), &paths, &record, &ns_dir, &derived_from);
+
+        assert_eq!(
+            by_status.is_some(),
+            by_swap.is_ok(),
+            "{}: `status` {} and the swap {}",
+            plant.name,
+            if by_status.is_some() { "proceeded" } else { "refused" },
+            if by_swap.is_ok() { "wrote" } else { "refused" }
+        );
+        assert_eq!(by_swap.is_ok(), plant.proceeds, "{}: {by_swap:?}", plant.name);
+        if plant.migrated {
+            let refusal = by_swap.as_ref().expect_err("refused");
+            assert!(
+                refusal.contains("migrated into the keychain item"),
+                "{}: the refusal names the state it found: {refusal}",
+                plant.name
+            );
+        }
+        if by_swap.is_ok() {
+            proceeded = proceeded.saturating_add(1);
+        } else {
+            refused = refused.saturating_add(1);
+        }
+    }
+    assert_eq!(proceeded, 2, "two states both sides write");
+    assert_eq!(refused, 3, "and three both sides refuse");
+}

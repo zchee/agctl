@@ -68,6 +68,7 @@ use crate::provider::claude::usage::RefreshError;
 use crate::runtime::coordinator::Cancel;
 use crate::runtime::coordinator::PassCtx;
 use crate::runtime::fault::Fault;
+use crate::secret::KeychainReader;
 use crate::secret::audit;
 use crate::secret::audit::AuditEntry;
 use crate::secret::audit::AuditEvent;
@@ -80,6 +81,7 @@ use crate::secret::claude_lock::LockSubject;
 use crate::secret::claude_lock::Tree;
 use crate::secret::default_reader;
 use crate::secret::file_store;
+use crate::secret::foreign_activity::ForeignActivity;
 use crate::secret::keychain_write;
 use crate::secret::keychain_write::KeychainWriteError;
 use crate::secret::keychain_write::OwnedSha8;
@@ -738,7 +740,15 @@ fn swap_phases(
         if let Err(report) = refresh_incoming(&mut incoming_credentials, ctx, &service, now) {
             return *report;
         }
-        write_back_refreshed(paths, incoming, &incoming_credentials, &derived_from, ctx);
+        write_back_refreshed(
+            paths,
+            incoming,
+            &incoming_credentials,
+            &derived_from,
+            reader.as_ref(),
+            ctx,
+            pass,
+        );
     }
     let after = incoming_credentials.digests();
 
@@ -1350,33 +1360,171 @@ fn refresh_incoming(
 ///
 /// A failure here does not fail the swap: the item write is what the operator
 /// asked for, and a saved refresh is a repair, not a precondition. It is
-/// logged, because the consequence — the incoming account needing a `login` —
-/// is worth a line.
+/// logged **and carried as a warning**, because the consequence — the incoming
+/// account needing a `login` — is worth telling the operator about rather than
+/// leaving in a log line nobody reads (`agctl-r9w`, review4 N-15).
 fn write_back_refreshed(
     paths: &Paths,
     incoming: &Incoming<'_>,
     refreshed: &Credentials,
     derived_from: &Digests,
+    reader: &dyn KeychainReader,
     ctx: &PassCtx,
+    pass: &mut Pass,
 ) {
     if !matches!(incoming.source, Source::OwnStore) {
         return;
     }
     let ns_dir =
         paths.namespace_dir(&incoming.record.account_uuid, &incoming.record.organization_uuid);
+    if let Err(refusal) =
+        guarded_write_back(paths, incoming.record, &ns_dir, refreshed, derived_from, reader, ctx)
+    {
+        tracing::warn!(
+            refusal = %refusal,
+            "the refreshed incoming credential was not saved to its own store"
+        );
+        let warning = format!(
+            "the incoming account's refreshed credential was not saved back to its own store: \
+             {refusal}; that account may need `agctl claude login`"
+        );
+        // Both, for the reason refusal B's warning is both: on **stderr** so a
+        // person at a terminal is told, and in the report so a consumer of
+        // `--json` does not lose a fact the terminal shows.
+        eprintln!("note: {warning}");
+        pass.warnings.push(warning);
+    }
+}
+
+/// The guards [`status::under_namespace_lock`] applies to this same file, in
+/// its order, for the one other writer of it.
+///
+/// Review4 N-15: `status` guards this write five ways and the swap applied
+/// **one** of them — the namespace lock, which excludes another agctl pass
+/// and excludes nothing else. The other four are here, and each is the
+/// *same function* `status` calls rather than a second spelling of it:
+///
+/// 1. **the namespace lock** — already held, taken at step 10 for this exact
+///    record, which is why this is not `status`'s whole function: that one
+///    acquires the lock itself (`flock`, and `flock` conflicts with a second
+///    descriptor in the same process, so a nested call would wait out the
+///    deadline and then report `busy`) and performs its own refresh POST. The
+///    two cannot be one call; the drift-guard test in `use_tests.rs` is what
+///    keeps them one decision.
+/// 2. **[`status::detect_unlisted`] under the lock** — a Claude Code lock
+///    artefact in the *incoming* namespace means a live session holds this
+///    file, and the lock does not exclude it; a keychain item under this
+///    namespace's name means the namespace has migrated and a plaintext write
+///    would land where nobody reads it (invariant I5'). `status` refuses
+///    outright in both states and so does this. The *unlisted* spelling is the
+///    one that matters: the swap takes no `dump-keychain`, and an empty
+///    listing would mean "nothing has migrated" rather than "I did not look",
+///    which is what made the migrated arm unreachable here (review F1). It
+///    costs one `find-generic-password` per candidate service name, on this
+///    path only.
+/// 3. **[`file_store::resolve_pending`] first** — a pending file left by an
+///    interrupted write is somebody's newer credential; resolving it before
+///    reading is what makes the read below the newest truth. Its *outcome* is
+///    kept, because a replay is this store healing itself rather than a second
+///    writer: see guard 4.
+/// 4. **[`status::reread`] under the lock, and a compare** — the credential
+///    this refresh was derived from was read in Phase A, *before* the locks,
+///    and the whole lock wait is the window. If what is on disk now is not
+///    what the refresh was derived from, another writer has been here and the
+///    pair in hand is a lost update waiting to happen. `status` spells this
+///    compare as a [`file_store::FileSnapshot`] identity check because its
+///    "before" is a `stat`; here the "before" is a *read*, so the compare is
+///    over [`Digests`] — the same question about the same window, asked of
+///    the contents rather than of the inode.
+///
+///    **Except after a replay.** When guard 3 moved a pending file into place,
+///    the file legitimately differs from what Phase A read and no second
+///    writer exists to blame — so the baseline is the re-read that *follows*
+///    the replay, which is where `status` takes its own. The refreshed pair is
+///    then written over the replayed content, and that is the safe direction:
+///    a pending file is only replayed when its metadata still matches the
+///    credentials file Phase A read (`resolve_pending` discards it as
+///    `FileChanged` otherwise), so both derive from that same file — and of
+///    the two, only the pair this pass just minted holds a refresh token the
+///    server has not rotated away. Refusing here would leave the account
+///    holding the token the POST spent, which is finding N-8 again.
+///
+///    The same holds for the other replay, `Replayed { first_write: true }`,
+///    which `resolve_pending` reaches only when the credentials file is
+///    **absent** and the pending metadata records no `derived_from` — that is,
+///    the pending was parked when nothing was at that name. Phase A read this
+///    namespace's file, so at that moment it existed: a pending parked before
+///    any file existed is therefore provably older than what Phase A read, and
+///    the refreshed pair is at least as new as either. Same outcome, same
+///    reason.
+/// 5. **`SavedToPending` is a refusal** — the rename failed and a live refresh
+///    token is parked under a different name. `resolve_pending` will replay it
+///    and `doctor` knows the name, so nothing is lost; but it is not the write
+///    that was asked for and reporting it as success is how the operator finds
+///    out from the next `login` prompt instead.
+///
+/// Returns the sentence the warning carries, which is why it is a `String`
+/// rather than a typed error: every arm is terminal for this repair and none
+/// of them is actionable by the caller.
+fn guarded_write_back(
+    paths: &Paths,
+    record: &AccountRecord,
+    ns_dir: &Path,
+    refreshed: &Credentials,
+    derived_from: &Digests,
+    reader: &dyn KeychainReader,
+    ctx: &PassCtx,
+) -> Result<(), String> {
+    let activity = status::detect_unlisted(ns_dir, record, reader);
+
+    // Before anything is decided, in `status`'s order: what a pending file
+    // means depends on what else is in the namespace, which is why `activity`
+    // is computed first and passed in.
+    let decision = file_store::resolve_pending(ns_dir, &activity)
+        .map_err(|err| format!("the pending write could not be resolved: {err}"))?;
+
+    match &activity {
+        ForeignActivity::ClaudeLock { name, age_ms } => {
+            return Err(format!(
+                "a Claude Code session holds `{name}` there ({age_ms} ms old), and the namespace \
+                 lock does not exclude it"
+            ));
+        }
+        ForeignActivity::MigratedToKeychain { service } => {
+            return Err(format!("that namespace has migrated into the keychain item `{service}`"));
+        }
+        ForeignActivity::None => {}
+    }
+
+    let Some(current) = status::reread(ns_dir) else {
+        return Err("the credential this refresh was derived from is gone".to_owned());
+    };
+    // A replay is not a second writer, so it is not a change to refuse over:
+    // the baseline moves to the file the replay produced (guard 4).
+    let replayed = matches!(decision, file_store::PendingDecision::Replayed { .. });
+    if !replayed && current.digests() != *derived_from {
+        return Err(
+            "it changed while this swap was preparing, so the refreshed pair was derived from a \
+             credential that is no longer there"
+                .to_owned(),
+        );
+    }
+
     let request = file_store::WriteRequest {
         paths,
-        ns_dir: &ns_dir,
+        ns_dir,
         blob_json: &refreshed.to_blob_json(),
         prior: Some(derived_from),
         new_expires_at_ms: refreshed.expires_at_ms,
         fault: Fault::none(),
     };
-    if let Err(err) = file_store::write_credentials(&request, ctx) {
-        tracing::error!(
-            error = %err,
-            "the refreshed incoming credential could not be saved to its own store"
-        );
+    match file_store::write_credentials(&request, ctx) {
+        Ok(file_store::WriteOutcome::Written { .. }) => Ok(()),
+        Ok(file_store::WriteOutcome::SavedToPending { error }) => Err(format!(
+            "the replacement could not be renamed into place and is parked in `{}` ({error})",
+            file_store::PENDING_FILE
+        )),
+        Err(err) => Err(err.to_string()),
     }
 }
 

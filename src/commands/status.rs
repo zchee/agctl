@@ -919,11 +919,11 @@ fn apply(span: &tracing::Span, outcome: &mut RowOutcome, result: &LockedResult) 
 
 /// What one trip through the namespace lock produced.
 #[derive(Debug)]
-struct LockedResult {
+pub(crate) struct LockedResult {
     /// The credentials to carry on with, or `None` when the row is finished.
-    credentials: Option<Credentials>,
+    pub(crate) credentials: Option<Credentials>,
     /// A state that replaces whatever the row had.
-    state: Option<AccountState>,
+    pub(crate) state: Option<AccountState>,
     note: Option<String>,
     pending_decision: Option<String>,
     lock_age_ms: Option<i64>,
@@ -971,7 +971,7 @@ impl Default for LockedResult {
     reason = "the ordering of these checks is the invariant; a split would let \
               a later edit reorder them without noticing"
 )]
-fn under_namespace_lock(
+pub(crate) fn under_namespace_lock(
     ctx: &PassCtx,
     shared: &Shared,
     record: &AccountRecord,
@@ -1933,10 +1933,53 @@ fn refresh_failure_state(err: &RefreshError) -> AccountState {
 }
 
 /// Looks for another owner of this namespace, under both spellings (AC20).
-fn detect(
+///
+/// `pub(crate)` for one caller outside this module: `use --live`'s write-back
+/// of a refreshed incoming credential writes the same file this module writes
+/// and must apply the same gate (`agctl-r9w`). It is the wrapper rather than
+/// [`foreign_activity::detect`] itself that is shared, because the
+/// `OwnedMeta` it builds — the export spelling, and the canonical one when it
+/// differs — is half of what AC20 asks for, and a second construction of it
+/// is how the two callers would come to disagree about which item is this
+/// namespace's.
+pub(crate) fn detect(
     ns_dir: &Path,
     record: &AccountRecord,
     listing: &[ServiceEntry],
+    reader: &dyn KeychainReader,
+) -> ForeignActivity {
+    detect_with(ns_dir, record, Some(listing), reader)
+}
+
+/// [`detect`] for a caller that took no `dump-keychain` listing at all.
+///
+/// The distinction is between *nothing is listed* and *nothing was listed*.
+/// A pass that took a listing and found no item for this namespace knows the
+/// namespace has not migrated, and plan AC20 asks it to issue no
+/// `find-generic-password` at all. `use --live`'s write-back takes no listing
+/// — the swap never runs `dump-keychain` — so an empty slice from it would
+/// mean "I did not look", and reading it as "nothing is there" is how the
+/// migrated arm of this gate became unreachable for the one caller that
+/// writes a *second* namespace (`agctl-r9w` review F1).
+///
+/// So this mode asks the keychain directly about the one or two names this
+/// namespace could have migrated under. It costs one `find-generic-password`
+/// per candidate name, on the refresh path only, and it is the same decision
+/// [`detect`] makes because it is the same function underneath: only *which
+/// services to consider* differs.
+pub(crate) fn detect_unlisted(
+    ns_dir: &Path,
+    record: &AccountRecord,
+    reader: &dyn KeychainReader,
+) -> ForeignActivity {
+    detect_with(ns_dir, record, None, reader)
+}
+
+/// The body of both, so the `OwnedMeta` both spellings turn on is built once.
+fn detect_with(
+    ns_dir: &Path,
+    record: &AccountRecord,
+    listing: Option<&[ServiceEntry]>,
     reader: &dyn KeychainReader,
 ) -> ForeignActivity {
     let AccountKind::Owned { export_sha8, .. } = &record.kind else {
@@ -1946,6 +1989,28 @@ fn detect(
     let owned = OwnedMeta {
         export_sha8,
         canonical_sha8: canonical.as_deref().filter(|sha| *sha != export_sha8.as_str()),
+    };
+
+    // Named `unlisted` rather than inlined so it outlives the borrow below.
+    // The names come from `foreign_activity::service_name`, which is what
+    // `foreign_activity::detect` itself spells them with — a second `format!`
+    // here would be a listing that silently matched nothing.
+    let unlisted: Vec<ServiceEntry>;
+    let listing = match listing {
+        Some(listing) => listing,
+        None => {
+            unlisted = [Some(owned.export_sha8), owned.canonical_sha8]
+                .into_iter()
+                .flatten()
+                .map(|sha8| ServiceEntry {
+                    service: foreign_activity::service_name(sha8),
+                    account: None,
+                    cdat: None,
+                    mdat: None,
+                })
+                .collect();
+            &unlisted
+        }
     };
     foreign_activity::detect(ns_dir, &owned, listing, reader)
 }
@@ -1957,7 +2022,11 @@ fn canonical_sha8(dir: &Path) -> Option<String> {
 }
 
 /// Re-reads a namespace's credentials, discarding the failure reason.
-fn reread(ns_dir: &Path) -> Option<Credentials> {
+///
+/// `pub(crate)` for the same caller as [`detect`]: the read that happens
+/// **under the lock** is a guard, and the swap needs this one rather than a
+/// second spelling of it.
+pub(crate) fn reread(ns_dir: &Path) -> Option<Credentials> {
     match location::from_file(ns_dir) {
         Resolved::Credentials(credentials) => Some(*credentials),
         _ => None,

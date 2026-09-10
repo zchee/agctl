@@ -70,6 +70,25 @@ pub struct OwnedMeta<'a> {
     pub canonical_sha8: Option<&'a str>,
 }
 
+/// The keychain service name a namespace's credentials migrate into.
+///
+/// The spelling [`detect`] and
+/// [`status::detect_unlisted`](crate::commands::status::detect_unlisted)
+/// share, and it exists because they must agree: the unlisted mode names the
+/// items to ask about and [`detect`] decides which listed entries are this
+/// namespace's, so two `format!`s of one shape would be a listing that
+/// silently matched nothing.
+///
+/// It is **not** the crate's only spelling of this string —
+/// `keychain_write.rs` and `namespace.rs` still build it inline, and the name
+/// collides with the unrelated `namespace::service_name(&EnvView)`, which
+/// answers for the *live* item rather than for a namespace. Unifying the
+/// remainder belongs to `agctl-8do` (unify the securestorage refusal
+/// predicate / service-name spelling), not here.
+pub fn service_name(sha8: &str) -> String {
+    format!("{}-{sha8}", namespace::LIVE_SERVICE)
+}
+
 /// Looks for signs that something other than agctl owns this namespace.
 ///
 /// The keychain is only consulted when `listing` — the `dump-keychain`
@@ -103,7 +122,7 @@ pub fn detect(
     }
 
     for sha8 in [Some(owned.export_sha8), owned.canonical_sha8].into_iter().flatten() {
-        let service = format!("{}-{sha8}", namespace::LIVE_SERVICE);
+        let service = service_name(sha8);
         if !listing.iter().any(|entry| entry.service == service) {
             continue;
         }

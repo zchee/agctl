@@ -1448,11 +1448,16 @@ fn ac67_refusal_d_on_the_refreshed_blob_is_decided_before_any_child_exists() {
 
     assert_eq!(token.calls(), 1, "the POST happened; it is its answer that does not fit");
     assert_eq!(writes(&fixture).len(), 0, "and still no child: {:?}", writes(&fixture));
-    // Phase A's read of the store's item, and the probe that asks whether the
+    // Phase A's read of the store's item; the probe that asks whether the
     // **incoming** store has migrated — which is only asked of a credential
     // that has expired, because that is the one case where refreshing it
-    // would rotate a token this swap could not save (finding N-8).
-    assert_security(&fixture, &[("find-generic-password", 2)]);
+    // would rotate a token this swap could not save (finding N-8); and the
+    // write-back's own gate asking the same question again **under the lock,
+    // after the POST**, once per name this namespace could have migrated
+    // under (`agctl-r9w` review F1: the export spelling and, when it differs,
+    // the canonical one — two here because a temporary directory's canonical
+    // path is not the one the record was created with).
+    assert_security(&fixture, &[("find-generic-password", 4)]);
     artefacts_released(&fixture);
     no_plaintext_store(&fixture, "after refusal D");
     assert!(
@@ -2604,10 +2609,12 @@ fn an_applied_swap_saves_the_refreshed_credential_back_to_the_incoming_store() {
     no_plaintext_store(&fixture, "after the swap");
     live_item_never_written(&fixture);
     // Phase A's read, the probe asking whether the incoming store has
-    // migrated, the re-read under the hold, and the verifying read.
+    // migrated, the write-back gate's two (one per candidate service name,
+    // asked again under the lock after the POST — `agctl-r9w` review F1), the
+    // re-read under the hold, and the verifying read.
     assert_security(
         &fixture,
-        &[("find-generic-password", 4), ("-i", 1), ("add-generic-password", 1)],
+        &[("find-generic-password", 6), ("-i", 1), ("add-generic-password", 1)],
     );
     audit_carries_no_token(&fixture);
 }
@@ -2666,9 +2673,10 @@ fn a_swap_discarded_after_the_refresh_still_leaves_the_refreshed_pair_saved() {
         "and its result is saved even though the swap wrote nothing: {saved}"
     );
     assert_eq!(writes(&fixture).len(), 0, "zero `-i` lines: {:?}", writes(&fixture));
-    // Phase A's read, the migration probe, and the re-read under the hold
-    // that found the change.
-    assert_security(&fixture, &[("find-generic-password", 3)]);
+    // Phase A's read, the migration probe, the write-back gate's two (one per
+    // candidate service name, under the lock after the POST — `agctl-r9w`
+    // review F1), and the re-read under the hold that found the change.
+    assert_security(&fixture, &[("find-generic-password", 5)]);
     artefacts_released(&fixture);
     no_plaintext_store(&fixture, "after a discarded swap");
     live_item_never_written(&fixture);
@@ -3591,4 +3599,209 @@ fn an_undo_whose_write_outcome_is_unknown_leaves_the_restored_credential_in_the_
         &[("find-generic-password", 6), ("-i", 1), ("add-generic-password", 1)],
     );
     let _ = token;
+}
+
+// ---------------------------------------------------------------------------
+// The write-back's guards (`agctl-r9w`, review4 N-15)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_write_back_racing_another_writer_keeps_the_other_writers_credential() {
+    // N-15 (a), reproduced at the only moment it can happen: the incoming
+    // credential is read in Phase A, *before* the locks, and the refresh POST
+    // is the widest part of the window between that read and the write-back.
+    // The mock holds the response open; a scoped thread waits for the request
+    // to actually arrive — so the write below is provably after Phase A's
+    // read — and writes a different credential into T's own store, which is
+    // what a second agctl pass refreshing that account looks like from here.
+    //
+    // Pre-fix the write-back overwrote it: `WriteRequest::prior` is recorded
+    // in the pending metadata and is not a compare-and-swap, so the other
+    // writer's refresh token died and that account needed an interactive
+    // `login`.
+    let server = MockServer::start();
+    let token = server.mock(|when, then| {
+        when.method(POST).path(common::TOKEN_PATH);
+        then.status(200).delay(Duration::from_millis(1_500)).json_body(json!({
+            "access_token": "sk-ant-oat01-rotated",
+            "refresh_token": "sk-ant-ort01-rotated",
+            "token_type": "Bearer",
+            "expires_in": 28_800,
+            "refresh_token_expires_in": 2_377_445,
+            "scope": "user:inference user:profile",
+        }));
+    });
+    let (fixture, _service) = two_accounts(&server, common::expired_at());
+    let store = incoming_store(&fixture);
+    let raced = common::identified_blob(
+        "sk-ant-oat01-raced",
+        "sk-ant-ort01-raced",
+        common::fresh_at(),
+        ACCT_T,
+        Some(ORG_T),
+    );
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            assert!(
+                common::wait_until(Duration::from_secs(20), || token.calls() > 0),
+                "the refresh POST should reach the mock"
+            );
+            fs::write(&store, &raced).expect("the racing write lands");
+        });
+
+        let (code, stdout, stderr) = swap(&fixture, &[]);
+        assert_eq!(code, 0, "the swap itself still applies: {stdout}{stderr}");
+        assert_eq!(token.calls(), 1, "exactly one refresh POST");
+        assert!(
+            stderr.contains("was not saved back to its own store"),
+            "the operator is told, rather than the write being reported as success:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("changed while this swap was preparing"),
+            "and told which guard refused:\n{stderr}"
+        );
+    });
+
+    assert_eq!(
+        fs::read_to_string(&store).expect("T's store is readable"),
+        raced,
+        "the other writer's credential is still there, byte for byte: no lost update"
+    );
+    assert!(
+        !store.with_extension("json.pending").exists(),
+        "and nothing was parked beside it either"
+    );
+    assert_eq!(writes(&fixture).len(), 1, "the item write the operator asked for still happened");
+    live_item_never_written(&fixture);
+    audit_carries_no_token(&fixture);
+    // The other shape of the count: no artefact, so the gate does reach the
+    // keychain — Phase A's read, the migration probe, the gate's one read per
+    // candidate service name under the lock, the re-read under the hold and
+    // the verifying read (`agctl-r9w` review F1).
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 6), ("-i", 1), ("add-generic-password", 1)],
+    );
+}
+
+#[test]
+fn a_write_back_into_a_namespace_a_claude_session_holds_is_refused() {
+    // N-15 (b): the namespace lock excludes another agctl pass and excludes
+    // nothing else. A live Claude Code session in the **incoming** namespace
+    // holds this same file under its own protocol, and its lock artefact is
+    // the only sign of it. `status` refuses to write such a namespace; this
+    // write site now refuses it too.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (fixture, _service) = two_accounts(&server, common::expired_at());
+    let store = incoming_store(&fixture);
+    let before = fs::read_to_string(&store).expect("T's store is readable");
+    fs::create_dir(fixture.ns_dir(ACCT_T, ORG_T).join(".oauth_refresh.lock"))
+        .expect("the artefact is plantable");
+
+    let (code, stdout, stderr) = swap(&fixture, &[]);
+
+    assert_eq!(code, 0, "the swap itself still applies: {stdout}{stderr}");
+    assert_eq!(token.calls(), 1, "the refresh still happened — this is about where it is saved");
+    assert!(
+        stderr.contains("a Claude Code session holds `.oauth_refresh.lock` there"),
+        "the refusal names the artefact it found:\n{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&store).expect("T's store is readable"),
+        before,
+        "the session's file is untouched"
+    );
+    assert_eq!(writes(&fixture).len(), 1, "one write reached the item");
+    live_item_never_written(&fixture);
+    // The gate's artefact scan is pure filesystem and comes **first**, so a
+    // namespace a session holds is refused without asking the keychain
+    // anything: Phase A's read, the migration probe, the re-read under the
+    // hold, and the verifying read — the count a swap had before `agctl-r9w`.
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 4), ("-i", 1), ("add-generic-password", 1)],
+    );
+}
+
+#[test]
+fn a_refused_write_back_is_carried_in_the_json_warnings() {
+    // The `--json` half of the same refusal (review F5). The sentence goes to
+    // stderr for a person and into `warnings` for a consumer, which is the
+    // channel refusal B's degraded warning already uses — a machine reading
+    // `--json` must not lose a fact the terminal shows.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (fixture, _service) = two_accounts(&server, common::expired_at());
+    fs::create_dir(fixture.ns_dir(ACCT_T, ORG_T).join(".oauth_refresh.lock"))
+        .expect("the artefact is plantable");
+
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert_eq!(token.calls(), 1);
+    let doc = outcome_doc(&stdout);
+    let warnings = doc["warnings"].as_array().expect("the outcome carries `warnings`");
+    assert!(
+        warnings.iter().any(|warning| {
+            let text = warning.as_str().unwrap_or_default();
+            text.contains("was not saved back to its own store")
+                && text.contains("a Claude Code session holds `.oauth_refresh.lock` there")
+        }),
+        "the refusal is in the document a consumer reads: {doc}"
+    );
+    assert!(!stdout.contains("sk-ant-"), "and the document carries no token material: {stdout}");
+    // The same sentence on stderr, and nothing beyond it: `--json`'s contract
+    // is that the document is the whole of stdout, and the note is a line for
+    // a person rather than a second document.
+    assert!(stderr.contains("was not saved back to its own store"), "{stderr}");
+    assert!(!stderr.contains("sk-ant-"), "{stderr}");
+}
+
+#[test]
+fn a_swap_that_writes_the_refresh_back_touches_nothing_outside_the_namespace_root() {
+    // AC81's containment claim over the write-back's own output, which
+    // `ac81_a_swap_touches_nothing_outside_the_namespace_root` cannot make:
+    // that test's incoming credential is **fresh**, so no refresh and no
+    // write-back happen inside it (review4 N-15's second sub-note). This one
+    // is the same walk with an expired incoming credential, so the write-back
+    // runs and every path it creates is inside the bound.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (fixture, _service) = two_accounts(&server, common::expired_at());
+    let live_store = fixture.live_store_dir();
+    fs::create_dir_all(&live_store).expect("the live store dir is creatable");
+    let before: std::collections::BTreeSet<_> = tree(&fixture).into_keys().collect();
+
+    let (code, stdout, stderr) = swap(&fixture, &[]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert_eq!(token.calls(), 1, "the refresh happened, so the write-back ran");
+    assert!(
+        fs::read_to_string(incoming_store(&fixture))
+            .expect("readable")
+            .contains("sk-ant-ort01-rotated"),
+        "the premise: the write-back wrote"
+    );
+
+    let after: std::collections::BTreeSet<_> = tree(&fixture).into_keys().collect();
+    let root = fixture.config_dir().join("claude");
+    let allowed =
+        [fixture.config_dir().join("cache"), fixture.config_dir().join("cache").join("claude")];
+    for path in after.symmetric_difference(&before) {
+        if allowed.contains(path) {
+            assert!(path.is_dir(), "`{}` is agctl's own cache directory", path.display());
+            continue;
+        }
+        assert!(
+            path.starts_with(&root),
+            "`{}` is outside the namespace root `{}`",
+            path.display(),
+            root.display()
+        );
+    }
+    for name in [".oauth_refresh.lock", ".storage-write", ".credentials.json"] {
+        assert!(!live_store.join(name).exists(), "the live store must be untouched: {name}");
+    }
+    live_item_never_written(&fixture);
 }
