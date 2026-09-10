@@ -197,6 +197,23 @@ pub fn export_spelling(dir: &Path) -> String {
     if trimmed.is_empty() { text } else { trimmed.to_owned() }
 }
 
+/// The namespace `CLAUDE_SECURESTORAGE_CONFIG_DIR` points this shell at, if
+/// any.
+///
+/// Fact F14's gate, in one place: the variable is *truthy*, not merely present,
+/// so an empty value is `None` — it names the live item exactly as an unset
+/// variable would. Every caller that has to answer "is this shell pointed at a
+/// namespace?" asks this rather than spelling `is_empty()` again, because the
+/// two halves of a swap disagreeing about that question is how a namespace ends
+/// up locked while the live item is written (risk R42).
+///
+/// Returning the value rather than a `bool`: both refusals name it, and a
+/// refusal that says only "the variable is set" leaves the user hunting for
+/// which shell set it.
+pub(crate) fn securestorage_namespace(env: &EnvView) -> Option<&str> {
+    env.securestorage_dir.as_deref().filter(|value| !value.is_empty())
+}
+
 /// The directory whose store Claude Code reads right now (fact F30, `A_()`).
 ///
 /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` wins when it holds a non-empty value —

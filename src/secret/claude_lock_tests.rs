@@ -2189,9 +2189,15 @@ fn a_symlinked_live_store_is_locked_where_it_resolves_to() {
     assert_eq!(hold.store_dir(), fixture.resolved, "the hold is about the resolved store");
 
     // The load-bearing assertion: the legacy artefact is the entry the peer
-    // names, and *not* the one beside the link.
-    let peers_spelling =
-        PathBuf::from(format!("{}{LEGACY_LOCK_SUFFIX}", fixture.resolved.display()));
+    // names, and *not* the one beside the link. The expected spelling comes
+    // from `fs::canonicalize` rather than from `namespace::canonical`, which is
+    // what production itself resolves with and what `Fixture::resolved` holds:
+    // an NFC or `realpath` divergence inside that helper would cancel out on
+    // both sides of the comparison and this test would pass through it.
+    let peers_spelling = PathBuf::from(format!(
+        "{}{LEGACY_LOCK_SUFFIX}",
+        fs::canonicalize(&fixture.store).expect("the live store resolves").display()
+    ));
     assert_eq!(fixture.legacy, peers_spelling);
     assert!(peers_spelling.is_dir(), "`{}` is agentctl's", peers_spelling.display());
     let beside_the_link = PathBuf::from(format!("{}{LEGACY_LOCK_SUFFIX}", fixture.store.display()));
@@ -2321,6 +2327,124 @@ fn a_symlinked_agentctl_store_is_still_refused() {
         0,
         "and nothing was created in what it pointed at"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Refusal E on the lock side
+// (`agentctl-p2-live-tree-securestorage-dir-refusal-r4v`)
+// ---------------------------------------------------------------------------
+
+/// A temporary root, agentctl's own store under it, and an `EnvView` whose
+/// `CLAUDE_SECURESTORAGE_CONFIG_DIR` is whatever the case is about.
+fn securestorage_fixture(value: Option<&str>) -> (tempfile::TempDir, Paths, EnvView) {
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let paths = Paths::with_config_dir(root.path().join("config"));
+    paths.ensure_dirs().expect("the agentctl store should be creatable");
+    let mut env = EnvView::with_home(root.path().to_path_buf());
+    env.securestorage_dir = value.map(str::to_owned);
+    (root, paths, env)
+}
+
+#[test]
+fn a_set_securestorage_dir_refuses_the_live_tree_before_anything_is_created() {
+    // `WriteTarget::live` refuses this environment, and until now the lock side
+    // accepted it: the store `live_store_dir` returns with the variable set is
+    // the *namespace* it points at, so a swap could have locked the namespace
+    // while the write half refused — or, worse, locked it under the name
+    // "live". The two halves must agree about what "live" means (risk R42).
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let paths = Paths::with_config_dir(root.path().join("config"));
+    paths.ensure_dirs().expect("the agentctl store should be creatable");
+    let namespace_dir = root.path().join("pointed-at");
+    fs::create_dir(&namespace_dir).expect("creatable");
+    let mut env = EnvView::with_home(root.path().to_path_buf());
+    env.securestorage_dir = Some(namespace_dir.to_string_lossy().into_owned());
+
+    // The store the environment now names is the namespace itself, so this is
+    // the subject a caller would build — the refusal is not about the caller
+    // having named the wrong directory.
+    let store = namespace::live_store_dir(&env);
+    assert_eq!(store, namespace_dir, "the environment names the namespace");
+
+    let refused =
+        LockAnchor::open(LockSubject { store_dir: &store, tree: Tree::Live }, &paths, &env)
+            .expect_err("a shell pointed at a namespace has no live store to lock");
+    let LockError::Unreachable { path, message } = &refused else {
+        panic!("expected `Unreachable`, got {refused:?}")
+    };
+    assert_eq!(path, &store);
+    assert!(message.contains(namespace::SECURESTORAGE_ENV), "it names the variable: {message}");
+    assert!(
+        message.contains(&namespace_dir.to_string_lossy().into_owned()),
+        "and the value, so the user can find the shell that set it: {message}"
+    );
+
+    // Before anything is created: the namespace is exactly as it was found.
+    assert_eq!(
+        fs::read_dir(&namespace_dir).expect("readable").count(),
+        0,
+        "no lock artefact was created inside it"
+    );
+    assert!(
+        !PathBuf::from(format!("{}{LEGACY_LOCK_SUFFIX}", namespace_dir.display())).exists(),
+        "and none beside it"
+    );
+}
+
+#[test]
+fn an_empty_securestorage_dir_is_not_refused() {
+    // Fact F14's gate is truthiness, not presence. An empty value is falsy to
+    // Claude Code, so it names the live store exactly as an unset variable
+    // would — refusing it would lock the user out of their own live store on a
+    // shell that merely exported the variable empty.
+    let (root, paths, env) = securestorage_fixture(Some(""));
+    let store = namespace::live_store_dir(&env);
+    assert_eq!(store, root.path().join(".claude"), "an empty value falls back to `~/.claude`");
+    fs::create_dir(&store).expect("creatable");
+
+    LockAnchor::open(LockSubject { store_dir: &store, tree: Tree::Live }, &paths, &env)
+        .expect("an empty value names the live store");
+}
+
+#[test]
+fn a_set_securestorage_dir_leaves_the_agentctl_tree_alone() {
+    // The refusal is about what "live" means, and agentctl's own tree does not
+    // depend on the variable at all: a `--claude-config-dir` session in a shell
+    // pointed at a namespace still has its own locks to take.
+    let (_root, paths, env) = securestorage_fixture(Some("/somewhere/else"));
+    let store = paths.namespace_dir("acct", "org");
+    fs::create_dir_all(&store).expect("creatable");
+
+    LockAnchor::open(LockSubject { store_dir: &store, tree: Tree::Agentctl }, &paths, &env)
+        .expect("agentctl's own tree is not the live one and never was");
+}
+
+#[test]
+fn the_lock_and_write_halves_refuse_exactly_the_same_environments() {
+    // The drift guard for risk R42. `namespace::securestorage_namespace` is the
+    // one definition of fact F14's gate; this pins the write half's answer to
+    // it across all three shapes the variable can have, so a future edit to
+    // either side that changes the gate fails here rather than in production.
+    // Only the *derivation* is exercised — no keychain item is named, opened or
+    // written.
+    let home = PathBuf::from("/does/not/need/to/exist");
+    for (value, pointed_at_a_namespace) in
+        [(None, false), (Some(""), false), (Some("/a/namespace"), true)]
+    {
+        let mut env = EnvView::with_home(home.clone());
+        env.securestorage_dir = value.map(str::to_owned);
+
+        assert_eq!(
+            namespace::securestorage_namespace(&env).is_some(),
+            pointed_at_a_namespace,
+            "the gate, for {value:?}"
+        );
+        assert_eq!(
+            crate::secret::keychain_write::WriteTarget::live(&env).is_err(),
+            pointed_at_a_namespace,
+            "and the write half agrees, for {value:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

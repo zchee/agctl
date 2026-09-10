@@ -287,6 +287,12 @@ pub enum LockError {
     #[error("`{}` cannot be locked: {message}", .path.display())]
     Unreachable {
         /// The directory the walk was heading for.
+        ///
+        /// The caller's own spelling when the refusal came *before* the walk —
+        /// this environment names no live store, or the one it names cannot be
+        /// resolved — and the path the walk was actually heading for once it
+        /// started, which for [`Tree::Live`] is the resolved store. The two
+        /// differ only when the store is reached through a symbolic link.
         path: PathBuf,
         /// What the walk refused, in its own words.
         message: String,
@@ -574,8 +580,12 @@ impl LockAnchor {
     /// [`LockError::WrongTree`] when the store directory is neither under
     /// [`Paths::namespace_root`] (for [`Tree::Agentctl`]) nor the live store
     /// itself (for [`Tree::Live`]), and [`LockError::Unreachable`] when the
-    /// walk refuses a component, cannot find one, or — for [`Tree::Live`] —
-    /// when the store this environment names cannot be resolved at all.
+    /// walk refuses a component or cannot find one. For [`Tree::Live`] that
+    /// same variant also carries the two refusals that come *before* the walk:
+    /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` holding a non-empty value, which means
+    /// this environment names a namespace rather than the live store (refusal
+    /// E, the one [`crate::secret::keychain_write::WriteTarget::live`] makes on
+    /// the write side), and a live store that cannot be resolved at all.
     pub fn open(subject: LockSubject<'_>, paths: &Paths, env: &EnvView) -> Result<Self, LockError> {
         let store_dir = subject.store_dir;
         let wrong_tree =
@@ -597,6 +607,28 @@ impl LockAnchor {
                 (paths.namespace_root(), store_dir.to_path_buf())
             }
             Tree::Live => {
+                // Refusal E, on the lock side. `CLAUDE_SECURESTORAGE_CONFIG_DIR`
+                // holding a non-empty value means this shell has been pointed at
+                // a *namespace*, so there is no live store for it to name and
+                // `Tree::Live` is not a claim that can be true here.
+                // `WriteTarget::live` already refuses the same environment
+                // (`secret/keychain_write.rs`), and the two halves of a swap
+                // disagreeing about what "live" means is exactly risk R42 — one
+                // would lock the namespace while the other wrote the live item.
+                // Both ask `namespace::securestorage_namespace`, so the
+                // truthiness gate (fact F14: an *empty* value is falsy and is
+                // not refused) is defined once.
+                if let Some(value) = namespace::securestorage_namespace(env) {
+                    return Err(LockError::Unreachable {
+                        path: store_dir.to_path_buf(),
+                        message: format!(
+                            "`{}` is set to `{value}` in this shell, so this environment names a \
+                             namespace rather than the live store; run without it, or lock the \
+                             namespace instead",
+                            namespace::SECURESTORAGE_ENV
+                        ),
+                    });
+                }
                 // The live store is *the* store this environment names — and on
                 // a normal machine it names it through a symbolic link:
                 // `~/.claude` pointing somewhere else is the configuration this
