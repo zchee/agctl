@@ -43,7 +43,7 @@ url = "2"
 assert_cmd = "2.2.2"
 httpmock = "0.8"
 insta = "1"
-jsonschema = "0.55"
+jsonschema = "0.56"
 predicates = "3.1.4"
 tempfile = "3.27.0"
 
