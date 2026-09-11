@@ -281,6 +281,29 @@ impl Fixture {
         ]
     }
 
+    /// Plants the live `.claude.json` — the file whose `oauthAccount` records
+    /// which account the live session last logged in as (facts F30, F33) — in
+    /// the shape the reference machine has it: `$HOME/.claude.json` is a
+    /// **symbolic link** into the resolved live store (fact F41). Returns the
+    /// link.
+    ///
+    /// Call after [`Fixture::live_through_link`], whose target directory the
+    /// file is written into. Never a real path: both ends are under the
+    /// fixture's own `$HOME`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the file or the link cannot be created.
+    pub fn live_claude_json(&self, document: &Value) -> PathBuf {
+        let target = self.home().join(".claude-real").join(".claude.json");
+        fs::write(&target, document.to_string())
+            .expect("the live `.claude.json` should be writable");
+        let link = self.home().join(".claude.json");
+        std::os::unix::fs::symlink(&target, &link)
+            .expect("the `.claude.json` link should be plantable");
+        link
+    }
+
     /// Sets one environment variable for every command this fixture builds.
     pub fn set(&mut self, key: &str, value: &str) -> &mut Self {
         self.env.retain(|(existing, _)| existing != key);
@@ -1117,7 +1140,7 @@ pub fn finish(child: Child) -> Output {
 /// write lines in it is a failure, not a pass, because "the write path did
 /// nothing" is exactly the way this criterion could otherwise be satisfied
 /// (critic M8).
-pub const KEYCHAIN_WRITE_TESTS: [&str; 36] = [
+pub const KEYCHAIN_WRITE_TESTS: [&str; 43] = [
     "ac59_the_write_transport_reads_one_line_from_stdin_and_redacts_the_hex",
     "ac60_a_service_no_test_registered_is_refused_and_stores_nothing",
     "ac61_what_the_write_path_stores_is_what_the_binary_reads",
@@ -1177,6 +1200,19 @@ pub const KEYCHAIN_WRITE_TESTS: [&str; 36] = [
     "a_live_undo_refreshes_an_expired_credential_and_persists_it",
     "a_live_undo_whose_refreshed_credential_cannot_be_saved_warns_on_stderr_and_in_json",
     "a_live_swap_between_two_orgs_of_one_account_files_the_displaced_credential_in_its_own_org",
+    // S23b (decision D-027). The first swaps and reverses, writing twice; the
+    // second swaps, reverses and swaps again, writing three times. Each pins
+    // its own number against its own log.
+    "a_live_swap_takes_ps_identity_from_claude_json_and_its_undo_takes_ts_from_the_audit_entry",
+    "a_second_live_swap_is_refused_until_the_first_is_undone_and_then_proceeds",
+    // The guard's table completes a swap in its two arms that do not block; the
+    // undo-of-undo and foreign-login refusals each start from applied swaps.
+    "the_outstanding_guard_keys_on_the_newest_live_entry_and_reads_an_unknown_one_against_the_item",
+    "a_live_undo_of_an_undo_is_refused_before_any_owned_namespace_is_read",
+    "a_live_undo_refuses_when_the_session_has_logged_in_as_another_account_since",
+    "the_guard_and_the_undo_read_the_whole_log_not_a_tail",
+    // Its "never landed" arm completes the reversal.
+    "a_live_undo_after_an_unknown_undo_asks_the_item_whether_that_undo_landed",
     // The namespace-target control for ruling G2's scope: it proves W4a's
     // behaviour over a refused audit log is unchanged, which means it completes
     // a swap and writes the namespaced item once.

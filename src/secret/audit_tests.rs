@@ -25,7 +25,63 @@ fn write_event(to: &str, from: Option<&str>) -> AuditEvent {
         from_digest8: from.map(str::to_owned),
         to_digest8: to.to_owned(),
         outcome: WriteOutcome::Applied,
+        direction: WriteDirection::Forward,
+        incoming_identity: None,
     }
+}
+
+#[test]
+fn a_write_line_from_before_decision_d027_reads_as_a_forward_swap_that_names_no_account() {
+    // Both D-027 fields are additive. A line written before they existed still
+    // parses, and reads the way the live-swap guard can afford to read it: a
+    // forward swap, which arms rather than disarms.
+    let line = r#"{"ts":"2026-09-10T00:00:00Z","monotonic_ms":0,"agctl_pid":1,"event":"write","target":"live","from_digest8":"deadbeef","to_digest8":"cafebabe","outcome":"applied"}"#;
+    let entry: AuditEntry = serde_json::from_str(line).expect("an older line still parses");
+    let AuditEvent::Write { direction, incoming_identity, .. } = entry.event else {
+        panic!("a write entry")
+    };
+    assert_eq!(direction, WriteDirection::Forward);
+    assert_eq!(incoming_identity, None);
+}
+
+#[test]
+fn a_live_forward_write_records_the_account_it_installed_by_id_alone() {
+    // Decision D-027: ids only, never a token or an email, and a member only on
+    // the entry that has one — an undo's line carries none.
+    let forward = AuditEntry::new(AuditEvent::Write {
+        target: Target::Live,
+        from_digest8: Some("deadbeef".to_owned()),
+        to_digest8: "cafebabe".to_owned(),
+        outcome: WriteOutcome::Applied,
+        direction: WriteDirection::Forward,
+        incoming_identity: Some(IncomingIdentity {
+            account_uuid: "acct-t".to_owned(),
+            organization_uuid: None,
+        }),
+    });
+    let line = serde_json::to_string(&forward).expect("the entry serialises");
+    let value: serde_json::Value = serde_json::from_str(&line).expect("the line parses");
+    assert_eq!(value["direction"], "forward", "{line}");
+    assert_eq!(
+        value["incoming_identity"],
+        serde_json::json!({ "account_uuid": "acct-t", "organization_uuid": null }),
+        "ids only: {line}"
+    );
+    let back: AuditEntry = serde_json::from_str(&line).expect("the line round-trips");
+    assert_eq!(back, forward);
+
+    let undo = AuditEntry::new(AuditEvent::Write {
+        target: Target::Live,
+        from_digest8: Some("cafebabe".to_owned()),
+        to_digest8: "deadbeef".to_owned(),
+        outcome: WriteOutcome::Applied,
+        direction: WriteDirection::Undo,
+        incoming_identity: None,
+    });
+    let line = serde_json::to_string(&undo).expect("the entry serialises");
+    let value: serde_json::Value = serde_json::from_str(&line).expect("the line parses");
+    assert_eq!(value["direction"], "undo", "{line}");
+    assert!(value.get("incoming_identity").is_none(), "no member for an absent account: {line}");
 }
 
 fn sample(mtime_ns: i64, age_ms: u64) -> LockSample {
@@ -326,7 +382,8 @@ fn a_write_serialises_with_the_documented_field_names() {
             "target",
             "from_digest8",
             "to_digest8",
-            "outcome"
+            "outcome",
+            "direction"
         ]
     );
     assert_eq!(value["event"], "write");

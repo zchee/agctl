@@ -153,6 +153,22 @@ pub enum AuditEvent {
         to_digest8: String,
         /// How it ended.
         outcome: WriteOutcome,
+        /// Which way round the swap ran (decision D-027).
+        ///
+        /// Additive: an entry written before the field existed reads as
+        /// [`WriteDirection::Forward`], which is the conservative reading for
+        /// the live-swap guard that consults it — it arms rather than disarms.
+        #[serde(default)]
+        direction: WriteDirection,
+        /// The account a **live forward** swap installed in the item, by id
+        /// alone — never a token and never an email (decision D-027).
+        ///
+        /// `use --undo` reads it as whose credential the item holds, which
+        /// Claude Code rewrites without a `tokenAccount` on its next refresh.
+        /// Compared against registry records only, never used to build a path.
+        /// Absent on every other entry, and from their lines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incoming_identity: Option<IncomingIdentity>,
     },
     /// One lock break, or one break the rule abandoned.
     ///
@@ -225,6 +241,30 @@ pub enum WriteOutcome {
     /// which the server has usually just rotated away, so the next pass may
     /// report `needs login` for reasons this pass created.
     Discarded,
+}
+
+/// Which way round a swap ran (decision D-027).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteDirection {
+    /// `use --live <id>` — and any write that is not a reversal, such as a
+    /// refresh saved in place.
+    #[default]
+    Forward,
+    /// `use --undo`.
+    Undo,
+}
+
+/// The account a live forward swap installed in the item, by id alone
+/// (decision D-027).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncomingIdentity {
+    /// The account UUID.
+    pub account_uuid: String,
+    /// The organization UUID, when the registry knows one; `None` for a record
+    /// still carrying the unknown-organization placeholder.
+    #[serde(default)]
+    pub organization_uuid: Option<String>,
 }
 
 /// Which tree a lock artefact belongs to (invariant I11′ containment).

@@ -72,8 +72,10 @@ fn accepts_new_only_as_an_inert_synonym() {
 
 use crate::secret::audit::AuditEntry;
 use crate::secret::audit::AuditEvent;
+use crate::secret::audit::IncomingIdentity;
 use crate::secret::audit::Tail;
 use crate::secret::audit::Target;
+use crate::secret::audit::WriteDirection;
 use crate::secret::audit::WriteOutcome;
 
 fn write(sha8: &str, from: Option<&str>, outcome: WriteOutcome) -> AuditEntry {
@@ -82,7 +84,17 @@ fn write(sha8: &str, from: Option<&str>, outcome: WriteOutcome) -> AuditEntry {
         from_digest8: from.map(str::to_owned),
         to_digest8: "cafebabe".to_owned(),
         outcome,
+        direction: WriteDirection::Forward,
+        incoming_identity: None,
     })
+}
+
+/// The account every hand-built live forward entry installed.
+fn installed_t() -> IncomingIdentity {
+    IncomingIdentity {
+        account_uuid: "acct-t".to_owned(),
+        organization_uuid: Some("org-t".to_owned()),
+    }
 }
 
 #[test]
@@ -188,12 +200,21 @@ fn live_write(from: &str) -> AuditEntry {
         from_digest8: Some(from.to_owned()),
         to_digest8: "cafebabe".to_owned(),
         outcome: WriteOutcome::Applied,
+        direction: WriteDirection::Forward,
+        incoming_identity: Some(installed_t()),
     })
 }
 
 /// The [`Undoable::Live`] [`live_write`] produces.
 fn live_undoable(from: &str) -> Undoable {
-    Undoable::Live { from_digest8: Some(from.to_owned()), to_digest8: "cafebabe".to_owned() }
+    Undoable::Live {
+        from_digest8: Some(from.to_owned()),
+        to_digest8: "cafebabe".to_owned(),
+        outcome: WriteOutcome::Applied,
+        direction: WriteDirection::Forward,
+        incoming_identity: Some(installed_t()),
+        later_unknown_undo: None,
+    }
 }
 
 #[test]
@@ -216,6 +237,8 @@ fn undo_reaches_past_a_live_entry_that_was_not_itself_reversible() {
         from_digest8: Some("ffffffff".to_owned()),
         to_digest8: "cafebabe".to_owned(),
         outcome: WriteOutcome::Discarded,
+        direction: WriteDirection::Forward,
+        incoming_identity: Some(installed_t()),
     });
     let tail = Tail {
         entries: vec![write("77777777", Some("11112222"), WriteOutcome::Applied), discarded],
@@ -1131,7 +1154,15 @@ fn recorded(blob: &str) -> String {
 
 /// [`live_reversal`] for a row that must resolve.
 fn resolves(paths: &Paths, config: &AgctlConfig, from: &str) -> Reversal {
-    match live_reversal(paths, config, Some(from), "cafebabe") {
+    match live_reversal(
+        paths,
+        config,
+        Some(from),
+        "cafebabe",
+        WriteOutcome::Applied,
+        Some(&installed_t()),
+        None,
+    ) {
         Ok(reversal) => reversal,
         Err(err) => panic!("the live reversal should resolve: {err}"),
     }
@@ -1139,7 +1170,15 @@ fn resolves(paths: &Paths, config: &AgctlConfig, from: &str) -> Reversal {
 
 /// [`live_reversal`] for a row that must refuse, and what it said.
 fn refuses(paths: &Paths, config: &AgctlConfig, from: Option<&str>) -> String {
-    match live_reversal(paths, config, from, "cafebabe") {
+    match live_reversal(
+        paths,
+        config,
+        from,
+        "cafebabe",
+        WriteOutcome::Applied,
+        Some(&installed_t()),
+        None,
+    ) {
         Ok(found) => {
             panic!("expected a refusal, got a reversal owned by `{}`", found.owner.account_uuid)
         }
@@ -1210,7 +1249,7 @@ fn a_live_third_party_is_the_one_owned_record_of_the_credentials_account_and_org
             .expect("the fixture parses");
 
     // `use --live acct-a/org-1` with org2's credential in the live item.
-    match third_namespace(&config, None, &org1, &displaced, Which::Live) {
+    match third_namespace(&config, None, &org1, displaced.identity().as_ref(), Which::Live) {
         Ok(Some(third)) => assert_eq!(third.organization_uuid, "org-2", "the credential's own org"),
         Ok(None) => panic!("org2's own record is a third party, not the no-record case"),
         Err(_) => panic!("one exact match is not two candidates"),
@@ -1231,7 +1270,7 @@ fn a_live_third_party_is_the_one_owned_record_of_the_credentials_account_and_org
     .to_string();
     let orgless = Credentials::parse_blob(orgless.as_bytes()).expect("the fixture parses");
     let elsewhere = keyed("acct-b", "org-b");
-    match third_namespace(&config, None, &elsewhere, &orgless, Which::Live) {
+    match third_namespace(&config, None, &elsewhere, orgless.identity().as_ref(), Which::Live) {
         Err(pair) => assert_eq!(
             (pair[0].organization_uuid.as_str(), pair[1].organization_uuid.as_str()),
             ("org-1", "org-2"),
@@ -1253,9 +1292,516 @@ fn a_live_third_party_is_the_one_owned_record_of_the_credentials_account_and_org
     };
     let config = AgctlConfig { accounts: vec![org1.clone(), read_only], ..AgctlConfig::default() };
     assert!(
-        matches!(third_namespace(&config, None, &org1, &displaced, Which::Live), Ok(None)),
+        matches!(
+            third_namespace(&config, None, &org1, displaced.identity().as_ref(), Which::Live),
+            Ok(None)
+        ),
         "only an `Owned` record can receive the displaced credential"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Decision D-027: whose the live item's credential is, and the guard
+// ---------------------------------------------------------------------------
+
+/// An identity naming `acct`, and `org` when given.
+fn named(acct: &str, org: Option<&str>) -> Identity {
+    Identity {
+        account_uuid: acct.to_owned(),
+        organization_uuid: org.map(str::to_owned),
+        email: None,
+        org_name: None,
+    }
+}
+
+/// An [`Attribution::Mismatch`] between two display ids.
+fn mismatch(item: &str, witness: &str) -> Attribution {
+    Attribution::Mismatch { item: item.to_owned(), witness: witness.to_owned() }
+}
+
+#[test]
+fn d027_the_live_credentials_identity_follows_the_precedence_and_refuses_a_disagreement() {
+    // The precedence, by row: the credential's own identity first, the
+    // witness when it has none, a refusal when the two disagree. The witness
+    // differs by direction and that is the rule's point — `.claude.json` for a
+    // forward swap, the account the undone entry installed for a reversal.
+    let p = named("acct-p", Some("org-p"));
+    let t = named("acct-t", Some("org-t"));
+    let t_orgless = named("acct-t", None);
+    let rows: Vec<(&str, Option<Identity>, Witness<'_>, Attribution)> = vec![
+        (
+            "forward: the credential names P and `.claude.json` agrees",
+            Some(p.clone()),
+            Witness::LoginRecord(Some(p.clone())),
+            Attribution::Known(Some(p.clone())),
+        ),
+        (
+            "forward: the credential names P and `.claude.json` names nobody",
+            Some(p.clone()),
+            Witness::LoginRecord(None),
+            Attribution::Known(Some(p.clone())),
+        ),
+        (
+            "forward: Claude Code's identity-less credential, `.claude.json` naming P",
+            None,
+            Witness::LoginRecord(Some(p.clone())),
+            Attribution::Known(Some(p.clone())),
+        ),
+        (
+            "forward: nothing names anybody",
+            None,
+            Witness::LoginRecord(None),
+            Attribution::Known(None),
+        ),
+        (
+            "forward: the credential names P and `.claude.json` names T",
+            Some(p.clone()),
+            Witness::LoginRecord(Some(t.clone())),
+            mismatch("acct-p/org-p", "acct-t/org-t"),
+        ),
+        (
+            "forward: one account in two organisations disagrees",
+            Some(named("acct-p", Some("org-1"))),
+            Witness::LoginRecord(Some(named("acct-p", Some("org-2")))),
+            mismatch("acct-p/org-1", "acct-p/org-2"),
+        ),
+        (
+            "forward: an organisation named on one side only is no disagreement",
+            Some(named("acct-p", None)),
+            Witness::LoginRecord(Some(p.clone())),
+            Attribution::Known(Some(named("acct-p", None))),
+        ),
+        (
+            "reverse: Claude Code's refreshed credential, the entry installed T",
+            None,
+            Witness::UndoneSwap(Some(&t)),
+            Attribution::Known(Some(t.clone())),
+        ),
+        (
+            "reverse: the credential names T and the entry agrees",
+            Some(t.clone()),
+            Witness::UndoneSwap(Some(&t)),
+            Attribution::Known(Some(t.clone())),
+        ),
+        (
+            "reverse: the credential names P but the entry installed T",
+            Some(p.clone()),
+            Witness::UndoneSwap(Some(&t)),
+            mismatch("acct-p/org-p", "acct-t/org-t"),
+        ),
+        (
+            "reverse: no installed account to witness, the credential decides",
+            Some(t.clone()),
+            Witness::UndoneSwap(None),
+            Attribution::Known(Some(t.clone())),
+        ),
+        (
+            "reverse: nothing names anybody",
+            None,
+            Witness::UndoneSwap(None),
+            Attribution::Known(None),
+        ),
+        (
+            "reverse: an installed account with no organisation names only its account",
+            None,
+            Witness::UndoneSwap(Some(&t_orgless)),
+            Attribution::Known(Some(named("acct-t", None))),
+        ),
+    ];
+    for (row, item, witness, expected) in rows {
+        assert_eq!(attribute(item, witness), expected, "{row}");
+    }
+}
+
+/// A live-store write, stamped `second` seconds past a fixed instant so that
+/// every entry in a row has an id of its own. Every one displaced `ffffffff`
+/// and wrote `cafebabe`.
+fn live_at(second: i64, direction: WriteDirection, outcome: WriteOutcome) -> AuditEntry {
+    let mut entry = AuditEntry::new(AuditEvent::Write {
+        target: Target::Live,
+        from_digest8: Some("ffffffff".to_owned()),
+        to_digest8: "cafebabe".to_owned(),
+        outcome,
+        direction,
+        incoming_identity: (direction == WriteDirection::Forward).then(installed_t),
+    });
+    entry.ts = jiff::Timestamp::from_second(1_800_000_000 + second).expect("a valid instant");
+    entry
+}
+
+#[test]
+fn d027_a_live_swap_is_outstanding_until_an_applied_undo_reverses_it() {
+    // Keyed on the newest live forward swap, read from `direction` rather than
+    // inferred. The item's digest matters only to an `unknown` swap: an item
+    // still holding what the swap displaced (`ffffffff`) says the write did not
+    // land.
+    const STILL_P: Option<&str> = Some("ffffffff");
+    const NOT_P: Option<&str> = Some("cafebabe");
+    let swap = live_at(1, WriteDirection::Forward, WriteOutcome::Applied);
+    let undo = live_at(2, WriteDirection::Undo, WriteOutcome::Applied);
+    let again = live_at(3, WriteDirection::Forward, WriteOutcome::Applied);
+    let unknown = live_at(4, WriteDirection::Forward, WriteOutcome::Unknown);
+    let namespaced = write("77777777", Some("11112222"), WriteOutcome::Applied);
+    let id = |entry: &AuditEntry| Some(Outstanding::Swap(entry.id().to_string()));
+    let rows = vec![
+        ("an empty log", Vec::new(), NOT_P, None),
+        ("one live swap, not undone", vec![swap.clone()], NOT_P, id(&swap)),
+        ("a live swap and its applied undo", vec![swap.clone(), undo.clone()], NOT_P, None),
+        (
+            "a later live swap after that undo",
+            vec![swap.clone(), undo.clone(), again.clone()],
+            NOT_P,
+            id(&again),
+        ),
+        (
+            "a failed undo, and an unknown one whose item still holds what it displaced, \
+             reversed nothing",
+            vec![
+                swap.clone(),
+                live_at(5, WriteDirection::Undo, WriteOutcome::Failed),
+                live_at(6, WriteDirection::Undo, WriteOutcome::Unknown),
+            ],
+            // The undo displaced `ffffffff`: an item still holding it says the
+            // undo never landed, so the swap it was reversing stands.
+            Some("ffffffff"),
+            id(&swap),
+        ),
+        (
+            "a discarded or a failed live swap changed nothing",
+            vec![
+                live_at(7, WriteDirection::Forward, WriteOutcome::Discarded),
+                live_at(8, WriteDirection::Forward, WriteOutcome::Failed),
+            ],
+            NOT_P,
+            None,
+        ),
+        (
+            "an unknown swap whose item no longer holds what it displaced may have landed",
+            vec![unknown.clone()],
+            NOT_P,
+            id(&unknown),
+        ),
+        (
+            "an unknown swap whose item still holds what it displaced did not apply",
+            vec![unknown],
+            STILL_P,
+            None,
+        ),
+        (
+            "a namespaced swap after a live one does not clear it",
+            vec![swap.clone(), namespaced.clone()],
+            NOT_P,
+            id(&swap),
+        ),
+        ("namespaced swaps alone do not arm it", vec![namespaced.clone(), namespaced], NOT_P, None),
+    ];
+    for (row, entries, item8, expected) in rows {
+        let tail = Tail { entries, unreadable: Vec::new() };
+        assert_eq!(outstanding_live_swap(&tail, item8), expected, "{row}");
+    }
+
+    // An unreadable line refuses whatever the parsed entries say.
+    let tail = Tail { entries: vec![swap, undo], unreadable: vec![(1, "truncated".to_owned())] };
+    assert_eq!(
+        outstanding_live_swap(&tail, NOT_P),
+        Some(Outstanding::Unreadable(1)),
+        "an unreadable line never passes"
+    );
+}
+
+#[test]
+fn d027_a_live_undo_takes_the_installed_account_from_the_entry_and_refuses_without_it() {
+    // Whose credential the live item holds comes from the entry's
+    // `incoming_identity` and from nowhere else. An entry without one refuses
+    // before any owned namespace is searched: a parked P that would resolve
+    // does not change the answer.
+    let (_dir, paths, config) = reversal_store();
+    let p = owned_by("sk-ant-oat01-p", P.0, P.1);
+    park(&paths, P, file_store::CREDENTIALS_FILE, &p);
+    let from = recorded(&p);
+
+    let refused = match live_reversal(
+        &paths,
+        &config,
+        Some(&from),
+        "cafebabe",
+        WriteOutcome::Applied,
+        None,
+        None,
+    ) {
+        Ok(found) => panic!(
+            "an entry naming no installed account must refuse, got `{}`",
+            found.owner.account_uuid
+        ),
+        Err(err) => err.to_string(),
+    };
+    assert!(refused.contains("does not record which account it installed"), "{refused}");
+
+    let installed = IncomingIdentity { account_uuid: T.0.to_owned(), organization_uuid: None };
+    let found = match live_reversal(
+        &paths,
+        &config,
+        Some(&from),
+        "cafebabe",
+        WriteOutcome::Unknown,
+        Some(&installed),
+        None,
+    ) {
+        Ok(found) => found,
+        Err(err) => panic!("the live reversal should resolve: {err}"),
+    };
+    assert_eq!(found.owner.account_uuid, P.0, "P's parked copy is still found by its digest");
+    let Some(undone) = found.undone else { panic!("a live reversal carries the swap it undoes") };
+    assert_eq!(undone.installed, named(T.0, None), "the entry's account, by id alone");
+    assert_eq!(
+        undone.outcome,
+        WriteOutcome::Unknown,
+        "and the outcome the item is checked against"
+    );
+    assert_eq!(
+        (undone.from_digest8.as_str(), undone.to_digest8.as_str()),
+        (from.as_str(), "cafebabe"),
+        "and both of its digests"
+    );
+}
+
+/// The swap a live undo reverses, as [`item_changed`] sees it: it displaced
+/// `ffffffff` and wrote `cafebabe`, installing `acct-t`/`org-t`.
+fn undone_entry(outcome: WriteOutcome) -> UndoneEntry {
+    UndoneEntry {
+        installed: named("acct-t", Some("org-t")),
+        outcome,
+        from_digest8: "ffffffff".to_owned(),
+        to_digest8: "cafebabe".to_owned(),
+        later_unknown_undo: None,
+    }
+}
+
+#[test]
+fn d027_a_live_undo_refuses_an_item_that_changed_hands_or_diverged() {
+    // `.claude.json` is a tripwire here and never a source: P (being put back)
+    // and T (installed) pass, anybody else is a foreign login. The diverged
+    // check applies to an `unknown` swap only; an `applied` one's digest change
+    // is T's ordinary refresh.
+    let owner = keyed("acct-p", "org-p");
+    let p = named("acct-p", Some("org-p"));
+    let t = named("acct-t", Some("org-t"));
+    let q = named("acct-q", Some("org-q"));
+    let p_elsewhere = named("acct-p", Some("org-x"));
+    let rows = [
+        (
+            "applied, `.claude.json` still names P",
+            WriteOutcome::Applied,
+            Some("cafebabe"),
+            Some(&p),
+            None,
+        ),
+        (
+            "applied, the session logged in as T",
+            WriteOutcome::Applied,
+            Some("cafebabe"),
+            Some(&t),
+            None,
+        ),
+        ("applied, `.claude.json` unreadable", WriteOutcome::Applied, Some("cafebabe"), None, None),
+        (
+            "applied, T refreshed in the item: exempt",
+            WriteOutcome::Applied,
+            Some("12345678"),
+            Some(&p),
+            None,
+        ),
+        (
+            "applied, the session logged in as a third account",
+            WriteOutcome::Applied,
+            Some("12345678"),
+            Some(&q),
+            Some(Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin)),
+        ),
+        (
+            "P's account in another organisation is somebody else",
+            WriteOutcome::Applied,
+            Some("cafebabe"),
+            Some(&p_elsewhere),
+            Some(Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin)),
+        ),
+        (
+            "unknown, the item still holds P",
+            WriteOutcome::Unknown,
+            Some("ffffffff"),
+            Some(&p),
+            None,
+        ),
+        ("unknown, the item holds T", WriteOutcome::Unknown, Some("cafebabe"), Some(&p), None),
+        (
+            "unknown, the item holds neither end",
+            WriteOutcome::Unknown,
+            Some("12345678"),
+            Some(&p),
+            Some(Refusal::LiveUndoItemChanged(ItemChange::Diverged)),
+        ),
+        (
+            "unknown and a foreign login: the login is what is named",
+            WriteOutcome::Unknown,
+            Some("12345678"),
+            Some(&q),
+            Some(Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin)),
+        ),
+    ];
+    for (row, outcome, item8, claimed, expected) in rows {
+        assert_eq!(item_changed(&undone_entry(outcome), &owner, item8, claimed), expected, "{row}");
+    }
+}
+
+#[test]
+fn d027_a_live_forward_entry_records_the_incoming_account_without_the_placeholder_org() {
+    // The registry's unknown-organization placeholder is not an organization:
+    // recording it would make the undo's comparison report a disagreement that
+    // is not there.
+    assert_eq!(
+        incoming_identity_of(&keyed("acct-t", "org-t")),
+        IncomingIdentity {
+            account_uuid: "acct-t".to_owned(),
+            organization_uuid: Some("org-t".to_owned())
+        }
+    );
+    assert_eq!(
+        incoming_identity_of(&keyed("acct-t", UNKNOWN_ORG)),
+        IncomingIdentity { account_uuid: "acct-t".to_owned(), organization_uuid: None },
+        "the placeholder maps to no organization"
+    );
+}
+
+#[test]
+fn d027_an_unknown_live_write_is_read_against_the_item_or_refused_as_unknown() {
+    // Ruling R16. The newest live entry's `unknown` outcome is settled by the
+    // item: every `live_at` entry displaced `ffffffff` and wrote `cafebabe`. An
+    // item holding neither end says nothing, and refuses as unknown (exit 28).
+    let swap = live_at(1, WriteDirection::Forward, WriteOutcome::Applied);
+    let unknown_undo = live_at(2, WriteDirection::Undo, WriteOutcome::Unknown);
+    let unknown_swap = live_at(3, WriteDirection::Forward, WriteOutcome::Unknown);
+    let as_swap = |entry: &AuditEntry| Some(Outstanding::Swap(entry.id().to_string()));
+    let as_unknown = |entry: &AuditEntry| Some(Outstanding::Unknown(entry.id().to_string()));
+    let rows = vec![
+        (
+            "an unknown swap whose item holds what it wrote landed",
+            vec![unknown_swap.clone()],
+            Some("cafebabe"),
+            as_swap(&unknown_swap),
+        ),
+        (
+            "an unknown swap whose item holds neither end",
+            vec![unknown_swap.clone()],
+            Some("12345678"),
+            as_unknown(&unknown_swap),
+        ),
+        (
+            "an unknown undo whose item holds what it wrote reversed the swap",
+            vec![swap.clone(), unknown_undo.clone()],
+            Some("cafebabe"),
+            None,
+        ),
+        (
+            "an unknown undo whose item still holds what it displaced left the swap standing",
+            vec![swap.clone(), unknown_undo.clone()],
+            Some("ffffffff"),
+            as_swap(&swap),
+        ),
+        (
+            "an unknown undo whose item holds neither end",
+            vec![swap, unknown_undo.clone()],
+            Some("12345678"),
+            as_unknown(&unknown_undo),
+        ),
+    ];
+    for (row, entries, item8, expected) in rows {
+        let tail = Tail { entries, unreadable: Vec::new() };
+        assert_eq!(outstanding_live_swap(&tail, item8), expected, "{row}");
+    }
+}
+
+#[test]
+fn d027_undo_reverses_an_outstanding_live_swap_before_anything_newer() {
+    // Ruling R16. An in-place namespace refresh written after a live swap must
+    // not become what `--undo` reverses, or the live swap becomes unreachable
+    // while the guard refuses every forward swap. With no live swap outstanding,
+    // W4a's newest-reversible rule stands, and a live undo it finds is refused
+    // by `run_undo` rather than reversed.
+    let swap = live_at(1, WriteDirection::Forward, WriteOutcome::Applied);
+    let undo = live_at(2, WriteDirection::Undo, WriteOutcome::Applied);
+    let unknown_undo = live_at(3, WriteDirection::Undo, WriteOutcome::Unknown);
+    let refresh = write("77777777", Some("11112222"), WriteOutcome::Applied);
+    let pick = |entries: Vec<AuditEntry>| select_undo(&Tail { entries, unreadable: Vec::new() });
+
+    assert!(
+        matches!(
+            pick(vec![swap.clone(), refresh.clone()]),
+            Undoable::Live { direction: WriteDirection::Forward, .. }
+        ),
+        "an outstanding live swap is reversed before a newer namespace refresh"
+    );
+    assert!(
+        matches!(
+            pick(vec![swap.clone(), undo.clone()]),
+            Undoable::Live { direction: WriteDirection::Undo, .. }
+        ),
+        "nothing outstanding: the newest reversible entry is the live undo, for `run_undo` to refuse"
+    );
+    assert!(
+        matches!(
+            pick(vec![swap.clone(), undo, refresh.clone()]),
+            Undoable::Found { ref sha8, .. } if sha8 == "77777777"
+        ),
+        "nothing outstanding: W4a's rule picks the newest reversible write"
+    );
+    // Ruling R17(3): an undo that ended `unknown` leaves the swap outstanding,
+    // so it is reversed again — and its digests go with it, for the item to say
+    // whether that undo landed after all.
+    match pick(vec![swap, unknown_undo, refresh]) {
+        Undoable::Live { direction: WriteDirection::Forward, later_unknown_undo, .. } => {
+            assert_eq!(
+                later_unknown_undo,
+                Some(UnknownUndo {
+                    from_digest8: Some("ffffffff".to_owned()),
+                    to_digest8: "cafebabe".to_owned(),
+                }),
+                "the unknown undo's digests travel with the swap"
+            );
+        }
+        other => panic!("the outstanding swap is reversed again, not {other:?}"),
+    }
+}
+
+#[test]
+fn d027_a_live_undo_after_an_unknown_undo_asks_the_item_whether_it_landed() {
+    // Ruling R17(3), as `item_changed` decides it. The swap displaced
+    // `ffffffff` and wrote `cafebabe`; a later undo that ended `unknown`
+    // displaced `cafebabe` and wrote `ffffffff`. Holding what that undo wrote,
+    // the item says it landed and the swap is already reversed; holding what it
+    // displaced, it did not land; holding neither says nothing.
+    let owner = keyed("acct-p", "org-p");
+    let p = named("acct-p", Some("org-p"));
+    let mut undone = undone_entry(WriteOutcome::Applied);
+    undone.later_unknown_undo = Some(UnknownUndo {
+        from_digest8: Some("cafebabe".to_owned()),
+        to_digest8: "ffffffff".to_owned(),
+    });
+    let rows = [
+        (
+            "the item holds what the unknown undo wrote",
+            Some("ffffffff"),
+            Some(Refusal::LiveUndoOfUndo),
+        ),
+        ("the item holds what the unknown undo displaced", Some("cafebabe"), None),
+        (
+            "the item holds neither end",
+            Some("12345678"),
+            Some(Refusal::LiveUndoItemChanged(ItemChange::Diverged)),
+        ),
+    ];
+    for (row, item8, expected) in rows {
+        assert_eq!(item_changed(&undone, &owner, item8, Some(&p)), expected, "{row}");
+    }
 }
 
 #[test]

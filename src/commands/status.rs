@@ -1883,6 +1883,10 @@ fn audit_write(
             from_digest8,
             to_digest8: to_digest8.to_owned(),
             outcome,
+            // A refresh saved in place is not a reversal, and names no
+            // account a live swap installed (decision D-027's two fields).
+            direction: audit::WriteDirection::Forward,
+            incoming_identity: None,
         },
     );
 }

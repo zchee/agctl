@@ -108,7 +108,7 @@ fn the_cli_exit_table_is_total_and_has_no_duplicate_or_reserved_value() {
         assert!(!seen.contains(&code), "{name} reuses exit code {code}");
         seen.push(code);
     }
-    assert_eq!(seen.len(), 15, "every code in the block is listed in ALL");
+    assert_eq!(seen.len(), 19, "every code in the block is listed in ALL");
 
     // The table itself, spelled out. Counting the entries proved only that
     // there were as many of them as expected: a renumbering, or a name moved onto another
@@ -133,6 +133,10 @@ fn the_cli_exit_table_is_total_and_has_no_duplicate_or_reserved_value() {
             ("audit_refused", 22),
             ("live_unreachable", 23),
             ("live_item_absent", 24),
+            ("live_swap_outstanding", 25),
+            ("live_undo_of_undo", 26),
+            ("live_undo_item_changed", 27),
+            ("live_write_unknown", 28),
         ],
         "the block is contiguous from 10 and each name keeps its own number"
     );
@@ -163,6 +167,10 @@ fn all_outcomes() -> Vec<Outcome> {
         Outcome::Refused(Refusal::LiveUnreachable),
         Outcome::Refused(Refusal::LiveItemAbsent),
         Outcome::Refused(Refusal::AuditRefused),
+        Outcome::Refused(Refusal::LiveSwapOutstanding),
+        Outcome::Refused(Refusal::LiveUndoOfUndo),
+        Outcome::Refused(Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin)),
+        Outcome::Refused(Refusal::LiveWriteUnknown),
     ]
 }
 
@@ -446,13 +454,55 @@ fn the_live_refusals_carry_the_letter_code_and_phase_w4b_fixed_for_each() {
             Phase::A,
         ),
         (Refusal::AuditRefused, None, Some("audit_refused"), swap_exit::AUDIT_REFUSED, Phase::B),
+        // S23b (decision D-027): all three are decided in Phase A, and the
+        // item-changed refusal carries one of two reasons under one code.
+        (
+            Refusal::LiveSwapOutstanding,
+            None,
+            Some("live_swap_outstanding"),
+            swap_exit::LIVE_SWAP_OUTSTANDING,
+            Phase::A,
+        ),
+        (
+            Refusal::LiveUndoOfUndo,
+            None,
+            Some("live_undo_of_undo"),
+            swap_exit::LIVE_UNDO_OF_UNDO,
+            Phase::A,
+        ),
+        (
+            Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin),
+            None,
+            Some("live_undo_foreign_login"),
+            swap_exit::LIVE_UNDO_ITEM_CHANGED,
+            Phase::A,
+        ),
+        (
+            Refusal::LiveUndoItemChanged(ItemChange::Diverged),
+            None,
+            Some("live_undo_item_diverged"),
+            swap_exit::LIVE_UNDO_ITEM_CHANGED,
+            Phase::A,
+        ),
+        (
+            Refusal::LiveWriteUnknown,
+            None,
+            Some("live_write_unknown"),
+            swap_exit::LIVE_WRITE_UNKNOWN,
+            Phase::A,
+        ),
     ];
     for (refusal, letter, reason, code, phase) in rows {
         assert_eq!(refusal.letter(), letter, "{refusal:?}'s `--json` letter");
         assert_eq!(refusal.reason(), reason, "{refusal:?}'s `--json` reason");
         assert_eq!(refusal.exit_code(), code, "{refusal:?}'s exit code");
         assert_eq!(refusal.decided_in(), phase, "{refusal:?} is decided in phase {}", phase.name());
-        assert!(DECISION_ORDER.contains(&refusal), "{refusal:?} is missing from DECISION_ORDER");
+        assert!(
+            DECISION_ORDER
+                .iter()
+                .any(|listed| std::mem::discriminant(listed) == std::mem::discriminant(&refusal)),
+            "{refusal:?} is missing from DECISION_ORDER"
+        );
     }
 }
 
@@ -489,6 +539,11 @@ fn the_live_refusals_are_decided_before_the_locks_and_in_the_contracts_order() {
         Refusal::LiveUnreachable,
         Refusal::LiveItemAbsent,
         Refusal::AuditRefused,
+        Refusal::LiveSwapOutstanding,
+        Refusal::LiveUndoOfUndo,
+        Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin),
+        Refusal::LiveUndoItemChanged(ItemChange::Diverged),
+        Refusal::LiveWriteUnknown,
     ] {
         assert!(!refusal.decided_in().holds_locks(), "{refusal:?} must not need a hold");
     }
@@ -507,9 +562,22 @@ fn the_live_refusals_are_decided_before_the_locks_and_in_the_contracts_order() {
     assert!(at(Refusal::LiveNamespaceEnv) < at(Refusal::LiveUnreachable));
     assert!(at(Refusal::LiveUnreachable) < at(Refusal::EnvToken));
     assert!(at(Refusal::EnvToken) < at(Refusal::LiveItemAbsent));
+    // Decision D-027. The undo-of-undo refusal is decided from the entry alone,
+    // before a reversal's subject is built; the guard and the item-changed
+    // refusal both need the item, so both follow `LiveItemAbsent`.
+    assert!(at(Refusal::NotOwned) < at(Refusal::LiveUndoOfUndo));
+    assert!(at(Refusal::LiveUndoOfUndo) < at(Refusal::LiveNamespaceEnv));
+    assert!(at(Refusal::LiveItemAbsent) < at(Refusal::LiveSwapOutstanding));
+    assert!(at(Refusal::LiveSwapOutstanding) < at(Refusal::LiveWriteUnknown));
+    assert!(at(Refusal::LiveWriteUnknown) < at(Refusal::LineTooLong));
+    assert!(
+        at(Refusal::LiveSwapOutstanding)
+            < at(Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin))
+    );
+    assert!(at(Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin)) < at(Refusal::LineTooLong));
     assert!(at(Refusal::LiveItemAbsent) < at(Refusal::LineTooLong));
     assert!(at(Refusal::LineTooLong) < at(Refusal::AuditRefused));
     assert!(at(Refusal::AuditRefused) < at(Refusal::CannotAdopt(adopt::Refusal::NewerCopy)));
     assert!(at(Refusal::CannotAdopt(adopt::Refusal::NewerCopy)) < at(Refusal::CompromisedHold));
-    assert_eq!(DECISION_ORDER.len(), 9, "every refusal the driver can raise is in the table");
+    assert_eq!(DECISION_ORDER.len(), 13, "every refusal the driver can raise is in the table");
 }

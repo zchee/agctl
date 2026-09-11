@@ -178,9 +178,54 @@ pub mod swap_exit {
     /// message says to run `claude` once. `--json` gives it `reason:
     /// "live_item_absent"` and no `refusal` member.
     pub const LIVE_ITEM_ABSENT: i32 = 24;
+    /// A live swap agctl made has not been undone, so the live `.claude.json`
+    /// no longer says whose credential the live item holds (decision D-027).
+    ///
+    /// **Temporary, lifted by S24.** Until agctl writes `oauthAccount` itself,
+    /// that record still names the account a live swap displaced, and a second
+    /// live swap would take it as the identity of the credential the first one
+    /// installed — filing that credential in the displaced account's namespace,
+    /// over its parked copy. So a forward live swap refuses while one is
+    /// outstanding and says to run `use --undo` first. Decided in Phase A after
+    /// the item read, which the `unknown` branch needs the item's digest for:
+    /// nothing is locked or written. `--json` gives it `reason:
+    /// "live_swap_outstanding"` and no `refusal` member.
+    pub const LIVE_SWAP_OUTSTANDING: i32 = 25;
+    /// `use --undo` would reverse the undo of a live swap (decision D-027).
+    ///
+    /// **Temporary, lifted by S24.** Reversing that undo would put the
+    /// swapped-in credential back into the live item while `.claude.json` still
+    /// names the account it displaced, and the guard behind
+    /// [`LIVE_SWAP_OUTSTANDING`] would read the reversal as the newest word.
+    /// Decided in Phase A from the audit entry alone, before any owned namespace
+    /// is read — or right after the item read, when a later undo that ended
+    /// `unknown` turns out to have landed; the message says to run `use --live
+    /// <id>` instead. `--json`
+    /// gives it `reason: "live_undo_of_undo"` and no `refusal` member.
+    pub const LIVE_UNDO_OF_UNDO: i32 = 26;
+    /// The live item is not what the swap `use --undo` would reverse left there
+    /// (decision D-027).
+    ///
+    /// **Temporary, lifted by S24.** Decided in Phase A right after the item
+    /// read, before any lock. `--json` gives it one of two reasons:
+    /// `"live_undo_foreign_login"` when `.claude.json` names an account that is
+    /// neither the one being put back nor the one the swap installed, and
+    /// `"live_undo_item_diverged"` when a swap that ended `unknown` left the
+    /// item holding neither end of it. No `refusal` member.
+    pub const LIVE_UNDO_ITEM_CHANGED: i32 = 27;
+    /// The newest live write ended `unknown`, and the live item holds neither
+    /// the credential it displaced nor the one it wrote (decision D-027).
+    ///
+    /// **Temporary, lifted by S24.** Nothing then says which account the live
+    /// item holds, so a forward live swap refuses rather than attributing it;
+    /// `agctl claude status` shows which account is live, and `use --undo` is
+    /// never blocked by this. Decided in Phase A after the item read, with the
+    /// guard behind [`LIVE_SWAP_OUTSTANDING`]. `--json` gives it `reason:
+    /// "live_write_unknown"` and no `refusal` member.
+    pub const LIVE_WRITE_UNKNOWN: i32 = 28;
 
     /// Every code above, for the exhaustiveness and uniqueness tests.
-    pub const ALL: [(&str, i32); 15] = [
+    pub const ALL: [(&str, i32); 19] = [
         ("refused_a", REFUSED_A),
         ("refused_c", REFUSED_C),
         ("refused_d", REFUSED_D),
@@ -196,6 +241,10 @@ pub mod swap_exit {
         ("audit_refused", AUDIT_REFUSED),
         ("live_unreachable", LIVE_UNREACHABLE),
         ("live_item_absent", LIVE_ITEM_ABSENT),
+        ("live_swap_outstanding", LIVE_SWAP_OUTSTANDING),
+        ("live_undo_of_undo", LIVE_UNDO_OF_UNDO),
+        ("live_undo_item_changed", LIVE_UNDO_ITEM_CHANGED),
+        ("live_write_unknown", LIVE_WRITE_UNKNOWN),
     ];
 }
 
