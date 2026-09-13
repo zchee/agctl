@@ -7,6 +7,10 @@
 #   1. none of the eleven test-seam environment-variable names appear in it, and
 #   2. the three production-visible names do.
 #
+# It also checks, from cargo's normal-edge feature resolution, that the shipped
+# and the `testing` builds get `serde_json/float_roundtrip` (the live
+# `.claude.json` guard's exact float parsing).
+#
 # The eleven are one representative name per seam-owning module, not the whole
 # test-only surface — fixtures/fake-security.sh alone defines ten
 # AGCTL_FAKE_SECURITY_* names on its own. The fake's write knob is the one
@@ -160,6 +164,26 @@ for name in "${production[@]}"; do
 		printf '  ok      %-32s %s\n' "$name" "$count"
 	else
 		printf '  FAIL    %-32s 0\n' "$name"
+		failures=$((failures + 1))
+	fi
+done
+
+echo
+echo "resolved dependency features (must be present):"
+# The live `.claude.json` rewrite's guard needs exact float parsing. Every test
+# build gets `serde_json/float_roundtrip` from a dev-dependency, so only the
+# normal-edge feature resolution — the shipped build's, and the `testing` build
+# AC75 runs — can show whether the artifact has it. `-e features` alone would
+# include the dev-dependency edge and pass without the feature.
+for features in "" "testing"; do
+	label=${features:-default}
+	# Captured first rather than piped: under `pipefail` an early `rg -q` exit
+	# could fail the pipeline through `cargo tree`'s SIGPIPE.
+	tree=$(cargo tree --offline -e features,normal ${features:+--features "$features"} -i serde_json 2>/dev/null || true)
+	if rg -q -F 'serde_json feature "float_roundtrip"' <<<"$tree"; then
+		printf '  ok      %-32s %s\n' "serde_json/float_roundtrip" "$label"
+	else
+		printf '  FAIL    %-32s %s\n' "serde_json/float_roundtrip" "$label"
 		failures=$((failures + 1))
 	fi
 done

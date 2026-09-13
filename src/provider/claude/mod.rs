@@ -15,9 +15,13 @@
 //!   3.4's three phases it decides it. No I/O.
 //! - [`adopt`] — what becomes of the credential a swap displaces (decision
 //!   D-017). No I/O.
+//! - [`claude_json`] — the live `~/.claude.json`'s one `oauthAccount`
+//!   rewrite after an applied live swap or undo (decision D-021), as a peer of
+//!   Claude Code's configuration lock.
 
 pub mod account;
 pub mod adopt;
+pub mod claude_json;
 pub mod credentials;
 pub mod discovery;
 pub mod namespace;

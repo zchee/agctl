@@ -152,6 +152,121 @@ fn claude_json_is_keyed_on_the_config_dir_not_the_store_dir() {
 }
 
 #[test]
+fn global_config_path_prefers_config_json_under_the_config_dir() {
+    // Claude Code's `Lt()`: `<be()>/.config.json` when it exists, else `OQt()`.
+    // Every row runs against a temporary home, so the one existence check this
+    // function makes never looks at the developer's own `~/.claude`.
+    let home = tempfile::TempDir::new().expect("a temporary home");
+    let other = tempfile::TempDir::new().expect("a temporary config dir");
+    let home_path = home.path().to_path_buf();
+    let other_path = other.path().to_path_buf();
+    let at_home = |config_dir: Option<&str>| EnvView {
+        securestorage_dir: None,
+        config_dir: config_dir.map(str::to_owned),
+        home: home_path.clone(),
+        oauth_token_set: false,
+    };
+    let other_text = other_path.to_string_lossy().into_owned();
+
+    // Neither `.config.json` exists yet: `claude_json_path`'s answer.
+    let tests: Vec<(&str, EnvView, PathBuf)> = vec![
+        ("nothing set, no .config.json", at_home(None), home_path.join(".claude.json")),
+        (
+            "CLAUDE_CONFIG_DIR set, no .config.json",
+            at_home(Some(&other_text)),
+            other_path.join(".claude.json"),
+        ),
+        (
+            "CLAUDE_CONFIG_DIR empty, no .config.json",
+            at_home(Some("")),
+            home_path.join(".claude.json"),
+        ),
+    ];
+    for (name, view, expected) in tests {
+        assert_eq!(global_config_path(&view), expected, "{name}");
+        assert_eq!(
+            global_config_path(&view),
+            claude_json_path(&view),
+            "{name}: falls back to OQt()"
+        );
+    }
+
+    // `$HOME/.claude/.config.json` present: it wins for an unset and for an
+    // empty `CLAUDE_CONFIG_DIR` — the empty value is never a relative path.
+    std::fs::create_dir_all(home_path.join(".claude")).expect("the config home is creatable");
+    std::fs::write(home_path.join(".claude").join(".config.json"), "{}").expect("a .config.json");
+    let preferred = home_path.join(".claude").join(".config.json");
+    assert_eq!(global_config_path(&at_home(None)), preferred, "$HOME/.claude/.config.json present");
+    assert_eq!(
+        global_config_path(&at_home(Some(""))),
+        preferred,
+        "CLAUDE_CONFIG_DIR=\"\" takes the $HOME/.claude rule, never a relative path"
+    );
+    assert!(global_config_path(&at_home(Some(""))).is_absolute(), "never a relative path");
+    // …but not for a `CLAUDE_CONFIG_DIR` naming somewhere else, whose own
+    // `.config.json` is absent.
+    assert_eq!(
+        global_config_path(&at_home(Some(&other_text))),
+        other_path.join(".claude.json"),
+        "a set CLAUDE_CONFIG_DIR looks only under itself"
+    );
+
+    // `CLAUDE_CONFIG_DIR=/x` with `/x/.config.json` present: it.
+    std::fs::write(other_path.join(".config.json"), "{}").expect("a .config.json under /x");
+    assert_eq!(
+        global_config_path(&at_home(Some(&other_text))),
+        other_path.join(".config.json"),
+        "CLAUDE_CONFIG_DIR=/x and /x/.config.json present"
+    );
+
+    // Followed like `existsSync`: a link named `.config.json` counts when its
+    // target exists, and a dangling one does not.
+    let linked = tempfile::TempDir::new().expect("a third directory");
+    let dangling = linked.path().join(".config.json");
+    std::os::unix::fs::symlink(linked.path().join("missing"), &dangling).expect("a dangling link");
+    let linked_view = at_home(Some(&linked.path().to_string_lossy()));
+    assert_eq!(
+        global_config_path(&linked_view),
+        linked.path().join(".claude.json"),
+        "a dangling .config.json link does not exist to existsSync"
+    );
+}
+
+#[test]
+fn backups_dir_is_under_the_config_home_not_beside_the_config_file() {
+    let view = env(None, None);
+    assert_eq!(backups_dir(&view), PathBuf::from("/Users/zchee/.claude/backups"));
+    assert_ne!(
+        backups_dir(&view).parent(),
+        claude_json_path(&view).parent(),
+        "the backups are not beside `~/.claude.json`"
+    );
+    assert_eq!(backups_dir(&env(None, Some("/x"))), PathBuf::from("/x/backups"));
+    assert_eq!(
+        backups_dir(&env(None, Some(""))),
+        PathBuf::from("/Users/zchee/.claude/backups"),
+        "an empty CLAUDE_CONFIG_DIR is $HOME/.claude, never relative"
+    );
+    // CLAUDE_SECURESTORAGE_CONFIG_DIR names a credential namespace, not the
+    // configuration home.
+    assert_eq!(
+        backups_dir(&env(Some("/store"), None)),
+        PathBuf::from("/Users/zchee/.claude/backups")
+    );
+
+    // The lock name is the literal file name plus `.lock`.
+    assert_eq!(
+        config_lock_name(std::path::Path::new("/Users/zchee/.claude.json")),
+        Some(std::ffi::OsString::from(".claude.json.lock"))
+    );
+    assert_eq!(
+        config_lock_name(std::path::Path::new("/x/.config.json")),
+        Some(std::ffi::OsString::from(".config.json.lock"))
+    );
+    assert_eq!(config_lock_name(std::path::Path::new("/")), None);
+}
+
+#[test]
 fn export_spelling_trims_one_trailing_slash_and_normalizes() {
     assert_eq!(export_spelling(std::path::Path::new("/a/b/")), "/a/b");
     assert_eq!(export_spelling(std::path::Path::new("/a/b")), "/a/b");

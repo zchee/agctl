@@ -2956,6 +2956,7 @@ fn use_live_json_carries_the_lock_timings_and_never_a_token() {
     assert_eq!(doc["lock"]["budget_ms"], json!(3000), "{doc}");
     assert_eq!(doc["lock"]["break"], Value::Null, "nothing was broken: {doc}");
     assert_eq!(doc["refusal"], Value::Null, "an applied swap refuses nothing: {doc}");
+    assert_eq!(doc["config"], Value::Null, "a namespace target runs no config step (S24b): {doc}");
     // Refusal B's warning is a fact a person is told on stderr; `--json`
     // carries it too rather than losing it.
     let warnings = doc["warnings"].as_array().expect("the document carries a warnings array");
@@ -4405,7 +4406,9 @@ fn a_live_swap_takes_ps_identity_from_the_profile_and_its_undo_asks_the_profile_
     // Claude Code then refreshes T in the item, identity-less too, and the
     // reversal asks again: the refreshed token names T, the account the swap
     // installed, so T's refreshed credential goes home to T's store.
-    // `.claude.json` names P throughout and is read by neither pass.
+    // `.claude.json` names P throughout and is no identity source for either
+    // pass; each pass's config step (S24b) refuses the compact file as not
+    // reproducible, so it stays byte-identical.
     let server = MockServer::start();
     let token = token_ok(&server);
     let (p_asked, t_asked) = live_profiles(&server);
@@ -4428,7 +4431,13 @@ fn a_live_swap_takes_ps_identity_from_the_profile_and_its_undo_asks_the_profile_
     );
     assert_eq!(seen, 3, "the forward hold took all three artefacts under the resolved store");
     hold_within_budget(&stderr);
-    assert!(!stderr.contains("/login"), "no outstanding-swap reminder any more: {stderr}");
+    // The retired reminder, by its own words: D-030's not-updated sentence
+    // (S24b) mentions a Claude Code `/login` as the other way the file changes.
+    assert!(
+        !stderr.contains("never `/login`") && !stderr.contains("while a live swap is outstanding"),
+        "no outstanding-swap reminder any more: {stderr}"
+    );
+    assert_eq!(config_steps(&fixture), [refused_not_reproducible()], "forward: refused");
     assert_eq!(
         (p_asked.calls(), t_asked.calls()),
         (1, 1),
@@ -4489,6 +4498,11 @@ fn a_live_swap_takes_ps_identity_from_the_profile_and_its_undo_asks_the_profile_
         fs::read(&claude_json).expect("readable"),
         claude_json_before,
         "`.claude.json` is byte-identical after both passes"
+    );
+    assert_eq!(
+        config_steps(&fixture),
+        [refused_not_reproducible(), refused_not_reproducible()],
+        "forward and undo: config refused / not_reproducible"
     );
 
     let entries = write_entries(&fixture);
@@ -4552,6 +4566,11 @@ fn live_undo_entries_record_the_account_they_installed() {
         assert_eq!(identity.len(), 2, "two ids and nothing else: {entry}");
         assert!(!entry.to_string().contains('@'), "no address: {entry}");
     }
+    assert_eq!(
+        config_steps(&fixture),
+        [skipped_absent(), skipped_absent()],
+        "forward and undo: one config_write line after each write line"
+    );
     assert_eq!((p_asked.calls(), t_asked.calls()), (2, 2), "two GETs per pass");
     assert_security(
         &fixture,
@@ -4651,6 +4670,8 @@ fn an_expired_live_credential_is_attributed_only_to_agctls_own_write() {
         let (code, stdout, stderr) = swap(&fixture, &["--json"]);
         assert_eq!(code, 0, "agctl's own expired bytes are P's: {stdout}{stderr}");
         assert_eq!(outcome_doc(&stdout)["outcome"], json!("applied"));
+        assert_config(&outcome_doc(&stdout), "refused", Some("not_reproducible"));
+        assert_eq!(config_steps(&fixture), [refused_not_reproducible()], "own-bytes arm");
         assert_eq!(never.calls(), 0, "the expired token was never sent anywhere");
         assert_eq!(t_asked.calls(), 1, "the incoming token is still asked in Phase B");
         assert_eq!(
@@ -4682,6 +4703,7 @@ fn an_expired_live_credential_is_attributed_only_to_agctls_own_write() {
         let doc = outcome_doc(&stdout);
         assert_eq!(doc["reason"], json!("live_token_expired"), "{doc}");
         assert_eq!(doc["refusal"], Value::Null, "{doc}");
+        assert_eq!(doc["config"], Value::Null, "the foreign arm runs no config step: {doc}");
         let note = doc["note"].as_str().unwrap_or_default();
         assert!(note.contains("has expired and agctl did not write it"), "{note}");
         assert!(note.contains("send one message in Claude Code"), "the remedy: {note}");
@@ -4743,7 +4765,8 @@ fn two_live_swaps_in_a_row_then_undo_then_undo_of_undo_all_apply() {
     // Code refreshes T1 in the item between the two swaps, so each parking is a
     // credential only the item held. Every step's parked credential is what the
     // item held, byte for byte, and `.claude.json` — naming P the whole time —
-    // is byte-unchanged throughout: S24a writes none.
+    // is byte-unchanged throughout: its compact bytes are not a shape the
+    // config step can reproduce, so every pass's step refuses it (S24b).
     let server = MockServer::start();
     let token = token_ok(&server);
     let p_asked = common::mock_profile(&server, "sk-ant-oat01-outgoing", (ACCT, ORG));
@@ -4791,6 +4814,7 @@ fn two_live_swaps_in_a_row_then_undo_then_undo_of_undo_all_apply() {
         "step 1 parked what the item held"
     );
     unchanged("P → T1");
+    assert_eq!(config_steps(&fixture), [refused_not_reproducible()], "P → T1's config step");
 
     // Claude Code refreshes T1 and writes it back identity-less.
     let t1_refreshed = claude_code_blob(
@@ -4814,6 +4838,7 @@ fn two_live_swaps_in_a_row_then_undo_then_undo_of_undo_all_apply() {
     );
     assert_eq!(fs::read(&t1_store).expect("readable"), t1_store_before, "T1's store untouched");
     unchanged("T1 → T2");
+    assert_config(&outcome_doc(&stdout), "refused", Some("not_reproducible"));
 
     // `--undo` puts T1 back.
     let (code, stdout, stderr) = undo(&fixture);
@@ -4841,6 +4866,17 @@ fn two_live_swaps_in_a_row_then_undo_then_undo_of_undo_all_apply() {
     );
     assert!(t2_store.exists(), "T2's store is still where the undo read it");
     unchanged("the undo of the undo");
+    assert_config(&outcome_doc(&stdout), "refused", Some("not_reproducible"));
+    assert_eq!(
+        config_steps(&fixture),
+        [
+            refused_not_reproducible(),
+            refused_not_reproducible(),
+            refused_not_reproducible(),
+            refused_not_reproducible(),
+        ],
+        "all four passes: config refused / not_reproducible, each after its write"
+    );
 
     let entries = write_entries(&fixture);
     let shape: Vec<(Value, Value)> = entries
@@ -4905,6 +4941,8 @@ fn a_live_undo_of_an_undo_puts_back_what_that_undo_displaced() {
     let doc = outcome_doc(&stdout);
     assert_eq!(doc["outcome"], json!("applied"), "{doc}");
     assert_eq!(doc["target"], json!("live"), "{doc}");
+    assert_config(&doc, "skipped", Some("absent"));
+    assert_eq!(config_steps(&fixture), [skipped_absent(), skipped_absent(), skipped_absent()]);
     assert_eq!(live_item(&fixture).as_deref(), Some(t_in_item.as_str()), "T is back");
     let entries = write_entries(&fixture);
     assert_eq!(entries.len(), 3, "{entries:?}");
@@ -4931,6 +4969,7 @@ fn a_live_undo_of_an_undo_puts_back_what_that_undo_displaced() {
     assert_eq!(code, 1, "two homes of one credential refuse rather than guess: {stderr}");
     assert!(stderr.contains("in both"), "{stderr}");
     assert_eq!(writes(&fixture).len(), 3, "and nothing was written");
+    assert_eq!(config_steps(&fixture).len(), 3, "and no config step was recorded for it");
     live_artefacts_released(&fixture, &resolved);
     audit_carries_no_token(&fixture);
 }
@@ -5023,7 +5062,15 @@ fn a_forward_swap_after_an_unknown_live_write_asks_the_profile_instead_of_refusi
                 item,
                 "{arm}: filed as the profile says, byte for byte"
             );
-            assert_eq!(audit_lines(&fixture).len(), history.len() + 1, "{arm}: one new entry");
+            // One new write entry, and the config step that follows it (S24b).
+            assert_eq!(write_lines(&fixture).len(), history.len() + 1, "{arm}: one new entry");
+            assert_eq!(
+                audit_lines(&fixture).len(),
+                history.len() + 2,
+                "{arm}: and its config step"
+            );
+            assert_config(&doc, "refused", Some("not_reproducible"));
+            assert_eq!(config_steps(&fixture), [refused_not_reproducible()], "{arm}");
             assert_eq!(t_asked.as_ref().map(Mock::calls), Some(1), "{arm}: T asked in Phase B");
             assert_security(
                 &fixture,
@@ -5032,6 +5079,7 @@ fn a_forward_swap_after_an_unknown_live_write_asks_the_profile_instead_of_refusi
         } else {
             let note = doc["note"].as_str().unwrap_or_default();
             assert!(note.contains("already the one the live store holds"), "{arm}: {note}");
+            assert_eq!(doc["config"], Value::Null, "{arm}: `already_active` runs no step: {doc}");
             assert_eq!(t_asked.as_ref().map(Mock::calls), Some(0), "{arm}: Phase B never reached");
             assert_eq!(writes(&fixture).len(), 0, "{arm}: nothing written");
             assert_eq!(audit_lines(&fixture).len(), history.len(), "{arm}: nothing audited");
@@ -5058,6 +5106,7 @@ fn the_undo_reads_the_whole_log_not_a_tail() {
 
     let (code, stdout, stderr) = swap(&fixture, &["--json"]);
     assert_eq!(code, 0, "the live swap applies: {stdout}{stderr}");
+    assert_config(&outcome_doc(&stdout), "skipped", Some("absent"));
 
     let refreshes: Vec<Value> = (0..300)
         .map(|second| planted_write(second, "namespace:0123abcd", "forward", "applied", "deadbeef"))
@@ -5075,6 +5124,7 @@ fn the_undo_reads_the_whole_log_not_a_tail() {
     let last = entries.last().expect("an entry");
     assert_eq!(last["target"], json!("live"), "the undo reversed the live swap: {last}");
     assert_eq!(last["direction"], json!("undo"), "{last}");
+    assert_eq!(config_steps(&fixture), [skipped_absent(), skipped_absent()], "forward and undo");
     assert_eq!((p_asked.calls(), t_asked.calls()), (2, 2));
     assert_security(
         &fixture,
@@ -5164,6 +5214,8 @@ fn a_live_undo_after_an_unknown_undo_asks_the_profile_whose_credential_the_item_
                 assert_eq!(seen, 3, "{arm}: the reversal took its hold");
                 hold_within_budget(&stderr);
                 assert_eq!(live_item(&fixture).as_deref(), Some(p.as_str()), "{arm}: P is back");
+                assert_config(&doc, "refused", Some("not_reproducible"));
+                assert_eq!(config_steps(&fixture), [refused_not_reproducible()], "{arm}");
                 assert_eq!(
                     p_asked.as_ref().map(Mock::calls),
                     Some(1),
@@ -5187,6 +5239,7 @@ fn a_live_undo_after_an_unknown_undo_asks_the_profile_whose_credential_the_item_
                     assert!(note.contains("nothing to put back"), "{arm}: {note}");
                 }
                 assert_eq!(seen, 0, "{arm}: nothing locked");
+                assert_eq!(doc["config"], Value::Null, "{arm}: no config step: {doc}");
                 assert_eq!(writes(&fixture).len(), 0, "{arm}: nothing written");
                 assert_eq!(audit_lines(&fixture).len(), 2, "{arm}: nothing audited");
                 assert_eq!(live_item(&fixture).as_deref(), Some(item), "{arm}: item untouched");
@@ -5224,6 +5277,7 @@ fn a_live_undo_refuses_when_the_session_has_logged_in_as_another_account_since()
 
     let (code, stdout, stderr) = swap(&fixture, &[]);
     assert_eq!(code, 0, "the live swap applies: {stdout}{stderr}");
+    assert_eq!(config_steps(&fixture), [refused_not_reproducible()], "the forward config step");
 
     fixture.keychain_item(
         LIVE_SERVICE,
@@ -5257,6 +5311,8 @@ fn a_live_undo_refuses_when_the_session_has_logged_in_as_another_account_since()
         "T's store keeps T's credential"
     );
     assert_eq!(fs::read(&claude_json).expect("readable"), claude_json_before);
+    assert_eq!(doc["config"], Value::Null, "the refused undo runs no config step: {doc}");
+    assert_eq!(config_steps(&fixture), [refused_not_reproducible()], "only the forward step");
     assert_eq!(write_lines(&fixture).len(), 1, "nothing audited beyond the swap");
     assert_security(
         &fixture,
@@ -5296,6 +5352,8 @@ fn a_live_undo_of_an_unknown_swap_asks_the_profile_whose_credential_the_item_hol
     let (code, stdout, stderr) = undo_json(&fixture);
     assert_eq!(code, 0, "the reversal proceeds on the profile's word: {stdout}{stderr}");
     assert_eq!(outcome_doc(&stdout)["outcome"], json!("applied"));
+    assert_config(&outcome_doc(&stdout), "skipped", Some("absent"));
+    assert_eq!(config_steps(&fixture), [skipped_absent()], "the applied undo's step");
     assert_eq!(live_item(&fixture).as_deref(), Some(p.as_str()), "P is back, byte for byte");
     let ts_store = fs::read_to_string(fixture.credentials_path(ACCT_T, ORG_T)).expect("T's store");
     assert!(
@@ -5328,6 +5386,7 @@ fn a_login_as_the_displaced_account_mid_swap_is_seen_by_the_undo_and_nothing_is_
 
     let (code, stdout, stderr) = swap(&fixture, &[]);
     assert_eq!(code, 0, "the live swap applies: {stdout}{stderr}");
+    assert_eq!(config_steps(&fixture), [skipped_absent()], "the forward step");
     let relogin =
         claude_code_blob("sk-ant-oat01-p-relogin", "sk-ant-ort01-p-relogin", common::fresh_at());
     fixture.keychain_item(LIVE_SERVICE, &relogin);
@@ -5342,6 +5401,8 @@ fn a_login_as_the_displaced_account_mid_swap_is_seen_by_the_undo_and_nothing_is_
     assert_eq!(doc["outcome"], json!("already_active"), "{doc}");
     let note = doc["note"].as_str().unwrap_or_default();
     assert!(note.contains("nothing to put back"), "{note}");
+    assert_eq!(doc["config"], Value::Null, "`already_active` runs no config step: {doc}");
+    assert_eq!(config_steps(&fixture), [skipped_absent()], "only the forward step");
     assert_eq!(seen, 0, "no hold");
     assert_eq!(relogin_asked.calls(), 1, "the new grant's token was asked");
     assert_eq!((p_asked.calls(), t_asked.calls()), (1, 1), "the forward swap's GETs only");
@@ -5396,6 +5457,8 @@ fn a_third_account_written_into_the_item_with_a_stale_oauth_account_is_filed_as_
         if x_is_owned {
             assert_eq!(code, 0, "X's credential is filed as X's: {stdout}{stderr}");
             assert_eq!(doc["outcome"], json!("applied"), "{doc}");
+            assert_config(&doc, "refused", Some("not_reproducible"));
+            assert_eq!(config_steps(&fixture), [refused_not_reproducible()], "the owned arm");
             assert_eq!(
                 fs::read_to_string(adopted_path(&fixture, ACCT_U, ORG_U)).expect("X was parked"),
                 x,
@@ -5412,6 +5475,8 @@ fn a_third_account_written_into_the_item_with_a_stale_oauth_account_is_filed_as_
         } else {
             assert_eq!(code, 14, "no account X: refusal F: {stdout}{stderr}");
             assert_eq!(doc["refusal"], json!("F"), "{doc}");
+            assert_eq!(doc["config"], Value::Null, "the unowned arm runs no config step: {doc}");
+            assert!(config_steps(&fixture).is_empty(), "and records none");
             let note = doc["note"].as_str().unwrap_or_default();
             assert!(note.contains("no account agctl owns is that one"), "{note}");
             assert!(note.contains(ACCT_U), "and it names X: {note}");
@@ -5458,6 +5523,7 @@ fn a_live_swap_parks_p_beside_its_owned_store_and_leaves_the_independent_grant_a
     assert_eq!(code, 0, "no `NewerCopy` against an independent grant: {stdout}{stderr}");
     let doc = outcome_doc(&stdout);
     assert_eq!(doc["outcome"], json!("applied"), "{doc}");
+    assert_config(&doc, "skipped", Some("absent"));
     assert_eq!(doc["adopted_to"], json!(ADOPTED), "{doc}");
     assert_eq!(
         fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("P was parked"),
@@ -5478,6 +5544,7 @@ fn a_live_swap_parks_p_beside_its_owned_store_and_leaves_the_independent_grant_a
         independent_before,
         "and the namespace's own login is still byte-unchanged"
     );
+    assert_eq!(config_steps(&fixture), [skipped_absent(), skipped_absent()], "forward and undo");
     assert_eq!((p_asked.calls(), t_asked.calls()), (2, 2));
     assert_security(
         &fixture,
@@ -5521,6 +5588,7 @@ fn an_undo_after_status_refreshed_ps_owned_store_still_finds_p() {
     let (code, stdout, stderr) = undo(&fixture);
     assert_eq!(code, 0, "the undo still finds P: {stdout}{stderr}");
     assert_eq!(live_item(&fixture).as_deref(), Some(p.as_str()), "P is back, byte for byte");
+    assert_eq!(config_steps(&fixture), [skipped_absent(), skipped_absent()], "forward and undo");
     assert_eq!((p_asked.calls(), t_asked.calls()), (2, 2));
     assert_security(
         &fixture,
@@ -5645,8 +5713,12 @@ fn ac82_a_live_swap_writes_the_unsuffixed_item_and_locks_the_resolved_store() {
     assert_eq!((p_asked.calls(), t_asked.calls()), (1, 1), "P's token in Phase A, T's in B");
     audit_carries_no_token(&fixture);
     let lines = audit_lines(&fixture);
-    assert_eq!(lines.len(), 1, "one write entry: {lines:?}");
+    assert_eq!(lines.len(), 2, "one write entry and its config step: {lines:?}");
+    assert_eq!(write_lines(&fixture).len(), 1, "one write entry: {lines:?}");
     assert!(lines[0].contains("\"target\":\"live\""), "and it names the live item: {}", lines[0]);
+    // No `.claude.json` in this fixture: the config step skips it (S24b).
+    assert_config(&doc, "skipped", Some("absent"));
+    assert_eq!(config_steps(&fixture), [skipped_absent()]);
 }
 
 #[test]
@@ -5682,6 +5754,9 @@ fn ac81_a_live_swap_touches_nothing_outside_the_namespace_root_but_the_three_art
 
     assert_eq!(code, 0, "the swap applies over a broken stale lock: {stdout}{stderr}");
     assert_eq!(seen, 3, "all three artefacts were held at once, at the resolved store");
+    // No `.claude.json` here, so the config step skips — and an absent file
+    // creates nothing, which the tree walk below still proves (S24b).
+    assert_eq!(config_steps(&fixture), [skipped_absent()]);
 
     // `Paths::ensure_dirs` makes agctl's own cache directories on every pass,
     // and invariant I1 names `cache_dir()` beside `config_dir()` as the two
@@ -5824,6 +5899,7 @@ fn ac76_a_live_swap_is_reversed_by_undo_and_the_item_holds_p_again() {
     assert!(held.contains("sk-ant-oat01-incoming"), "the live item holds T's access token: {held}");
     assert!(held.contains("sk-ant-ort01-incoming"), "and T's refresh token: {held}");
     assert!(!held.contains("sk-ant-oat01-outgoing"), "and no longer P's: {held}");
+    assert_eq!(config_steps(&fixture), [skipped_absent()], "the forward config step");
     // P went to its own namespace's adopted copy, inside the root.
     let parked =
         fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("P is in its own namespace");
@@ -5858,6 +5934,11 @@ fn ac76_a_live_swap_is_reversed_by_undo_and_the_item_holds_p_again() {
 
     let writes_seen: Vec<String> = write_lines(&fixture);
     assert_eq!(writes_seen.len(), 2, "one write each way: {writes_seen:?}");
+    assert_eq!(
+        config_steps(&fixture),
+        [skipped_absent(), skipped_absent()],
+        "and a step after each"
+    );
     for line in &writes_seen {
         assert!(line.contains("\"target\":\"live\""), "both entries name the live item: {line}");
         assert_eq!(field(line, "outcome").as_deref(), Some("applied"), "both applied: {line}");
@@ -5912,7 +5993,11 @@ fn ac67_e_an_undo_of_a_live_entry_from_a_namespaced_shell_refuses_e() {
     let writes_before = writes(&fixture).len();
     let audit_before = audit_lines(&fixture).len();
     assert_eq!(writes_before, 1, "the premise: the forward swap wrote the live item once");
-    assert_eq!(audit_before, 1, "and left one entry, the live write `--undo` selects");
+    assert_eq!(
+        audit_before, 2,
+        "and left one write entry, the live write `--undo` selects, and its config step"
+    );
+    assert_eq!(config_steps(&fixture), [skipped_absent()], "the forward half: skipped / absent");
     fixture.set("CLAUDE_SECURESTORAGE_CONFIG_DIR", &spelling);
 
     let watch = ArtefactWatch::start(Fixture::live_hold_artefacts(&resolved));
@@ -5941,6 +6026,7 @@ fn ac67_e_an_undo_of_a_live_entry_from_a_namespaced_shell_refuses_e() {
     assert_eq!(doc["outcome"], json!("refused"), "{doc}");
     assert_eq!(doc["refusal"], json!("E"), "the lettered refusal: {doc}");
     assert_eq!(doc["reason"], Value::Null, "and no `reason`, because it has a letter: {doc}");
+    assert_eq!(doc["config"], Value::Null, "the E refusal runs no config step: {doc}");
 
     // Nothing locked, nothing written, nothing adopted, by either run.
     assert_eq!(writes(&fixture).len(), writes_before, "zero further `add-generic-password` lines");
@@ -6471,6 +6557,7 @@ fn a_live_swap_between_two_orgs_of_one_account_files_the_displaced_credential_in
         org1_before,
         "org1's store still untouched"
     );
+    assert_eq!(config_steps(&fixture), [skipped_absent(), skipped_absent()], "a step each way");
     hold_within_budget(&stderr);
     live_artefacts_released(&fixture, &resolved);
     // Each way: Phase A's read, the re-read under the hold, the verifying read
@@ -6527,6 +6614,7 @@ fn a_live_swap_creates_ps_namespace_only_under_the_namespace_root() {
     let parked = fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("readable");
     assert!(parked.contains("sk-ant-oat01-outgoing"), "and that file is P: {parked}");
     assert_eq!(common::mode_of(&adopted_path(&fixture, ACCT, ORG)) & 0o777, 0o600, "at 0600");
+    assert_eq!(config_steps(&fixture), [skipped_absent()], "the config step skips");
     live_artefacts_released(&fixture, &resolved);
     assert_security(
         &fixture,
@@ -6593,6 +6681,8 @@ fn a_live_undo_refreshes_an_expired_credential_and_persists_it() {
         let (seen, _windows) = watch.finish();
         assert_eq!(code, 0, "{arm}: the reversal applies over a refresh: {stdout}{stderr}");
         assert_eq!(seen, 3, "{arm}: the reversal's hold took all three artefacts");
+        assert_config(&outcome_doc(&stdout), "skipped", Some("absent"));
+        assert_eq!(config_steps(&fixture), [skipped_absent(), skipped_absent()], "{arm}");
         let warnings = outcome_doc(&stdout)["warnings"].clone();
         assert!(
             !warnings.to_string().contains("was not saved back"),
@@ -6680,6 +6770,8 @@ fn a_live_undo_whose_refreshed_credential_cannot_be_saved_warns_on_stderr_and_in
     assert_eq!(code, 0, "the reversal still applies: {stdout}{stderr}");
     let doc = outcome_doc(&stdout);
     assert_eq!(doc["outcome"], json!("applied"), "{doc}");
+    assert_config(&doc, "skipped", Some("absent"));
+    assert_eq!(config_steps(&fixture), [skipped_absent(), skipped_absent()]);
     let warnings = doc["warnings"].as_array().expect("the document carries a warnings array");
     let refused: Vec<&str> = warnings
         .iter()
@@ -6756,6 +6848,8 @@ fn a_live_undo_whose_adopted_copy_cannot_take_a_refresh_is_refused_before_the_po
     let doc = outcome_doc(&stdout);
     assert_eq!(doc["outcome"], json!("needs_refresh"), "{doc}");
     assert_eq!(doc["refusal"], Value::Null, "{doc}");
+    assert_eq!(doc["config"], Value::Null, "the 21 undo runs no config step: {doc}");
+    assert_eq!(config_steps(&fixture), [skipped_absent()], "only the forward half's step");
     let note = doc["note"].as_str().unwrap_or_default();
     assert!(note.contains("pending write"), "why: {note}");
     assert!(note.contains("nothing was written"), "{note}");
@@ -6822,6 +6916,8 @@ fn a_live_undo_of_a_migrated_namespaces_parked_credential_refreshes_and_persists
     assert_eq!(code, 0, "a migrated namespace does not stop the live undo: {stdout}{stderr}");
     let doc = outcome_doc(&stdout);
     assert_eq!(doc["outcome"], json!("applied"), "{doc}");
+    assert_config(&doc, "skipped", Some("absent"));
+    assert_eq!(config_steps(&fixture), [skipped_absent(), skipped_absent()]);
     assert!(!doc["warnings"].to_string().contains("was not saved back"), "{doc}");
     let saved = fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("readable");
     assert!(saved.contains("sk-ant-ort01-rotated"), "persisted beside the store: {saved}");
@@ -6890,6 +6986,8 @@ fn a_live_undo_from_ps_own_store_whose_refresh_cannot_be_saved_warns_on_stderr_a
     assert_eq!(code, 0, "the reversal still applies: {stdout}{stderr}");
     let doc = outcome_doc(&stdout);
     assert_eq!(doc["outcome"], json!("applied"), "{doc}");
+    assert_config(&doc, "skipped", Some("absent"));
+    assert_eq!(config_steps(&fixture), [skipped_absent(), skipped_absent()]);
     let warnings = doc["warnings"].as_array().expect("the document carries a warnings array");
     let refused: Vec<&str> = warnings
         .iter()
@@ -6962,6 +7060,8 @@ fn a_live_parking_supersedes_only_an_earlier_live_parking() {
         assert!(note.contains("was not parked by a live swap agctl recorded"), "{note}");
         assert!(note.contains("move the file aside"), "and a remedy that always exists: {note}");
         assert!(!note.contains("belongs to another account"), "never (a)'s sentence: {note}");
+        assert_eq!(doc["config"], Value::Null, "an F refusal runs no config step: {doc}");
+        assert!(config_steps(&fixture).is_empty(), "and records none");
         assert_eq!(
             fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("readable"),
             namespace_source,
@@ -7005,6 +7105,8 @@ fn a_live_parking_supersedes_only_an_earlier_live_parking() {
         assert_eq!(code, 14, "refusal F: {stdout}{stderr}");
         let note = outcome_doc(&stdout)["note"].as_str().unwrap_or_default().to_owned();
         assert!(note.contains("belongs to another account"), "check (a)'s sentence: {note}");
+        assert_eq!(outcome_doc(&stdout)["config"], Value::Null, "no config step for an F refusal");
+        assert!(config_steps(&fixture).is_empty(), "and none recorded after the planted write");
         assert!(!note.contains("was not parked by a live swap"), "never (b)'s: {note}");
         assert_eq!(
             fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("readable"),
@@ -7043,6 +7145,12 @@ fn a_live_parking_supersedes_only_an_earlier_live_parking() {
         let (code, stdout, stderr) = swap(&fixture, &["--json"]);
         assert_eq!(code, 0, "an earlier live parking is superseded: {stdout}{stderr}");
         assert_eq!(outcome_doc(&stdout)["outcome"], json!("applied"));
+        assert_config(&outcome_doc(&stdout), "skipped", Some("absent"));
+        assert_eq!(
+            config_steps(&fixture),
+            [skipped_absent(), skipped_absent(), skipped_absent()],
+            "the applying arm: a step after each of its three live writes"
+        );
         assert_eq!(
             fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("readable"),
             p_next,
@@ -7085,6 +7193,7 @@ fn a_live_parking_supersedes_the_copy_an_undo_refreshed_and_wrote_back() {
 
     let (code, stdout, stderr) = undo_json(&fixture);
     assert_eq!(code, 0, "the undo refreshes P and applies: {stdout}{stderr}");
+    assert_config(&outcome_doc(&stdout), "skipped", Some("absent"));
     let written_back = fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("readable");
     assert!(written_back.contains("sk-ant-oat01-rotated"), "the premise: {written_back}");
     let undo_entry = write_entries(&fixture).pop().expect("the undo's entry");
@@ -7107,6 +7216,12 @@ fn a_live_parking_supersedes_the_copy_an_undo_refreshed_and_wrote_back() {
     assert_eq!(code, 0, "the next live swap supersedes the written-back copy: {stdout}{stderr}");
     let doc = outcome_doc(&stdout);
     assert_eq!(doc["outcome"], json!("applied"), "no F and no `NewerCopy`: {doc}");
+    assert_config(&doc, "skipped", Some("absent"));
+    assert_eq!(
+        config_steps(&fixture),
+        [skipped_absent(), skipped_absent(), skipped_absent()],
+        "a step after each applied pass"
+    );
     assert_eq!(
         fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("readable"),
         descendant,
@@ -7152,6 +7267,8 @@ fn a_live_swap_applies_when_the_incoming_accounts_profile_cannot_answer() {
     let (code, stdout, stderr) = swap(&fixture, &["--json"]);
     assert_eq!(code, 0, "T's profile being down does not refuse: {stdout}{stderr}");
     assert_eq!(outcome_doc(&stdout)["outcome"], json!("applied"));
+    assert_config(&outcome_doc(&stdout), "not_attempted", Some("profile_unavailable"));
+    assert_eq!(config_steps(&fixture), [not_attempted("profile_unavailable")]);
     assert_eq!(t_down.calls(), 1, "T's token was asked once, in Phase B, and failed");
     assert_eq!(p_asked.calls(), 1);
     let held = live_item(&fixture).expect("readable");
@@ -7177,6 +7294,7 @@ fn a_live_undo_applies_when_the_restored_accounts_profile_cannot_answer() {
 
     let (code, stdout, stderr) = swap(&fixture, &[]);
     assert_eq!(code, 0, "the forward swap applies: {stdout}{stderr}");
+    assert_eq!(config_steps(&fixture), [skipped_absent()], "the forward half: no `.claude.json`");
     assert_eq!(p_ok.calls(), 1, "P's token answered in the forward swap's Phase A");
     p_ok.delete();
     let p_down = server.mock(|when, then| {
@@ -7189,6 +7307,8 @@ fn a_live_undo_applies_when_the_restored_accounts_profile_cannot_answer() {
     let (code, stdout, stderr) = undo_json(&fixture);
     assert_eq!(code, 0, "P's profile being down does not refuse the undo: {stdout}{stderr}");
     assert_eq!(outcome_doc(&stdout)["outcome"], json!("applied"));
+    assert_config(&outcome_doc(&stdout), "not_attempted", Some("profile_unavailable"));
+    assert_eq!(config_steps(&fixture), [skipped_absent(), not_attempted("profile_unavailable")]);
     assert_eq!(p_down.calls(), 1, "P's token was asked once, in the undo's Phase B, and failed");
     assert_eq!(t_asked.calls(), 2, "T's token: the forward Phase B and the undo's Phase A");
     let back = live_item(&fixture).expect("readable");
@@ -7267,6 +7387,9 @@ fn ac72_a_live_swap_to_the_credential_already_in_the_item_is_already_active() {
     assert_eq!(doc["lock"]["hold_ms"], Value::Null, "and no hold was taken: {doc}");
     assert_eq!(writes(&fixture).len(), 0, "zero `-i` lines");
     assert!(audit_lines(&fixture).is_empty(), "and zero audit lines");
+    // S24b-1: no config step on `already_active` (S24b-2 adds the catch-up here).
+    assert_eq!(doc["config"], Value::Null, "`already_active` carries `config: null`: {doc}");
+    assert!(config_steps(&fixture).is_empty(), "0 config_write lines");
     assert_security(&fixture, &[("find-generic-password", 1)]);
     // Phase A asks whose the item's credential is before it looks at the
     // incoming store: one GET, which rotates nothing.
@@ -7307,6 +7430,7 @@ fn ac74_a_live_write_that_hangs_is_unknown_with_its_audit_id_and_a_released_hold
     let expected: std::collections::BTreeSet<&str> = [
         "adopted_to",
         "audit",
+        "config",
         "from",
         "kind",
         "lock",
@@ -7321,6 +7445,13 @@ fn ac74_a_live_write_that_hangs_is_unknown_with_its_audit_id_and_a_released_hold
     .into_iter()
     .collect();
     assert_eq!(keys, expected, "the outcome document's key set: {doc}");
+    // S24b: an `unknown` write is followed by a config step that records it did
+    // not attempt the rewrite — the item may not hold the incoming credential.
+    assert_config(&doc, "not_attempted", Some("swap_unknown"));
+    assert_eq!(
+        (doc["config"]["backup"].clone(), doc["config"]["hold_ms"].clone()),
+        (Value::Null, Value::Null)
+    );
     assert_eq!(doc["kind"], json!("outcome"), "{doc}");
     assert_eq!(doc["outcome"], json!("unknown"), "{doc}");
     assert_eq!(doc["refusal"], Value::Null, "`unknown` is not a lettered refusal: {doc}");
@@ -7353,6 +7484,11 @@ fn ac74_a_live_write_that_hangs_is_unknown_with_its_audit_id_and_a_released_hold
     let lines = write_lines(&fixture);
     assert_eq!(lines.len(), 1, "one entry: {lines:?}");
     assert_eq!(field(&lines[0], "outcome").as_deref(), Some("unknown"), "{}", lines[0]);
+    assert_eq!(
+        config_steps(&fixture),
+        [not_attempted("swap_unknown")],
+        "one config_write line after the `unknown` write"
+    );
     assert_eq!(field(&lines[0], "target").as_deref(), Some("live"), "{}", lines[0]);
     // The child was killed before it could touch the item.
     assert_eq!(live_item(&fixture).expect("readable"), before, "the live item still holds P");
@@ -7414,6 +7550,8 @@ fn ac71_a_live_item_that_changes_before_the_hold_discards_the_swap() {
     let doc = outcome_doc(&stdout);
     assert_eq!(doc["outcome"], json!("discarded"), "{doc}");
     assert_eq!(doc["refusal"], Value::Null, "a discard is not a lettered refusal: {doc}");
+    assert_eq!(doc["config"], Value::Null, "a discarded write runs no config step: {doc}");
+    assert!(config_steps(&fixture).is_empty(), "0 config_write lines");
     assert!(!stdout.contains("sk-ant-"), "{stdout}");
 
     assert_eq!(writes(&fixture).len(), 0, "zero `-i` lines: {:?}", writes(&fixture));
@@ -7425,5 +7563,631 @@ fn ac71_a_live_item_that_changes_before_the_hold_discards_the_swap() {
     assert_security(&fixture, &[("find-generic-password", 2)]);
     assert_eq!((p_asked.calls(), t_asked.calls()), (1, 1), "both GETs precede the pause");
     audit_carries_no_token(&fixture);
+    let _ = token;
+}
+
+// ---------------------------------------------------------------------------
+// S24b-1 — the live `.claude.json` rewrite after an applied live write
+// ---------------------------------------------------------------------------
+
+/// The five caches the config step deletes (spike S13, V9).
+const STALE_CACHES: [&str; 5] = [
+    "modelAccessCache",
+    "orgModelDefaultCache",
+    "cachedExtraUsageDisabledReason",
+    "cachedUsageUtilization",
+    "passesEligibilityCache",
+];
+
+/// One config step, as its `config_write` audit line records it.
+type ConfigStep = (String, Option<String>);
+
+fn skipped_absent() -> ConfigStep {
+    ("skipped".to_owned(), Some("absent".to_owned()))
+}
+
+fn refused_not_reproducible() -> ConfigStep {
+    ("refused".to_owned(), Some("not_reproducible".to_owned()))
+}
+
+fn not_attempted(reason: &str) -> ConfigStep {
+    ("not_attempted".to_owned(), Some(reason.to_owned()))
+}
+
+/// Every `config_write` line's outcome and reason, oldest first — asserting on
+/// the way that each one directly follows the `write` line it names in
+/// `after`, which is what "one config step per live write" means on disk.
+fn config_steps(fixture: &Fixture) -> Vec<ConfigStep> {
+    let lines = audit_lines(fixture);
+    let mut steps = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if !line.contains("\"event\":\"config_write\"") {
+            continue;
+        }
+        let entry: Value = serde_json::from_str(line).expect("a config_write line parses");
+        let write: Value = index
+            .checked_sub(1)
+            .and_then(|before| lines.get(before))
+            .map(|before| serde_json::from_str(before).expect("the line before parses"))
+            .unwrap_or_else(|| panic!("a config_write line is never the first line: {lines:?}"));
+        assert_eq!(
+            write["event"],
+            json!("write"),
+            "a config_write line directly follows its write line: {lines:#?}"
+        );
+        let id = format!("{}#{}", write["ts"].as_str().expect("a timestamp"), write["agctl_pid"]);
+        assert_eq!(entry["after"], json!(id), "and names that write: {line}");
+        let line_text = line.as_str();
+        assert!(!line_text.contains('@') && !line_text.contains("sk-ant-"), "ids only: {line}");
+        steps.push((
+            entry["outcome"].as_str().expect("an outcome").to_owned(),
+            entry["reason"].as_str().map(str::to_owned),
+        ));
+    }
+    steps
+}
+
+/// Asserts an outcome document's `config` member is exactly the step's words,
+/// with no path, id or email beside them.
+fn assert_config(doc: &Value, outcome: &str, reason: Option<&str>) {
+    let config = &doc["config"];
+    let keys: std::collections::BTreeSet<&str> = config
+        .as_object()
+        .unwrap_or_else(|| panic!("`config` is an object here: {doc}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["backup", "budget_ms", "hold_ms", "outcome", "reason"].into_iter().collect(),
+        "the config member's key set: {doc}"
+    );
+    assert_eq!(config["outcome"], json!(outcome), "config.outcome: {doc}");
+    assert_eq!(config["reason"], reason.map_or(Value::Null, |r| json!(r)), "config.reason: {doc}");
+    assert_eq!(config["budget_ms"], json!(1200), "{doc}");
+    let text = config.to_string();
+    assert!(!text.contains('/') && !text.contains('@'), "no path, no email: {text}");
+    assert!(!text.contains(ACCT) && !text.contains(ACCT_T), "no account id: {text}");
+}
+
+/// D-030's sentence, as the `warnings` entry carries it.
+fn not_updated(phrase: &str) -> String {
+    format!(
+        "`~/.claude.json` was not updated ({phrase}); running sessions keep showing the previous \
+         account until the next swap or undo, or a Claude Code `/login`"
+    )
+}
+
+/// Asserts D-030's sentence reached stderr and `warnings`, and names no command.
+fn assert_not_updated(doc: &Value, stderr: &str, phrase: &str) {
+    let sentence = not_updated(phrase);
+    assert!(stderr.contains(&format!("warning: {sentence}")), "on stderr: {stderr}");
+    let warnings: Vec<&str> =
+        doc["warnings"].as_array().expect("warnings").iter().filter_map(Value::as_str).collect();
+    assert_eq!(
+        warnings.iter().filter(|warning| **warning == sentence).count(),
+        1,
+        "exactly once in `warnings`: {warnings:?}"
+    );
+    let line = stderr.lines().find(|line| line.contains("was not updated")).expect("the line");
+    for text in [line, sentence.as_str()] {
+        let frame = text.replacen(phrase, "", 1);
+        assert!(!frame.contains("run "), "names no command: {text}");
+        assert!(!text.contains("agctl claude") && !text.contains("--undo"), "{text}");
+    }
+}
+
+/// The `oauthAccount` object the rewrite builds from `common::mock_profile`'s
+/// document for `acct`/`org`, stamped `fetched_at`.
+fn profile_account(acct: &str, org: &str, fetched_at: i64) -> Value {
+    json!({
+        "accountUuid": acct,
+        "emailAddress": "profile@example.com",
+        "organizationUuid": org,
+        "hasExtraUsageEnabled": false,
+        "billingType": "stripe_subscription",
+        "accountCreatedAt": "2026-01-01T00:00:00Z",
+        "ccOnboardingFlags": {},
+        "claudeCodeTrialEndsAt": null,
+        "claudeCodeTrialDurationDays": null,
+        "seatTier": null,
+        "displayName": "Profile Fixture",
+        "profileFetchedAt": fetched_at,
+    })
+}
+
+/// `planted` with the allowlist applied — `oauthAccount` replaced by
+/// `account`, the five caches deleted, nothing else — as Claude Code renders a
+/// document. The byte-level proof that the renderer agrees with
+/// `JSON.stringify` is the unit test's, whose expected side is text.
+fn rewritten(planted: &Value, account: Value) -> String {
+    let mut document = planted.as_object().expect("an object").clone();
+    document.insert("oauthAccount".to_owned(), account);
+    for key in STALE_CACHES {
+        document.shift_remove(key);
+    }
+    serde_json::to_string_pretty(&document).expect("renderable")
+}
+
+/// The hex SHA-256 prefix the audit log records for `bytes`.
+fn sha8_of(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes)).get(..8).expect("a digest").to_owned()
+}
+
+/// The backups' names, sorted; none when `backups/` is absent.
+fn backup_names(fixture: &Fixture) -> Vec<String> {
+    let Ok(read) = fs::read_dir(fixture.backups_dir()) else { return Vec::new() };
+    let mut names: Vec<String> = read
+        .map(|entry| entry.expect("an entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Every name holding `.tmp.` beside the live `.claude.json` target.
+fn config_temps(fixture: &Fixture) -> Vec<String> {
+    fs::read_dir(fixture.home().join(".claude-real"))
+        .expect("the resolved store is listable")
+        .map(|entry| entry.expect("an entry").file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp."))
+        .collect()
+}
+
+/// Asserts `$HOME/.claude.json` is still the link into the resolved store.
+fn config_link_intact(fixture: &Fixture, link: &Path) {
+    let meta = fs::symlink_metadata(link).expect("the link is there");
+    assert!(meta.file_type().is_symlink(), "`.claude.json` is still a symlink");
+    assert_eq!(
+        fs::read_link(link).expect("a readable link"),
+        fixture.home().join(".claude-real").join(".claude.json"),
+        "pointing where it pointed"
+    );
+}
+
+#[test]
+fn a_live_swap_rewrites_oauth_account_through_the_link_and_backs_up_first() {
+    // AC75, forward. A JS-shaped `.claude.json` — thirty members, the five
+    // caches, P's twenty-key login object — reached through the `$HOME` link:
+    // T's object replaces P's, the caches go, every other byte stays, the
+    // backup is the planted bytes, the link is intact and the lock released.
+    // Once with `--json` for the `config` member, once as a person sees it.
+    for as_json in [true, false] {
+        let arm = if as_json { "--json" } else { "the terminal" };
+        let server = MockServer::start();
+        let token = token_ok(&server);
+        let (p_asked, t_asked) = live_profiles(&server);
+        let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+        let planted = common::live_config_document();
+        let link = fixture.live_claude_json_js(&planted);
+        let target = fixture.home().join(".claude-real").join(".claude.json");
+        let planted_bytes = fs::read(&target).expect("the planted target");
+        assert!(!planted_bytes.ends_with(b"\n"), "the premise: JS writes no trailing newline");
+
+        let started = common::now_ms();
+        let (code, stdout, stderr) = swap(&fixture, if as_json { &["--json"] } else { &[] });
+        let finished = common::now_ms();
+        assert_eq!(code, 0, "{arm}: the swap applies: {stdout}{stderr}");
+
+        let written = fs::read_to_string(&target).expect("the rewritten target");
+        let parsed: Value = serde_json::from_str(&written).expect("still JSON");
+        let fetched_at = parsed["oauthAccount"]["profileFetchedAt"].as_i64().expect("stamped");
+        assert!((started..=finished).contains(&fetched_at), "{arm}: stamped during the pass");
+        assert_eq!(
+            written,
+            rewritten(&planted, profile_account(ACCT_T, ORG_T, fetched_at)),
+            "{arm}: T's object, the caches gone, and every other byte of the planted text"
+        );
+        assert!(!written.ends_with('\n'), "{arm}: no trailing newline");
+        for cache in STALE_CACHES {
+            assert!(parsed.get(cache).is_none(), "{arm}: `{cache}` deleted");
+        }
+        for kept in ["userID", "mcpServers", "projects", "numStartups", "s1mAccessCache"] {
+            assert_eq!(parsed[kept], planted[kept], "{arm}: `{kept}` kept");
+        }
+        config_link_intact(&fixture, &link);
+        assert!(
+            !fixture.config_lock_path().exists(),
+            "{arm}: `$HOME/.claude.json.lock` absent after"
+        );
+        assert!(config_temps(&fixture).is_empty(), "{arm}: no temporary file");
+
+        let backups = backup_names(&fixture);
+        assert_eq!(backups.len(), 1, "{arm}: one backup: {backups:?}");
+        let stamp = backups[0].strip_prefix(".claude.json.backup.").expect("the peer's name shape");
+        assert!(stamp.len() == 13 && stamp.bytes().all(|b| b.is_ascii_digit()), "{backups:?}");
+        assert_eq!(
+            fs::read(fixture.backups_dir().join(&backups[0])).expect("readable"),
+            planted_bytes,
+            "{arm}: the backup is the planted bytes"
+        );
+
+        assert_eq!(
+            config_steps(&fixture),
+            [("applied".to_owned(), None)],
+            "{arm}: one applied step"
+        );
+        let line: Value = serde_json::from_str(
+            audit_lines(&fixture).iter().find(|l| l.contains("config_write")).expect("the line"),
+        )
+        .expect("parses");
+        assert_eq!(line["backup"], json!(backups[0]), "{arm}: the line names the backup: {line}");
+        assert_eq!(line["account"], installed(ACCT_T, ORG_T), "{arm}: T's ids: {line}");
+        assert_eq!(line["from_sha8"], json!(sha8_of(&planted_bytes)), "{line}");
+        assert_eq!(line["to_sha8"], json!(sha8_of(written.as_bytes())), "{line}");
+        assert!(
+            line["hold_ms"].as_u64().is_some_and(|ms| ms <= 1200),
+            "{arm}: inside 1 200 ms: {line}"
+        );
+
+        if as_json {
+            let doc = outcome_doc(&stdout);
+            assert_eq!(doc["outcome"], json!("applied"), "{doc}");
+            assert_config(&doc, "applied", None);
+            assert_eq!(doc["config"]["backup"], json!(backups[0]), "{doc}");
+            assert!(doc["config"]["hold_ms"].is_u64(), "{doc}");
+            let plan = json_docs(&stdout).into_iter().next().expect("the plan document");
+            assert_eq!(plan["kind"], json!("plan"), "{plan}");
+            assert_eq!(plan["config_path"], json!(link.display().to_string()), "{plan}");
+        } else {
+            assert!(
+                stdout.contains("running sessions show the new account within a second"),
+                "{arm}: S13-3's clause: {stdout}"
+            );
+            assert!(stdout.contains("run `/model` once"), "{stdout}");
+        }
+        assert!(!stderr.contains("was not updated"), "{arm}: no D-030 warning: {stderr}");
+        hold_within_budget(&stderr);
+        live_artefacts_released(&fixture, &resolved);
+        assert_security(
+            &fixture,
+            &[("find-generic-password", 3), ("-i", 1), ("add-generic-password", 1)],
+        );
+        assert_eq!((p_asked.calls(), t_asked.calls()), (1, 1), "{arm}: GETs P 1, T 1 — no third");
+        audit_carries_no_token(&fixture);
+        assert_eq!(token.calls(), 0);
+    }
+}
+
+#[test]
+fn a_live_undo_rewrites_oauth_account_with_the_restored_accounts_profile() {
+    // AC75, reverse, and ruling R-B: the undo's own config step writes P's
+    // object from P's Phase B GET — the same threading — so the GET counts are
+    // S24a's for this pair and nothing is fetched again.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (p_asked, t_asked) = live_profiles(&server);
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+    let planted = common::live_config_document();
+    let link = fixture.live_claude_json_js(&planted);
+    let target = fixture.home().join(".claude-real").join(".claude.json");
+    let planted_bytes = fs::read(&target).expect("the planted target");
+
+    let (code, stdout, stderr) = swap(&fixture, &[]);
+    assert_eq!(code, 0, "the forward swap applies: {stdout}{stderr}");
+    let post_swap = fs::read(&target).expect("after the swap");
+    assert_eq!(config_steps(&fixture), [("applied".to_owned(), None)]);
+    assert_eq!((p_asked.calls(), t_asked.calls()), (1, 1), "the forward swap's two GETs");
+
+    let started = common::now_ms();
+    let (code, stdout, stderr) = undo_json(&fixture);
+    let finished = common::now_ms();
+    assert_eq!(code, 0, "the undo applies: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], json!("applied"), "{doc}");
+    assert_config(&doc, "applied", None);
+
+    let written = fs::read_to_string(&target).expect("after the undo");
+    let parsed: Value = serde_json::from_str(&written).expect("JSON");
+    assert_eq!(parsed["oauthAccount"]["accountUuid"], json!(ACCT), "P's ids: {written}");
+    assert_eq!(parsed["oauthAccount"]["organizationUuid"], json!(ORG), "{written}");
+    let fetched_at = parsed["oauthAccount"]["profileFetchedAt"].as_i64().expect("stamped");
+    assert!((started..=finished).contains(&fetched_at), "stamped by the undo");
+    // The undo's input is the post-swap file; the rewrite of it is the planted
+    // document with P's refreshed object — the caches were gone already.
+    assert_eq!(written, rewritten(&planted, profile_account(ACCT, ORG, fetched_at)));
+    config_link_intact(&fixture, &link);
+
+    let backups = backup_names(&fixture);
+    assert_eq!(backups.len(), 2, "one backup per rewrite: {backups:?}");
+    assert_eq!(fs::read(fixture.backups_dir().join(&backups[0])).expect("r"), planted_bytes);
+    assert_eq!(
+        fs::read(fixture.backups_dir().join(&backups[1])).expect("readable"),
+        post_swap,
+        "the second backup is the post-swap bytes"
+    );
+    assert_eq!(
+        config_steps(&fixture),
+        [("applied".to_owned(), None), ("applied".to_owned(), None)],
+        "two applied steps, each after its write"
+    );
+    // R-B: S24a's counts for this pair (`live_undo_entries_record_the_account_they_installed`).
+    assert_eq!(
+        (p_asked.calls(), t_asked.calls()),
+        (2, 2),
+        "the owner's bearer mock counted, no re-fetch"
+    );
+    assert!(!fixture.config_lock_path().exists());
+    live_artefacts_released(&fixture, &resolved);
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 7), ("-i", 2), ("add-generic-password", 2)],
+    );
+    audit_carries_no_token(&fixture);
+    assert_eq!(token.calls(), 0);
+}
+
+#[test]
+fn a_swap_applies_when_the_incoming_profile_cannot_be_read_and_says_the_config_was_not_updated() {
+    // Ruling G3 and D-030. T's Phase B GET fails: the swap applies (exit 0), the
+    // config step is not attempted — there is no document to write — and the
+    // file, byte-identical, is named in D-030's sentence, which promises no
+    // re-run.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let p_asked = common::mock_profile(&server, "sk-ant-oat01-outgoing", (ACCT, ORG));
+    let t_down = server.mock(|when, then| {
+        when.method(GET)
+            .path(common::PROFILE_PATH)
+            .header("authorization", "Bearer sk-ant-oat01-incoming");
+        then.status(500).body("upstream error");
+    });
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+    let link = fixture.live_claude_json_js(&common::live_config_document());
+    let planted_bytes = fs::read(&link).expect("the planted target");
+
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+    assert_eq!(code, 0, "applied, exit 0: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], json!("applied"), "{doc}");
+    assert_config(&doc, "not_attempted", Some("profile_unavailable"));
+    assert_eq!(
+        (doc["config"]["backup"].clone(), doc["config"]["hold_ms"].clone()),
+        (Value::Null, Value::Null)
+    );
+    assert_not_updated(&doc, &stderr, "the server could not be asked for that account's profile");
+    assert_eq!(
+        fs::read(&link).expect("readable"),
+        planted_bytes,
+        "the planted target byte-identical"
+    );
+    assert!(!fixture.backups_dir().exists(), "no `backups/` created");
+    assert!(!fixture.config_lock_path().exists(), "no lock");
+    config_link_intact(&fixture, &link);
+    assert_eq!(config_steps(&fixture), [not_attempted("profile_unavailable")]);
+    assert_eq!((p_asked.calls(), t_down.calls()), (1, 1), "GETs P 1, T 1 (failed)");
+    live_artefacts_released(&fixture, &resolved);
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 3), ("-i", 1), ("add-generic-password", 1)],
+    );
+    audit_carries_no_token(&fixture);
+    let _ = token;
+}
+
+#[test]
+fn a_held_config_lock_leaves_the_swap_applied_and_the_config_unwritten() {
+    // Ruling G6: a Claude Code session holds the config lock throughout. agctl
+    // waits on the ladder with nothing held — the credential-store hold was
+    // already released — then gives up: the swap stands, the file is
+    // untouched, and the peer's lock is neither removed nor re-stamped.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (p_asked, t_asked) = live_profiles(&server);
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+    let link = fixture.live_claude_json_js(&common::live_config_document());
+    let planted_bytes = fs::read(&link).expect("the planted target");
+    let lock = fixture.plant_config_lock(Duration::ZERO);
+    let lock_mtime = fs::metadata(&lock).and_then(|meta| meta.modified()).expect("stat");
+
+    let started = Instant::now();
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+    let took = started.elapsed();
+    assert_eq!(code, 0, "exit 0: {stdout}{stderr}");
+    assert!(took >= Duration::from_millis(1400), "the ladder ran: {took:?}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], json!("applied"), "{doc}");
+    assert_config(&doc, "skipped", Some("lock_busy"));
+    assert_not_updated(&doc, &stderr, "a Claude Code session held its config lock");
+    assert!(lock.is_dir(), "the planted directory is present");
+    assert_eq!(
+        fs::metadata(&lock).and_then(|m| m.modified()).expect("stat"),
+        lock_mtime,
+        "mtime unchanged"
+    );
+    assert_eq!(fs::read(&link).expect("readable"), planted_bytes, "target byte-identical");
+    assert!(backup_names(&fixture).is_empty(), "no backup written");
+    assert!(config_temps(&fixture).is_empty(), "no temporary file");
+    assert_eq!(config_steps(&fixture), [("skipped".to_owned(), Some("lock_busy".to_owned()))]);
+    assert_eq!((p_asked.calls(), t_asked.calls()), (1, 1));
+    live_artefacts_released(&fixture, &resolved);
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 3), ("-i", 1), ("add-generic-password", 1)],
+    );
+    audit_carries_no_token(&fixture);
+    let _ = token;
+}
+
+#[test]
+fn a_stale_config_lock_is_never_broken_and_the_swap_stands() {
+    // Ruling G5: a config lock a minute old is past the peer's 10 s window, and
+    // agctl still does not break it — the peer's own save will.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (p_asked, t_asked) = live_profiles(&server);
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+    let link = fixture.live_claude_json_js(&common::live_config_document());
+    let planted_bytes = fs::read(&link).expect("the planted target");
+    let lock = fixture.plant_config_lock(Duration::from_secs(60));
+    let lock_mtime = fs::metadata(&lock).and_then(|meta| meta.modified()).expect("stat");
+
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+    assert_eq!(code, 0, "the swap stands: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_config(&doc, "skipped", Some("lock_stale"));
+    assert_not_updated(&doc, &stderr, "its config lock was left behind by a session that stopped");
+    assert!(lock.is_dir(), "still present");
+    assert_eq!(
+        fs::metadata(&lock).and_then(|m| m.modified()).expect("stat"),
+        lock_mtime,
+        "not re-stamped"
+    );
+    assert_eq!(fs::read(&link).expect("readable"), planted_bytes, "target byte-identical");
+    assert!(backup_names(&fixture).is_empty(), "no backup");
+    assert_eq!(config_steps(&fixture), [("skipped".to_owned(), Some("lock_stale".to_owned()))]);
+    assert_eq!((p_asked.calls(), t_asked.calls()), (1, 1));
+    live_artefacts_released(&fixture, &resolved);
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 3), ("-i", 1), ("add-generic-password", 1)],
+    );
+    let _ = token;
+}
+
+#[test]
+fn one_config_write_line_follows_each_live_write_and_none_follows_a_refusal() {
+    // D-028's "one confirmed rmw": at most one config step per live write, and
+    // none where nothing was written. P → T applies, a forward pass whose item
+    // cannot be identified refuses 29, and `--undo` applies — with P's own
+    // profile down in its Phase B, so its step writes nothing and still leaves
+    // its one line (ruling G14).
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let mut p_asked = common::mock_profile(&server, "sk-ant-oat01-outgoing", (ACCT, ORG));
+    let mut t_asked = common::mock_profile(&server, "sk-ant-oat01-incoming", (ACCT_T, ORG_T));
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+    let link = fixture.live_claude_json_js(&common::live_config_document());
+
+    let (code, stdout, stderr) = swap(&fixture, &[]);
+    assert_eq!(code, 0, "P → T applies: {stdout}{stderr}");
+    let after_swap = fs::read(&link).expect("readable");
+    assert_eq!(config_steps(&fixture), [("applied".to_owned(), None)]);
+
+    // The item now holds T, and T's token cannot be asked: refusal 29.
+    t_asked.delete();
+    let mut t_down = server.mock(|when, then| {
+        when.method(GET)
+            .path(common::PROFILE_PATH)
+            .header("authorization", "Bearer sk-ant-oat01-incoming");
+        then.status(503).body("upstream unavailable");
+    });
+    let lines_before = audit_lines(&fixture).len();
+    let (code, stdout, stderr) = swap_to(&fixture, EMAIL, &["--json"]);
+    assert_eq!(code, 29, "refused: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["config"], Value::Null, "a refusal has no config step: {doc}");
+    assert_eq!(audit_lines(&fixture).len(), lines_before, "and adds no line");
+    assert_eq!(fs::read(&link).expect("readable"), after_swap, "nor touches the file");
+    assert_eq!(t_down.calls(), 1);
+    t_down.delete();
+    let t_back = common::mock_profile(&server, "sk-ant-oat01-incoming", (ACCT_T, ORG_T));
+    assert_eq!(p_asked.calls(), 1, "P's token answered the forward swap's Phase A");
+    p_asked.delete();
+    let p_down = server.mock(|when, then| {
+        when.method(GET)
+            .path(common::PROFILE_PATH)
+            .header("authorization", "Bearer sk-ant-oat01-outgoing");
+        then.status(503).body("upstream unavailable");
+    });
+
+    let (code, stdout, stderr) = undo(&fixture);
+    assert_eq!(code, 0, "the undo applies: {stdout}{stderr}");
+    assert_eq!(
+        config_steps(&fixture),
+        [("applied".to_owned(), None), not_attempted("profile_unavailable")],
+        "exactly two config_write lines, each directly after its write line"
+    );
+    assert_eq!(write_lines(&fixture).len(), 2, "two writes");
+    assert_eq!(backup_names(&fixture).len(), 1, "one rewrite, one backup");
+    assert_eq!(fs::read(&link).expect("readable"), after_swap, "the undo's step wrote nothing");
+    assert_eq!((t_back.calls(), p_down.calls()), (1, 1));
+    live_artefacts_released(&fixture, &resolved);
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 8), ("-i", 2), ("add-generic-password", 2)],
+    );
+    audit_carries_no_token(&fixture);
+    let _ = token;
+}
+
+#[test]
+fn a_namespace_swap_never_touches_claude_json() {
+    // I18's isolated half stands: a namespace target runs no config step, even
+    // with a perfectly reproducible live `.claude.json` beside it.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (fixture, _service) = two_accounts(&server, common::fresh_at());
+    fs::create_dir_all(fixture.home().join(".claude-real")).expect("creatable");
+    let link = fixture.live_claude_json_js(&common::live_config_document());
+    let target = fixture.home().join(".claude-real").join(".claude.json");
+    let bytes = fs::read(&target).expect("readable");
+    let (target_inode, link_inode) = (
+        common::inode_of(&target),
+        fs::symlink_metadata(&link)
+            .map(|meta| std::os::unix::fs::MetadataExt::ino(&meta))
+            .expect("stat"),
+    );
+
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+    assert_eq!(code, 0, "the namespace swap applies: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert!(doc["target"].as_str().is_some_and(|t| t.starts_with("namespace:")), "{doc}");
+    assert_eq!(doc["config"], Value::Null, "`config` is null for a namespace target: {doc}");
+    let plan = json_docs(&stdout).into_iter().next().expect("the plan");
+    assert_eq!(plan["config_path"], Value::Null, "the plan names no config file: {plan}");
+    assert!(config_steps(&fixture).is_empty(), "0 config_write lines");
+    assert_eq!(fs::read(&target).expect("readable"), bytes, "target byte-identical");
+    assert_eq!(common::inode_of(&target), target_inode, "and the same inode");
+    assert_eq!(
+        fs::symlink_metadata(&link)
+            .map(|meta| std::os::unix::fs::MetadataExt::ino(&meta))
+            .expect("stat"),
+        link_inode,
+        "the link's own inode"
+    );
+    config_link_intact(&fixture, &link);
+    assert!(!fixture.config_lock_path().exists(), "no lock directory");
+    assert!(!fixture.backups_dir().exists(), "no backups");
+    assert!(!stderr.contains("was not updated"), "{stderr}");
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 3), ("-i", 1), ("add-generic-password", 1)],
+    );
+    let _ = token;
+}
+
+#[test]
+fn a_compact_claude_json_is_refused_as_not_reproducible_and_left_byte_identical() {
+    // Drift 8, on the real flow: the compact fixture is not a shape Claude Code
+    // writes, so re-serialising it cannot reproduce it and the step refuses
+    // before any lock.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (p_asked, t_asked) = live_profiles(&server);
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+    let link = fixture.live_claude_json(&claude_json_naming(ACCT, ORG, EMAIL));
+    let bytes = fs::read(&link).expect("readable");
+
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+    assert_eq!(code, 0, "the swap applies: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_config(&doc, "refused", Some("not_reproducible"));
+    assert_not_updated(
+        &doc,
+        &stderr,
+        "agctl could not reproduce its bytes exactly, so it did not rewrite it",
+    );
+    assert_eq!(fs::read(&link).expect("readable"), bytes, "target byte-identical");
+    assert!(!fixture.config_lock_path().exists(), "no lock directory");
+    assert!(!fixture.backups_dir().exists(), "no backup");
+    config_link_intact(&fixture, &link);
+    assert_eq!(config_steps(&fixture), [refused_not_reproducible()]);
+    assert_eq!((p_asked.calls(), t_asked.calls()), (1, 1));
+    live_artefacts_released(&fixture, &resolved);
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 3), ("-i", 1), ("add-generic-password", 1)],
+    );
     let _ = token;
 }

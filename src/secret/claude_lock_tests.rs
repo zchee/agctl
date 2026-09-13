@@ -2490,7 +2490,7 @@ fn append_and_read(paths: &Paths, draft: Option<BreakDraft>) -> Vec<LockBreakRec
         .into_iter()
         .filter_map(|entry| match entry.event {
             AuditEvent::LockBreak(record) => Some(record),
-            AuditEvent::Write { .. } => None,
+            _ => None,
         })
         .collect()
 }

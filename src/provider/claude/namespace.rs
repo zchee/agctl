@@ -49,6 +49,7 @@
     )
 )]
 
+use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
@@ -249,10 +250,64 @@ pub fn live_store_dir(env: &EnvView) -> PathBuf {
 /// `--new-only` isolation incomplete (risk R10).
 ///
 /// Consulted only for the live row (invariant I13).
+///
+/// This is Claude Code's `OQt()`, **without** `Lt()`'s `.config.json`
+/// precedence. The display-only callers (`discovery::live_identity`, `login`,
+/// `doctor`'s isolation section) read this path; every writer, lock and backup
+/// derivation — `claude_json`, `config_lock`, and later M6 and `doctor`'s
+/// config row — must use [`global_config_path`], or the lock and the rewrite
+/// would target a file the peer does not (ruling Q9).
 pub fn claude_json_path(env: &EnvView) -> PathBuf {
     match env.config_dir.as_deref() {
         Some(value) if !value.is_empty() => PathBuf::from(normalize(value)).join(".claude.json"),
         _ => env.home.join(".claude.json"),
+    }
+}
+
+/// The global configuration file Claude Code reads and writes: its `Lt()`
+/// (spike S13, V8; ruling G13 as corrected by Q9).
+///
+/// `<config home>/.config.json` when that path exists — following links, as
+/// `existsSync` does — and [`claude_json_path`] otherwise. Every writer of the
+/// file, its lock and its backups derive from this, never from
+/// [`claude_json_path`] alone.
+///
+/// The existence check is the one filesystem access in this module.
+pub fn global_config_path(env: &EnvView) -> PathBuf {
+    let preferred = config_home(env).join(".config.json");
+    if preferred.exists() { preferred } else { claude_json_path(env) }
+}
+
+/// Where the peer keeps its `.claude.json` backups: `<config home>/backups`
+/// (Claude Code's `Ac()`), which is **not** beside the configuration file.
+pub fn backups_dir(env: &EnvView) -> PathBuf {
+    config_home(env).join("backups")
+}
+
+/// The name of the configuration lock directory for `config_path`:
+/// `<file name>.lock`, beside the **literal** path (drift 1).
+///
+/// `proper-lockfile`'s `lockfilePath` is `${configPath}.lock` and is never
+/// passed through `realpath`, so for `~/.claude.json` — a symbolic link on the
+/// reference machine — the lock is `~/.claude.json.lock`, beside the link and
+/// not beside its target. `None` for a path with no file name.
+pub fn config_lock_name(config_path: &Path) -> Option<OsString> {
+    let mut name = config_path.file_name()?.to_os_string();
+    name.push(".lock");
+    Some(name)
+}
+
+/// Claude Code's `be()` as a writer derives it: `CLAUDE_CONFIG_DIR` when it
+/// holds a non-empty value, else `$HOME/.claude`, NFC-normalized.
+///
+/// An empty value follows [`live_store_dir`]'s documented divergence rather
+/// than `be()`'s `??`, so no derivation here is ever a relative path. That is
+/// also where it differs from [`config_dir_or_default`], which keeps the empty
+/// string because the naming rule hashes the raw value.
+fn config_home(env: &EnvView) -> PathBuf {
+    match env.config_dir.as_deref() {
+        Some(value) if !value.is_empty() => PathBuf::from(normalize(value)),
+        _ => PathBuf::from(normalize(&env.home.join(".claude").to_string_lossy())),
     }
 }
 

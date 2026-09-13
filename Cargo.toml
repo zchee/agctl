@@ -28,7 +28,7 @@ ratatui = "0.30"
 rustix = { version = "1", features = ["fs", "process"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 sha2 = "0.11.0"
 signal-hook = "0.4"
 tabled = "0.22"

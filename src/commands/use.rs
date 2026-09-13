@@ -62,8 +62,21 @@
 //! only to a write agctl itself made ([`identity_by_own_write`]), and anything
 //! else refuses ([`Refusal::IdentityUnavailable`]). The incoming credential is
 //! asked once more in Phase B, after its refresh, so a pass issues at most two
-//! GETs. `.claude.json` is never read on this path: after a live swap it names
-//! the account the swap displaced until something rewrites it.
+//! GETs. `.claude.json` is never read as an identity source on this path: after
+//! a live swap it names the account the swap displaced until something rewrites
+//! it.
+//!
+//! ## The config step (S24b)
+//!
+//! That rewrite is this pass's own last step. After Phase C has released Claude
+//! Code's credential-store locks, an **applied** live write is followed by one
+//! [`claude_json::rmw`] of the live configuration file, from the profile
+//! document Phase B's second GET already fetched — never a third GET — and by
+//! one `config_write` audit line. An `unknown` write records that the step was
+//! not attempted; every other outcome, a namespace target and every
+//! `already_active` return run no step at all. A step that does not apply never
+//! changes the swap's outcome or exit code: the swap did apply, and the caller
+//! is told on stderr and in `--json`'s `warnings` that the file was not updated.
 //!
 //! ## The one thing this file must never do
 //!
@@ -94,6 +107,8 @@ use crate::config::paths::UNKNOWN_ORG;
 use crate::error::AppError;
 use crate::error::EXIT_OK;
 use crate::provider::claude::adopt;
+use crate::provider::claude::claude_json;
+use crate::provider::claude::claude_json::ConfigReport;
 use crate::provider::claude::credentials::Credentials;
 use crate::provider::claude::credentials::Digests;
 use crate::provider::claude::credentials::Identity;
@@ -117,6 +132,7 @@ use crate::secret::KeychainReader;
 use crate::secret::audit;
 use crate::secret::audit::AuditEntry;
 use crate::secret::audit::AuditEvent;
+use crate::secret::audit::ConfigReason;
 use crate::secret::audit::Target;
 use crate::secret::claude_lock;
 use crate::secret::claude_lock::AcquireOutcome;
@@ -227,6 +243,11 @@ struct Report {
     warnings: Vec<String>,
     /// A sentence for the terminal.
     note: Option<String>,
+    /// The config step that followed Phase C on the live target (S24b): the
+    /// rewrite's outcome, or `not_attempted` after an `unknown` write. `None`
+    /// wherever no step belongs — a namespace target, `already_active`, and
+    /// every outcome that wrote nothing.
+    config: Option<ConfigReport>,
 }
 
 impl Report {
@@ -242,6 +263,7 @@ impl Report {
             lock: LockReport::default(),
             warnings: Vec::new(),
             note: Some(note),
+            config: None,
         }
     }
 
@@ -269,6 +291,7 @@ impl Report {
             lock: LockReport::default(),
             warnings: Vec::new(),
             note: Some(note),
+            config: None,
         }
     }
 }
@@ -877,6 +900,7 @@ fn swap_phases(
             lock: LockReport::default(),
             warnings: Vec::new(),
             note: Some("that account's credential is already the one this store holds".to_owned()),
+            config: None,
         };
     }
 
@@ -1097,6 +1121,10 @@ fn swap_phases(
     // credential, one rotation on.
     let planned_digest8 = audit::digest8(&incoming_credentials.digests().access_sha256)
         .unwrap_or_else(|| "unknown".to_owned());
+    // The live target's plan and prompt name the configuration file the config
+    // step rewrites, so the one confirmation covers both writes and no prompt
+    // ever sits inside a hold (decision D-026).
+    let config_path = (which == Which::Live).then(|| namespace::global_config_path(env));
     if args.json {
         emit_plan(
             &store_dir,
@@ -1105,6 +1133,7 @@ fn swap_phases(
             &planned_digest8,
             &service,
             direction,
+            config_path.as_deref(),
         );
     }
     if !args.yes
@@ -1116,6 +1145,7 @@ fn swap_phases(
             &planned_digest8,
             &service,
             direction,
+            config_path.as_deref().map(|path| claude_json::shown_path(path, &env.home)).as_deref(),
         )
     {
         return report;
@@ -1197,33 +1227,44 @@ fn swap_phases(
     // it was read for. After step 13, so a stale token has been refreshed and
     // can be asked; before step 14 and the adoption write, so a disagreement
     // refuses with nothing parked. A profile that cannot answer does not
-    // refuse: the record is agctl's own, and this pass writes nothing with the
-    // document.
-    if let Some(profiles) = profiles.as_ref()
-        && let Err(named) = installs_its_own_account(
+    // refuse: the record is agctl's own.
+    //
+    // The document the server answered with is **kept** (S24b, ruling Q1): it
+    // is what the config step after Phase C writes into `.claude.json`, so that
+    // step never issues a GET of its own. On a live reversal this same call
+    // asks with the parked P's credential for the owner's record, so one
+    // threading serves both directions (ruling R-B). A profile that could not
+    // be read leaves `None`, and the config step records it as not attempted.
+    let installed_profile = match profiles.as_ref() {
+        Some(profiles) => match installs_its_own_account(
             profiles.as_ref(),
             &incoming_credentials,
             incoming.record,
             now,
             ctx.cancel(),
-        )
-    {
-        return Report::refused(
-            Refusal::CannotAdopt(adopt::Refusal::IdentityMismatch),
-            &service,
-            format!(
-                "the credential to be installed cannot be written: the server says it belongs to \
-                 `{named}`, but it was read as `{}`'s; agctl will not install a credential under \
-                 the wrong account{}",
-                printable(&incoming.record.account_uuid),
-                if refresh_unsaved {
-                    "; it was refreshed on the way and the refreshed pair was not saved anywhere"
-                } else {
-                    ""
-                }
-            ),
-        );
-    }
+        ) {
+            Ok(profile) => profile,
+            Err(named) => {
+                return Report::refused(
+                    Refusal::CannotAdopt(adopt::Refusal::IdentityMismatch),
+                    &service,
+                    format!(
+                        "the credential to be installed cannot be written: the server says it \
+                         belongs to `{named}`, but it was read as `{}`'s; agctl will not install \
+                         a credential under the wrong account{}",
+                        printable(&incoming.record.account_uuid),
+                        if refresh_unsaved {
+                            "; it was refreshed on the way and the refreshed pair was not saved \
+                             anywhere"
+                        } else {
+                            ""
+                        }
+                    ),
+                );
+            }
+        },
+        None => None,
+    };
     let after = incoming_credentials.digests();
 
     // Step 14: refusal D's second check, on the refreshed blob, and then the
@@ -1294,7 +1335,7 @@ fn swap_phases(
     // hold: a pause inside one would break invariant I17 even under a fault.
     fault.pause_point("before_swap_write");
 
-    phase_c(
+    let mut report = phase_c(
         paths,
         PhaseC {
             target: &subject.target,
@@ -1335,7 +1376,68 @@ fn swap_phases(
         env,
         ctx,
         fault,
-    )
+    );
+
+    // The config step (S24b, §D9). `phase_c` has returned, so its `drop(hold)`
+    // has already released Claude Code's three credential-store locks: the
+    // configuration lock never nests with them. What is still held — the
+    // namespace locks and the audit log's descriptor — is agctl's own.
+    report.config = config_step(&report.outcome, which, installed_profile.as_ref(), |profile| {
+        claude_json::rmw(env, profile, ctx)
+    });
+    if let Some(config) = &report.config {
+        // One line per step, even when nothing was written (ruling G14),
+        // through the descriptor the Phase B gate proved appendable.
+        audit_append_through(
+            paths,
+            live_log.as_ref(),
+            &log_path,
+            AuditEvent::ConfigWrite(config.record(report.audit_id.clone())),
+        );
+        if let Some(reason) = config.not_updated() {
+            // Through `Pass`, because `swap_in` replaces `Report::warnings`
+            // with the pass's own (finding N1).
+            let warning = claude_json::not_updated_warning(
+                reason,
+                &namespace::global_config_path(env),
+                &env.home,
+            );
+            eprintln!("warning: {warning}");
+            pass.warnings.push(warning);
+        }
+    }
+    report
+}
+
+/// Whether the config step runs after Phase C, and what it records when it
+/// does not (§D9).
+///
+/// - **An applied live write** rewrites the configuration file from the
+///   installed account's profile, or records `not_attempted` /
+///   `profile_unavailable` when Phase B could not read one.
+/// - **An `unknown` live write** records `not_attempted` / `swap_unknown`: the
+///   item may not hold the incoming credential, so nothing is written from it.
+/// - **Everything else** — a namespace target, and every outcome that wrote
+///   nothing — runs no step and records nothing.
+///
+/// `rmw` is the rewrite itself, a parameter so a test can count its calls.
+fn config_step(
+    outcome: &Outcome,
+    which: Which,
+    installed: Option<&Profile>,
+    rmw: impl FnOnce(&Profile) -> ConfigReport,
+) -> Option<ConfigReport> {
+    if which != Which::Live {
+        return None;
+    }
+    match outcome {
+        Outcome::Applied => Some(match installed {
+            Some(profile) => rmw(profile),
+            None => ConfigReport::not_attempted(ConfigReason::ProfileUnavailable),
+        }),
+        Outcome::Unknown => Some(ConfigReport::not_attempted(ConfigReason::SwapUnknown)),
+        _ => None,
+    }
 }
 
 /// The registry record the displaced credential belongs to, when that is
@@ -1691,22 +1793,33 @@ fn already_holds_the_incoming_grant(
 /// account of the record it was read for — or `Err` with the account the
 /// server named instead.
 ///
-/// A profile that cannot answer, and a token that cannot be asked, pass: the
-/// record is agctl's own registry row, and nothing is written with the
-/// document.
+/// A profile that cannot answer, and a token that cannot be asked, pass as
+/// `Ok(None)`: the record is agctl's own registry row. A verified profile that
+/// names the record comes back **whole** (S24b, ruling Q1), because it is the
+/// document the config step writes into `.claude.json` — never logged, never
+/// rendered, and never put in a [`Report`].
 fn installs_its_own_account(
     source: &dyn ProfileSource,
     credentials: &Credentials,
     record: &AccountRecord,
     now: i64,
     cancel: &Cancel,
-) -> Result<(), String> {
+) -> Result<Option<Profile>, String> {
     match read_profile(source, credentials, now, cancel) {
         ProfileRead::Verified(profile) => {
-            let named = identity_of(profile);
-            if swap::identity_is(Some(&named), record) { Ok(()) } else { Err(display_of(&named)) }
+            let named = Identity {
+                account_uuid: profile.account_uuid.clone(),
+                organization_uuid: Some(profile.organization_uuid.clone()),
+                email: None,
+                org_name: None,
+            };
+            if swap::identity_is(Some(&named), record) {
+                Ok(Some(profile))
+            } else {
+                Err(display_of(&named))
+            }
         }
-        ProfileRead::Expired | ProfileRead::Unavailable(_) => Ok(()),
+        ProfileRead::Expired | ProfileRead::Unavailable(_) => Ok(None),
     }
 }
 
@@ -1723,6 +1836,7 @@ fn already_active(service: &str, active8: Option<String>, note: String) -> Repor
         lock: LockReport::default(),
         warnings: Vec::new(),
         note: Some(note),
+        config: None,
     }
 }
 
@@ -1894,6 +2008,7 @@ fn phase_c(
         lock,
         warnings: Vec::new(),
         note: Some(note),
+        config: None,
     };
 
     let clock = Clock::system();
@@ -2114,6 +2229,7 @@ fn phase_c(
                     }
                 }
             )),
+            config: None,
         };
     }
 
@@ -2249,6 +2365,9 @@ fn phase_c(
         lock,
         warnings: Vec::new(),
         note,
+        // Set by `swap_phases`' config step, which runs only once this hold
+        // has been dropped.
+        config: None,
     }
 }
 
@@ -2624,6 +2743,7 @@ fn emit_plan(
     to_digest8: &str,
     service: &str,
     direction: Direction,
+    config_path: Option<&Path>,
 ) {
     let doc = serde_json::json!({
         "kind": "plan",
@@ -2636,6 +2756,9 @@ fn emit_plan(
         "account": incoming.email.as_deref().unwrap_or(&incoming.account_uuid),
         "from": { "digest8": from_digest8 },
         "to": { "digest8": to_digest8 },
+        // The configuration file the live target's config step rewrites; `null`
+        // for a namespace, which runs no step (S24b).
+        "config_path": config_path.map(|path| path.display().to_string()),
     });
     match serde_json::to_string_pretty(&doc) {
         Ok(text) => println!("{text}"),
@@ -2658,6 +2781,11 @@ fn emit_plan(
 /// scripted answer: `Tty::confirm` needs a terminal on standard input, which
 /// no test in this repository has, so a hard-wired `Tty` here would make the
 /// "answered no" arm reachable only by a person.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the question names every fact the operator is consenting to, and the live \
+              target's configuration file is the eighth"
+)]
 fn confirm(
     prompt: &mut dyn Prompt,
     store_dir: &Path,
@@ -2666,18 +2794,20 @@ fn confirm(
     to_digest8: &str,
     service: &str,
     direction: Direction,
+    config_shown: Option<&str>,
 ) -> Option<Report> {
     let verb = match direction {
         Direction::Forward => "replace",
         Direction::Reverse => "put back",
     };
     let question = format!(
-        "{verb} the credential in `{}` (digest {}) with `{}`'s (digest {})? It takes effect on \
+        "{verb} the credential in `{}` (digest {}) with `{}`'s (digest {}){}? It takes effect on \
          your next message, within 30 s; run `/model` once afterwards to refresh model access",
         store_dir.display(),
         from_digest8.as_deref().unwrap_or("none"),
         incoming.email.as_deref().unwrap_or(&incoming.account_uuid),
         to_digest8,
+        config_shown.map(claude_json::plan_line).unwrap_or_default(),
     );
     match prompt.confirm(&question) {
         Ok(true) => None,
@@ -2699,6 +2829,7 @@ fn cancelled(service: &str, note: String) -> Report {
         lock: LockReport::default(),
         warnings: Vec::new(),
         note: Some(note),
+        config: None,
     }
 }
 
@@ -3446,6 +3577,11 @@ fn emit(report: &Report, as_json: bool) -> Result<(), AppError> {
             // letter is a security signal and must not be produced by an
             // ordinary write failure.
             "refusal": serde_json::Value::Null,
+            // The live config step, on every document by the same rule: `null`
+            // where no step belongs, else its outcome and reason words, the
+            // backup's file name and the hold's timings — no path, no account
+            // id, no email (S24b, §D14).
+            "config": report.config.as_ref().map(ConfigReport::json),
         });
         // A refusal carries a **letter** or a **reason**, never both and never
         // neither: `Refusal::reason` is the exact complement of
@@ -3469,11 +3605,15 @@ fn emit(report: &Report, as_json: bool) -> Result<(), AppError> {
 
     let mut out = Tty;
     if matches!(report.outcome, Outcome::Applied) {
+        // S13-3's clause only when the configuration file was rewritten: that is
+        // what running sessions reload within a second (V13).
+        let reloaded = report.config.as_ref().is_some_and(|config| config.not_updated().is_none());
         out.tell(&format!(
             "swapped: `{}` now holds the incoming credential (digest {}). It takes effect on your \
-             next message, within 30 s; run `/model` once to refresh model access.",
+             next message, within 30 s; {}run `/model` once to refresh model access.",
             report.service,
             report.to_digest8.as_deref().unwrap_or("unknown"),
+            if reloaded { claude_json::completion_clause() } else { "" },
         ));
         // Finding N-7. The two notes an applied swap can carry are both
         // failures of a credential-at-rest cleanup — the shadowing

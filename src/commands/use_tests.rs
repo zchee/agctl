@@ -461,6 +461,7 @@ fn confirm_with(answer: Result<bool, ()>) -> Option<Report> {
         "bbbbbbbb",
         "Claude Code-credentials-cafebabe",
         Direction::Forward,
+        None,
     )
 }
 
@@ -1456,10 +1457,14 @@ fn the_installed_credential_is_refused_only_when_the_profile_names_another_accou
     // the server no longer honours and a token already expired all pass: the
     // record is agctl's own registry row, and a flaky profile endpoint must not
     // refuse a swap after its refresh POST and write-back (verifier mutation e).
+    //
+    // S24b (ruling Q1) changed only the passing verdict's type: a pass is now
+    // `Ok(Some(profile))` when the profile verified the record and `Ok(None)`
+    // when it could not be read. Every row's verdict is the same one it was.
     let t = keyed("acct-t", "org-t");
     let fresh = claude_code_item("sk-ant-oat01-t-fresh", NOW + 60_000);
     let expired = claude_code_item("sk-ant-oat01-t-expired", NOW - 1);
-    // (row, the credential, what the profile answers, the verdict, GETs)
+    // (row, the credential, what the profile answers, passes?, GETs)
     type Row<'a> = (&'a str, &'a Credentials, Answer, Result<(), String>, usize);
     let rows: [Row<'_>; 7] = [
         ("the profile names the record", &fresh, Answer::Names("acct-t", "org-t"), Ok(()), 1),
@@ -1479,12 +1484,204 @@ fn the_installed_credential_is_refused_only_when_the_profile_names_another_accou
     for (row, credentials, answer, expected, gets) in rows {
         let profiles = ScriptedProfiles::answering(answer);
         assert_eq!(
-            installs_its_own_account(&profiles, credentials, &t, NOW, &Cancel::new()),
+            installs_its_own_account(&profiles, credentials, &t, NOW, &Cancel::new()).map(|_| ()),
             expected,
             "{row}"
         );
         assert_eq!(profiles.asked(), gets, "{row}: the GETs issued");
     }
+}
+
+#[test]
+fn the_installed_accounts_profile_reaches_the_config_step() {
+    // Ruling Q1 / R-B: the document Phase B's GET verified is threaded back, so
+    // the config step writes from it and never asks again. Only a verified
+    // profile naming the record comes back whole; every row that could not be
+    // read is `Ok(None)`, which the config step records as `profile_unavailable`;
+    // another account is still the refusal it was.
+    let t = keyed("acct-t", "org-t");
+    let fresh = claude_code_item("sk-ant-oat01-t-fresh", NOW + 60_000);
+    let expired = claude_code_item("sk-ant-oat01-t-expired", NOW - 1);
+    // (row, the credential, what the profile answers, the verdict by ids, GETs)
+    type Verdict = Result<Option<(String, String)>, String>;
+    let ids = |acct: &str, org: &str| Ok(Some((acct.to_owned(), org.to_owned())));
+    let rows: [(&str, &Credentials, Answer, Verdict, usize); 7] = [
+        ("names the record", &fresh, Answer::Names("acct-t", "org-t"), ids("acct-t", "org-t"), 1),
+        ("a 500", &fresh, Answer::Status(500), Ok(None), 1),
+        ("a transport failure", &fresh, Answer::Transport, Ok(None), 1),
+        ("a malformed document", &fresh, Answer::Malformed, Ok(None), 1),
+        ("a 401", &fresh, Answer::Status(401), Ok(None), 1),
+        ("an expired token, never asked", &expired, Answer::Names("acct-t", "org-t"), Ok(None), 0),
+        (
+            "another account",
+            &fresh,
+            Answer::Names("acct-q", "org-q"),
+            Err("acct-q/org-q".to_owned()),
+            1,
+        ),
+    ];
+    for (row, credentials, answer, expected, gets) in rows {
+        let profiles = ScriptedProfiles::answering(answer);
+        let got = installs_its_own_account(&profiles, credentials, &t, NOW, &Cancel::new());
+        let by_ids = got.as_ref().map(|profile| {
+            profile.as_ref().map(|p| (p.account_uuid.clone(), p.organization_uuid.clone()))
+        });
+        assert_eq!(by_ids.map_err(Clone::clone), expected, "{row}");
+        assert_eq!(profiles.asked(), gets, "{row}: the GETs issued");
+        if let Ok(Some(profile)) = &got {
+            // The whole document, not just the ids: it is what `oauthAccount` is
+            // built from.
+            assert_eq!(profile.document["account"]["uuid"], "acct-t", "{row}");
+            let config = config_step(
+                &Outcome::Applied,
+                Which::Live,
+                got.as_ref().ok().and_then(Option::as_ref),
+                |p| {
+                    assert_eq!(
+                        p.account_uuid, "acct-t",
+                        "the rewrite receives the verified profile"
+                    );
+                    ConfigReport::not_attempted(ConfigReason::Io)
+                },
+            );
+            assert!(config.is_some(), "{row}: the step ran with it");
+        }
+    }
+}
+
+#[test]
+fn the_config_step_runs_only_after_an_applied_live_write() {
+    // §D9's gating, as a table over the swap's outcome, the target and whether
+    // Phase B kept a profile. The rewrite is a counting stub, so "rmw called" is
+    // a count rather than an inference.
+    let profile = parse_profile(serde_json::json!({
+        "account": { "uuid": "acct-t", "email": "t@example.com" },
+        "organization": { "uuid": "org-t" },
+    }))
+    .expect("a V14 document");
+    let applied = ConfigReport {
+        outcome: crate::secret::audit::ConfigOutcome::Applied,
+        reason: None,
+        account: None,
+        from_sha8: None,
+        to_sha8: None,
+        backup: None,
+        hold_ms: Some(1),
+    };
+    let not_attempted = |reason| Some(ConfigReport::not_attempted(reason));
+    let outcomes = [
+        Outcome::Applied,
+        Outcome::Unknown,
+        Outcome::Discarded,
+        Outcome::Failed,
+        Outcome::Busy,
+        Outcome::AlreadyActive,
+        Outcome::Cancelled,
+        Outcome::NeedsRefresh,
+        Outcome::Refused(Refusal::CompromisedHold),
+    ];
+    for outcome in &outcomes {
+        for which in [Which::Live, Which::Namespace] {
+            for installed in [Some(&profile), None] {
+                let calls = AtomicUsize::new(0);
+                let got = config_step(outcome, which, installed, |p| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(p.account_uuid, "acct-t");
+                    applied.clone()
+                });
+                let (expected, rmw_calls) = match (outcome, which, installed) {
+                    (_, Which::Namespace, _) => (None, 0),
+                    (Outcome::Applied, Which::Live, Some(_)) => (Some(applied.clone()), 1),
+                    (Outcome::Applied, Which::Live, None) => {
+                        (not_attempted(ConfigReason::ProfileUnavailable), 0)
+                    }
+                    (Outcome::Unknown, Which::Live, _) => {
+                        (not_attempted(ConfigReason::SwapUnknown), 0)
+                    }
+                    _ => (None, 0),
+                };
+                let row = format!("{outcome:?} × {which:?} × profile {}", installed.is_some());
+                assert_eq!(got, expected, "{row}");
+                assert_eq!(calls.load(Ordering::SeqCst), rmw_calls, "{row}: rmw calls");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_not_applied_warning_is_d030s_sentence_for_every_reason_and_both_directions() {
+    // Decision D-030: while S24b-2's catch-up is absent the sentence names no
+    // command and promises no re-run. It takes no direction, so a swap and an
+    // undo print the same words; both are checked so a later edit that adds one
+    // cannot make them diverge unnoticed.
+    let home = std::path::PathBuf::from("/Users/example");
+    let config_path = home.join(".claude.json");
+    let phrases = [
+        (ConfigReason::Absent, "there is no such file"),
+        (ConfigReason::Unreadable, "it could not be read as a regular file"),
+        (ConfigReason::Unparseable, "it is not valid JSON"),
+        (ConfigReason::NotAnObject, "its top level is not a JSON object"),
+        (
+            ConfigReason::NotReproducible,
+            "agctl could not reproduce its bytes exactly, so it did not rewrite it",
+        ),
+        (ConfigReason::BackupUnwritable, "agctl could not write a backup of it first"),
+        (ConfigReason::LockBusy, "a Claude Code session held its config lock"),
+        (ConfigReason::LockStale, "its config lock was left behind by a session that stopped"),
+        (ConfigReason::Cancelled, "the run was cancelled before it could take the config lock"),
+        (ConfigReason::ChangedUnderLock, "it changed while agctl held its config lock"),
+        (ConfigReason::Compromised, "agctl's config lock was broken while it held it"),
+        (ConfigReason::Budget, "the rewrite could not finish inside the config lock's time budget"),
+        (ConfigReason::Io, "the rewrite could not be written"),
+        (
+            ConfigReason::ProfileUnavailable,
+            "the server could not be asked for that account's profile",
+        ),
+        (ConfigReason::SwapUnknown, "the swap's own outcome could not be confirmed"),
+    ];
+    for direction in [Direction::Forward, Direction::Reverse] {
+        for (reason, phrase) in phrases {
+            let report = ConfigReport::not_attempted(reason);
+            let reason = report.not_updated().expect("a step that did not apply has a reason");
+            let text = claude_json::not_updated_warning(reason, &config_path, &home);
+            let expected = format!(
+                "`~/.claude.json` was not updated ({phrase}); running sessions keep showing the \
+                 previous account until the next swap or undo, or a Claude Code `/login`"
+            );
+            assert_eq!(text, expected, "{direction:?} {reason:?}: equals D-030's sentence");
+            // `cancelled`'s frozen phrase says "the run was cancelled", so the
+            // `run ` check reads the sentence around the phrase: that is where a
+            // command, or a promise to run one again, would be.
+            let frame = text.replacen(phrase, "", 1);
+            assert!(
+                !frame.contains("run "),
+                "{direction:?} {reason:?}: contains no `run `: {text}"
+            );
+            for forbidden in ["run the", "run `", "agctl claude", "--undo", "@"] {
+                assert!(
+                    !text.contains(forbidden),
+                    "{direction:?} {reason:?}: contains no `{forbidden}`: {text}"
+                );
+            }
+        }
+    }
+
+    // A `CLAUDE_CONFIG_DIR` outside `$HOME` is shown in full; control
+    // characters from the environment are escaped.
+    let outside = std::path::Path::new("/opt/claude-config/.claude.json");
+    let text = claude_json::not_updated_warning(ConfigReason::LockBusy, outside, &home);
+    assert!(text.starts_with("`/opt/claude-config/.claude.json` was not updated ("), "{text}");
+    let hostile = std::path::Path::new("/opt/x\u{1b}[2J/.claude.json");
+    let text = claude_json::not_updated_warning(ConfigReason::LockBusy, hostile, &home);
+    assert!(!text.contains('\u{1b}'), "the escape character is escaped: {text:?}");
+
+    // An applied step owes no warning at all.
+    let applied = ConfigReport {
+        outcome: crate::secret::audit::ConfigOutcome::Applied,
+        reason: None,
+        ..ConfigReport::not_attempted(ConfigReason::Io)
+    };
+    assert_eq!(applied.not_updated(), None);
 }
 
 #[test]

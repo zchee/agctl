@@ -338,6 +338,48 @@ impl Fixture {
         link
     }
 
+    /// `$HOME/.claude.json.lock`: the configuration lock Claude Code takes
+    /// beside the **literal** `.claude.json` path — beside the link, never
+    /// beside its target — and agctl's config step takes as its peer (S24b).
+    #[must_use]
+    pub fn config_lock_path(&self) -> PathBuf {
+        self.home().join(".claude.json.lock")
+    }
+
+    /// The peer's `.claude.json` backups: `$HOME/.claude/backups`, spelled
+    /// through the resolved store the `.claude` link points at.
+    #[must_use]
+    pub fn backups_dir(&self) -> PathBuf {
+        self.home().join(".claude-real").join("backups")
+    }
+
+    /// Plants the configuration lock as a Claude Code session holding it would
+    /// leave it, with its modification time `age` in the past, and returns it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the directory cannot be created or its time set.
+    pub fn plant_config_lock(&self, age: Duration) -> PathBuf {
+        let path = self.config_lock_path();
+        fs::create_dir(&path).expect("the configuration lock is plantable");
+        if !age.is_zero() {
+            let at = std::time::SystemTime::now().checked_sub(age).expect("a plausible instant");
+            let since = at.duration_since(std::time::UNIX_EPOCH).expect("after the epoch");
+            let stamp = rustix::fs::Timespec {
+                tv_sec: i64::try_from(since.as_secs()).expect("a plausible second"),
+                tv_nsec: i64::from(since.subsec_nanos()),
+            };
+            rustix::fs::utimensat(
+                rustix::fs::CWD,
+                &path,
+                &rustix::fs::Timestamps { last_access: stamp, last_modification: stamp },
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .expect("the lock's modification time is settable");
+        }
+        path
+    }
+
     /// Sets one environment variable for every command this fixture builds.
     pub fn set(&mut self, key: &str, value: &str) -> &mut Self {
         self.env.retain(|(existing, _)| existing != key);
@@ -888,6 +930,81 @@ pub fn mock_profile<'a>(
     })
 }
 
+/// A live `.claude.json` document in the shape Claude Code keeps it (S24b):
+/// thirty top-level members, among them the five caches the config step
+/// deletes, `userID`, `mcpServers`, `projects`, and a twenty-key `oauthAccount`
+/// naming the store account **P** as a login leaves it — six of those keys the
+/// start-up profile refresh never writes.
+///
+/// Plant it with [`Fixture::live_claude_json_js`], which renders it as
+/// `JSON.stringify(_, null, 2)` does.
+#[must_use]
+pub fn live_config_document() -> Value {
+    json!({
+        "numStartups": 184,
+        "installMethod": "native",
+        "autoUpdates": false,
+        "modelAccessCache": { "claude-opus-5": true, "claude-sonnet-5": true },
+        "tipsHistory": { "memory-command": 12, "theme-command": 3 },
+        "userID": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "firstStartTime": "2025-11-02T08:15:30.123Z",
+        "orgModelDefaultCache": { "org": "claude-opus-5" },
+        "mcpServers": {
+            "local": { "type": "stdio", "command": "node", "args": ["server.js"], "env": {} },
+        },
+        "projects": {
+            "/Users/example/src/app": {
+                "allowedTools": [],
+                "history": [],
+                "hasTrustDialogAccepted": true,
+                "lastCost": 0.5601675,
+                "lastDuration": 118_233,
+            },
+        },
+        "oauthAccount": {
+            "accountUuid": ACCT,
+            "emailAddress": EMAIL,
+            "organizationUuid": ORG,
+            "hasExtraUsageEnabled": true,
+            "billingType": "stripe_subscription",
+            "accountCreatedAt": "2025-01-01T00:00:00Z",
+            "subscriptionCreatedAt": "2025-02-01T00:00:00Z",
+            "ccOnboardingFlags": { "seen": true },
+            "claudeCodeTrialEndsAt": null,
+            "claudeCodeTrialDurationDays": null,
+            "seatTier": "premium",
+            "displayName": "Owner",
+            "fullName": "Owner Person",
+            "profileFetchedAt": 1_780_000_000_000_i64,
+            "organizationRole": "admin",
+            "workspaceRole": "developer",
+            "organizationName": "Acme",
+            "organizationType": "claude_max",
+            "organizationRateLimitTier": "default_claude_max_20x",
+            "userRateLimitTier": "default",
+        },
+        "hasCompletedOnboarding": true,
+        "lastOnboardingVersion": "2.1.263",
+        "cachedExtraUsageDisabledReason": null,
+        "subscriptionNoticeCount": 0,
+        "hasAvailableSubscription": false,
+        "cachedUsageUtilization": { "five_hour": 0.25, "seven_day": -0.5 },
+        "promptQueueUseCount": 7,
+        "bypassPermissionsModeAccepted": true,
+        "fallbackAvailableWarningThreshold": 0.5,
+        "isQualifiedForDataSharing": false,
+        "shiftEnterKeyBindingInstalled": true,
+        "theme": "dark",
+        "editorMode": "vim",
+        "notes": "日本語 🦀 \"quoted\" \\ back\nline",
+        "claudeCodeFirstTokenDate": "2025-11-02T08:16:01.000Z",
+        "cachedGrowthBookFeatures": { "tengu_flag": { "value": true } },
+        "startupPrefetchedAt": 1_789_000_000_123_i64,
+        "passesEligibilityCache": { "eligible": false },
+        "s1mAccessCache": {},
+    })
+}
+
 /// An expiry far enough in the past to be expired under any margin.
 #[must_use]
 pub fn expired_at() -> i64 {
@@ -1214,7 +1331,7 @@ pub fn finish(child: Child) -> Output {
 /// write lines in it is a failure, not a pass, because "the write path did
 /// nothing" is exactly the way this criterion could otherwise be satisfied
 /// (critic M8).
-pub const KEYCHAIN_WRITE_TESTS: [&str; 57] = [
+pub const KEYCHAIN_WRITE_TESTS: [&str; 65] = [
     "ac59_the_write_transport_reads_one_line_from_stdin_and_redacts_the_hex",
     "ac60_a_service_no_test_registered_is_refused_and_stores_nothing",
     "ac61_what_the_write_path_stores_is_what_the_binary_reads",
@@ -1307,6 +1424,17 @@ pub const KEYCHAIN_WRITE_TESTS: [&str; 57] = [
     // behaviour over a refused audit log is unchanged, which means it completes
     // a swap and writes the namespaced item once.
     "a_refused_audit_log_does_not_refuse_a_namespaced_swap",
+    // S24b-1 (the live `.claude.json` rewrite). Each completes at least one live
+    // pass — the undo test and the one-line-per-write test write once each way —
+    // and the namespace control writes the namespaced item once.
+    "a_live_swap_rewrites_oauth_account_through_the_link_and_backs_up_first",
+    "a_live_undo_rewrites_oauth_account_with_the_restored_accounts_profile",
+    "a_swap_applies_when_the_incoming_profile_cannot_be_read_and_says_the_config_was_not_updated",
+    "a_held_config_lock_leaves_the_swap_applied_and_the_config_unwritten",
+    "a_stale_config_lock_is_never_broken_and_the_swap_stands",
+    "one_config_write_line_follows_each_live_write_and_none_follows_a_refusal",
+    "a_namespace_swap_never_touches_claude_json",
+    "a_compact_claude_json_is_refused_as_not_reproducible_and_left_byte_identical",
 ];
 
 /// Fact F42's keychain update line, for a test that means to write one.

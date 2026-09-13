@@ -235,7 +235,7 @@ fn tail_returns_the_last_entries_oldest_first() {
         .iter()
         .map(|entry| match &entry.event {
             AuditEvent::Write { to_digest8, .. } => to_digest8.clone(),
-            AuditEvent::LockBreak(_) => panic!("these are writes"),
+            other => panic!("these are writes: {other:?}"),
         })
         .collect();
     assert_eq!(digests, ["bbbbbbbb", "cccccccc"]);
@@ -862,4 +862,250 @@ fn append_through_refuses_what_append_refuses_before_writing_a_byte() {
         "",
         "and nothing was written to it"
     );
+}
+
+// ---------------------------------------------------------------------------
+// S24b: the config step's own event kind
+// ---------------------------------------------------------------------------
+
+/// A config step's record, as `use.rs`'s config step appends it.
+fn config_record(outcome: ConfigOutcome, reason: Option<ConfigReason>) -> ConfigWriteRecord {
+    ConfigWriteRecord {
+        after: Some("2026-09-14T00:00:00Z#4242".to_owned()),
+        outcome,
+        reason,
+        account: Some(IncomingIdentity {
+            account_uuid: "acct-t".to_owned(),
+            organization_uuid: Some("org-t".to_owned()),
+        }),
+        from_sha8: Some("0123abcd".to_owned()),
+        to_sha8: (outcome == ConfigOutcome::Applied).then(|| "89abcdef".to_owned()),
+        backup: Some(".claude.json.backup.1789000000000".to_owned()),
+        hold_ms: Some(12),
+    }
+}
+
+#[test]
+fn config_write_carries_ids_only_and_parses_old_lines() {
+    // Ruling Q7: additive, ids only. The pre-S24b lines — a write and a lock
+    // break, exactly as `b6f8055` spells them — read back to the entries they
+    // were, before and after a `config_write` line joins them.
+    let (_dir, paths) = store();
+    let old_write = AuditEntry::new(write_event("aabbccdd", Some("11223344")));
+    let old_break = AuditEntry::new(AuditEvent::LockBreak(break_record()));
+    append(&paths, &old_write).expect("appendable");
+    append(&paths, &old_break).expect("appendable");
+    let before = tail(&paths, usize::MAX).expect("readable");
+    assert_eq!(before.entries, vec![old_write.clone(), old_break.clone()], "the old lines");
+    assert!(before.unreadable.is_empty());
+
+    let config =
+        AuditEntry::new(AuditEvent::ConfigWrite(config_record(ConfigOutcome::Applied, None)));
+    append(&paths, &config).expect("a config_write entry is appendable");
+
+    let text = std::fs::read_to_string(log_path(&paths)).expect("readable");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "one line per entry: {text}");
+    let line = lines[2];
+    assert!(line.contains("\"event\":\"config_write\""), "the event kind: {line}");
+    assert!(line.contains("\"outcome\":\"applied\""), "{line}");
+    assert!(line.contains("\"account_uuid\":\"acct-t\""), "the account by id: {line}");
+    assert!(!line.contains('@'), "no email address can be in the line: {line}");
+    assert!(!line.contains("email"), "no email member either: {line}");
+    assert!(!line.contains('/'), "no path: the backup is a file name: {line}");
+
+    let after = tail(&paths, usize::MAX).expect("readable");
+    assert!(after.unreadable.is_empty(), "{:?}", after.unreadable);
+    assert_eq!(
+        after.entries,
+        vec![old_write, old_break, config],
+        "the round trip, old lines unchanged"
+    );
+
+    // Every word of the vocabulary survives the trip.
+    let words = [
+        (ConfigOutcome::Skipped, ConfigReason::Absent, "skipped", "absent"),
+        (ConfigOutcome::Skipped, ConfigReason::LockBusy, "skipped", "lock_busy"),
+        (ConfigOutcome::Skipped, ConfigReason::LockStale, "skipped", "lock_stale"),
+        (ConfigOutcome::Skipped, ConfigReason::Cancelled, "skipped", "cancelled"),
+        (ConfigOutcome::Refused, ConfigReason::Unreadable, "refused", "unreadable"),
+        (ConfigOutcome::Refused, ConfigReason::Unparseable, "refused", "unparseable"),
+        (ConfigOutcome::Refused, ConfigReason::NotAnObject, "refused", "not_an_object"),
+        (ConfigOutcome::Refused, ConfigReason::NotReproducible, "refused", "not_reproducible"),
+        (ConfigOutcome::Refused, ConfigReason::BackupUnwritable, "refused", "backup_unwritable"),
+        (ConfigOutcome::Aborted, ConfigReason::ChangedUnderLock, "aborted", "changed_under_lock"),
+        (ConfigOutcome::Aborted, ConfigReason::Compromised, "aborted", "compromised"),
+        (ConfigOutcome::Aborted, ConfigReason::Budget, "aborted", "budget"),
+        (ConfigOutcome::Failed, ConfigReason::Io, "failed", "io"),
+        (
+            ConfigOutcome::NotAttempted,
+            ConfigReason::ProfileUnavailable,
+            "not_attempted",
+            "profile_unavailable",
+        ),
+        (ConfigOutcome::NotAttempted, ConfigReason::SwapUnknown, "not_attempted", "swap_unknown"),
+    ];
+    for (outcome, reason, outcome_word, reason_word) in words {
+        let entry = AuditEntry::new(AuditEvent::ConfigWrite(config_record(outcome, Some(reason))));
+        let line = entry_line(&entry).expect("a valid entry serialises");
+        assert!(line.contains(&format!("\"outcome\":\"{outcome_word}\"")), "{line}");
+        assert!(line.contains(&format!("\"reason\":\"{reason_word}\"")), "{line}");
+        let back: AuditEntry = serde_json::from_str(line.trim_end()).expect("it reads back");
+        assert_eq!(back, entry, "{outcome_word}/{reason_word}");
+    }
+}
+
+#[test]
+fn a_config_write_with_a_whole_digest_or_a_path_is_refused() {
+    // Risk R34 for the new kind (finding N11): a caller that passed a whole
+    // digest, or a path where a file name belongs, fails the append rather than
+    // leaking it — through both entry points, before a byte is written.
+    let (_dir, paths) = store();
+    let whole = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+    let applied = config_record(ConfigOutcome::Applied, None);
+
+    let bad = [
+        (
+            "a 64-hex from_sha8",
+            ConfigWriteRecord { from_sha8: Some(whole.to_owned()), ..applied.clone() },
+        ),
+        (
+            "a 64-hex to_sha8",
+            ConfigWriteRecord { to_sha8: Some(whole.to_owned()), ..applied.clone() },
+        ),
+        (
+            "an uppercase prefix",
+            ConfigWriteRecord { from_sha8: Some("AABBCCDD".to_owned()), ..applied.clone() },
+        ),
+        (
+            "a backup path",
+            ConfigWriteRecord {
+                backup: Some("/x/.claude.json.backup.1".to_owned()),
+                ..applied.clone()
+            },
+        ),
+        (
+            "a backup name in another shape",
+            ConfigWriteRecord {
+                backup: Some(".claude.json.corrupted.1".to_owned()),
+                ..applied.clone()
+            },
+        ),
+        (
+            "a backup name with no stamp",
+            ConfigWriteRecord {
+                backup: Some(".claude.json.backup.".to_owned()),
+                ..applied.clone()
+            },
+        ),
+        (
+            "a read-only outcome word",
+            ConfigWriteRecord { outcome: ConfigOutcome::Unrecognized, ..applied.clone() },
+        ),
+        (
+            "a read-only reason word",
+            ConfigWriteRecord { reason: Some(ConfigReason::Unrecognized), ..applied.clone() },
+        ),
+    ];
+    for (row, record) in bad {
+        let entry = AuditEntry::new(AuditEvent::ConfigWrite(record));
+        let refused = append(&paths, &entry).expect_err(row);
+        assert!(matches!(refused, AppError::Config(_)), "{row}: {refused}");
+        assert!(!log_path(&paths).exists(), "{row}: a refused entry creates no log");
+    }
+    let whole_digest = AuditEntry::new(AuditEvent::ConfigWrite(ConfigWriteRecord {
+        from_sha8: Some(whole.to_owned()),
+        ..applied.clone()
+    }));
+    let refused = append(&paths, &whole_digest).expect_err("a 64-hex from_sha8 is refused");
+    assert!(refused.to_string().contains("digest prefixes only"), "{refused}");
+    let with_path = AuditEntry::new(AuditEvent::ConfigWrite(ConfigWriteRecord {
+        backup: Some("/x/.claude.json.backup.1".to_owned()),
+        ..applied.clone()
+    }));
+    let refused = append(&paths, &with_path).expect_err("a backup path is refused");
+    assert!(
+        !refused.to_string().contains("/x/"),
+        "the refusal does not repeat the path: {refused}"
+    );
+
+    // Through the held descriptor too, and nothing lands in the log it opened.
+    let (_root, rooted) = store_with_root();
+    let path = log_path(&rooted);
+    let held = open_log(&rooted, &path).expect("a healthy log opens");
+    for entry in [&whole_digest, &with_path] {
+        append_through(&held, &path, entry).expect_err("append_through applies the same checks");
+    }
+    assert_eq!(std::fs::read_to_string(&path).expect("readable"), "", "nothing was written");
+
+    // The shapes the step does write are accepted.
+    for name in [".claude.json.backup.1789000000000", ".config.json.backup.1"] {
+        let entry = AuditEntry::new(AuditEvent::ConfigWrite(ConfigWriteRecord {
+            backup: Some(name.to_owned()),
+            ..applied.clone()
+        }));
+        entry_line(&entry).unwrap_or_else(|err| panic!("{name} is a backup name: {err}"));
+    }
+}
+
+#[test]
+fn an_unrecognised_config_outcome_or_reason_parses_as_unrecognized() {
+    // Ruling Q7's fallback: a later build's outcome or reason word reads as
+    // `Unrecognized` and the line stays in `Tail::entries`, so `use --undo`
+    // — which refuses on any unreadable line — is not blocked by it.
+    let (_dir, paths) = store();
+    append(&paths, &AuditEntry::new(write_event("aaaaaaaa", None))).expect("appendable");
+    let path = log_path(&paths);
+    let mut text = std::fs::read_to_string(&path).expect("readable");
+    text.push_str(
+        "{\"ts\":\"2026-09-14T00:00:00Z\",\"monotonic_ms\":1,\"agctl_pid\":2,\
+         \"event\":\"config_write\",\"after\":null,\"outcome\":\"future\",\"reason\":\"future\"}\n",
+    );
+    rewrite_log(&path, &text);
+
+    let read = tail(&paths, usize::MAX).expect("readable");
+    assert!(read.unreadable.is_empty(), "the line is in Tail::entries: {:?}", read.unreadable);
+    assert_eq!(read.entries.len(), 2, "the line is in Tail::entries");
+    let AuditEvent::ConfigWrite(record) = &read.entries[1].event else {
+        panic!("a config_write entry: {:?}", read.entries[1])
+    };
+    assert_eq!(record.outcome, ConfigOutcome::Unrecognized);
+    assert_eq!(record.reason, Some(ConfigReason::Unrecognized));
+    assert_eq!(record.backup, None, "absent members read as absent");
+}
+
+#[test]
+fn an_unrecognised_event_kind_lands_in_entries_not_unreadable() {
+    // Ruling Q8 (b), proved: serde's internally tagged `other` behind
+    // `AuditEntry`'s `flatten` reads a later build's additive event kind — with
+    // members of its own — as `Unrecognized`, so the next additive kind does
+    // not repeat the downgrade hazard `config_write` has for older builds.
+    let (_dir, paths) = store();
+    std::fs::create_dir_all(paths.namespace_root()).expect("the namespace root is creatable");
+    let path = log_path(&paths);
+    let planted = "{\"ts\":\"2026-09-14T00:00:00Z\",\"monotonic_ms\":7,\"agctl_pid\":42,\
+                   \"event\":\"future_kind\",\"x\":1}\n";
+    std::fs::write(&path, planted).expect("the log is writable");
+
+    let read = tail(&paths, usize::MAX).expect("readable");
+    assert!(read.unreadable.is_empty(), "Tail::unreadable is empty: {:?}", read.unreadable);
+    assert_eq!(read.entries.len(), 1);
+    assert_eq!(read.entries[0].event, AuditEvent::Unrecognized);
+    assert_eq!(
+        (read.entries[0].monotonic_ms, read.entries[0].agctl_pid),
+        (7, 42),
+        "provenance kept"
+    );
+    assert_eq!(
+        crate::commands::r#use::select_undo(&read),
+        crate::commands::r#use::Undoable::Nothing,
+        "an unknown kind is not a write, and not a reason to refuse"
+    );
+
+    // Read-only: neither entry point writes it, and the log is unchanged.
+    let unrecognised = AuditEntry::new(AuditEvent::Unrecognized);
+    let refused =
+        append(&paths, &unrecognised).expect_err("an unrecognised event is never written");
+    assert!(matches!(refused, AppError::Config(_)), "{refused}");
+    assert_eq!(std::fs::read_to_string(&path).expect("readable"), planted, "the log is unchanged");
 }

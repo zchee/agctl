@@ -24,6 +24,11 @@
 //! section 3.5): `flock` is an inode lock, so a lock file inside a directory
 //! that another tool may delete and recreate is a lock two processes can hold
 //! at once. Out of the namespace, never unlinked, the inode is stable.
+//!
+//! The only writes outside these roots are the live-store lock artefacts, the
+//! live item, and `~/.claude.json`'s rmw, whose paths
+//! `provider::claude::namespace` derives from the environment — which is why
+//! [`Paths`] cannot hold them.
 
 use std::path::Component;
 use std::path::Path;

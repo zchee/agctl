@@ -181,6 +181,118 @@ pub enum AuditEvent {
     /// gap: plan section 3.8 forbids any I/O between the last sample and the
     /// `rmdir`, and an audit append is I/O.
     LockBreak(LockBreakRecord),
+    /// One config step of a live pass: the `.claude.json` rewrite that follows
+    /// an applied live write, or the record that it was not attempted (S24b,
+    /// ruling G14).
+    ///
+    /// One line per step even when nothing was written, so the log says why a
+    /// file was left as it was.
+    ConfigWrite(ConfigWriteRecord),
+    /// An event kind this build does not know: a later agctl's additive kind,
+    /// read rather than refused (principle P3, ruling Q8 (b)).
+    ///
+    /// **Read-only.** [`append`] and [`append_through`] refuse to write it, so a
+    /// line can only ever arrive here from a newer build. Every reader that
+    /// matches [`AuditEvent::Write`] treats it as it treats any other
+    /// non-write event.
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// What one config step of a live pass did (S24b, ruling Q7).
+///
+/// Ids and digest prefixes only: `account` is the pair of ids written into
+/// `oauthAccount`, never an email, and `backup` is a file **name**, never a
+/// path — [`append`] refuses an entry that carries anything else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigWriteRecord {
+    /// The [`AuditId`] of the `write` entry this pass appended, as its
+    /// `Display` renders it.
+    #[serde(default)]
+    pub after: Option<String>,
+    /// How the step ended.
+    pub outcome: ConfigOutcome,
+    /// Why, when it did not apply.
+    #[serde(default)]
+    pub reason: Option<ConfigReason>,
+    /// The account written into `oauthAccount`, by id alone.
+    #[serde(default)]
+    pub account: Option<IncomingIdentity>,
+    /// The first eight hex digits of the SHA-256 of the file as it was read.
+    #[serde(default)]
+    pub from_sha8: Option<String>,
+    /// The first eight hex digits of the SHA-256 of the file as it was
+    /// written; only on `applied`.
+    #[serde(default)]
+    pub to_sha8: Option<String>,
+    /// The backup's file name, under the peer's `backups/`.
+    #[serde(default)]
+    pub backup: Option<String>,
+    /// How long the configuration lock was held, in whole milliseconds, when
+    /// one was taken.
+    #[serde(default)]
+    pub hold_ms: Option<u64>,
+}
+
+/// How a config step ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigOutcome {
+    /// The file was rewritten.
+    Applied,
+    /// Nothing was there to rewrite, or the lock could not be taken.
+    Skipped,
+    /// The file could not be rewritten safely, decided before anything was
+    /// written.
+    Refused,
+    /// A check under the lock failed and nothing was renamed.
+    Aborted,
+    /// A write or a rename failed.
+    Failed,
+    /// The step deliberately did not run.
+    NotAttempted,
+    /// A word a later build writes; read-only.
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// Why a config step did not apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigReason {
+    /// There is no configuration file.
+    Absent,
+    /// It is not a regular file, or it is too large, or it could not be read.
+    Unreadable,
+    /// It is not JSON.
+    Unparseable,
+    /// Its top level is not an object.
+    NotAnObject,
+    /// Re-serialising it did not reproduce its bytes.
+    NotReproducible,
+    /// Its backup could not be written first.
+    BackupUnwritable,
+    /// A Claude Code session held the configuration lock throughout the ladder.
+    LockBusy,
+    /// The configuration lock was stale; agctl never breaks it.
+    LockStale,
+    /// The run was cancelled while waiting for the lock.
+    Cancelled,
+    /// The file changed while agctl held the lock.
+    ChangedUnderLock,
+    /// agctl's lock was broken while it held it.
+    Compromised,
+    /// A term could not finish inside the lock's budget.
+    Budget,
+    /// A write or a rename failed.
+    Io,
+    /// The installed account's profile could not be read.
+    ProfileUnavailable,
+    /// The swap's own outcome is `unknown`.
+    SwapUnknown,
+    /// A word a later build writes; read-only.
+    #[serde(other)]
+    Unrecognized,
 }
 
 /// Which keychain item an event is about.
@@ -517,11 +629,52 @@ pub(crate) fn append_through(
 /// and one digest check: a second spelling of either would let an entry that
 /// [`append`] refuses reach the log through [`append_through`].
 fn entry_line(entry: &AuditEntry) -> Result<String, AppError> {
-    if let AuditEvent::Write { from_digest8, to_digest8, .. } = &entry.event {
-        if let Some(from) = from_digest8 {
-            check_digest8("from_digest8", from)?;
+    match &entry.event {
+        AuditEvent::Write { from_digest8, to_digest8, .. } => {
+            if let Some(from) = from_digest8 {
+                check_digest8("from_digest8", from)?;
+            }
+            check_digest8("to_digest8", to_digest8)?;
         }
-        check_digest8("to_digest8", to_digest8)?;
+        // Risk R34 for the config step (ruling Q7, finding N11): the same
+        // prefix rule for both digests, and a backup that is a bare file name in
+        // the peer's shape — a caller that passed a whole digest or a path fails
+        // the append rather than leaking it.
+        AuditEvent::ConfigWrite(record) => {
+            if let Some(from) = &record.from_sha8 {
+                check_digest8("from_sha8", from)?;
+            }
+            if let Some(to) = &record.to_sha8 {
+                check_digest8("to_sha8", to)?;
+            }
+            if let Some(backup) = &record.backup
+                && !is_backup_name(backup)
+            {
+                return Err(AppError::Config(format!(
+                    "an audit entry's `backup` must be a `.claude.json.backup.<ms>` file name, not \
+                     {} characters; the audit log holds no paths",
+                    backup.len()
+                )));
+            }
+            if record.outcome == ConfigOutcome::Unrecognized
+                || record.reason == Some(ConfigReason::Unrecognized)
+            {
+                return Err(AppError::Config(
+                    "an audit entry's config outcome or reason is a word this build only reads; it \
+                     is never written"
+                        .to_owned(),
+                ));
+            }
+        }
+        // Read-only (ruling Q8 (b)): writing it would record an event nobody
+        // performed under a name that means "a later build wrote this".
+        AuditEvent::Unrecognized => {
+            return Err(AppError::Config(
+                "an unrecognised audit event is read from a later build's log, never written"
+                    .to_owned(),
+            ));
+        }
+        AuditEvent::LockBreak(_) => {}
     }
 
     let mut line = serde_json::to_string(entry).map_err(|err| {
@@ -779,7 +932,10 @@ pub struct Tail {
 /// An absent log is no entries rather than an error: a store that has never
 /// written a keychain item has nothing to explain. A line carrying *unknown
 /// members* is not unreadable either — serde ignores them, so a log written by
-/// a later agctl still reads here (principle P3).
+/// a later agctl still reads here (principle P3). Nor is a line whose `event`
+/// is a kind this build does not know: it reads as [`AuditEvent::Unrecognized`]
+/// rather than landing in [`Tail::unreadable`], where `use --undo` would refuse
+/// on it (ruling Q8 (b)).
 ///
 /// The read goes through [`read_log`]'s `O_NOFOLLOW` walk, the same one
 /// [`append`] writes through.
@@ -838,6 +994,17 @@ fn check_digest8(field: &'static str, value: &str) -> Result<(), AppError> {
 fn is_digest8(value: &str) -> bool {
     value.len() == DIGEST_PREFIX_LEN
         && value.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Whether `value` is a backup file name in the peer's shape:
+/// `.claude.json.backup.<digits>` or `.config.json.backup.<digits>`, and so
+/// carries no `/`.
+fn is_backup_name(value: &str) -> bool {
+    [".claude.json.backup.", ".config.json.backup."].iter().any(|prefix| {
+        value
+            .strip_prefix(prefix)
+            .is_some_and(|stamp| !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 /// `jiff::Timestamp` as an RFC 3339 string.

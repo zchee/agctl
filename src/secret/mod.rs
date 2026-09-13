@@ -24,6 +24,8 @@
 //!   Code lock, which is how `doctor` finds a leaked one.
 //! - [`claude_lock`] is Claude Code's own `mkdir` lock protocol, implemented
 //!   as a peer. Landed with no caller in W2; a swap wires it up in W4a.
+//! - [`config_lock`] is the same protocol's one `.claude.json` lock, taken as
+//!   a peer that never breaks it, for the live config rewrite (S24b).
 //! - [`foreign_activity`] answers "is somebody else using this namespace?".
 //! - [`location`] picks between the keychain and the file for one account.
 
@@ -37,6 +39,7 @@
 
 pub mod audit;
 pub mod claude_lock;
+pub mod config_lock;
 pub mod file_store;
 pub mod foreign_activity;
 pub mod held_locks;
