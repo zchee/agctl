@@ -276,7 +276,7 @@ pub fn run_with(
         // leaves the identity as unknown as it already was, and the check
         // below is what turns that into an error.
         match oauth::profile(client, &credentials, login.cancel) {
-            Ok(document) => apply_profile(&mut credentials, &document),
+            Ok(document) => apply_profile(&mut credentials, document),
             Err(err) => tracing::warn!("could not read the account profile: {err}"),
         }
     }
@@ -516,34 +516,26 @@ fn fault() -> Fault {
 
 /// Fills in an identity from a profile response (fact F26).
 ///
-/// The document's exact shape was never captured on the wire, so every field
-/// is optional and a document that carries none of them simply leaves the
-/// credentials as they were. Both the nested spelling Claude Code's exchange
-/// uses and a flat top-level `uuid`/`email_address` are accepted.
-fn apply_profile(credentials: &mut Credentials, document: &serde_json::Value) {
-    let account = document.get("account").unwrap_or(document);
-    let organization = document.get("organization");
-
-    let uuid = account.get("uuid").and_then(serde_json::Value::as_str);
-    let email = account.get("email_address").and_then(serde_json::Value::as_str);
-    let org_uuid = organization.and_then(|o| o.get("uuid")).and_then(serde_json::Value::as_str);
-    let org_name = organization.and_then(|o| o.get("name")).and_then(serde_json::Value::as_str);
-    if uuid.is_none() && email.is_none() && org_uuid.is_none() {
-        return;
-    }
-
+/// Through V14's schema ([`oauth::parse_profile`]), which the live swap reads
+/// too: `account.uuid`, `account.email` — or the exchange's `email_address` —
+/// and `organization.uuid`. A document missing any of them leaves the
+/// credentials as they were, and the caller's "named no account" check is what
+/// turns that into an error. The failure is logged by member name only.
+fn apply_profile(credentials: &mut Credentials, document: serde_json::Value) {
+    let profile = match oauth::parse_profile(document) {
+        Ok(profile) => profile,
+        Err(err) => {
+            tracing::warn!("the account profile named no usable identity: {err}");
+            return;
+        }
+    };
+    let org_name = profile.organization_name().map(str::to_owned);
     let token_account = credentials.token_account.get_or_insert_with(Default::default);
-    if let Some(uuid) = uuid {
-        token_account.uuid = Some(uuid.to_owned());
-    }
-    if let Some(email) = email {
-        token_account.email_address = Some(email.to_owned());
-    }
-    if let Some(org_uuid) = org_uuid {
-        token_account.organization_uuid = Some(org_uuid.to_owned());
-    }
+    token_account.uuid = Some(profile.account_uuid);
+    token_account.email_address = Some(profile.email);
+    token_account.organization_uuid = Some(profile.organization_uuid);
     if let Some(org_name) = org_name {
-        token_account.organization_name = Some(org_name.to_owned());
+        token_account.organization_name = Some(org_name);
     }
 }
 

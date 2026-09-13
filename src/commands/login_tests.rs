@@ -672,14 +672,78 @@ fn a_profile_document_without_an_identity_changes_nothing() {
     )
     .expect("the response should convert");
 
-    apply_profile(&mut credentials, &serde_json::json!({"unrelated": true}));
+    apply_profile(&mut credentials, serde_json::json!({"unrelated": true}));
     assert!(credentials.token_account.is_none(), "an empty profile must not invent an identity");
 
-    apply_profile(&mut credentials, &serde_json::json!({"uuid": "flat-account"}));
+    // V14 captured the document's shape, so a flat top-level `uuid` is no
+    // longer guessed at: it names nobody. (Before S24 this row read the flat
+    // spelling as the account, because the shape had never been captured.)
+    apply_profile(&mut credentials, serde_json::json!({"uuid": "flat-account"}));
+    assert!(credentials.token_account.is_none(), "a flat document names no account");
+
+    // Nor does a nested one missing any of V14's three members.
+    apply_profile(
+        &mut credentials,
+        serde_json::json!({
+            "account": {"uuid": ACCOUNT, "email": "someone@example.com"},
+        }),
+    );
+    assert!(credentials.token_account.is_none(), "no organization, no identity");
+}
+
+#[test]
+fn login_still_names_the_account_from_a_profile_that_uses_email() {
+    // V14: the profile carries `account.email`. The phase-1 parser read only
+    // the exchange's `account.email_address`, so a real profile's address was
+    // dropped and the record was saved without one. The exchange-shaped
+    // fallback test above keeps `email_address` passing.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(Method::POST).path("/v1/oauth/token");
+        then.status(200).json_body(exchange_response(None, None));
+    });
+    let profile = server.mock(|when, then| {
+        when.method(Method::GET)
+            .path("/api/oauth/profile")
+            .header("authorization", "Bearer sk-ant-oat01-fake-access")
+            .header("cache-control", "no-cache");
+        then.status(200).json_body(serde_json::json!({
+            "account": {
+                "uuid": ACCOUNT,
+                "email": "v14@example.com",
+                "display_name": "Someone",
+                "has_claude_max": true,
+            },
+            "organization": {"uuid": ORGANIZATION, "name": "V14 Org", "organization_type": "claude_max"},
+        }));
+    });
+
+    let home = TempDir::new().expect("a temporary directory should be creatable");
+    let paths = Paths::with_config_dir(home.path().to_path_buf());
+    let cancel = Cancel::new();
+    let login = Login {
+        paths: &paths,
+        manual: true,
+        label: None,
+        live_identity: None,
+        live_identity_source: PathBuf::new(),
+        no_duplicate: false,
+        cancel: &cancel,
+    };
+
+    run_with(&login, &client_for(&server), &mut FakeIo::new("CODE-A"))
+        .expect("the login should succeed");
+
+    profile.assert();
+    let config = AgctlConfig::load(&paths).expect("the config should load");
+    let record = config.get(ACCOUNT, ORGANIZATION).expect("the profile should have named it");
+    assert_eq!(record.email.as_deref(), Some("v14@example.com"), "`account.email` is read");
+    assert_eq!(record.org_name.as_deref(), Some("V14 Org"));
+    let blob = stored_blob(&paths.namespace_dir(ACCOUNT, ORGANIZATION));
+    assert_eq!(blob["claudeAiOauth"]["tokenAccount"]["uuid"], serde_json::json!(ACCOUNT));
     assert_eq!(
-        credentials.token_account.and_then(|account| account.uuid).as_deref(),
-        Some("flat-account"),
-        "a flat document is accepted too, since the shape was never captured"
+        blob["claudeAiOauth"]["tokenAccount"]["emailAddress"],
+        serde_json::json!("v14@example.com")
     );
 }
 

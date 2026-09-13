@@ -160,13 +160,18 @@ pub enum AuditEvent {
         /// the live-swap guard that consults it — it arms rather than disarms.
         #[serde(default)]
         direction: WriteDirection,
-        /// The account a **live forward** swap installed in the item, by id
-        /// alone — never a token and never an email (decision D-027).
+        /// The account a **live** write installed in the item, by id alone —
+        /// never a token and never an email (decision D-027).
         ///
-        /// `use --undo` reads it as whose credential the item holds, which
-        /// Claude Code rewrites without a `tokenAccount` on its next refresh.
-        /// Compared against registry records only, never used to build a path.
-        /// Absent on every other entry, and from their lines.
+        /// Written on every live write, forward **and** undo (S24): for an
+        /// undo it is the account put back. `use --undo` reads it as the
+        /// account the write it reverses installed — which is what lets an
+        /// undo itself be undone — and a live swap whose item token has
+        /// expired takes it as the identity of the bytes that write put there.
+        /// Compared against
+        /// registry records only, never used to build a path. Absent on
+        /// namespace entries, and on live entries written before S24 — which
+        /// is why an entry without it refuses rather than being guessed at.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         incoming_identity: Option<IncomingIdentity>,
     },
@@ -255,8 +260,8 @@ pub enum WriteDirection {
     Undo,
 }
 
-/// The account a live forward swap installed in the item, by id alone
-/// (decision D-027).
+/// The account a live write installed in the item, by id alone (decision
+/// D-027; on undo entries too since S24).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncomingIdentity {
     /// The account UUID.

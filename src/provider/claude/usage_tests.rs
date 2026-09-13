@@ -787,3 +787,42 @@ fn refresh_errors_say_what_the_row_should_do_about_them() {
     assert_eq!(RefreshError::Cancelled.to_string(), "cancelled");
     assert_eq!(RefreshError::Transient("dns".to_owned()).to_string(), "dns");
 }
+
+#[test]
+fn the_oauth_client_is_the_production_profile_source() {
+    // `ProfileSource` is the seam the swap's unit tests fake; the production
+    // implementation must be the same GET `oauth::profile_of` makes, so what the
+    // fakes stand in for is what the binary does.
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/oauth/profile")
+            .header("authorization", "Bearer sk-ant-oat01-profile-source")
+            .header("cache-control", "no-cache");
+        then.status(200).json_body(json!({
+            "account": { "uuid": "acct-1", "email": "someone@example.com" },
+            "organization": { "uuid": "org-1" },
+        }));
+    });
+    let client = OauthClient::with_endpoints(
+        &server.url("/cai/oauth/authorize"),
+        &server.url("/v1/oauth/token"),
+        &server.url("/api/oauth/profile"),
+        "agctl/test",
+    )
+    .expect("the mock endpoints parse");
+    let blob = json!({
+        "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-profile-source",
+            "refreshToken": "sk-ant-ort01-profile-source",
+            "expiresAt": 4_000_000_000_000_i64,
+        }
+    });
+    let credentials =
+        Credentials::parse_blob(blob.to_string().as_bytes()).expect("the fixture blob parses");
+    let source: &dyn ProfileSource = &client;
+    let profile = source.profile_of(&credentials, &Cancel::new()).expect("the profile answers");
+    mock.assert();
+    assert_eq!(profile.account_uuid, "acct-1");
+    assert_eq!(profile.organization_uuid, "org-1");
+}

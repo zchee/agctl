@@ -538,6 +538,176 @@ fn the_profile_call_sends_the_bearer_token() {
 }
 
 #[test]
+fn the_profile_parser_requires_v14s_three_fields_and_reads_account_email() {
+    // V14's schema: `account.uuid`, `account.email` and `organization.uuid` are
+    // required; every other member is kept. The exchange's `email_address` is
+    // the fallback spelling, read only when `email` is absent.
+    let v14 = serde_json::json!({
+        "account": {
+            "uuid": "acct-1",
+            "email": "v14@example.com",
+            "display_name": "Someone",
+            "has_claude_max": true,
+        },
+        "organization": { "uuid": "org-1", "name": "Org", "rate_limit_tier": "default" },
+    });
+    let profile = parse_profile(v14.clone()).expect("V14's document parses");
+    assert_eq!(profile.account_uuid, "acct-1");
+    assert_eq!(profile.email, "v14@example.com");
+    assert_eq!(profile.organization_uuid, "org-1");
+    assert_eq!(profile.organization_name(), Some("Org"));
+    assert_eq!(profile.document, v14, "every member is kept, untouched, for S24b's builder");
+    let debug = format!("{profile:?}");
+    assert!(
+        !debug.contains("v14@example.com") && !debug.contains("Someone"),
+        "`Debug` never prints the address or the document: {debug}"
+    );
+
+    let fallback = parse_profile(serde_json::json!({
+        "account": { "uuid": "acct-1", "email_address": "exchange@example.com" },
+        "organization": { "uuid": "org-1" },
+    }))
+    .expect("the exchange's spelling still parses");
+    assert_eq!(fallback.email, "exchange@example.com", "the `email_address` fallback");
+
+    let both = parse_profile(serde_json::json!({
+        "account": { "uuid": "acct-1", "email": "v14@example.com", "email_address": "old@example.com" },
+        "organization": { "uuid": "org-1" },
+    }))
+    .expect("both spellings parse");
+    assert_eq!(both.email, "v14@example.com", "V14's spelling wins when both are present");
+
+    let rows = [
+        (
+            "no account.uuid",
+            serde_json::json!({ "account": { "email": "e@x" }, "organization": { "uuid": "o" } }),
+            "account.uuid",
+        ),
+        (
+            "an empty account.uuid",
+            serde_json::json!({ "account": { "uuid": "", "email": "e@x" }, "organization": { "uuid": "o" } }),
+            "account.uuid",
+        ),
+        (
+            "no email of either spelling",
+            serde_json::json!({ "account": { "uuid": "a" }, "organization": { "uuid": "o" } }),
+            "account.email",
+        ),
+        (
+            "no organization",
+            serde_json::json!({ "account": { "uuid": "a", "email": "e@x" } }),
+            "organization.uuid",
+        ),
+        (
+            "an organization uuid that is not a string",
+            serde_json::json!({ "account": { "uuid": "a", "email": "e@x" }, "organization": { "uuid": 7 } }),
+            "organization.uuid",
+        ),
+        (
+            "a flat top-level uuid, which V14 never sends",
+            serde_json::json!({ "uuid": "a", "email_address": "e@x" }),
+            "account.uuid",
+        ),
+    ];
+    for (row, document, member) in rows {
+        let err = parse_profile(document).expect_err(row);
+        assert_eq!(
+            err.to_string(),
+            format!("`{member}` is missing, empty or not a string"),
+            "{row}"
+        );
+        assert!(!err.to_string().contains("e@x"), "{row}: the error never quotes a value");
+    }
+}
+
+#[test]
+fn profile_of_asks_with_no_cache_and_reports_an_incomplete_document_by_member() {
+    // V14's request: the bearer token, `accept` and `cache-control: no-cache`.
+    // A document missing a required member is an `Http` error with the
+    // response's own status and a body naming the member — never its values.
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(Method::GET)
+            .path("/api/oauth/profile")
+            .header("authorization", "Bearer sk-ant-oat01-stored-access")
+            .header("accept", "application/json")
+            .header("cache-control", "no-cache");
+        then.status(200).json_body(serde_json::json!({
+            "account": { "uuid": "acct-1", "email": "someone@example.com" },
+            "organization": { "uuid": "org-1" },
+        }));
+    });
+    let profile = profile_of(&client_for(&server), &stored_credentials(), &Cancel::new())
+        .expect("the profile should be readable");
+    mock.assert();
+    assert_eq!(
+        (profile.account_uuid.as_str(), profile.organization_uuid.as_str()),
+        ("acct-1", "org-1")
+    );
+
+    let incomplete = MockServer::start();
+    incomplete.mock(|when, then| {
+        when.method(Method::GET).path("/api/oauth/profile");
+        then.status(200).json_body(serde_json::json!({
+            "account": { "uuid": "acct-1", "email": "someone@example.com" },
+        }));
+    });
+    match profile_of(&client_for(&incomplete), &stored_credentials(), &Cancel::new()) {
+        Err(OauthError::Http { status: 200, body }) => {
+            assert!(body.contains("organization.uuid"), "the member is named: {body}");
+            assert!(!body.contains("someone@example.com"), "and no value is quoted: {body}");
+        }
+        other => panic!("an incomplete document must be an `Http` error, got {other:?}"),
+    }
+
+    let revoked = MockServer::start();
+    revoked.mock(|when, then| {
+        when.method(Method::GET).path("/api/oauth/profile");
+        then.status(401).body("{}");
+    });
+    assert!(
+        matches!(
+            profile_of(&client_for(&revoked), &stored_credentials(), &Cancel::new()),
+            Err(OauthError::Http { status: 401, .. })
+        ),
+        "a 401 keeps its status, for the swap to read as an expired token"
+    );
+}
+
+#[test]
+fn a_profile_error_never_quotes_the_document() {
+    // S24a-R2(5). The profile carries the account's personal data, so no error
+    // built from it may quote it: not serde's own message for a body that is
+    // not JSON, and not a value from a document missing a member. Every
+    // sentence names a field path or says what the body is, and nothing else.
+    const PLANTED: &str = "planted-pii-value@example.com";
+    let not_json = MockServer::start();
+    not_json.mock(|when, then| {
+        when.method(Method::GET).path("/api/oauth/profile");
+        then.status(200).body(format!("{{\"account\": {{\"email\": \"{PLANTED}\"  truncated"));
+    });
+    let missing = MockServer::start();
+    missing.mock(|when, then| {
+        when.method(Method::GET).path("/api/oauth/profile");
+        then.status(200).json_body(serde_json::json!({
+            "account": { "uuid": PLANTED, "email": PLANTED },
+            "organization": { "uuid": 12345 },
+        }));
+    });
+    for (row, server) in [("a body that is not JSON", &not_json), ("a missing member", &missing)] {
+        match profile_of(&client_for(server), &stored_credentials(), &Cancel::new()) {
+            Err(err) => {
+                let sentence = err.to_string();
+                assert!(!sentence.contains(PLANTED), "{row}: the value is quoted: {sentence}");
+                assert!(!format!("{err:?}").contains(PLANTED), "{row}: nor in `Debug`: {err:?}");
+                assert!(sentence.contains("could not be parsed"), "{row}: {sentence}");
+            }
+            Ok(profile) => panic!("{row}: must not parse, got {profile:?}"),
+        }
+    }
+}
+
+#[test]
 fn to_credentials_builds_the_f40_blob_shape() {
     let wire: TokenResponseWire =
         serde_json::from_slice(&fixture_bytes()).expect("the fixture should deserialize");

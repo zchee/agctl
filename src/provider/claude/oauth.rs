@@ -95,7 +95,8 @@ pub const AUTHORIZE_URL_CONSOLE: &str = "https://platform.claude.com/oauth/autho
 /// The token endpoint, for both grants (facts F8, F25).
 pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 
-/// The identity fallback endpoint (fact F26).
+/// The profile endpoint (facts F26, V14): login's identity fallback, and since
+/// S24 the source of whose credential a live store holds.
 pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 
 /// Where the authorization server sends the user in manual mode, which
@@ -105,7 +106,7 @@ pub const MANUAL_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/ca
 /// The time budget for one call to the token endpoint (fact F8).
 pub const TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The time budget for the profile call (fact F26).
+/// The time budget for the profile call (fact F26; V14's number).
 pub const PROFILE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the loopback listener waits for the browser to come back.
@@ -139,6 +140,17 @@ pub const TOKEN_URL_ENV: &str = "AGCTL_CLAUDE_TOKEN_URL";
 /// Test-only override for the authorize endpoint (plan section 3.9).
 #[cfg(feature = "testing")]
 pub const AUTHORIZE_URL_ENV: &str = "AGCTL_CLAUDE_AUTHORIZE_URL";
+
+/// Test-only override for the profile endpoint (plan section 3.9, S24).
+///
+/// Unset, a `testing` build asks the real [`PROFILE_URL`], exactly as the token
+/// and authorize overrides fall back to theirs: the user-operated live check
+/// (AC76) runs a `testing` build against the real live item, and a binary that
+/// failed closed here would refuse every live swap it was built to check. The
+/// suite fails closed instead — `tests/common`'s `Fixture::new` points this at
+/// an address nothing listens on unless a test wires its mock.
+#[cfg(feature = "testing")]
+pub const PROFILE_URL_ENV: &str = "AGCTL_CLAUDE_PROFILE_URL";
 
 /// A successful response from the token endpoint (facts F8, F25).
 pub struct TokenResponse {
@@ -398,11 +410,12 @@ pub struct OauthClient {
 impl OauthClient {
     /// Builds a client for the real endpoints.
     ///
-    /// With the `testing` feature, `AGCTL_CLAUDE_TOKEN_URL` and
-    /// `AGCTL_CLAUDE_AUTHORIZE_URL` redirect the two endpoints at a mock
-    /// server. Both are compiled out otherwise: a release build that could be
-    /// pointed at an arbitrary token endpoint by an environment variable is an
-    /// exfiltration vector (plan section 3.9, AC37).
+    /// With the `testing` feature, `AGCTL_CLAUDE_TOKEN_URL`,
+    /// `AGCTL_CLAUDE_AUTHORIZE_URL` and `AGCTL_CLAUDE_PROFILE_URL` redirect the
+    /// three endpoints at a mock server. All three are compiled out otherwise:
+    /// a release build that could be pointed at an arbitrary token endpoint by
+    /// an environment variable is an exfiltration vector (plan section 3.9,
+    /// AC37).
     ///
     /// # Errors
     ///
@@ -410,7 +423,8 @@ impl OauthClient {
     pub fn from_env(user_agent: &str) -> Result<Self, AppError> {
         let authorize = url_override(AUTHORIZE_URL_ENV_NAME).unwrap_or_else(default_authorize_url);
         let token = url_override(TOKEN_URL_ENV_NAME).unwrap_or_else(|| TOKEN_URL.to_owned());
-        Self::with_endpoints(&authorize, &token, PROFILE_URL, user_agent)
+        let profile = url_override(PROFILE_URL_ENV_NAME).unwrap_or_else(|| PROFILE_URL.to_owned());
+        Self::with_endpoints(&authorize, &token, &profile, user_agent)
     }
 
     /// Builds a client against explicit endpoints.
@@ -480,6 +494,14 @@ const AUTHORIZE_URL_ENV_NAME: Option<&str> = Some(AUTHORIZE_URL_ENV);
 /// The name of the authorize-endpoint override, or `None` in a release build.
 #[cfg(not(feature = "testing"))]
 const AUTHORIZE_URL_ENV_NAME: Option<&str> = None;
+
+/// The name of the profile-endpoint override, or `None` in a release build.
+#[cfg(feature = "testing")]
+const PROFILE_URL_ENV_NAME: Option<&str> = Some(PROFILE_URL_ENV);
+
+/// The name of the profile-endpoint override, or `None` in a release build.
+#[cfg(not(feature = "testing"))]
+const PROFILE_URL_ENV_NAME: Option<&str> = None;
 
 /// Reads an endpoint override, if this build has one to read.
 fn url_override(name: Option<&str>) -> Option<String> {
@@ -717,8 +739,11 @@ fn post_token(
     Err(TokenFailure { error: OauthError::Http { status, body: redact(&text) }, retry_after })
 }
 
-/// Fetches the profile, the identity fallback when the exchange named no
-/// account (fact F26).
+/// Fetches the profile as a raw document (fact F26).
+///
+/// Login's identity fallback and `accounts relocate`'s organization lookup
+/// read it this way; the live swap reads it through [`profile_of`], which
+/// holds the document to V14's schema.
 ///
 /// # Errors
 ///
@@ -729,15 +754,52 @@ pub fn profile(
     creds: &Credentials,
     cancel: &Cancel,
 ) -> Result<Value, OauthError> {
+    get_profile(client, creds, cancel).map(|(_, document)| document)
+}
+
+/// Fetches the profile and holds it to V14's schema: whose credential `creds`
+/// is, as the server names it.
+///
+/// One GET, never retried. It rotates nothing — unlike a refresh, it spends no
+/// grant — which is why a live swap may issue it in Phase A, before the
+/// consent prompt.
+///
+/// # Errors
+///
+/// See [`OauthError`]. A document missing one of the three members agctl
+/// requires is [`OauthError::Http`] with the response's own status and a body
+/// naming the member, never the document's values.
+pub fn profile_of(
+    client: &OauthClient,
+    creds: &Credentials,
+    cancel: &Cancel,
+) -> Result<Profile, OauthError> {
+    let (status, document) = get_profile(client, creds, cancel)?;
+    parse_profile(document).map_err(|err| OauthError::Http {
+        status,
+        body: format!("the profile response could not be parsed: {err}"),
+    })
+}
+
+/// The one profile GET, and the status it answered with.
+fn get_profile(
+    client: &OauthClient,
+    creds: &Credentials,
+    cancel: &Cancel,
+) -> Result<(u16, Value), OauthError> {
     if cancel.is_cancelled() {
         return Err(OauthError::Cancelled);
     }
 
+    // `cache-control: no-cache` is V14's: the answer is about the credential
+    // in hand now, and an intermediary's copy of an earlier answer would name
+    // whoever held the token before.
     let sent = client
         .profile_agent
         .get(&client.profile_url)
         .header("authorization", creds.authorization_header())
         .header("accept", "application/json")
+        .header("cache-control", "no-cache")
         .header("user-agent", &client.user_agent)
         .call();
 
@@ -753,10 +815,89 @@ pub fn profile(
     if !(200..300).contains(&status) {
         return Err(OauthError::Http { status, body: redact(&text) });
     }
-    serde_json::from_str(&text).map_err(|err| OauthError::Http {
+    // A fixed sentence rather than serde's own: its message can quote part of
+    // the document, and the document carries the account's personal data.
+    let document = serde_json::from_str(&text).map_err(|_| OauthError::Http {
         status,
-        body: format!("the profile response could not be parsed: {err}"),
-    })
+        body: "the profile response could not be parsed: it is not a JSON document".to_owned(),
+    })?;
+    Ok((status, document))
+}
+
+/// Whose credential a profile GET was made with, as the server names it (V14).
+///
+/// Three members are required — `account.uuid`, `account.email` and
+/// `organization.uuid` — and everything else the server sent is kept,
+/// untouched, in [`Profile::document`]. The email is the account's personal
+/// data: it is never logged, never printed and never written by anything that
+/// holds a `Profile` for identity alone, and `Debug` redacts it together with
+/// the document.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Profile {
+    /// The account UUID.
+    pub account_uuid: String,
+    /// The account's email address (`account.email`, or the exchange-shaped
+    /// `account.email_address`).
+    pub email: String,
+    /// The organization UUID.
+    pub organization_uuid: String,
+    /// The whole document as the server sent it.
+    pub document: Value,
+}
+
+impl Profile {
+    /// The organization's display name, when the document carries one.
+    pub fn organization_name(&self) -> Option<&str> {
+        self.document.get("organization")?.get("name")?.as_str()
+    }
+}
+
+impl std::fmt::Debug for Profile {
+    /// The two ids and nothing else, so a failing assertion or a `tracing`
+    /// field cannot print the email or the rest of the document.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Profile")
+            .field("account_uuid", &self.account_uuid)
+            .field("email", &"<redacted>")
+            .field("organization_uuid", &self.organization_uuid)
+            .field("document", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Which required member a profile document lacked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("`{0}` is missing, empty or not a string")]
+pub struct ProfileParseError(&'static str);
+
+/// Holds a profile document to V14's schema.
+///
+/// `account.email` is V14's spelling. `account.email_address` is the
+/// exchange's, which login's fixtures and fact F25 use, and is read when the
+/// first is absent. A document with a flat top-level `uuid` names nobody: the
+/// shape was captured (V14), so a guess at another one is no longer a
+/// kindness.
+///
+/// # Errors
+///
+/// Returns [`ProfileParseError`] naming the first required member that is
+/// missing, empty or not a string. The value is never quoted.
+pub fn parse_profile(document: Value) -> Result<Profile, ProfileParseError> {
+    let text = |block: &str, member: &str| {
+        document
+            .get(block)
+            .and_then(|found| found.get(member))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let account_uuid = text("account", "uuid").ok_or(ProfileParseError("account.uuid"))?;
+    let email = text("account", "email")
+        .or_else(|| text("account", "email_address"))
+        .ok_or(ProfileParseError("account.email"))?;
+    let organization_uuid =
+        text("organization", "uuid").ok_or(ProfileParseError("organization.uuid"))?;
+    Ok(Profile { account_uuid, email, organization_uuid, document })
 }
 
 /// Maps a `ureq` failure onto a transport or timeout error.

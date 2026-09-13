@@ -108,7 +108,7 @@ fn the_cli_exit_table_is_total_and_has_no_duplicate_or_reserved_value() {
         assert!(!seen.contains(&code), "{name} reuses exit code {code}");
         seen.push(code);
     }
-    assert_eq!(seen.len(), 19, "every code in the block is listed in ALL");
+    assert_eq!(seen.len(), 17, "every code in the block is listed in ALL");
 
     // The table itself, spelled out. Counting the entries proved only that
     // there were as many of them as expected: a renumbering, or a name moved onto another
@@ -133,12 +133,10 @@ fn the_cli_exit_table_is_total_and_has_no_duplicate_or_reserved_value() {
             ("audit_refused", 22),
             ("live_unreachable", 23),
             ("live_item_absent", 24),
-            ("live_swap_outstanding", 25),
-            ("live_undo_of_undo", 26),
             ("live_undo_item_changed", 27),
-            ("live_write_unknown", 28),
+            ("identity_unavailable", 29),
         ],
-        "the block is contiguous from 10 and each name keeps its own number"
+        "each name keeps its own number, and S23b's retired 25, 26 and 28 are not reused"
     );
 }
 
@@ -167,10 +165,9 @@ fn all_outcomes() -> Vec<Outcome> {
         Outcome::Refused(Refusal::LiveUnreachable),
         Outcome::Refused(Refusal::LiveItemAbsent),
         Outcome::Refused(Refusal::AuditRefused),
-        Outcome::Refused(Refusal::LiveSwapOutstanding),
-        Outcome::Refused(Refusal::LiveUndoOfUndo),
+        Outcome::Refused(Refusal::IdentityUnavailable(IdentityGap::ProfileUnavailable)),
+        Outcome::Refused(Refusal::IdentityUnavailable(IdentityGap::TokenExpired)),
         Outcome::Refused(Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin)),
-        Outcome::Refused(Refusal::LiveWriteUnknown),
     ]
 }
 
@@ -454,20 +451,22 @@ fn the_live_refusals_carry_the_letter_code_and_phase_w4b_fixed_for_each() {
             Phase::A,
         ),
         (Refusal::AuditRefused, None, Some("audit_refused"), swap_exit::AUDIT_REFUSED, Phase::B),
-        // S23b (decision D-027): all three are decided in Phase A, and the
-        // item-changed refusal carries one of two reasons under one code.
+        // S24: whose credential the live item holds. Both decided in Phase A,
+        // right after the item read; the unavailable identity carries one of
+        // two reasons under one fresh code, and the foreign login keeps 27 with
+        // the one reason S23b's two left it.
         (
-            Refusal::LiveSwapOutstanding,
+            Refusal::IdentityUnavailable(IdentityGap::ProfileUnavailable),
             None,
-            Some("live_swap_outstanding"),
-            swap_exit::LIVE_SWAP_OUTSTANDING,
+            Some("profile_unavailable"),
+            swap_exit::IDENTITY_UNAVAILABLE,
             Phase::A,
         ),
         (
-            Refusal::LiveUndoOfUndo,
+            Refusal::IdentityUnavailable(IdentityGap::TokenExpired),
             None,
-            Some("live_undo_of_undo"),
-            swap_exit::LIVE_UNDO_OF_UNDO,
+            Some("live_token_expired"),
+            swap_exit::IDENTITY_UNAVAILABLE,
             Phase::A,
         ),
         (
@@ -475,20 +474,6 @@ fn the_live_refusals_carry_the_letter_code_and_phase_w4b_fixed_for_each() {
             None,
             Some("live_undo_foreign_login"),
             swap_exit::LIVE_UNDO_ITEM_CHANGED,
-            Phase::A,
-        ),
-        (
-            Refusal::LiveUndoItemChanged(ItemChange::Diverged),
-            None,
-            Some("live_undo_item_diverged"),
-            swap_exit::LIVE_UNDO_ITEM_CHANGED,
-            Phase::A,
-        ),
-        (
-            Refusal::LiveWriteUnknown,
-            None,
-            Some("live_write_unknown"),
-            swap_exit::LIVE_WRITE_UNKNOWN,
             Phase::A,
         ),
     ];
@@ -539,11 +524,9 @@ fn the_live_refusals_are_decided_before_the_locks_and_in_the_contracts_order() {
         Refusal::LiveUnreachable,
         Refusal::LiveItemAbsent,
         Refusal::AuditRefused,
-        Refusal::LiveSwapOutstanding,
-        Refusal::LiveUndoOfUndo,
+        Refusal::IdentityUnavailable(IdentityGap::ProfileUnavailable),
+        Refusal::IdentityUnavailable(IdentityGap::TokenExpired),
         Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin),
-        Refusal::LiveUndoItemChanged(ItemChange::Diverged),
-        Refusal::LiveWriteUnknown,
     ] {
         assert!(!refusal.decided_in().holds_locks(), "{refusal:?} must not need a hold");
     }
@@ -562,22 +545,45 @@ fn the_live_refusals_are_decided_before_the_locks_and_in_the_contracts_order() {
     assert!(at(Refusal::LiveNamespaceEnv) < at(Refusal::LiveUnreachable));
     assert!(at(Refusal::LiveUnreachable) < at(Refusal::EnvToken));
     assert!(at(Refusal::EnvToken) < at(Refusal::LiveItemAbsent));
-    // Decision D-027. The undo-of-undo refusal is decided from the entry alone,
-    // before a reversal's subject is built; the guard and the item-changed
-    // refusal both need the item, so both follow `LiveItemAbsent`.
-    assert!(at(Refusal::NotOwned) < at(Refusal::LiveUndoOfUndo));
-    assert!(at(Refusal::LiveUndoOfUndo) < at(Refusal::LiveNamespaceEnv));
-    assert!(at(Refusal::LiveItemAbsent) < at(Refusal::LiveSwapOutstanding));
-    assert!(at(Refusal::LiveSwapOutstanding) < at(Refusal::LiveWriteUnknown));
-    assert!(at(Refusal::LiveWriteUnknown) < at(Refusal::LineTooLong));
-    assert!(
-        at(Refusal::LiveSwapOutstanding)
-            < at(Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin))
-    );
-    assert!(at(Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin)) < at(Refusal::LineTooLong));
+    // S24. Both identity refusals need the item, so both follow
+    // `LiveItemAbsent`; the foreign login is decided from the identity the
+    // unavailable-identity refusal would have refused without, so it follows
+    // that; and both precede Phase B's first refusal.
+    let unavailable = at(Refusal::IdentityUnavailable(IdentityGap::ProfileUnavailable));
+    let foreign = at(Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin));
+    assert!(at(Refusal::LiveItemAbsent) < unavailable);
+    assert!(unavailable < foreign);
+    assert!(foreign < at(Refusal::LineTooLong));
     assert!(at(Refusal::LiveItemAbsent) < at(Refusal::LineTooLong));
     assert!(at(Refusal::LineTooLong) < at(Refusal::AuditRefused));
     assert!(at(Refusal::AuditRefused) < at(Refusal::CannotAdopt(adopt::Refusal::NewerCopy)));
     assert!(at(Refusal::CannotAdopt(adopt::Refusal::NewerCopy)) < at(Refusal::CompromisedHold));
-    assert_eq!(DECISION_ORDER.len(), 13, "every refusal the driver can raise is in the table");
+    assert_eq!(DECISION_ORDER.len(), 11, "every refusal the driver can raise is in the table");
+}
+
+#[test]
+fn the_unavailable_identity_carries_both_reasons_under_one_code_and_no_letter() {
+    // S24's refusal, by its two reasons. One code, because a script acts on
+    // "nothing could say whose credential the live item holds" the same way
+    // whichever it was; two reasons, because the remedy differs — check the
+    // connection, or send Claude Code one message so it refreshes the token.
+    let gaps = [
+        (IdentityGap::ProfileUnavailable, "profile_unavailable"),
+        (IdentityGap::TokenExpired, "live_token_expired"),
+    ];
+    for (gap, reason) in gaps {
+        let refusal = Refusal::IdentityUnavailable(gap);
+        assert_eq!(refusal.reason(), Some(reason), "{gap:?}'s reason");
+        assert_eq!(refusal.letter(), None, "{gap:?} is unlettered: A–F are spoken for");
+        assert_eq!(refusal.exit_code(), 29, "{gap:?} exits the fresh code");
+        assert_eq!(refusal.decided_in(), Phase::A, "{gap:?} is decided before anything is held");
+    }
+    // `DECISION_ORDER` lists the variant once; its position stands for both.
+    assert_eq!(
+        DECISION_ORDER
+            .iter()
+            .filter(|listed| matches!(listed, Refusal::IdentityUnavailable(_)))
+            .count(),
+        1
+    );
 }

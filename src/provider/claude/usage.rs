@@ -70,6 +70,7 @@ use crate::provider::claude::credentials::Credentials;
 use crate::provider::claude::oauth;
 use crate::provider::claude::oauth::OauthClient;
 use crate::provider::claude::oauth::OauthError;
+use crate::provider::claude::oauth::Profile;
 use crate::provider::claude::oauth::TokenResponse;
 use crate::runtime::coordinator::Cancel;
 use crate::usage::model::Credits;
@@ -721,6 +722,36 @@ impl TokenRefresher for OauthClient {
             // cannot arise on a refresh grant.
             other => RefreshError::Transient(other.to_string()),
         })
+    }
+}
+
+/// Asks the server whose credential this is (V14).
+///
+/// The seam [`TokenRefresher`] is for the refresh POST, for the profile GET:
+/// the production implementation is [`OauthClient`], and the swap's unit tests
+/// substitute doubles, so no unit test can reach the real endpoint.
+///
+/// The error stays an [`OauthError`] rather than a narrower type of its own,
+/// because the caller's classification needs the HTTP status: a 401 or a 403
+/// means the token is no longer honoured, which is not the same answer as
+/// "the server could not be asked".
+pub trait ProfileSource: Send + Sync {
+    /// One profile GET with `credentials`' access token, held to V14's schema.
+    ///
+    /// # Errors
+    ///
+    /// See [`OauthError`].
+    fn profile_of(&self, credentials: &Credentials, cancel: &Cancel)
+    -> Result<Profile, OauthError>;
+}
+
+impl ProfileSource for OauthClient {
+    fn profile_of(
+        &self,
+        credentials: &Credentials,
+        cancel: &Cancel,
+    ) -> Result<Profile, OauthError> {
+        oauth::profile_of(self, credentials, cancel)
     }
 }
 

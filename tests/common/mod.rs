@@ -17,7 +17,7 @@
 //! - `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`,
 //!   `CLAUDE_CODE_OAUTH_TOKEN` and `AGCTL_CONFIG_DIR` are removed, so an
 //!   inherited value cannot point the binary back at the real machine;
-//! - the three endpoint overrides default to `127.0.0.1:1`, which nothing
+//! - the four endpoint overrides default to `127.0.0.1:1`, which nothing
 //!   listens on, so a regression that fetched anyway fails loudly here rather
 //!   than quietly reaching Anthropic;
 //! - the keychain is either disabled outright or replaced by the fake
@@ -55,6 +55,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 use assert_cmd::Command;
+use httpmock::Method::GET;
+use httpmock::Mock;
+use httpmock::MockServer;
 use rustix::fs::FlockOperation;
 use serde_json::Value;
 use serde_json::json;
@@ -90,6 +93,9 @@ pub const TOKEN_PATH: &str = "/v1/oauth/token";
 
 /// The usage endpoint's path under the base URL (fact F1).
 pub const USAGE_PATH: &str = "/api/oauth/usage";
+
+/// The profile endpoint's path under the base URL (V14).
+pub const PROFILE_PATH: &str = "/api/oauth/profile";
 
 /// The organization directory name a login uses when the exchange named none.
 pub const UNKNOWN_ORG: &str = "_unknown-org";
@@ -137,6 +143,11 @@ impl Fixture {
         fixture.set("AGCTL_CLAUDE_USAGE_URL", "http://127.0.0.1:1");
         fixture.set("AGCTL_CLAUDE_TOKEN_URL", "http://127.0.0.1:1/token");
         fixture.set("AGCTL_CLAUDE_AUTHORIZE_URL", "http://127.0.0.1:1/authorize");
+        // The live swap's profile GET carries the live item's bearer token, so
+        // it gets the same unroutable default: the `testing` binary with the
+        // variable unset asks the real endpoint (S24a-R2(8)), which a test that
+        // forgot its mock must never reach.
+        fixture.set("AGCTL_CLAUDE_PROFILE_URL", "http://127.0.0.1:1/api/oauth/profile");
         // `login` prints the URL either way; opening a window on the
         // developer's desktop from a test run is not acceptable.
         fixture.set("AGCTL_NO_BROWSER", "1");
@@ -304,6 +315,29 @@ impl Fixture {
         link
     }
 
+    /// Plants the live `.claude.json` exactly as [`Fixture::live_claude_json`]
+    /// does, but pretty-printed the way Claude Code writes it
+    /// (`JSON.stringify(_, null, 2)`): two-space indentation and no trailing
+    /// newline. Returns the link.
+    ///
+    /// Unused by S24a, which writes no `.claude.json`; it is here for the
+    /// config write that follows, whose byte-level comparisons need the shape
+    /// the peer actually leaves. The compact variant stays for the tests that
+    /// only need the file to exist.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the file or the link cannot be created.
+    pub fn live_claude_json_js(&self, document: &Value) -> PathBuf {
+        let target = self.home().join(".claude-real").join(".claude.json");
+        let text = serde_json::to_string_pretty(document).expect("the document is serializable");
+        fs::write(&target, text).expect("the live `.claude.json` should be writable");
+        let link = self.home().join(".claude.json");
+        std::os::unix::fs::symlink(&target, &link)
+            .expect("the `.claude.json` link should be plantable");
+        link
+    }
+
     /// Sets one environment variable for every command this fixture builds.
     pub fn set(&mut self, key: &str, value: &str) -> &mut Self {
         self.env.retain(|(existing, _)| existing != key);
@@ -311,11 +345,13 @@ impl Fixture {
         self
     }
 
-    /// Points the usage and token endpoints at a mock server.
+    /// Points the usage, token, authorize and profile endpoints at a mock
+    /// server.
     pub fn endpoints(&mut self, base_url: &str) -> &mut Self {
         self.set("AGCTL_CLAUDE_USAGE_URL", base_url);
         self.set("AGCTL_CLAUDE_TOKEN_URL", &format!("{base_url}{TOKEN_PATH}"));
         self.set("AGCTL_CLAUDE_AUTHORIZE_URL", &format!("{base_url}/oauth/authorize"));
+        self.set("AGCTL_CLAUDE_PROFILE_URL", &format!("{base_url}{PROFILE_PATH}"));
         self
     }
 
@@ -814,6 +850,44 @@ pub fn now_ms() -> i64 {
     i64::try_from(since.as_millis()).expect("the epoch milliseconds fit in an i64")
 }
 
+/// Mocks the profile endpoint for one bearer token, answering V14's document
+/// naming `acct`/`org`.
+///
+/// Matched on `authorization: Bearer <access_token>` and V14's
+/// `cache-control: no-cache`, so a test's call counts say **whose** token was
+/// asked, and a GET that carried any other token — or none — matches nothing
+/// and is answered 404 by the server, which the swap reads as a profile that
+/// could not be asked.
+#[must_use]
+pub fn mock_profile<'a>(
+    server: &'a MockServer,
+    access_token: &str,
+    (acct, org): (&str, &str),
+) -> Mock<'a> {
+    let bearer = format!("Bearer {access_token}");
+    server.mock(|when, then| {
+        when.method(GET)
+            .path(PROFILE_PATH)
+            .header("authorization", bearer.as_str())
+            .header("cache-control", "no-cache");
+        then.status(200).json_body(json!({
+            "account": {
+                "uuid": acct,
+                "email": "profile@example.com",
+                "display_name": "Profile Fixture",
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            "organization": {
+                "uuid": org,
+                "name": "Acme",
+                "organization_type": "claude_max",
+                "billing_type": "stripe_subscription",
+                "rate_limit_tier": "default_claude_max_20x",
+            },
+        }));
+    })
+}
+
 /// An expiry far enough in the past to be expired under any margin.
 #[must_use]
 pub fn expired_at() -> i64 {
@@ -1140,7 +1214,7 @@ pub fn finish(child: Child) -> Output {
 /// write lines in it is a failure, not a pass, because "the write path did
 /// nothing" is exactly the way this criterion could otherwise be satisfied
 /// (critic M8).
-pub const KEYCHAIN_WRITE_TESTS: [&str; 43] = [
+pub const KEYCHAIN_WRITE_TESTS: [&str; 57] = [
     "ac59_the_write_transport_reads_one_line_from_stdin_and_redacts_the_hex",
     "ac60_a_service_no_test_registered_is_refused_and_stores_nothing",
     "ac61_what_the_write_path_stores_is_what_the_binary_reads",
@@ -1195,24 +1269,40 @@ pub const KEYCHAIN_WRITE_TESTS: [&str; 43] = [
     "ac81_a_live_swap_touches_nothing_outside_the_namespace_root_but_the_three_artefacts",
     "ac76_a_live_swap_is_reversed_by_undo_and_the_item_holds_p_again",
     "ac67_e_an_undo_of_a_live_entry_from_a_namespaced_shell_refuses_e",
-    "the_live_r3h_row_parks_the_displaced_copy_in_the_incoming_namespace",
     "a_live_swap_creates_ps_namespace_only_under_the_namespace_root",
     "a_live_undo_refreshes_an_expired_credential_and_persists_it",
     "a_live_undo_whose_refreshed_credential_cannot_be_saved_warns_on_stderr_and_in_json",
+    "a_live_undo_of_a_migrated_namespaces_parked_credential_refreshes_and_persists",
+    "a_live_undo_from_ps_own_store_whose_refresh_cannot_be_saved_warns_on_stderr_and_in_json",
+    "a_live_parking_supersedes_only_an_earlier_live_parking",
+    "a_live_parking_supersedes_the_copy_an_undo_refreshed_and_wrote_back",
+    "a_live_swap_applies_when_the_incoming_accounts_profile_cannot_answer",
+    "a_live_undo_applies_when_the_restored_accounts_profile_cannot_answer",
+    // S24a-R3.A(i)'s refusal starts from a completed forward swap, so it writes
+    // once too.
+    "a_live_undo_whose_adopted_copy_cannot_take_a_refresh_is_refused_before_the_post",
     "a_live_swap_between_two_orgs_of_one_account_files_the_displaced_credential_in_its_own_org",
-    // S23b (decision D-027). The first swaps and reverses, writing twice; the
-    // second swaps, reverses and swaps again, writing three times. Each pins
-    // its own number against its own log.
-    "a_live_swap_takes_ps_identity_from_claude_json_and_its_undo_takes_ts_from_the_audit_entry",
-    "a_second_live_swap_is_refused_until_the_first_is_undone_and_then_proceeds",
-    // The guard's table completes a swap in its two arms that do not block; the
-    // undo-of-undo and foreign-login refusals each start from applied swaps.
-    "the_outstanding_guard_keys_on_the_newest_live_entry_and_reads_an_unknown_one_against_the_item",
-    "a_live_undo_of_an_undo_is_refused_before_any_owned_namespace_is_read",
+    // S24 (the profile as the live identity source). Every one completes at
+    // least one live pass; the ones that reverse write once each way, and the
+    // proof test writes four times. Each pins its own number against its own
+    // log. `the_live_r3h_row_parks_the_displaced_copy_in_the_incoming_namespace`
+    // left the list: its shape is `already_active` by identity now, and writes
+    // nothing.
+    "a_live_swap_takes_ps_identity_from_the_profile_and_its_undo_asks_the_profile_again",
+    "live_undo_entries_record_the_account_they_installed",
+    "an_expired_live_credential_is_attributed_only_to_agctls_own_write",
+    "two_live_swaps_in_a_row_then_undo_then_undo_of_undo_all_apply",
+    "a_live_undo_of_an_undo_puts_back_what_that_undo_displaced",
+    "a_forward_swap_after_an_unknown_live_write_asks_the_profile_instead_of_refusing_28",
+    "the_undo_reads_the_whole_log_not_a_tail",
+    "a_live_undo_after_an_unknown_undo_asks_the_profile_whose_credential_the_item_holds",
     "a_live_undo_refuses_when_the_session_has_logged_in_as_another_account_since",
-    "the_guard_and_the_undo_read_the_whole_log_not_a_tail",
-    // Its "never landed" arm completes the reversal.
-    "a_live_undo_after_an_unknown_undo_asks_the_item_whether_that_undo_landed",
+    "a_live_undo_of_an_unknown_swap_asks_the_profile_whose_credential_the_item_holds",
+    "a_login_as_the_displaced_account_mid_swap_is_seen_by_the_undo_and_nothing_is_misfiled",
+    "a_third_account_written_into_the_item_with_a_stale_oauth_account_is_filed_as_the_profile_says",
+    "a_live_swap_parks_p_beside_its_owned_store_and_leaves_the_independent_grant_alone",
+    "an_undo_after_status_refreshed_ps_owned_store_still_finds_p",
+    "a_namespace_swap_is_unchanged_by_the_profile",
     // The namespace-target control for ruling G2's scope: it proves W4a's
     // behaviour over a refused audit log is unchanged, which means it completes
     // a swap and writes the namespaced item once.

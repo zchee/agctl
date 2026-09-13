@@ -583,3 +583,54 @@ fn task_fours_three_sub_rows_answer_the_same_for_a_live_target() {
          otherwise have said `NewerCopy` here"
     );
 }
+
+#[test]
+fn a_live_forward_parking_is_the_third_namespace_row_weighed_against_the_adopted_copy() {
+    // `agctl-cf1i` option A (S24 §D4) leaves this matrix exactly as it is. A
+    // live forward swap asks the third-namespace row with two things changed by
+    // its caller: `existing` comes from `<ns(P)>/.credentials.adopted.json`
+    // rather than `.credentials.json`, and `target_migrated` is never set —
+    // Claude Code's composed read never reads the adopted name, so a migrated
+    // namespace cannot shadow it. The caller writes a `ToStore` answer to the
+    // adopted copy.
+    //
+    // `Existing::Different` never reaches this row from that caller (S24a-R2(1)):
+    // a different copy there is refused before the matrix, or — when an earlier
+    // live swap parked it — superseded and passed as `Absent`. So the rows the
+    // caller relies on are these.
+    let parked = |existing: Existing| Input { target_migrated: false, ..input(existing) };
+    let cases: Vec<(&str, Input, Adoption)> = vec![
+        (
+            "no copy parked yet, or a superseded live parking: write it",
+            parked(Existing::Absent),
+            Adoption::ToStore,
+        ),
+        ("the same credential already parked", parked(Existing::Same), Adoption::AlreadyPresent),
+        (
+            "a pending write in that namespace still refuses",
+            Input { pending_present: true, ..parked(Existing::Absent) },
+            Adoption::Refused(Refusal::PendingPresent),
+        ),
+        (
+            "an unreadable adopted copy still refuses",
+            parked(Existing::Unreadable),
+            Adoption::Refused(Refusal::Unreadable),
+        ),
+    ];
+    for (name, input, expected) in cases {
+        assert_eq!(decide(&input), expected, "live parking row: {name}");
+    }
+
+    // The namespace target's rows are untouched: a migrated third store and a
+    // newer copy still refuse exactly as W4a decided.
+    assert_eq!(
+        decide(&Input { target_migrated: true, ..input(Existing::Absent) }),
+        Adoption::Refused(Refusal::Migrated),
+        "a namespace target's migrated third store still refuses"
+    );
+    assert_eq!(
+        decide(&input(Existing::Different { expires_at_ms: NOW + 2 * HOUR })),
+        Adoption::Refused(Refusal::NewerCopy),
+        "and its newer copy still refuses"
+    );
+}

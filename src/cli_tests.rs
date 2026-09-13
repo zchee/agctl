@@ -575,3 +575,29 @@ fn a_subcommand_is_required() {
     let message = parse_err(&["agctl"]);
     assert!(!message.is_empty(), "bare `agctl` should not parse as a runnable command");
 }
+
+#[test]
+fn the_swap_exit_table_has_seventeen_unique_codes_and_retires_25_26_and_28() {
+    // S24 lifted S23b's temporary refusals. Their numbers are retired rather
+    // than reused: a script that learned "25 means undo first" must never see
+    // 25 come back meaning something else, so the table holds none of the three
+    // and no refusal or outcome exits one.
+    use crate::cli::swap_exit;
+    use crate::provider::claude::swap::DECISION_ORDER;
+
+    let codes: Vec<i32> = swap_exit::ALL.iter().map(|(_, code)| *code).collect();
+    assert_eq!(codes.len(), 17, "the table's size: {codes:?}");
+    let mut unique = codes.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), codes.len(), "no two names share a code: {codes:?}");
+    assert!(codes.iter().all(|code| *code >= 3), "0, 1 and 2 are taken: {codes:?}");
+    for retired in [25, 26, 28] {
+        assert!(!codes.contains(&retired), "{retired} is retired, not reused: {codes:?}");
+        assert!(
+            DECISION_ORDER.iter().all(|refusal| refusal.exit_code() != retired),
+            "no refusal exits the retired {retired}"
+        );
+    }
+    assert_eq!(swap_exit::IDENTITY_UNAVAILABLE, 29, "the fresh code S24 added");
+}

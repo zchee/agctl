@@ -37,19 +37,33 @@
 //! the forward path at all, and arises only in `use --undo`, whose target
 //! comes from the audit log rather than from the environment.
 //!
-//! The live target is the same procedure with four extra refusals and one
-//! narrower containment rule. **Nothing under the live store is ever written
-//! or removed**: invariant I11′'s W4b relaxation is exactly *the three lock
+//! The live target is the same procedure with more refusals and one narrower
+//! containment rule. **Nothing under the live store is ever written or
+//! removed**: invariant I11′'s W4b relaxation is exactly *the three lock
 //! artefacts plus the keychain item*, so
 //!
 //! - an absent live item ([`Refusal::LiveItemAbsent`]) refuses rather than
 //!   taking W4a's first-write path, which would remove
 //!   `~/.claude/.credentials.json`;
 //! - the displaced credential goes to **its own account's namespace** under
-//!   `namespace_root()`, never to a `.credentials.adopted.json` beside the
-//!   live store;
+//!   `namespace_root()` — on the forward direction always to that namespace's
+//!   `.credentials.adopted.json` (`agctl-cf1i`) — never beside the live store;
 //! - a refused audit log ([`Refusal::AuditRefused`]) refuses the swap, because
 //!   the log is the only durable evidence a live-store lock break leaves.
+//!
+//! ## Whose credential the live item holds (S24)
+//!
+//! Claude Code writes the live item without a `tokenAccount`, so the credential
+//! there never says whose it is. Phase A asks the server: **one profile GET**
+//! with the item's own access token, right after the item read ([`identify`]).
+//! That is Phase A's one network read, and it may sit in front of the consent
+//! prompt because a GET rotates nothing — finding N-8 is about step 13's
+//! refresh POST. An expired token cannot be asked; its bytes are attributed
+//! only to a write agctl itself made ([`identity_by_own_write`]), and anything
+//! else refuses ([`Refusal::IdentityUnavailable`]). The incoming credential is
+//! asked once more in Phase B, after its refresh, so a pass issues at most two
+//! GETs. `.claude.json` is never read on this path: after a live swap it names
+//! the account the swap displaced until something rewrites it.
 //!
 //! ## The one thing this file must never do
 //!
@@ -85,13 +99,16 @@ use crate::provider::claude::credentials::Digests;
 use crate::provider::claude::credentials::Identity;
 use crate::provider::claude::credentials::KeychainStdinLine;
 use crate::provider::claude::credentials::REFRESH_MARGIN_MS;
-use crate::provider::claude::discovery;
 use crate::provider::claude::namespace;
 use crate::provider::claude::namespace::EnvView;
+use crate::provider::claude::oauth::OauthError;
+use crate::provider::claude::oauth::Profile;
 use crate::provider::claude::swap;
+use crate::provider::claude::swap::IdentityGap;
 use crate::provider::claude::swap::ItemChange;
 use crate::provider::claude::swap::Outcome;
 use crate::provider::claude::swap::Refusal;
+use crate::provider::claude::usage::ProfileSource;
 use crate::provider::claude::usage::RefreshError;
 use crate::runtime::coordinator::Cancel;
 use crate::runtime::coordinator::PassCtx;
@@ -393,21 +410,8 @@ fn run_live(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
     };
     let report = swap_in(&swap, &incoming, store.as_ref(), args);
     emit(&report, args.json)?;
-    // Decision D-027's mitigation for what no guard can see yet: a Claude Code
-    // `/login` as the displaced account while this swap is outstanding looks
-    // exactly like the swapped-in account's own refresh until S24. On stderr,
-    // beside refusal B's note, so `--json`'s stdout stays a stream of
-    // documents.
-    if which == Which::Live && matches!(report.outcome, Outcome::Applied) {
-        eprintln!("note: {OUTSTANDING_REMINDER}");
-    }
     Ok(report.outcome.exit_code())
 }
-
-/// What a live swap tells its operator on the way out, and what the
-/// outstanding-live-swap refusal repeats (decision D-027).
-const OUTSTANDING_REMINDER: &str = "while a live swap is outstanding, return with `agctl claude \
-                                    use --undo`, never `/login` in Claude Code";
 
 /// Which of the two credential stores a pass is about.
 ///
@@ -764,57 +768,76 @@ fn swap_phases(
     let before = if item_present { displaced.as_ref().map(Credentials::digests) } else { None };
     let from_digest8 = before.as_ref().and_then(|d| audit::digest8(&d.access_sha256));
 
-    // The two decision D-027 checks that need the item and nothing more,
-    // decided here: after step 7's single read and `LiveItemAbsent`, before the
-    // incoming read, the locks, the log, the prompt and the POST.
+    // Whose the displaced credential is, decided here: after step 7's single
+    // read and `LiveItemAbsent`, before the incoming read, the locks, the log,
+    // the prompt and the POST (S24, §D1).
     //
-    // Forward, the outstanding-live-swap guard (`live_swap_outstanding`,
-    // temporary until S24). In reverse, the item must still be what the swap
-    // being undone left there (`item_changed`); its `.claude.json` read is a
-    // tripwire, and never where an identity comes from.
-    if which == Which::Live
-        && direction == Direction::Forward
-        && let Some((refusal, note)) = live_swap_outstanding(paths, from_digest8.as_deref())
-    {
-        return Report::refused(refusal, &service, note);
-    }
-    if which == Which::Live
-        && let Some(undone) = incoming.undone
-    {
-        let claimed = discovery::live_identity(env);
-        if let Some(refusal) =
-            item_changed(undone, incoming.record, from_digest8.as_deref(), claimed.as_ref())
-        {
-            // The `unknown` write the item is checked against: a later undo's
-            // when there is one, else the swap's own.
-            let (checked_from, checked_to) = match &undone.later_unknown_undo {
-                Some(later) => {
-                    (later.from_digest8.as_deref().unwrap_or("none"), later.to_digest8.as_str())
+    // The namespace target keeps the credential's own identity, exactly as W4a
+    // does. The live target asks the server ([`identify`]), because a
+    // credential Claude Code wrote carries no `tokenAccount` and so never names
+    // an account by itself. The answer is carried beside the credential rather
+    // than written into it, so nothing agctl files on disk claims a
+    // `tokenAccount` the server did not issue (invariant I13), and it is the
+    // **one** identity every later predicate asks — `third_namespace`,
+    // `Parties.identity`, `decide_adoption` and the no-record sentence.
+    //
+    // The profile source is kept for Phase B, which asks it once more about
+    // the credential being installed.
+    let (identity, profiles) = match (displaced.as_ref(), which) {
+        (None, _) => (None, None),
+        (Some(p), Which::Namespace) => (p.identity(), None),
+        (Some(p), Which::Live) => {
+            let profiles = match status::default_profile_source() {
+                Ok(profiles) => profiles,
+                Err(err) => {
+                    return Report::refused(
+                        Refusal::IdentityUnavailable(IdentityGap::ProfileUnavailable),
+                        &service,
+                        profile_unavailable_note(&err.to_string()),
+                    );
                 }
-                None => (undone.from_digest8.as_str(), undone.to_digest8.as_str()),
             };
-            let note = match refusal {
-                Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin) => format!(
-                    "the live session has logged in as `{}` since that swap, which is neither the \
-                     account being put back nor the one the swap installed; run `agctl claude \
-                     use --live` to adopt it, or resolve it by hand",
-                    claimed.as_ref().map_or_else(String::new, display_of)
-                ),
-                Refusal::LiveUndoOfUndo => format!(
-                    "the live swap `--undo` would reverse was already put back: a later undo \
-                     ended `unknown`, and the live item holds what that undo wrote \
-                     (`{checked_to}`); run `agctl claude use --live <id>` for the account you want \
-                     instead"
-                ),
-                // The diverged item: the only other refusal `item_changed`
-                // returns.
-                _ => format!(
-                    "a live write ended `unknown`, and the live item now holds neither the \
-                     credential it displaced (`{checked_from}`) nor the one it wrote \
-                     (`{checked_to}`); agctl will not guess what is there"
-                ),
-            };
-            return Report::refused(refusal, &service, note);
+            let log = || audit::tail(paths, usize::MAX);
+            let now = now_ms();
+            match identify(profiles.as_ref(), p, from_digest8.as_deref(), &log, now, ctx.cancel()) {
+                Ok(identity) => (Some(identity), Some(profiles)),
+                Err(unidentified) => return unidentified.report(&service),
+            }
+        }
+    };
+
+    // A live reversal's three arms (§D1), from the identity just resolved:
+    // the account the swap being undone installed proceeds; the account being
+    // put back is already there; anybody else is a login nobody asked agctl
+    // to reverse.
+    if let (Some(undone), Some(item)) = (incoming.undone, identity.as_ref()) {
+        match undo_arm(undone, incoming.record, item) {
+            UndoArm::Proceed => {}
+            UndoArm::AlreadyActive => {
+                return already_active(
+                    &service,
+                    from_digest8.clone(),
+                    format!(
+                        "`{}`'s credential is already the one the live store holds: the session \
+                         has logged in as that account since the swap, so there is nothing to \
+                         put back; this swap is already reversed, and later namespace swaps \
+                         become undoable after the next live swap",
+                        display_of(item)
+                    ),
+                );
+            }
+            UndoArm::ForeignLogin => {
+                return Report::refused(
+                    Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin),
+                    &service,
+                    format!(
+                        "the live session has logged in as `{}` since that swap, which is neither \
+                         the account being put back nor the one the swap installed; run `agctl \
+                         claude use --live` to adopt it, or resolve it by hand",
+                        display_of(item)
+                    ),
+                );
+            }
         }
     }
 
@@ -857,6 +880,30 @@ fn swap_phases(
         };
     }
 
+    // §D5, the live forward direction only: the item already holds a copy of
+    // the incoming account's grant that is at least as new as the one in the
+    // incoming store — the state a Claude Code refresh leaves after an earlier
+    // swap. Step 8's digests differ, so without this the pass would take task
+    // 4's row and install the store's older copy of the same grant, whose
+    // refresh token the server has already rotated away. A reversal decided
+    // the same question above, as its "already there" arm.
+    if which == Which::Live
+        && direction == Direction::Forward
+        && let (Some(item), Some(item_identity)) = (displaced.as_ref(), identity.as_ref())
+        && already_holds_the_incoming_grant(
+            item_identity,
+            item,
+            incoming.record,
+            &incoming_credentials,
+        )
+    {
+        return already_active(
+            &service,
+            from_digest8,
+            "that account's credential is already the one the live store holds".to_owned(),
+        );
+    }
+
     // Step 9, refusal D's first check: on the **stored** blob, outside every
     // lock and before any child exists (invariant I15).
     let account = crate::secret::current_account();
@@ -866,87 +913,6 @@ fn swap_phases(
     ) {
         return Report::refused(Refusal::LineTooLong, &service, line_too_long_note());
     }
-
-    // Whose the displaced credential is (decision D-027). Decided here, after
-    // Phase A's reads and before the first lock, because both of its refusals
-    // are about what those reads found and neither needs anything held.
-    //
-    // A credential **Claude Code** wrote into the live item carries no
-    // `tokenAccount`, so on a real machine the blob alone never names P and no
-    // live swap could pass. For the live target the identity is the
-    // credential's own when it names one, and otherwise comes from the one
-    // other source each direction may trust (`attribute`):
-    //
-    // - forward, `.claude.json`'s `oauthAccount`, through discovery's own
-    //   reader — the source the live row already uses (fact F33);
-    // - in reverse, the account the swap being undone installed, as its audit
-    //   entry records it (`incoming_identity`) — and **never** `oauthAccount`,
-    //   which agctl does not write until S24 and which after a live swap still
-    //   names the account that swap displaced.
-    //
-    // It is carried beside the credential rather than written into it, so
-    // nothing agctl files on disk claims a `tokenAccount` the server did not
-    // issue (invariant I13). The namespace target keeps the credential's own
-    // identity, exactly as W4a does.
-    let identity = match (displaced.as_ref(), which) {
-        (None, _) => None,
-        (Some(p), Which::Namespace) => p.identity(),
-        (Some(p), Which::Live) => {
-            let witness = match direction {
-                Direction::Forward => Witness::LoginRecord(discovery::live_identity(env)),
-                Direction::Reverse => {
-                    Witness::UndoneSwap(incoming.undone.map(|undone| &undone.installed))
-                }
-            };
-            match attribute(p.identity(), witness) {
-                Attribution::Known(Some(identity)) => Some(identity),
-                // An unidentified credential in the **live** item is refused
-                // rather than attributed. Everywhere there is a record to
-                // attribute it to, fact F4's identity-less blob passes the
-                // guard: it is an older blob, not evidence of a different
-                // account. Here there is no such record and no witness named
-                // one either. Attributing it to the incoming account would let
-                // task 4's row discard what may be somebody's only copy;
-                // attributing it to nobody would lose it outright. Decision
-                // D-017 is categorical, so this refuses — under refusal **F**'s
-                // `Unreadable` reason, with a sentence of its own, because
-                // `Unreadable`'s speaks of "the copy already stored".
-                Attribution::Known(None) => {
-                    return Report::refused(
-                        Refusal::CannotAdopt(adopt::Refusal::Unreadable),
-                        &service,
-                        "the outgoing credential cannot be adopted: the credential in the live \
-                         item does not say which account it belongs to, and the live store is no \
-                         account's own, so there is no namespace agctl could file it in without \
-                         guessing"
-                            .to_owned(),
-                    );
-                }
-                // The credential names one account and the witness another:
-                // one of the two is stale, and nothing here says which.
-                Attribution::Mismatch { item, witness } => {
-                    let named = match direction {
-                        Direction::Forward => format!(
-                            "the live `.claude.json` says this session is logged in as \
-                             `{witness}`"
-                        ),
-                        Direction::Reverse => {
-                            format!("the swap being undone installed `{witness}`'s credential")
-                        }
-                    };
-                    return Report::refused(
-                        Refusal::CannotAdopt(adopt::Refusal::IdentityMismatch),
-                        &service,
-                        format!(
-                            "the outgoing credential cannot be adopted: the credential in the \
-                             live item belongs to `{item}`, but {named}; agctl will not guess \
-                             which account it is"
-                        ),
-                    );
-                }
-            }
-        }
-    };
 
     // --- Phase B ---------------------------------------------------------
     // The **third** namespace, resolved here in Phase A's reading rather than
@@ -1159,6 +1125,9 @@ fn swap_phases(
     // to. Under the namespace locks, outside Claude Code's, and now behind
     // the consent gate.
     let now = now_ms();
+    // Whether step 13 refreshed the incoming credential and could not save the
+    // result anywhere, for the one refusal that can still follow (review F2).
+    let mut refresh_unsaved = false;
     if incoming_credentials.access_expired(now, REFRESH_MARGIN_MS) {
         // Every other refresh in this crate saves its result where it read it
         // (`status::under_namespace_lock`, `status::refresh_in_place`), and
@@ -1188,17 +1157,71 @@ fn swap_phases(
             );
         }
         let derived_from = incoming_credentials.digests();
+        // A live reversal reads P from its namespace's adopted copy
+        // (`agctl-cf1i` option A), and the refreshed pair is saved back there
+        // below (S24a-R1). Everything that would stop that save and can be
+        // known now is decided now, **before** the POST (S24a-R3.A): after it
+        // the pre-refresh pair is dead, so a refusal then would drop the one
+        // live copy of P. Same outcome and code as the migrated store above.
+        if which == Which::Live
+            && let Source::AdoptedCopy(copy_dir) = &incoming.source
+            && let Err(why) = adopted_copy_takes_a_refresh(copy_dir, &derived_from)
+        {
+            return Report::needs_refresh(
+                &service,
+                format!(
+                    "`{}`'s parked credential has expired, and {why}, so a refresh of it could not \
+                     be saved; nothing was written — run `agctl claude status` to settle that \
+                     namespace, then run this again",
+                    printable(&incoming.record.account_uuid)
+                ),
+            );
+        }
         if let Err(report) = refresh_incoming(&mut incoming_credentials, ctx, &service, now) {
             return *report;
         }
-        write_back_refreshed(
+        refresh_unsaved = !write_back_refreshed(
             paths,
+            which,
             incoming,
             &incoming_credentials,
             &derived_from,
             reader.as_ref(),
             ctx,
             pass,
+        );
+    }
+
+    // §D1's second GET, the live target only: the credential about to go into
+    // the item — T forward, the parked P on a reversal — must be the record's
+    // it was read for. After step 13, so a stale token has been refreshed and
+    // can be asked; before step 14 and the adoption write, so a disagreement
+    // refuses with nothing parked. A profile that cannot answer does not
+    // refuse: the record is agctl's own, and this pass writes nothing with the
+    // document.
+    if let Some(profiles) = profiles.as_ref()
+        && let Err(named) = installs_its_own_account(
+            profiles.as_ref(),
+            &incoming_credentials,
+            incoming.record,
+            now,
+            ctx.cancel(),
+        )
+    {
+        return Report::refused(
+            Refusal::CannotAdopt(adopt::Refusal::IdentityMismatch),
+            &service,
+            format!(
+                "the credential to be installed cannot be written: the server says it belongs to \
+                 `{named}`, but it was read as `{}`'s; agctl will not install a credential under \
+                 the wrong account{}",
+                printable(&incoming.record.account_uuid),
+                if refresh_unsaved {
+                    "; it was refreshed on the way and the refreshed pair was not saved anywhere"
+                } else {
+                    ""
+                }
+            ),
         );
     }
     let after = incoming_credentials.digests();
@@ -1302,7 +1325,10 @@ fn swap_phases(
             // live store is ever written or removed" structural rather than a
             // promise.
             shadowing_store: !item_present && displaced.is_some(),
-            incoming_identity: (which == Which::Live && direction == Direction::Forward)
+            // Every live write records the account it installed, forward and
+            // undo alike (§D7): an undo of an undo reads it back, and so does
+            // a later swap whose item token has expired.
+            incoming_identity: (which == Which::Live)
                 .then(|| incoming_identity_of(incoming.record)),
         },
         line,
@@ -1338,10 +1364,10 @@ fn swap_phases(
 /// every identified credential in it is a third party's and the store-identity
 /// test simply does not apply.
 ///
-/// `identity` is whose the displaced credential is **as Phase A attributed
-/// it**, which for the live target need not be the credential's own
-/// `tokenAccount` (decision D-027). An unattributed live credential never gets
-/// here: Phase A refuses it.
+/// `identity` is whose the displaced credential is **as Phase A resolved
+/// it**, which for the live target is the profile's answer or agctl's own
+/// write's, never the credential's `tokenAccount` alone (S24). An unresolved
+/// live credential never gets here: Phase A refuses it.
 ///
 /// # Selecting the third party, and why the two targets differ (review F1)
 ///
@@ -1403,66 +1429,307 @@ fn exactly_one<T>(items: impl IntoIterator<Item = T>) -> Result<Option<T>, [T; 2
     }
 }
 
-/// Where the identity of the credential in the live item may come from when
-/// that credential does not carry one (decision D-027).
-///
-/// One variant per direction, because the two may not trust the same source.
+/// What one profile GET said about a credential (§D1).
 #[derive(Debug)]
-enum Witness<'a> {
-    /// A forward live swap: `.claude.json`'s `oauthAccount`, when it could be
-    /// read — the last login through this configuration directory, which is
-    /// what the live item holds when no live swap is outstanding.
-    LoginRecord(Option<Identity>),
-    /// A reversal of a live swap: the account that swap installed in the item,
-    /// as its audit entry records it (`incoming_identity`). Never
-    /// `oauthAccount`, which agctl does not write until S24 and which after a
-    /// live swap still names the account that swap displaced.
-    UndoneSwap(Option<&'a Identity>),
+enum ProfileRead {
+    /// The server named the account.
+    Verified(Profile),
+    /// The token cannot be asked: its `expiresAt` has passed, or the server
+    /// answered 401 or 403. A revoked token reads like an expired one, and
+    /// neither is asked anything further.
+    Expired,
+    /// The server could not be asked, or its answer was not V14's document.
+    Unavailable(OauthError),
 }
 
-/// Whose the credential in the live item is, as [`attribute`] decided it.
-#[derive(Debug, PartialEq, Eq)]
-enum Attribution {
-    /// That account, or `None` when neither the credential nor the witness
-    /// names one.
-    Known(Option<Identity>),
-    /// The credential names one account and the witness another. Display ids
-    /// only, escaped for printing — never token material.
-    Mismatch {
-        /// The account the credential's own `tokenAccount` names.
-        item: String,
-        /// The account the witness names.
-        witness: String,
-    },
-}
-
-/// Decision D-027's precedence for the identity of the credential in the live
-/// item.
+/// Asks the server whose `credentials` are — unless their access token has
+/// already expired, in which case nothing is asked at all.
 ///
-/// - The credential names an account: that account — unless the witness names
-///   a **different** one ([`swap::identities_agree`]), which refuses, because
-///   one of the two is stale and nothing here says which.
-/// - It names none: the witness's account, or `None` when the witness has
-///   none either, which the caller refuses rather than attributing the
-///   credential to anybody.
-fn attribute(item: Option<Identity>, witness: Witness<'_>) -> Attribution {
-    let witnessed = match witness {
-        Witness::LoginRecord(claimed) => claimed,
-        Witness::UndoneSwap(installed) => installed.cloned(),
-    };
-    match (item, witnessed) {
-        (Some(item), Some(witnessed)) if !swap::identities_agree(&item, &witnessed) => {
-            Attribution::Mismatch { item: display_of(&item), witness: display_of(&witnessed) }
-        }
-        (Some(item), _) => Attribution::Known(Some(item)),
-        (None, witnessed) => Attribution::Known(witnessed),
+/// The expiry is tested with **no** margin: a token that is still honoured
+/// for a minute can still answer, and a margin here would send a live item
+/// that is merely close to its refresh down the stricter expired path.
+fn read_profile(
+    source: &dyn ProfileSource,
+    credentials: &Credentials,
+    now: i64,
+    cancel: &Cancel,
+) -> ProfileRead {
+    if credentials.access_expired(now, 0) {
+        return ProfileRead::Expired;
+    }
+    match source.profile_of(credentials, cancel) {
+        Ok(profile) => ProfileRead::Verified(profile),
+        Err(OauthError::Http { status: 401 | 403, .. }) => ProfileRead::Expired,
+        Err(err) => ProfileRead::Unavailable(err),
     }
 }
 
-/// The account a live forward swap installs, as its audit entry records it
-/// (decision D-027): ids only, and the organization only when the record knows
-/// one — [`UNKNOWN_ORG`] is a placeholder, and recording it would make the
-/// undo's comparison report a disagreement that is not there.
+/// A profile's identity, ids only: the email and the rest of the document go
+/// no further than this (no PII leaves the profile).
+fn identity_of(profile: Profile) -> Identity {
+    Identity {
+        account_uuid: profile.account_uuid,
+        organization_uuid: Some(profile.organization_uuid),
+        email: None,
+        org_name: None,
+    }
+}
+
+/// Why [`identify`] could not name the account whose credential the live item
+/// holds.
+#[derive(Debug, PartialEq, Eq)]
+enum Unidentified {
+    /// Nothing can say whose it is: refusal 29, with the redacted transport
+    /// error for `profile_unavailable`.
+    Gap(IdentityGap, Option<String>),
+    /// The credential's own `tokenAccount` names one account and the resolved
+    /// identity another. Display ids only, escaped — never token material.
+    Mismatch {
+        /// The account the credential's own `tokenAccount` names.
+        item: String,
+        /// The account the profile, or agctl's own write, names.
+        resolved: String,
+        /// Which of the two resolved it, for the sentence.
+        by: Resolver,
+    },
+    /// An expired token sent the resolution to agctl's own log, and the log
+    /// was refused or could not be read: refusal `audit_refused`, with this
+    /// sentence.
+    LogRefused(String),
+}
+
+/// Where a live item's identity was resolved from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolver {
+    /// The profile GET.
+    Profile,
+    /// The audit entry of the write that put those bytes in the item.
+    OwnWrite,
+}
+
+impl Unidentified {
+    /// The Phase A refusal this is.
+    fn report(self, service: &str) -> Report {
+        match self {
+            Self::Gap(gap, detail) => {
+                let note = match gap {
+                    IdentityGap::ProfileUnavailable => {
+                        profile_unavailable_note(detail.as_deref().unwrap_or("no answer"))
+                    }
+                    IdentityGap::TokenExpired => {
+                        "the live credential has expired and agctl did not \
+                                                  write it, so nothing can say whose it is; send \
+                                                  one message in Claude Code, which refreshes it, \
+                                                  then run this again"
+                            .to_owned()
+                    }
+                };
+                Report::refused(Refusal::IdentityUnavailable(gap), service, note)
+            }
+            Self::Mismatch { item, resolved, by } => {
+                let named = match by {
+                    Resolver::Profile => format!("the server says it belongs to `{resolved}`"),
+                    Resolver::OwnWrite => {
+                        format!("agctl wrote those bytes into the item for `{resolved}`")
+                    }
+                };
+                Report::refused(
+                    Refusal::CannotAdopt(adopt::Refusal::IdentityMismatch),
+                    service,
+                    format!(
+                        "the outgoing credential cannot be adopted: the credential in the live \
+                         item says it belongs to `{item}`, but {named}; agctl will not guess which \
+                         account it is"
+                    ),
+                )
+            }
+            Self::LogRefused(note) => Report::refused(Refusal::AuditRefused, service, note),
+        }
+    }
+}
+
+/// Refusal 29's `profile_unavailable` sentence, around a redacted error.
+fn profile_unavailable_note(error: &str) -> String {
+    format!(
+        "agctl could not ask the server whose credential the live item holds (`{}`); nothing was \
+         written — check the connection and run this again",
+        printable(error)
+    )
+}
+
+/// Whose credential the live item holds (§D1): **the one identity rule** for
+/// the live target, forward and in reverse.
+///
+/// - **An unexpired token** is asked: the profile names the account, and a
+///   profile that cannot answer refuses (`profile_unavailable`). There is no
+///   fallback to `.claude.json`'s login record, which is the stale source this
+///   replaces.
+/// - **An expired token** — or one the server no longer honours — cannot be
+///   asked, so its bytes are attributed only to a write agctl itself made
+///   ([`identity_by_own_write`]), and anything else refuses
+///   (`live_token_expired`). `log` reads agctl's own audit log, and is called
+///   on this path only.
+/// - Either way, a credential whose own `tokenAccount` names a **different**
+///   account refuses (refusal **F**): one of the two is wrong, and nothing here
+///   says which.
+///
+/// `item8` is the item's digest prefix, as step 7 read it.
+fn identify(
+    source: &dyn ProfileSource,
+    item: &Credentials,
+    item8: Option<&str>,
+    log: &dyn Fn() -> Result<audit::Tail, AppError>,
+    now: i64,
+    cancel: &Cancel,
+) -> Result<Identity, Unidentified> {
+    let (resolved, by) = match read_profile(source, item, now, cancel) {
+        ProfileRead::Verified(profile) => (identity_of(profile), Resolver::Profile),
+        ProfileRead::Unavailable(err) => {
+            return Err(Unidentified::Gap(IdentityGap::ProfileUnavailable, Some(err.to_string())));
+        }
+        ProfileRead::Expired => {
+            let tail = log().map_err(|err| {
+                Unidentified::LogRefused(match err {
+                    // `open_log`'s own words, as step 10b's gate would say
+                    // them about the same log.
+                    AppError::Config(refused) => {
+                        format!("a swap of the live store will not proceed unrecorded: {refused}")
+                    }
+                    other => format!(
+                        "the live credential has expired, and agctl's audit log could not be \
+                         read ({other}) to tell whether agctl wrote it; see `agctl claude doctor`"
+                    ),
+                })
+            })?;
+            let own = item8.and_then(|item8| identity_by_own_write(&tail, item8));
+            let Some(own) = own else {
+                return Err(Unidentified::Gap(IdentityGap::TokenExpired, None));
+            };
+            (own, Resolver::OwnWrite)
+        }
+    };
+    match item.identity() {
+        Some(claimed) if !swap::identities_agree(&claimed, &resolved) => {
+            Err(Unidentified::Mismatch {
+                item: display_of(&claimed),
+                resolved: display_of(&resolved),
+                by,
+            })
+        }
+        _ => Ok(resolved),
+    }
+}
+
+/// The account agctl's own newest live write of `item8` installed (§D1): the
+/// newest live `Write`, of either direction, that may have landed (`applied`
+/// or `unknown`) and whose `to_digest8` is `item8`.
+///
+/// `None` when there is no such write — the bytes are not agctl's — and when
+/// the newest one predates `incoming_identity` on its direction, which says
+/// nothing rather than something older. Discarded and failed writes put
+/// nothing in the item, so they are no evidence either way.
+fn identity_by_own_write(tail: &audit::Tail, item8: &str) -> Option<Identity> {
+    let installed = tail.entries.iter().rev().find_map(|entry| match &entry.event {
+        AuditEvent::Write {
+            target: Target::Live,
+            to_digest8,
+            outcome: audit::WriteOutcome::Applied | audit::WriteOutcome::Unknown,
+            incoming_identity,
+            ..
+        } if to_digest8 == item8 => Some(incoming_identity.as_ref()),
+        _ => None,
+    })??;
+    Some(Identity {
+        account_uuid: installed.account_uuid.clone(),
+        organization_uuid: installed.organization_uuid.clone(),
+        email: None,
+        org_name: None,
+    })
+}
+
+/// What a live `use --undo` does, given whose credential the item holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UndoArm {
+    /// The account the swap being undone installed: reverse it.
+    Proceed,
+    /// The account being put back is already there — a `/login` as it since
+    /// the swap — so there is nothing to put back.
+    AlreadyActive,
+    /// Somebody else: refusal 27, `live_undo_foreign_login`.
+    ForeignLogin,
+}
+
+/// §D1's three arms for a live reversal, in order: the installed account
+/// first, then the owner, then anybody else.
+fn undo_arm(undone: &UndoneEntry, owner: &AccountRecord, item: &Identity) -> UndoArm {
+    if swap::identities_agree(item, &undone.installed) {
+        UndoArm::Proceed
+    } else if swap::identity_is(Some(item), owner) {
+        UndoArm::AlreadyActive
+    } else {
+        UndoArm::ForeignLogin
+    }
+}
+
+/// §D5: whether the live item already holds the incoming account's grant, at
+/// least as new as the copy about to be installed.
+///
+/// Equal expiries count as "not older": nothing distinguishes the two copies,
+/// and keeping the one the session is already using cannot install a refresh
+/// token the server has rotated away.
+fn already_holds_the_incoming_grant(
+    item_identity: &Identity,
+    item: &Credentials,
+    incoming: &AccountRecord,
+    incoming_credentials: &Credentials,
+) -> bool {
+    swap::identity_is(Some(item_identity), incoming)
+        && item.expires_at_ms >= incoming_credentials.expires_at_ms
+}
+
+/// §D1's Phase B check: whether the credential about to be installed is the
+/// account of the record it was read for — or `Err` with the account the
+/// server named instead.
+///
+/// A profile that cannot answer, and a token that cannot be asked, pass: the
+/// record is agctl's own registry row, and nothing is written with the
+/// document.
+fn installs_its_own_account(
+    source: &dyn ProfileSource,
+    credentials: &Credentials,
+    record: &AccountRecord,
+    now: i64,
+    cancel: &Cancel,
+) -> Result<(), String> {
+    match read_profile(source, credentials, now, cancel) {
+        ProfileRead::Verified(profile) => {
+            let named = identity_of(profile);
+            if swap::identity_is(Some(&named), record) { Ok(()) } else { Err(display_of(&named)) }
+        }
+        ProfileRead::Expired | ProfileRead::Unavailable(_) => Ok(()),
+    }
+}
+
+/// An `already_active` outcome whose active credential is the item's.
+fn already_active(service: &str, active8: Option<String>, note: String) -> Report {
+    Report {
+        outcome: Outcome::AlreadyActive,
+        target: None,
+        service: service.to_owned(),
+        from_digest8: active8.clone(),
+        to_digest8: active8,
+        audit_id: None,
+        adopted_to: None,
+        lock: LockReport::default(),
+        warnings: Vec::new(),
+        note: Some(note),
+    }
+}
+
+/// The account a live write installs, as its audit entry records it (decision
+/// D-027): ids only, and the organization only when the record knows one —
+/// [`UNKNOWN_ORG`] is a placeholder, and recording it would make the undo's
+/// comparison report a disagreement that is not there.
 fn incoming_identity_of(record: &AccountRecord) -> audit::IncomingIdentity {
     audit::IncomingIdentity {
         account_uuid: record.account_uuid.clone(),
@@ -1584,9 +1851,10 @@ struct PhaseC<'a> {
     /// from (finding N-2), which is the exposure decision D-024 exists to
     /// prevent.
     shadowing_store: bool,
-    /// On a live forward swap, the account being swapped in, by id alone — the
-    /// entry's `incoming_identity`, which `use --undo` reads back (decision
-    /// D-027). `None` on every other pass.
+    /// On a live pass, forward or undo, the account being installed, by id
+    /// alone — the entry's `incoming_identity`, which `use --undo` and an
+    /// expired-token swap read back (decision D-027, §D7). `None` for a
+    /// namespace pass.
     incoming_identity: Option<audit::IncomingIdentity>,
 }
 
@@ -2039,52 +2307,84 @@ fn refresh_incoming(
 /// that reason; this one does too, through the same tmp-fsync-rename writer,
 /// under the namespace lock step 10 already holds for this record.
 ///
-/// Only for [`Source::OwnStore`], whose source is a plaintext
-/// `.credentials.json`: the forward direction, and a **live** reversal whose
-/// credential the forward pass filed in its own namespace's store (W4b §D5,
-/// ruling G9 — `agctl-bk5`'s live half, a change of target rather than a new
-/// path). A namespaced reversal reads the store's adopted copy, which is the
-/// file the staging protocol protects and whose contents a later `--undo`'s
-/// digest guard compares against, and a live reversal of task 4's keep arm
-/// reads the incoming namespace's adopted copy; writing a refreshed credential
-/// to either still needs its own ruling.
+/// Two sources are saved back, each to where it was read:
+///
+/// - [`Source::OwnStore`], a plaintext `.credentials.json`: the forward
+///   direction, and a **live** reversal whose credential sits in its own
+///   namespace's store (W4b §D5, ruling G9 — `agctl-bk5`'s live half).
+/// - [`Source::AdoptedCopy`] on a **live** reversal: the adopted copy a live
+///   forward swap parks P in (`agctl-cf1i` option A), which is that
+///   credential's only home (S24a-R1, [`write_back_to_adopted_copy`]).
+///
+/// A namespaced reversal's adopted copy is the file the staging protocol
+/// protects and whose contents a later `--undo`'s digest guard compares
+/// against; writing a refreshed credential there still needs its own ruling.
 ///
 /// A failure here does not fail the swap: the item write is what the operator
 /// asked for, and a saved refresh is a repair, not a precondition. It is
 /// logged **and carried as a warning**, because the consequence — the incoming
 /// account needing a `login` — is worth telling the operator about rather than
 /// leaving in a log line nobody reads (`agctl-r9w`, review4 N-15).
+///
+/// Returns whether the refreshed pair was saved; `false` also for the namespace
+/// reversal, which has no write-back.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pass's own values, each one read where it is needed; bundling them would be a \
+              struct with one caller"
+)]
 fn write_back_refreshed(
     paths: &Paths,
+    which: Which,
     incoming: &Incoming<'_>,
     refreshed: &Credentials,
     derived_from: &Digests,
     reader: &dyn KeychainReader,
     ctx: &PassCtx,
     pass: &mut Pass,
-) {
-    if !matches!(incoming.source, Source::OwnStore) {
-        return;
-    }
-    let ns_dir =
-        paths.namespace_dir(&incoming.record.account_uuid, &incoming.record.organization_uuid);
-    if let Err(refusal) =
-        guarded_write_back(paths, incoming.record, &ns_dir, refreshed, derived_from, reader, ctx)
-    {
+) -> bool {
+    let (saved, home, consequence) = match (&incoming.source, which) {
+        (Source::OwnStore, _) => {
+            let ns_dir = paths
+                .namespace_dir(&incoming.record.account_uuid, &incoming.record.organization_uuid);
+            (
+                guarded_write_back(
+                    paths,
+                    incoming.record,
+                    &ns_dir,
+                    refreshed,
+                    derived_from,
+                    reader,
+                    ctx,
+                ),
+                "its own store",
+                "that account may need `agctl claude login`",
+            )
+        }
+        (Source::AdoptedCopy(copy_dir), Which::Live) => (
+            write_back_to_adopted_copy(paths, copy_dir, refreshed, derived_from, ctx),
+            "its adopted copy",
+            "the live item holds the only copy of it once this undo applies",
+        ),
+        (Source::AdoptedCopy(_), Which::Namespace) => return false,
+    };
+    if let Err(refusal) = saved {
         tracing::warn!(
             refusal = %refusal,
-            "the refreshed incoming credential was not saved to its own store"
+            "the refreshed incoming credential was not saved back where it was read"
         );
         let warning = format!(
-            "the incoming account's refreshed credential was not saved back to its own store: \
-             {refusal}; that account may need `agctl claude login`"
+            "the incoming account's refreshed credential was not saved back to {home}: \
+             {refusal}; {consequence}"
         );
         // Both, for the reason refusal B's warning is both: on **stderr** so a
         // person at a terminal is told, and in the report so a consumer of
         // `--json` does not lose a fact the terminal shows.
         eprintln!("note: {warning}");
         pass.warnings.push(warning);
+        return false;
     }
+    true
 }
 
 /// The guards [`status::under_namespace_lock`] applies to this same file, in
@@ -2219,6 +2519,95 @@ fn guarded_write_back(
     }
 }
 
+/// Whether a live reversal's adopted copy can take the refreshed pair: the
+/// gate S24a-R3 names, and nothing else.
+///
+/// Checked twice: before step 13's POST, where a failure refuses with nothing
+/// spent, and again at the write, where it can only warn. Deliberately **not**
+/// `status::detect_unlisted`: its migrated-namespace arm guards a
+/// `.credentials.json` a keychain item would shadow, and a migrated `ns(P)` is
+/// the adopted copy's normal state — Claude Code never reads that name — and
+/// its Claude Code lock arm guards a file a session in `ns(P)` reads, which the
+/// adopted copy is not. Nor `file_store::resolve_pending`, which replays into
+/// `.credentials.json`, the namespace's own grant that `agctl-cf1i` keeps
+/// byte-identical: a pending file is a reason to stop, not something to replay.
+fn adopted_copy_takes_a_refresh(copy_dir: &Path, derived_from: &Digests) -> Result<(), String> {
+    if pending_present(copy_dir) {
+        return Err("an unresolved pending write is parked in its namespace".to_owned());
+    }
+    match location::from_adopted(copy_dir) {
+        Resolved::Credentials(found) if found.digests() == *derived_from => Ok(()),
+        Resolved::Credentials(_) => {
+            Err("its adopted copy changed since this undo read it".to_owned())
+        }
+        _ => Err("its adopted copy can no longer be read".to_owned()),
+    }
+}
+
+/// Saves a live reversal's refreshed pair over the adopted copy it came from
+/// (S24a-R1, R2(2), R3.B).
+///
+/// Under the owner's namespace lock, which step 10 took: re-read the copy,
+/// write only while it still holds the pair the refresh was derived from, and
+/// through D-024's own writer, whose stage-and-rename refuses a link or a
+/// non-regular file and never leaves a half-written copy. Every failure comes
+/// back as the sentence the warning carries; none refuses the undo, because
+/// after the POST the refreshed pair is the only live copy of the credential
+/// and the item write is how it survives.
+fn write_back_to_adopted_copy(
+    paths: &Paths,
+    copy_dir: &Path,
+    refreshed: &Credentials,
+    derived_from: &Digests,
+    ctx: &PassCtx,
+) -> Result<(), String> {
+    adopted_copy_takes_a_refresh(copy_dir, derived_from)?;
+    file_store::write_adopted(paths, copy_dir, &refreshed.to_blob_json(), ctx)
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+/// Whether an adopted copy holds a credential a **live** write left there
+/// (S24a-R2(1)(b), review F1).
+///
+/// Two live writes leave a credential in an adopted copy, and the log names it
+/// differently for each:
+///
+/// - a **forward** swap parks the credential it displaces there — its
+///   `from_digest8`;
+/// - an **undo** reads the credential it puts back from there and, when it
+///   refreshed that credential first, writes the refreshed pair back there
+///   (S24a-R1) — its `to_digest8`.
+///
+/// An undo's `from_digest8` is not counted: a live reversal files what it
+/// displaces into that account's `.credentials.json`, never beside a store.
+///
+/// The adopted copy has other writers — a namespace swap's D-024 row, a
+/// namespace reversal's staged copy, the namespace keep arm — and what they
+/// leave may be a namespace swap's undo source, so only a live write's copy may
+/// be superseded by a later live parking. Any outcome counts, because the
+/// parking is written in Phase B before the write's own outcome is known. A log
+/// that cannot be read answers "no", which refuses.
+fn parked_by_a_live_write(paths: &Paths, found: &Credentials) -> bool {
+    let Some(found8) = audit::digest8(&found.digests().access_sha256) else { return false };
+    let Ok(tail) = audit::tail(paths, usize::MAX) else { return false };
+    tail.entries.iter().any(|entry| match &entry.event {
+        AuditEvent::Write {
+            target: Target::Live,
+            direction: audit::WriteDirection::Forward,
+            from_digest8: Some(from),
+            ..
+        } => *from == found8,
+        AuditEvent::Write {
+            target: Target::Live,
+            direction: audit::WriteDirection::Undo,
+            to_digest8,
+            ..
+        } => *to_digest8 == found8,
+        _ => false,
+    })
+}
+
 /// Step 12's plan, for `--json`.
 ///
 /// The contract's "`--json` prints the plan **before** prompting". It is a
@@ -2333,11 +2722,9 @@ struct Incoming<'a> {
     /// and `swap_in` takes this by reference. Naming the source instead keeps
     /// the read inside the phase that uses it.
     source: Source,
-    /// For a reversal of a **live** swap, that swap as its audit entry records
-    /// it: the account it installed — whose the credential the item holds now
-    /// is, when that credential no longer says — and the outcome and digests
-    /// the item is checked against (decision D-027). `None` on every other
-    /// pass.
+    /// For a reversal of a **live** write, the account that write installed,
+    /// which the item's identity is checked against (§D1's three arms). `None`
+    /// on every other pass.
     undone: Option<&'a UndoneEntry>,
 }
 
@@ -2345,11 +2732,14 @@ struct Incoming<'a> {
 enum Source {
     /// The record's own namespace store, `.credentials.json`: the incoming
     /// account's on the forward path, and on a live reversal the displaced
-    /// credential's own account's, where §D5's ordinary row filed it.
+    /// credential's own account's when a reversal, a pre-S24 forward swap or
+    /// the duplicate guard left it there.
     OwnStore,
     /// An adopted copy in the directory given: the store's own for a
-    /// namespaced reversal (decision D-024), and the incoming namespace's for a
-    /// live reversal of task 4's keep arm (§D5's re-cut of `agctl-r3h`).
+    /// namespaced reversal (decision D-024), and for a live reversal the
+    /// displaced credential's own account's — where a live forward swap parks
+    /// it (`agctl-cf1i` option A), and where task 4's keep arm did (§D5's
+    /// re-cut of `agctl-r3h`).
     AdoptedCopy(std::path::PathBuf),
 }
 
@@ -2482,10 +2872,10 @@ struct Parties<'a> {
     /// The account the displaced credential belongs to, when it is neither of
     /// the two above and agctl has a record for it — see [`third_namespace`].
     third: Option<&'a AccountRecord>,
-    /// Whose the displaced credential is, as Phase A attributed it: its own
-    /// `tokenAccount`, or for the live target the witness decision D-027 names
-    /// when it carries none. Every identity question the adoption asks, asks
-    /// this rather than the blob.
+    /// Whose the displaced credential is, as Phase A resolved it: its own
+    /// `tokenAccount` for a namespace, and for the live target the profile's
+    /// answer or agctl's own write's ([`identify`]). Every identity question
+    /// the adoption asks, asks this rather than the blob.
     identity: Option<&'a Identity>,
 }
 
@@ -2502,8 +2892,12 @@ struct Parties<'a> {
 /// reason carries a sentence that would be false for it (W4b §D5): the live
 /// item's credential names an account no `Owned` record claims. It is still
 /// refusal **F** with the matrix's reason — only the sentence is its own. A
-/// live credential nothing attributes never gets here: Phase A refuses it where
-/// it is attributed (decision D-027).
+/// live credential nothing identifies never gets here: Phase A refuses it where
+/// it is identified (S24).
+///
+/// On the live forward direction the third-namespace row writes the adopted
+/// copy rather than `.credentials.json` (`agctl-cf1i` option A); see
+/// `parked_beside` below.
 fn decide_adoption(
     paths: &Paths,
     parties: &Parties<'_>,
@@ -2588,6 +2982,19 @@ fn decide_adoption(
     // what the third-namespace row did with it instead.
     let displaced_is_incoming = !same_namespace && swap::identity_is(identity, incoming);
     let mut occupied_by_another = false;
+    // `agctl-cf1i` option A: on the live forward direction a displaced
+    // credential that belongs to a third account is **always** parked in that
+    // account's `.credentials.adopted.json`, and its `.credentials.json` is
+    // never compared against or written. That file may hold an independent
+    // grant of the same account — the namespace's own `agctl claude login` —
+    // and `place` reads a different digest there as an older or newer copy of
+    // *this* grant: it overwrote a newer-expiring login, or refused
+    // `NewerCopy` against a grant that had nothing to do with this one. The
+    // adopted copy only ever holds what a live item held for that account, so
+    // `place`'s rule is one grant's lineage again. The reverse direction keeps
+    // `ToStore`: there the store copy and the item copy *are* one lineage,
+    // because agctl copied the item's credential out of that store.
+    let parked_beside = which == Which::Live && direction == Direction::Forward;
 
     let (ns_dir, existing, prior) = if displaced_is_incoming {
         // When this row keeps the copy it writes the **store's** D-024
@@ -2597,16 +3004,15 @@ fn decide_adoption(
         // the previous swap adopted there (review F1). No keychain probe: the
         // row's own question is answered from Phase A's credential.
         //
-        // For the **live** target the sibling is the **incoming namespace's**,
-        // and the substitution is §D5's live re-cut of `agctl-r3h`. `<D>` is
-        // `~/.claude`: a `.credentials.adopted.json` there is outside
-        // `namespace_root()`, is the write invariant I11′ forbids, and is what
-        // would make AC81's live containment assertion false. The incoming
-        // namespace's sibling is inside `namespace_root()` and is still **not**
-        // a `.credentials.json`, so neither the write-back's compare-and-swap
-        // nor the incoming store is touched — which is the property the row
-        // exists to preserve. The live `--undo` reads it back from there,
-        // through the `PathBuf` `Source::AdoptedCopy` already carries.
+        // The **live** target keeps nothing on this row (review F3). §D5's
+        // `already_holds_the_incoming_grant` asks the same predicate first and
+        // answers every copy of the incoming account's grant that is not older
+        // than the one being installed, and a reversal's `== owner` arm answers
+        // it before that; so what reaches here is a duplicate or an older copy,
+        // which the matrix discards. The keep answer — which would write the
+        // incoming namespace's adopted copy without R2(1)(b)'s lineage check —
+        // is refused below rather than performed. The incoming namespace is
+        // still named, for the pending gate the matrix asks first.
         let sibling = match which {
             Which::Namespace => store_dir.to_path_buf(),
             Which::Live => paths.namespace_dir(&incoming.account_uuid, &incoming.organization_uuid),
@@ -2659,19 +3065,76 @@ fn decide_adoption(
             });
         };
         let dir = paths.namespace_dir(&record.account_uuid, &record.organization_uuid);
-        // The digests are kept as well as the classification: they are what
-        // the compare-and-swap below compares, because the classification
-        // cannot (finding N-4).
-        let (existing, prior) = inspect(location::from_file(&dir), displaced);
-        (dir, existing, prior)
+        if parked_beside {
+            // The duplicate guard, and it is required: a credential already at
+            // home in that namespace's own `.credentials.json` — an earlier
+            // parking, or the very bytes a swap copied out of it — needs no
+            // second home. Parking it anyway would put one digest in two files,
+            // and `live_reversal`'s exactly-one rule would then refuse the undo
+            // that names it.
+            if let Resolved::Credentials(home) = location::from_file(&dir)
+                && home.digests() == displaced.digests()
+            {
+                return Ok(AdoptionPlan::Nothing);
+            }
+            let read = location::from_adopted(&dir);
+            // The adopted copy has other writers (S24a-R2(1)): a namespace
+            // swap's D-024 row, a namespace reversal's staged copy and the
+            // namespace keep arm all leave a namespace swap's undo source there,
+            // possibly another account's only copy. A different credential
+            // there is therefore never weighed by `place` — no `NewerCopy`, no
+            // overwrite — unless it is (a) this account's, by the crate's one
+            // identity predicate (fact F4's identity-less blob passes, as
+            // everywhere), and (b) an earlier **live** parking, by the audit
+            // log. Such a copy is superseded by this one.
+            let existing = match &read {
+                Resolved::Credentials(found) if found.digests() != displaced.digests() => {
+                    // (a) first, and with `OccupiedByAnother`'s own sentence: a
+                    // live write's lineage is no licence to replace another
+                    // account's credential (a namespace reversal's staged copy
+                    // can hold any occupant).
+                    if !swap::same_identity(found, record) {
+                        return Err(refused(adopt::Refusal::OccupiedByAnother));
+                    }
+                    if !parked_by_a_live_write(paths, found) {
+                        return Err(Box::new(Report::refused(
+                            Refusal::CannotAdopt(adopt::Refusal::OccupiedByAnother),
+                            service,
+                            format!(
+                                "the outgoing credential cannot be adopted: the adopted copy in \
+                                 `{}` was not parked by a live swap agctl recorded — a namespace \
+                                 swap's undo source, or a copy a live undo refreshed and wrote \
+                                 back but never recorded because it then ended busy, discarded or \
+                                 refused; undo that namespace swap, or move the file aside, then \
+                                 run this again",
+                                dir.display()
+                            ),
+                        )));
+                    }
+                    adopt::Existing::Absent
+                }
+                _ => classify(read, displaced),
+            };
+            (dir, existing, None)
+        } else {
+            // The digests are kept as well as the classification: they are what
+            // the compare-and-swap below compares, because the classification
+            // cannot (finding N-4).
+            let (existing, prior) = inspect(location::from_file(&dir), displaced);
+            (dir, existing, prior)
+        }
     };
 
     // The matrix's last row, and it costs a keychain read — but only on the
     // path that needs it. When the namespaces are the same the store has
     // migrated by construction (that is *why* there is a swap) and ruling
     // OQ2's carve-out is the exception that covers it, so `adopt::decide`
-    // does not consult this flag there and nothing is read.
-    let target_migrated = !same_namespace && !displaced_is_incoming && migrated(paths, third, ctx);
+    // does not consult this flag there and nothing is read. A live forward
+    // parking asks nothing either: the adopted copy is a name Claude Code's
+    // composed read never reads (decision D-024), so whether that namespace
+    // has migrated cannot shadow it.
+    let target_migrated =
+        !same_namespace && !displaced_is_incoming && !parked_beside && migrated(paths, third, ctx);
 
     let decision = adopt::decide(&adopt::Input {
         displaced_is_incoming,
@@ -2692,7 +3155,22 @@ fn decide_adoption(
         // a duplicate of — or older than — the one being installed.
         adopt::Adoption::AlreadyPresent | adopt::Adoption::Discarded => Ok(AdoptionPlan::Nothing),
         adopt::Adoption::Refused(refusal) => Err(refused(refusal)),
+        // Unreachable on the live target (see the `displaced_is_incoming` row
+        // above), and refused rather than written if that ever stops being
+        // true: a live keep would bypass the adopted copy's lineage check.
+        adopt::Adoption::ToAdoptedCopy if which == Which::Live => Err(Box::new(Report::refused(
+            Refusal::CannotAdopt(adopt::Refusal::NewerCopy),
+            service,
+            "the outgoing credential cannot be adopted: the live item holds a copy of the incoming \
+             account's credential that is not older than the one being installed, and it is not \
+             kept beside a store on the live target; nothing was swapped"
+                .to_owned(),
+        ))),
         adopt::Adoption::ToAdoptedCopy => Ok(AdoptionPlan::AdoptedCopy(ns_dir)),
+        // `adopt::decide` answers the third-namespace row with `ToStore`; a
+        // live forward parking writes that answer to the adopted copy instead
+        // (`agctl-cf1i` option A), and `adopt.rs` stays as it is.
+        adopt::Adoption::ToStore if parked_beside => Ok(AdoptionPlan::AdoptedCopy(ns_dir)),
         adopt::Adoption::ToStore => Ok(AdoptionPlan::ThirdStore { ns_dir, prior }),
     }
 }
@@ -2971,10 +3449,12 @@ fn emit(report: &Report, as_json: bool) -> Result<(), AppError> {
         });
         // A refusal carries a **letter** or a **reason**, never both and never
         // neither: `Refusal::reason` is the exact complement of
-        // `Refusal::letter`, and `swap_tests.rs` pins that. The unlettered four
+        // `Refusal::letter`, and `swap_tests.rs` pins that. The unlettered ones
         // are the OQ1 precondition, which is decided before Phase A's work
-        // begins, and W4b's three, which sit outside plan section 3.4's
-        // canonical **A**–**F** because those letters were already spoken for.
+        // begins, and the live store's own — W4b's three and the two about
+        // whose credential the live item holds — which sit outside plan
+        // section 3.4's canonical **A**–**F** because those letters were
+        // already spoken for.
         if let Outcome::Refused(refusal) = &report.outcome {
             match refusal.reason() {
                 Some(reason) => doc["reason"] = serde_json::json!(reason),
@@ -3052,7 +3532,8 @@ pub(crate) enum Undoable {
     },
     /// The swap to reverse targets the **live** item: an outstanding live
     /// forward swap, or — when none is outstanding — the newest reversible
-    /// write, which is then a live undo that [`run_undo`] refuses to reverse.
+    /// write, which may itself be a live undo. Reversing an undo is an
+    /// ordinary reversal since S24: its entry names the account it put back.
     ///
     /// Carried rather than skipped, and that is load-bearing: stepping past a
     /// live-store entry to reach an older namespaced one would reverse a swap
@@ -3067,19 +3548,14 @@ pub(crate) enum Undoable {
         from_digest8: Option<String>,
         /// The digest prefix of the credential the swap wrote.
         to_digest8: String,
-        /// How the swap ended — what [`item_changed`]'s diverged check keys
-        /// on (decision D-027).
+        /// How the swap ended — an undo that did not apply leaves the swap it
+        /// was reversing outstanding.
         outcome: audit::WriteOutcome,
-        /// Which way round it ran: a live **undo** is refused rather than
-        /// reversed ([`Refusal::LiveUndoOfUndo`]).
+        /// Which way round it ran.
         direction: audit::WriteDirection,
-        /// The account a live forward swap installed, which the reversal takes
-        /// as the identity of the credential the item holds.
+        /// The account the write installed, which the reversal checks the
+        /// item's identity against.
         incoming_identity: Option<audit::IncomingIdentity>,
-        /// A live undo that ended `unknown` after this swap, when there is one
-        /// (decision D-027): the item is checked against its digests before
-        /// this swap is reversed again.
-        later_unknown_undo: Option<UnknownUndo>,
     },
     /// There is no write to undo.
     Nothing,
@@ -3095,15 +3571,14 @@ pub(crate) enum Undoable {
 /// later live undo applied over is what `--undo` means, whatever is newer than
 /// it. `status` and `watch` record a migrated namespace's in-place refresh as a
 /// reversible namespace write, and reaching for that instead would leave the
-/// live swap unreachable while the outstanding-live-swap guard refuses every
-/// forward swap until it is undone. An undo that did not apply does not clear
-/// the swap, so undoing again reverses it again.
+/// live swap to be reversed only once every refresh after it had been. An undo
+/// that did not apply does not clear the swap, so undoing again reverses it
+/// again — and the item's identity says whether that undo landed after all.
 ///
 /// **Otherwise the newest reversible write**, W4a's rule: the newest `Write`
 /// whose outcome was `Applied` or `Unknown`, whatever it targeted. `Discarded`
 /// and `Failed` wrote nothing, so there is nothing of theirs to undo. A live
-/// entry found this way is an undo, which [`run_undo`] refuses to reverse
-/// ([`Refusal::LiveUndoOfUndo`]).
+/// entry found this way is an undo, which is reversed like any other write.
 ///
 /// # Why an unreadable line refuses rather than being skipped
 ///
@@ -3119,25 +3594,14 @@ pub(crate) fn select_undo(tail: &audit::Tail) -> Undoable {
     }
     let reversible: Vec<Undoable> = tail.entries.iter().rev().filter_map(undoable).collect();
     let mut undone_later = false;
-    let mut later_unknown = None;
     let mut outstanding = None;
     for (index, candidate) in reversible.iter().enumerate() {
-        let Undoable::Live { direction, outcome, from_digest8, to_digest8, .. } = candidate else {
+        let Undoable::Live { direction, outcome, .. } = candidate else {
             continue;
         };
         match direction {
-            audit::WriteDirection::Undo if *outcome == audit::WriteOutcome::Applied => {
-                undone_later = true;
-            }
-            // An undo that ended `unknown` does not clear the swap, but it may
-            // have landed: its digests go with the swap, for the item to say.
             audit::WriteDirection::Undo => {
-                if later_unknown.is_none() {
-                    later_unknown = Some(UnknownUndo {
-                        from_digest8: from_digest8.clone(),
-                        to_digest8: to_digest8.clone(),
-                    });
-                }
+                undone_later |= *outcome == audit::WriteOutcome::Applied;
             }
             audit::WriteDirection::Forward => {
                 if !undone_later {
@@ -3147,26 +3611,7 @@ pub(crate) fn select_undo(tail: &audit::Tail) -> Undoable {
             }
         }
     }
-    let Some(index) = outstanding else {
-        return reversible.into_iter().next().unwrap_or(Undoable::Nothing);
-    };
-    let mut picked = reversible.into_iter().nth(index).unwrap_or(Undoable::Nothing);
-    if let Undoable::Live { later_unknown_undo, .. } = &mut picked {
-        *later_unknown_undo = later_unknown;
-    }
-    picked
-}
-
-/// A live undo that ended `unknown` after the swap `--undo` is about to
-/// reverse again (decision D-027). The item says whether it landed: holding
-/// what it wrote means it did, and the swap is already reversed; holding what
-/// it displaced means it did not; holding neither says nothing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UnknownUndo {
-    /// The digest prefix of what that undo displaced.
-    pub(crate) from_digest8: Option<String>,
-    /// The digest prefix of what that undo wrote.
-    pub(crate) to_digest8: String,
+    reversible.into_iter().nth(outstanding.unwrap_or(0)).unwrap_or(Undoable::Nothing)
 }
 
 /// One audit entry as a candidate for `--undo`, or `None` when it is not a
@@ -3205,235 +3650,8 @@ fn undoable(entry: &AuditEntry) -> Option<Undoable> {
             outcome: *outcome,
             direction: *direction,
             incoming_identity: incoming_identity.clone(),
-            later_unknown_undo: None,
         },
     })
-}
-
-/// Why a forward live swap refuses while a live swap agctl made is still
-/// outstanding (decision D-027) — the refusal to give and its sentence — or
-/// `None` when none is.
-///
-/// **Temporary, lifted by S24.** A credential Claude Code wrote into the live
-/// item names no account, so a forward live swap takes its identity from
-/// `.claude.json`'s `oauthAccount` — a record agctl does not write until S24.
-/// Between a live swap and its `use --undo` that record therefore still names
-/// the account the swap **displaced**, and a second live swap would attribute
-/// the credential the first one installed to that account and file it in that
-/// account's namespace, over the copy the first swap parked there. Once S24's
-/// profile client names the item's account itself and agctl writes
-/// `oauthAccount` on every live swap, the record is never stale and this guard
-/// goes with it.
-///
-/// Decided after step 7's item read, because the `unknown` branch compares the
-/// entry with the item's digest (`item8`). The **whole** log is read, not a
-/// tail: `status` and `watch` record every in-place namespace refresh, so a
-/// window short enough to push the live swap out of it is a window in which
-/// this guard silently stands down. It never passes unread either — a
-/// **refused** log (a link or a FIFO at its name, a link on the way to it) is
-/// refusal `audit_refused`, in the words step 10b's gate uses for the same log,
-/// and any other failure to read it, or an unreadable line, refuses: what could
-/// not be read may be the swap this guard exists for.
-fn live_swap_outstanding(paths: &Paths, item8: Option<&str>) -> Option<(Refusal, String)> {
-    let tail = match audit::tail(paths, usize::MAX) {
-        Ok(tail) => tail,
-        Err(AppError::Config(refused)) => {
-            return Some((
-                Refusal::AuditRefused,
-                format!("a swap of the live store will not proceed unrecorded: {refused}"),
-            ));
-        }
-        Err(err) => {
-            return Some((
-                Refusal::LiveSwapOutstanding,
-                format!(
-                    "the audit log could not be read ({err}), so agctl cannot tell whether a \
-                     live swap it made is still outstanding; see `agctl claude doctor`"
-                ),
-            ));
-        }
-    };
-    Some(match outstanding_live_swap(&tail, item8)? {
-        Outstanding::Swap(id) => (
-            Refusal::LiveSwapOutstanding,
-            format!(
-                "a previous live swap (audit {id}) is still outstanding; run `agctl claude use \
-                 --undo` first; {OUTSTANDING_REMINDER}"
-            ),
-        ),
-        Outstanding::Unknown(id) => (
-            Refusal::LiveWriteUnknown,
-            format!(
-                "the last live write (`{id}`) ended `unknown` and the live item has changed \
-                 since, so nothing says which account it holds; run `agctl claude status` to see \
-                 which account is live (`agctl claude doctor` names the entry)"
-            ),
-        ),
-        Outstanding::Unreadable(line) => (
-            Refusal::LiveSwapOutstanding,
-            format!(
-                "the audit log's line {line} could not be read, and it may record a live swap \
-                 that has not been undone; agctl will not guess whose credential the live item \
-                 holds (`agctl claude doctor` names the line)"
-            ),
-        ),
-    })
-}
-
-/// What [`outstanding_live_swap`] found in the log.
-#[derive(Debug, PartialEq, Eq)]
-enum Outstanding {
-    /// The outstanding live swap, by its audit id.
-    Swap(String),
-    /// The newest live write ended `unknown` and the item holds neither end of
-    /// it, so nothing says whose credential is in it.
-    Unknown(String),
-    /// A line of the log could not be read, and it may be a live write.
-    Unreadable(usize),
-}
-
-/// Whether the log leaves a live swap outstanding (decision D-027).
-///
-/// Keyed on the **newest live write**, read from the entries' `direction`
-/// rather than inferred. A namespace swap is another item: one made after a
-/// live swap does not clear the guard, and one alone does not arm it. A
-/// discarded or failed write changed nothing and is skipped. An entry written
-/// before `direction` existed reads as a forward swap, which arms rather than
-/// disarms.
-///
-/// That newest live write settles the question, and an `unknown` outcome is
-/// settled against the item:
-///
-/// - **forward, `applied`**: outstanding.
-/// - **forward, `unknown`**: the item still holding what it displaced says the
-///   write never landed, so not outstanding; otherwise it may have landed, so
-///   outstanding.
-/// - **undo, `applied`**: it put the swap back, so not outstanding.
-/// - **undo, `unknown`**: the item holding what it wrote says it landed, so not
-///   outstanding; the item still holding what it displaced leaves the swap it
-///   was reversing standing, and that swap is what is named.
-/// - **either, `unknown`, and the item holds neither end**: nothing says what is
-///   in the item at all — [`Outstanding::Unknown`], which refuses a forward
-///   swap under its own code and never blocks `use --undo`.
-///
-/// Any unreadable line refuses, wherever it is: it may be the newest live write.
-fn outstanding_live_swap(tail: &audit::Tail, item8: Option<&str>) -> Option<Outstanding> {
-    if let Some((line, _)) = tail.unreadable.first() {
-        return Some(Outstanding::Unreadable(*line));
-    }
-    let mut live = tail.entries.iter().filter_map(live_write).rev();
-    let newest = live.next()?;
-    let holds_from = newest.from_digest8.is_some() && item8 == newest.from_digest8;
-    let holds_to = item8 == Some(newest.to_digest8);
-    if newest.outcome == audit::WriteOutcome::Unknown && !holds_from && !holds_to {
-        return Some(Outstanding::Unknown(newest.entry.id().to_string()));
-    }
-    match newest.direction {
-        audit::WriteDirection::Forward => (newest.outcome == audit::WriteOutcome::Applied
-            || !holds_from)
-            .then(|| Outstanding::Swap(newest.entry.id().to_string())),
-        audit::WriteDirection::Undo => {
-            if newest.outcome == audit::WriteOutcome::Applied || holds_to {
-                return None;
-            }
-            // The undo did not land, so the swap it was reversing stands — and
-            // that swap, not the undo, is what the refusal names.
-            let standing = live
-                .find(|write| write.direction == audit::WriteDirection::Forward)
-                .unwrap_or(newest);
-            Some(Outstanding::Swap(standing.entry.id().to_string()))
-        }
-    }
-}
-
-/// One live write that may have written something, as the guard reads it.
-struct LiveWrite<'a> {
-    /// The entry itself, for its audit id.
-    entry: &'a AuditEntry,
-    /// Which way round that swap ran.
-    direction: audit::WriteDirection,
-    /// How it ended — `Applied` or `Unknown`; the rest are not writes.
-    outcome: audit::WriteOutcome,
-    /// The digest prefix of what it displaced.
-    from_digest8: Option<&'a str>,
-    /// The digest prefix of what it wrote.
-    to_digest8: &'a str,
-}
-
-/// One entry as a live write, or `None` when it is neither live nor a write
-/// that may have landed.
-fn live_write(entry: &AuditEntry) -> Option<LiveWrite<'_>> {
-    let AuditEvent::Write {
-        target: Target::Live,
-        from_digest8,
-        to_digest8,
-        outcome,
-        direction,
-        ..
-    } = &entry.event
-    else {
-        return None;
-    };
-    matches!(outcome, audit::WriteOutcome::Applied | audit::WriteOutcome::Unknown).then(|| {
-        LiveWrite {
-            entry,
-            direction: *direction,
-            outcome: *outcome,
-            from_digest8: from_digest8.as_deref(),
-            to_digest8,
-        }
-    })
-}
-
-/// Whether the live item is still what the swap `use --undo` reverses left
-/// there (decision D-027), or why not.
-///
-/// Two checks on what Phase A has already read — the item's digest and one read
-/// of `.claude.json` — and both refuse rather than attribute:
-///
-/// - **a foreign login.** `.claude.json`'s `oauthAccount` is a **tripwire**
-///   here, never a source. After a live swap it normally still names the
-///   account being put back (`owner`, P), and it names the account the swap
-///   installed (T) if the session logged in as that one. Any other account
-///   means the session logged in as somebody else since, the item holds *that*
-///   account's credential, and the entry would misname it as T's.
-/// - **a later undo that ended `unknown`**, when the swap has one: the item
-///   holding what that undo wrote says it landed, so the swap is already
-///   reversed and reversing it again is an undo of an undo
-///   ([`Refusal::LiveUndoOfUndo`]); holding what it displaced says it did not,
-///   and the reversal proceeds; holding neither says nothing.
-/// - **a diverged item**, for an `unknown` swap only: the item holds neither
-///   the credential the swap displaced nor the one it wrote, so nothing says
-///   what is there. An `applied` swap is exempt, because a digest change there
-///   is T's ordinary refresh.
-///
-/// Residual, recorded rather than guarded: a login as P itself while the swap
-/// is outstanding passes the tripwire, and is indistinguishable from T's
-/// refresh until S24's profile client.
-fn item_changed(
-    undone: &UndoneEntry,
-    owner: &AccountRecord,
-    item8: Option<&str>,
-    claimed: Option<&Identity>,
-) -> Option<Refusal> {
-    if let Some(claimed) = claimed
-        && !swap::identity_is(Some(claimed), owner)
-        && !swap::identities_agree(claimed, &undone.installed)
-    {
-        return Some(Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin));
-    }
-    let diverged = Refusal::LiveUndoItemChanged(ItemChange::Diverged);
-    if let Some(later) = &undone.later_unknown_undo {
-        if item8 == Some(later.to_digest8.as_str()) {
-            return Some(Refusal::LiveUndoOfUndo);
-        }
-        let did_not_land = item8.is_some() && item8 == later.from_digest8.as_deref();
-        return (!did_not_land).then_some(diverged);
-    }
-    let unknown_and_neither = matches!(undone.outcome, audit::WriteOutcome::Unknown)
-        && item8 != Some(undone.from_digest8.as_str())
-        && item8 != Some(undone.to_digest8.as_str());
-    unknown_and_neither.then_some(diverged)
 }
 
 /// `claude use --undo` — plan section 3.4's rollback.
@@ -3449,11 +3667,12 @@ fn item_changed(
 /// a namespace swap made after it cannot be undone until it has been.
 ///
 /// A reversal of a **live** swap runs the same way, against `Tree::Live` and
-/// with §D5's live adoption rules. It is the one path on which refusal **E**
-/// is reachable: the target comes from the **audit log**, not from
-/// `CLAUDE_SECURESTORAGE_CONFIG_DIR`, so the two can disagree — and a run whose
-/// shell names a namespace while the entry names the live item would take the
-/// locks in one place and write the other, which is what **E** refuses.
+/// with §D5's live adoption rules — including the reversal of a live undo,
+/// which puts back what that undo displaced. It is the one path on which
+/// refusal **E** is reachable: the target comes from the **audit log**, not
+/// from `CLAUDE_SECURESTORAGE_CONFIG_DIR`, so the two can disagree — and a run
+/// whose shell names a namespace while the entry names the live item would take
+/// the locks in one place and write the other, which is what **E** refuses.
 ///
 /// # Errors
 ///
@@ -3466,7 +3685,7 @@ fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
     paths.ensure_dirs()?;
     // The whole log (decision D-027): namespace refresh lines accumulate, and a
     // window short enough to push the live swap out of it is a window in which
-    // the outstanding-live-swap guard can never be cleared.
+    // `--undo` would reach for a refresh instead.
     let tail = audit::tail(&paths, usize::MAX)?;
     // The registry is loaded before the match so each arm can build its
     // reversal in place. Splitting the match in two — choose, then resolve —
@@ -3490,43 +3709,13 @@ fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
         Undoable::Found { sha8, from_digest8, to_digest8 } => {
             namespaced_reversal(&paths, &config, &sha8, from_digest8.as_deref(), &to_digest8)?
         }
-        Undoable::Live {
-            from_digest8,
-            to_digest8,
-            outcome,
-            direction,
-            incoming_identity,
-            later_unknown_undo,
-        } => {
-            // Decision D-027: the newest swap is itself the undo of a live
-            // swap. Reversing it would put the swapped-in credential back while
-            // `.claude.json` still names the account it displaced, and would
-            // leave the outstanding-live-swap guard reading that reversal as the
-            // newest word. Decided from the entry alone, before `live_reversal`
-            // reads any owned namespace; temporary, lifted by S24.
-            if direction == audit::WriteDirection::Undo {
-                let mut report = Report::refused(
-                    Refusal::LiveUndoOfUndo,
-                    "",
-                    "the newest swap in the audit log is the undo of a live swap, and undoing \
-                     that undo is not supported yet; run `agctl claude use --live <id>` for the \
-                     account you want instead"
-                        .to_owned(),
-                );
-                report.target = Some(Target::Live.to_string());
-                emit(&report, args.json)?;
-                return Ok(report.outcome.exit_code());
-            }
-            live_reversal(
-                &paths,
-                &config,
-                from_digest8.as_deref(),
-                &to_digest8,
-                outcome,
-                incoming_identity.as_ref(),
-                later_unknown_undo,
-            )?
-        }
+        Undoable::Live { from_digest8, to_digest8, incoming_identity, .. } => live_reversal(
+            &paths,
+            &config,
+            from_digest8.as_deref(),
+            &to_digest8,
+            incoming_identity.as_ref(),
+        )?,
     };
 
     let env = EnvView::from_process();
@@ -3576,21 +3765,13 @@ struct Reversal {
     undone: Option<UndoneEntry>,
 }
 
-/// The live swap `use --undo` reverses, as the reversal needs it (decision
-/// D-027).
+/// The live write `use --undo` reverses, as the reversal needs it: the account
+/// it installed, which the item's identity is checked against (§D1).
 #[derive(Debug)]
 struct UndoneEntry {
-    /// The account that swap installed in the item — the entry's
+    /// The account that write installed in the item — the entry's
     /// `incoming_identity`, ids only.
     installed: Identity,
-    /// How that swap ended.
-    outcome: audit::WriteOutcome,
-    /// The digest prefix of the credential it displaced.
-    from_digest8: String,
-    /// The digest prefix of the credential it wrote.
-    to_digest8: String,
-    /// A live undo that ended `unknown` after that swap, when there is one.
-    later_unknown_undo: Option<UnknownUndo>,
 }
 
 /// A reversal of a swap against a namespace agctl owns (W4a's path,
@@ -3698,54 +3879,52 @@ fn namespaced_reversal(
 ///
 /// # Where the credential to put back is, and why it is found by digest
 ///
-/// A live swap files the credential it displaces in **that credential's own
-/// account's** namespace and nowhere else (§D5):
-/// `<namespace(P)>/.credentials.json` for the ordinary row, and
-/// `<namespace(T)>/.credentials.adopted.json` for task 4's keep arm, whose
-/// displaced credential *is* the incoming account T's. The contract names the
-/// second as `Source::AdoptedCopy(namespace(T))`; this finds both, because
-/// neither account can be derived from the entry:
+/// A live write files the credential it displaces in **that credential's own
+/// account's** namespace and nowhere else: a forward swap in
+/// `<namespace(P)>/.credentials.adopted.json` (`agctl-cf1i` option A), or in
+/// its `.credentials.json` when those very bytes were already at home there; a
+/// reversal in `<namespace(T)>/.credentials.json`; and task 4's keep arm in
+/// `<namespace(T)>/.credentials.adopted.json`. A swap from before S24 filed a
+/// forward swap's P in `.credentials.json` too. This finds all of them,
+/// because neither account can be derived from the entry alone:
 ///
-/// - `AuditEvent::Write` names the account a live forward swap *installed*
-///   (`incoming_identity`, decision D-027) but not the one it displaced, and
-///   the displaced credential is the one being put back;
-/// - the only other witness, the live item (which holds T), would have to be
-///   read **before** Phase A — a `security` child spawned ahead of refusal
-///   **E**, which §D1 says spawns none, and a second item read ahead of Phase
-///   A's single one.
+/// - `AuditEvent::Write` names the account a live write *installed*
+///   (`incoming_identity`) but not the one it displaced, and the displaced
+///   credential is the one being put back;
+/// - the only other witness, the live item, would have to be read **before**
+///   Phase A — a `security` child spawned ahead of refusal **E**, which §D1
+///   says spawns none, and a second item read ahead of Phase A's single one.
 ///
 /// So it looks for the credential by the one key the entry does carry, the
-/// displaced digest prefix, in exactly the places §D5 can have filed it: the
-/// `.credentials.json` and the adopted copy of every namespace an `Owned`
-/// record claims, **counting a copy only when the credential belongs to that
-/// record** (`swap::same_identity`). That condition is what "its own account's
-/// namespace" means, and it keeps a copy parked anywhere else — a namespace
-/// swap's D-024 sibling holding somebody else's credential — from being taken
-/// for this swap's. Exactly one match proceeds, with that record as the owner;
-/// none refuses, because there is nothing to put back; two refuse and name
-/// both, because agctl will not guess which of them to write into the live
-/// item. For task 4's keep arm the one match *is* the contract's
-/// `Source::AdoptedCopy(namespace(T))`.
+/// displaced digest prefix, in exactly the places a live write can have filed
+/// it: the `.credentials.json` and the adopted copy of every namespace an
+/// `Owned` record claims, **counting a copy only when the credential belongs to
+/// that record** (`swap::same_identity`). That condition is what "its own
+/// account's namespace" means, and it keeps a copy parked anywhere else — a
+/// namespace swap's D-024 sibling holding somebody else's credential — from
+/// being taken for this swap's. Exactly one match proceeds, with that record as
+/// the owner; none refuses, because there is nothing to put back; two refuse
+/// and name both, because agctl will not guess which of them to write into the
+/// live item.
 ///
 /// The namespaced path's `to_digest8` guard is subsumed rather than dropped:
 /// matching `from_digest8` exactly is a stronger statement than "not
 /// `to_digest8`".
 ///
-/// # Whose credential the item holds (decision D-027)
+/// # Whose credential the item holds
 ///
-/// The entry's `incoming_identity` — the account the swap installed — is carried
-/// out as [`Reversal::undone`] with the outcome and both digests, for Phase A's
-/// attribution and [`item_changed`]'s checks. An entry without it refuses here,
-/// before any owned namespace is read: nothing else may say whose the item's
-/// credential is, and `oauthAccount` in particular may not.
+/// The entry's `incoming_identity` — the account the write installed — is
+/// carried out as [`Reversal::undone`] for Phase A's three arms: the item's
+/// identity, as the profile or agctl's own write names it, is checked against
+/// it (§D1). An entry without it refuses here, before any owned namespace is
+/// read: a live forward entry from before S23b, or a live undo entry from
+/// before S24, says nothing the item can be checked against.
 fn live_reversal(
     paths: &Paths,
     config: &AgctlConfig,
     from_digest8: Option<&str>,
     to_digest8: &str,
-    outcome: audit::WriteOutcome,
     incoming_identity: Option<&audit::IncomingIdentity>,
-    later_unknown_undo: Option<UnknownUndo>,
 ) -> Result<Reversal, AppError> {
     let Some(from_digest8) = from_digest8 else {
         // Unreachable through agctl's own writes: an absent live item refuses
@@ -3823,10 +4002,6 @@ fn live_reversal(
                 email: None,
                 org_name: None,
             },
-            outcome,
-            from_digest8: from_digest8.to_owned(),
-            to_digest8: to_digest8.to_owned(),
-            later_unknown_undo,
         }),
     })
 }

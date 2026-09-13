@@ -4,10 +4,10 @@
 # Builds agctl the way a release is built (default features, release profile)
 # into a scratch target directory, then proves two things about the artifact:
 #
-#   1. none of the ten test-seam environment-variable names appear in it, and
+#   1. none of the eleven test-seam environment-variable names appear in it, and
 #   2. the three production-visible names do.
 #
-# The ten are one representative name per seam-owning module, not the whole
+# The eleven are one representative name per seam-owning module, not the whole
 # test-only surface — fixtures/fake-security.sh alone defines ten
 # AGCTL_FAKE_SECURITY_* names on its own. The fake's write knob is the one
 # exception to "one per owner": the keychain *write* path is the only seam that
@@ -17,10 +17,12 @@
 # introduces it.
 #
 # The first is the one that matters. The `testing` feature compiles overrides for
-# the OAuth token endpoint, the authorize endpoint and the usage endpoint; a
-# release binary that honoured AGCTL_CLAUDE_TOKEN_URL would send a refresh
-# token wherever an environment variable pointed it. The second half is there so
-# that a build which somehow contains no strings at all cannot pass by accident.
+# the OAuth token endpoint, the authorize endpoint, the profile endpoint and the
+# usage endpoint; a release binary that honoured AGCTL_CLAUDE_TOKEN_URL would send
+# a refresh token wherever an environment variable pointed it, and one that
+# honoured AGCTL_CLAUDE_PROFILE_URL would send the live item's bearer token. The
+# second half is there so that a build which somehow contains no strings at all
+# cannot pass by accident.
 #
 # The build goes to a scratch directory, never ./target and never the shared
 # dev target dir (~/.cache/rust/target, formerly /Volumes/tmpfs/target), so
@@ -85,6 +87,7 @@ seams=(
 	AGCTL_CLAUDE_USAGE_URL
 	AGCTL_CLAUDE_TOKEN_URL
 	AGCTL_CLAUDE_AUTHORIZE_URL
+	AGCTL_CLAUDE_PROFILE_URL
 	AGCTL_FAKE_SECURITY_LOG
 	AGCTL_FAKE_SECURITY_WRITE_EXIT
 	AGCTL_NO_BROWSER

@@ -47,7 +47,8 @@ fn a_write_line_from_before_decision_d027_reads_as_a_forward_swap_that_names_no_
 #[test]
 fn a_live_forward_write_records_the_account_it_installed_by_id_alone() {
     // Decision D-027: ids only, never a token or an email, and a member only on
-    // the entry that has one — an undo's line carries none.
+    // the entry that has one — a namespace entry, or a live undo line written
+    // before S24, carries none.
     let forward = AuditEntry::new(AuditEvent::Write {
         target: Target::Live,
         from_digest8: Some("deadbeef".to_owned()),
@@ -82,6 +83,50 @@ fn a_live_forward_write_records_the_account_it_installed_by_id_alone() {
     let value: serde_json::Value = serde_json::from_str(&line).expect("the line parses");
     assert_eq!(value["direction"], "undo", "{line}");
     assert!(value.get("incoming_identity").is_none(), "no member for an absent account: {line}");
+}
+
+#[test]
+fn a_live_undo_write_records_the_account_it_put_back_by_id_alone() {
+    // S24 (§D7): every live write names the account it installed, an undo's
+    // too — which for an undo is the account put back. An undo of that undo
+    // reads it back, and so does a later swap whose item token has expired. The
+    // field is unchanged: ids only, the organization when the record knows one.
+    let undo = AuditEntry::new(AuditEvent::Write {
+        target: Target::Live,
+        from_digest8: Some("cafebabe".to_owned()),
+        to_digest8: "deadbeef".to_owned(),
+        outcome: WriteOutcome::Unknown,
+        direction: WriteDirection::Undo,
+        incoming_identity: Some(IncomingIdentity {
+            account_uuid: "acct-p".to_owned(),
+            organization_uuid: Some("org-p".to_owned()),
+        }),
+    });
+    let line = serde_json::to_string(&undo).expect("the entry serialises");
+    let value: serde_json::Value = serde_json::from_str(&line).expect("the line parses");
+    assert_eq!(value["direction"], "undo", "{line}");
+    assert_eq!(
+        value["incoming_identity"],
+        serde_json::json!({ "account_uuid": "acct-p", "organization_uuid": "org-p" }),
+        "{line}"
+    );
+    assert_eq!(
+        value["incoming_identity"].as_object().map(serde_json::Map::len),
+        Some(2),
+        "two ids and nothing else — no email, no name: {line}"
+    );
+    assert!(!line.contains('@'), "no address anywhere on the line: {line}");
+    let back: AuditEntry = serde_json::from_str(&line).expect("the line round-trips");
+    assert_eq!(back, undo);
+
+    // And an undo line written before S24 still parses, naming nobody.
+    let older = r#"{"ts":"2026-09-11T00:00:00Z","monotonic_ms":0,"agctl_pid":1,"event":"write","target":"live","from_digest8":"cafebabe","to_digest8":"deadbeef","outcome":"applied","direction":"undo"}"#;
+    let entry: AuditEntry = serde_json::from_str(older).expect("an S23b undo line still parses");
+    let AuditEvent::Write { direction, incoming_identity, .. } = entry.event else {
+        panic!("a write entry")
+    };
+    assert_eq!(direction, WriteDirection::Undo);
+    assert_eq!(incoming_identity, None);
 }
 
 fn sample(mtime_ns: i64, age_ms: u64) -> LockSample {

@@ -56,12 +56,12 @@ scripts/release-gate.sh
 
 It builds `cargo build --release` (default features, no `--config`, into a scratch
 `--target-dir` that is never `./target` and never the shared `~/.cache/rust/target`) and
-greps the artifact for two lists. The ten seam names are one representative name per
+greps the artifact for two lists. The eleven seam names are one representative name per
 seam-owning module, not the whole test-only surface — `fixtures/fake-security.sh` alone
 defines ten `AGCTL_FAKE_SECURITY_*` names on its own. The fake's **write** knob is the
 one exception to "one per owner": the keychain write path is the only seam that can change
-a keychain, so it is gated by name rather than by family. **Ten seam names, every one of
-which must be absent:**
+a keychain, so it is gated by name rather than by family. **Eleven seam names, every one
+of which must be absent:**
 
 | name | owner |
 |------|-------|
@@ -72,6 +72,7 @@ which must be absent:**
 | `AGCTL_CLAUDE_USAGE_URL` | `src/provider/claude/usage.rs` |
 | `AGCTL_CLAUDE_TOKEN_URL` | `src/provider/claude/oauth.rs` |
 | `AGCTL_CLAUDE_AUTHORIZE_URL` | `src/provider/claude/oauth.rs` |
+| `AGCTL_CLAUDE_PROFILE_URL` | `src/provider/claude/oauth.rs` (the live swap's profile GET) |
 | `AGCTL_FAKE_SECURITY_LOG` | `fixtures/fake-security.sh` |
 | `AGCTL_FAKE_SECURITY_WRITE_EXIT` | `fixtures/fake-security.sh` (the `-i` write path) |
 | `AGCTL_NO_BROWSER` | `src/commands/login.rs` |

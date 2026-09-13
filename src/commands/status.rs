@@ -2090,6 +2090,17 @@ pub fn default_refresher() -> Result<Arc<dyn TokenRefresher>, AppError> {
     Ok(Arc::new(OauthClient::from_env(&crate::provider::claude::user_agent())?))
 }
 
+/// The production [`ProfileSource`], beside [`default_refresher`] and built
+/// the same way.
+///
+/// # Errors
+///
+/// Returns [`AppError::Config`] when an endpoint override is not a URL.
+pub fn default_profile_source()
+-> Result<Arc<dyn crate::provider::claude::usage::ProfileSource>, AppError> {
+    Ok(Arc::new(OauthClient::from_env(&crate::provider::claude::user_agent())?))
+}
+
 #[cfg(test)]
 #[path = "status_tests.rs"]
 mod tests;

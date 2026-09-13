@@ -163,53 +163,47 @@ pub enum Refusal {
     /// the CLI refusal, `doctor`'s `audit log` row and this carry one
     /// sentence. Namespace swaps keep W4a's behaviour.
     AuditRefused,
-    /// A live swap agctl made has not been undone, so a forward live swap
-    /// refuses (decision D-027).
+    /// Nothing can say whose credential the live item holds, so the swap does
+    /// not guess (S24).
     ///
-    /// **Temporary, lifted by S24.** The live item's credential carries no
-    /// identity when Claude Code wrote it, so a forward live swap takes it from
-    /// `.claude.json`'s `oauthAccount` — which agctl does not write until S24,
-    /// and which therefore still names the account an outstanding live swap
-    /// displaced. Unlettered, with `reason: "live_swap_outstanding"`; decided
-    /// in Phase A after the item read, because the `unknown` branch needs the
-    /// item's digest.
-    LiveSwapOutstanding,
-    /// The newest live write ended `unknown`, and the live item holds neither
-    /// end of it (decision D-027).
+    /// The profile client is the identity source for the live target, and
+    /// agctl's own audit entry the only fallback when the token has expired.
+    /// When neither answers, the live item's credential is somebody's and
+    /// nothing says whose, so nothing is filed anywhere. Unlettered — plan
+    /// section 3.4's **A**–**F** are spoken for — with the reason
+    /// [`IdentityGap`] names. Decided in Phase A right after the item read,
+    /// before every lock, the audit log, the prompt and the POST.
+    IdentityUnavailable(IdentityGap),
+    /// The live item holds a credential of an account that is neither the one
+    /// `use --undo` would put back nor the one the swap being undone installed
+    /// (decision D-027, decided by the profile since S24).
     ///
-    /// **Temporary, lifted by S24.** Nothing says which account the item holds,
-    /// so a forward live swap refuses; `use --undo` is never blocked by it.
-    /// Unlettered, with `reason: "live_write_unknown"`; decided in Phase A with
-    /// [`Self::LiveSwapOutstanding`], after the item read.
-    LiveWriteUnknown,
-    /// `use --undo` would reverse the undo of a live swap (decision D-027).
-    ///
-    /// **Temporary, lifted by S24.** Reversing that undo would put the
-    /// swapped-in credential back into the live item while `.claude.json` still
-    /// names the account it displaced, and [`Self::LiveSwapOutstanding`] would
-    /// read the reversal as the newest word and stand down. Unlettered, with
-    /// `reason: "live_undo_of_undo"`; decided in Phase A from the audit entry
-    /// alone, before any owned namespace is read — or right after the item
-    /// read, when a later undo that ended `unknown` turns out to have landed.
-    LiveUndoOfUndo,
-    /// The live item is not what the swap `use --undo` would reverse left there
-    /// (decision D-027).
-    ///
-    /// **Temporary, lifted by S24.** Unlettered, with the reason [`ItemChange`]
-    /// names; decided in Phase A right after the item read, before any lock.
+    /// The live session logged in as somebody else since that swap, and a
+    /// reversal would file that account's credential as the installed one's.
+    /// Unlettered, with the reason [`ItemChange`] names; decided in Phase A
+    /// right after the item read, before any lock.
     LiveUndoItemChanged(ItemChange),
 }
 
-/// Why [`Refusal::LiveUndoItemChanged`] refused (decision D-027).
+/// Why [`Refusal::IdentityUnavailable`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IdentityGap {
+    /// The profile GET did not answer: a transport failure, a timeout, a
+    /// status other than 401 or 403, or a document without V14's members.
+    ProfileUnavailable,
+    /// The live item's access token has expired — or the server no longer
+    /// honours it — and no write of agctl's own put those bytes there, so the
+    /// token cannot be asked and nothing else may say whose it is.
+    TokenExpired,
+}
+
+/// Why [`Refusal::LiveUndoItemChanged`] refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ItemChange {
-    /// `.claude.json` names an account that is neither the one being put back
-    /// nor the one the swap installed: the live session logged in as somebody
-    /// else since that swap.
+    /// The item's credential belongs to an account that is neither the one
+    /// being put back nor the one the swap installed: the live session logged
+    /// in as somebody else since that swap.
     ForeignLogin,
-    /// The swap ended `unknown`, and the item holds neither the credential it
-    /// displaced nor the one it wrote.
-    Diverged,
 }
 
 impl Refusal {
@@ -227,9 +221,7 @@ impl Refusal {
             | Self::LiveUnreachable
             | Self::LiveItemAbsent
             | Self::AuditRefused
-            | Self::LiveSwapOutstanding
-            | Self::LiveWriteUnknown
-            | Self::LiveUndoOfUndo
+            | Self::IdentityUnavailable(_)
             | Self::LiveUndoItemChanged(_) => None,
         }
     }
@@ -251,11 +243,11 @@ impl Refusal {
             Self::LiveUnreachable => Some("live_unreachable"),
             Self::LiveItemAbsent => Some("live_item_absent"),
             Self::AuditRefused => Some("audit_refused"),
-            Self::LiveSwapOutstanding => Some("live_swap_outstanding"),
-            Self::LiveWriteUnknown => Some("live_write_unknown"),
-            Self::LiveUndoOfUndo => Some("live_undo_of_undo"),
+            Self::IdentityUnavailable(IdentityGap::ProfileUnavailable) => {
+                Some("profile_unavailable")
+            }
+            Self::IdentityUnavailable(IdentityGap::TokenExpired) => Some("live_token_expired"),
             Self::LiveUndoItemChanged(ItemChange::ForeignLogin) => Some("live_undo_foreign_login"),
-            Self::LiveUndoItemChanged(ItemChange::Diverged) => Some("live_undo_item_diverged"),
             Self::CompromisedHold
             | Self::EnvToken
             | Self::LineTooLong
@@ -276,9 +268,7 @@ impl Refusal {
             Self::AuditRefused => swap_exit::AUDIT_REFUSED,
             Self::LiveUnreachable => swap_exit::LIVE_UNREACHABLE,
             Self::LiveItemAbsent => swap_exit::LIVE_ITEM_ABSENT,
-            Self::LiveSwapOutstanding => swap_exit::LIVE_SWAP_OUTSTANDING,
-            Self::LiveWriteUnknown => swap_exit::LIVE_WRITE_UNKNOWN,
-            Self::LiveUndoOfUndo => swap_exit::LIVE_UNDO_OF_UNDO,
+            Self::IdentityUnavailable(_) => swap_exit::IDENTITY_UNAVAILABLE,
             Self::LiveUndoItemChanged(_) => swap_exit::LIVE_UNDO_ITEM_CHANGED,
         }
     }
@@ -303,20 +293,13 @@ impl Refusal {
             // After Phase A's single read of the item, before any lock: an
             // absent live item is what says the live store has not migrated.
             Self::LiveItemAbsent => Phase::A,
-            // After the item read and `LiveItemAbsent` (decision D-027): the
-            // `unknown` branch compares the entry with the item's digest.
-            // Nothing is locked.
-            Self::LiveSwapOutstanding => Phase::A,
-            // Decided with the guard, from the same log walk and item digest
-            // (decision D-027).
-            Self::LiveWriteUnknown => Phase::A,
-            // From the audit entry alone, in `run_undo`, before the reversal
-            // reads any owned namespace — or right after a live reversal's item
-            // read, when a later undo that ended `unknown` turns out to have
-            // landed (decision D-027). Nothing is locked either way.
-            Self::LiveUndoOfUndo => Phase::A,
-            // Right after a live reversal's item read, before any lock
-            // (decision D-027).
+            // Right after the item read and `LiveItemAbsent`, where the live
+            // item's identity is resolved: one profile GET, which rotates
+            // nothing, and on an expired token a read of agctl's own log.
+            // Nothing is locked (S24).
+            Self::IdentityUnavailable(_) => Phase::A,
+            // At the same place, a reversal only: the resolved identity is
+            // neither the owner nor the account the swap installed.
             Self::LiveUndoItemChanged(_) => Phase::A,
             // First checked in Phase A against the stored blob, and again in
             // Phase B against the refreshed one — both before any child
@@ -327,9 +310,9 @@ impl Refusal {
             // is touched and before the adoption write — which is itself a
             // mutation — and with nothing of Claude Code's held. The same
             // refusal is also reached earlier, in Phase A after the item read,
-            // when the outstanding-live-swap guard's read of the log meets a
-            // refused log (decision D-027); the later of the two is what this
-            // names, as for `LineTooLong`.
+            // when an expired live token sends the identity resolution to a log
+            // that is refused or cannot be read; the later of the two is what
+            // this names, as for `LineTooLong`.
             Self::AuditRefused => Phase::B,
             // The adoption runs under the namespace locks in Phase B, which
             // is where its refusal is decided (ruling OQ2, condition (c)).
@@ -356,23 +339,17 @@ impl Refusal {
 /// so they never compete and the order between them is documentation rather
 /// than precedence.
 ///
-/// S23b's three (decision D-027) sit where they are decided.
-/// [`Refusal::LiveUndoOfUndo`] is decided in `run_undo` from the audit entry,
-/// before a reversal's subject is built, so it precedes `LiveNamespaceEnv`.
-/// [`Refusal::LiveSwapOutstanding`] (forward) and
-/// [`Refusal::LiveUndoItemChanged`] (reverse) both follow the item read and so
-/// follow `LiveItemAbsent`, on the two branches of the direction.
-/// [`Refusal::LiveWriteUnknown`] is decided at the guard's own point, from the
-/// same log walk and item digest.
-pub const DECISION_ORDER: [Refusal; 13] = [
+/// S24's two sit where the live item's identity is resolved, right after the
+/// item read and so after `LiveItemAbsent`: [`Refusal::IdentityUnavailable`]
+/// in both directions, then — a reversal only, from the identity just
+/// resolved — [`Refusal::LiveUndoItemChanged`].
+pub const DECISION_ORDER: [Refusal; 11] = [
     Refusal::NotOwned,
-    Refusal::LiveUndoOfUndo,
     Refusal::LiveNamespaceEnv,
     Refusal::LiveUnreachable,
     Refusal::EnvToken,
     Refusal::LiveItemAbsent,
-    Refusal::LiveSwapOutstanding,
-    Refusal::LiveWriteUnknown,
+    Refusal::IdentityUnavailable(IdentityGap::ProfileUnavailable),
     Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin),
     Refusal::LineTooLong,
     Refusal::AuditRefused,
