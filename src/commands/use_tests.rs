@@ -706,6 +706,14 @@ impl crate::provider::claude::usage::TokenRefresher for NeverRefreshes {
     }
 }
 
+/// The plan is asked only after a refresh POST, so the drift guard never
+/// reaches it either.
+impl ProfileSource for NeverRefreshes {
+    fn profile_of(&self, _: &Credentials, _: &Cancel) -> Result<Profile, OauthError> {
+        panic!("the drift guard compares guards, not plans")
+    }
+}
+
 #[test]
 fn the_write_back_refuses_a_namespace_that_has_migrated_into_the_keychain() {
     // Invariant I5': a plaintext credential written beside an item that
@@ -887,6 +895,7 @@ fn the_write_back_refuses_exactly_what_status_refuses_at_the_same_write_site() {
                 Duration::from_secs(1),
             ),
             refresher: std::sync::Arc::new(NeverRefreshes),
+            profiles: std::sync::Arc::new(NeverRefreshes),
             reader_factory: std::sync::Arc::new(move |_ctx| Box::new(write_back_reader(migrated))),
             listing,
             fault: Fault::none(),

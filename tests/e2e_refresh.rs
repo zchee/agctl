@@ -1475,3 +1475,203 @@ fn ac65_a_blob_over_the_stdin_limit_spawns_no_write() {
     );
     fixture.assert_keychain_read_only();
 }
+
+// ---------------------------------------------------------------------------
+// The plan (`agctl-p3-plan-column-owned-accounts-3ws`, S24c)
+// ---------------------------------------------------------------------------
+
+/// How long a test waits for the plan GET once the POST has been seen.
+///
+/// Kept well under the fault's own 10 s `PAUSE_BUDGET`: a GET placed after
+/// the pause point only arrives once the pause gives up, and this wait must
+/// time out first rather than see it arrive. The GET that belongs before the
+/// pause follows the POST by one local round trip.
+const PAUSED_BUDGET: Duration = Duration::from_secs(5);
+
+/// A hand-built blob with no plan at all — neither `subscriptionType` nor
+/// `rateLimitTier` — the shape of a store logged in before S24c.
+fn blob_without_a_plan(access: &str, refresh: &str, expires_at_ms: i64) -> String {
+    json!({
+        "claudeAiOauth": {
+            "accessToken": access,
+            "refreshToken": refresh,
+            "expiresAt": expires_at_ms,
+            "scopes": ["user:inference", "user:profile"],
+            "tokenAccount": {
+                "uuid": ACCT,
+                "emailAddress": EMAIL,
+                "organizationUuid": ORG,
+                "organizationName": "Acme",
+            },
+        }
+    })
+    .to_string()
+}
+
+/// A store holding one owned account, expired, with no plan.
+fn expired_owned_without_a_plan(server: &MockServer) -> Fixture {
+    let mut fixture = Fixture::new();
+    fixture.endpoints(&server.base_url());
+    fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
+    fixture.write_credentials(
+        ACCT,
+        ORG,
+        &blob_without_a_plan("sk-ant-oat01-stale", "sk-ant-ort01-stale", common::expired_at()),
+    );
+    fixture
+}
+
+/// The owned namespace's credential file, parsed.
+fn stored_blob(fixture: &Fixture) -> Value {
+    let text = fs::read_to_string(fixture.credentials_path(ACCT, ORG)).expect("readable");
+    serde_json::from_str(&text).expect("the credential file is JSON")
+}
+
+#[test]
+fn the_plan_is_asked_under_the_namespace_lock_before_the_write() {
+    // Ruling B6 on the file path, from outside the process. `pause_before_rename`
+    // holds it between the refresh and the write; the plan GET — matched on
+    // the rotated token, so it came after the POST — has to arrive while it is
+    // held there, with the namespace lock taken.
+    let server = MockServer::start();
+    let _usage = usage_ok(&server);
+    let token = token_ok(&server, 28_800);
+    let profile = common::mock_profile(&server, "sk-ant-oat01-rotated", (ACCT, ORG));
+
+    let fixture = expired_owned(&server);
+    let resume = fixture.scratch("resume");
+    let lock = fixture.lock_path(ACCT, ORG);
+
+    let child = fixture
+        .raw()
+        .args(["claude", "status", "--refresh", "--account", EMAIL])
+        .env("AGCTL_FAULT", "pause_before_rename")
+        .env("AGCTL_FAULT_RESUME", &resume)
+        .spawn()
+        .expect("agctl should start");
+
+    assert!(
+        common::wait_until(OBSERVE_BUDGET, || token.calls() == 1),
+        "the refresh POST should have gone out before the pause"
+    );
+    let asked = common::wait_until(PAUSED_BUDGET, || profile.calls() == 1);
+    let held = common::lock_is_held(&lock);
+    fs::write(&resume, "go").expect("the resume file should be writable");
+    let finished = common::finish(child);
+
+    assert!(asked, "the plan GET should arrive while the process waits before the write");
+    assert!(held, "and while it holds the namespace lock");
+    assert_eq!(finished.code(), 0, "stderr:\n{}", finished.stderr);
+    assert_eq!(profile.calls(), 1, "asked once");
+    let blob = stored_blob(&fixture);
+    assert_eq!(blob["claudeAiOauth"]["accessToken"], json!("sk-ant-oat01-rotated"));
+    assert_eq!(blob["claudeAiOauth"]["subscriptionType"], json!("max"));
+    assert_eq!(blob["claudeAiOauth"]["rateLimitTier"], json!("default_claude_max_20x"));
+}
+
+#[test]
+fn a_refresh_whose_profile_answers_500_still_saves_the_rotated_credential() {
+    // Ruling R-J from outside: the profile failing costs the plan and nothing
+    // else. The rotated pair is on disk, the row is `ok`, and stderr says
+    // nothing about it (ruling G5: a `debug` line, under the `warn` default).
+    let server = MockServer::start();
+    let _usage = usage_ok(&server);
+    let token = token_ok(&server, 28_800);
+    let profile = server.mock(|when, then| {
+        when.method(GET)
+            .path(common::PROFILE_PATH)
+            .header("authorization", "Bearer sk-ant-oat01-rotated");
+        then.status(500).body("upstream unavailable");
+    });
+
+    let fixture = expired_owned_without_a_plan(&server);
+    let output = fixture
+        .cmd()
+        .args(["claude", "status", "--json", "--refresh", "--account", EMAIL])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let stderr = common::strip_ansi(&String::from_utf8(output.stderr).expect("stderr is UTF-8"));
+
+    assert_eq!(token.calls(), 1);
+    assert_eq!(profile.calls(), 1, "asked once, never retried");
+    assert_eq!(only_row(&stdout)["state"], json!("ok"), "{stdout}");
+    let blob = stored_blob(&fixture);
+    assert_eq!(blob["claudeAiOauth"]["accessToken"], json!("sk-ant-oat01-rotated"));
+    assert_eq!(blob["claudeAiOauth"]["refreshToken"], json!("sk-ant-ort01-rotated"));
+    assert_eq!(blob["claudeAiOauth"].get("subscriptionType"), None, "no plan was recorded");
+    assert_eq!(blob["claudeAiOauth"].get("rateLimitTier"), None, "and no tier");
+    assert!(!stderr.contains("plan"), "no stderr sentence about the plan:\n{stderr}");
+    assert!(!stderr.contains("profile"), "nor about the profile:\n{stderr}");
+}
+
+#[test]
+fn a_refused_tier_is_logged_by_its_length_and_never_stored() {
+    // Ruling G9 from outside: a tier one byte past Claude Code's own bound is
+    // not stored, and the debug line that says so carries its length and not
+    // one byte of the value. The sentinel inside it is how the test sees that.
+    let sentinel = "s24csentinel";
+    let prefix = format!("default_{sentinel}_");
+    let tier = format!("{prefix}{}", "x".repeat(65 - prefix.len()));
+    assert_eq!(tier.len(), 65, "the fixture is one byte past the bound");
+
+    let server = MockServer::start();
+    let _usage = usage_ok(&server);
+    let _token = token_ok(&server, 28_800);
+    let profile = common::mock_profile_organization(
+        &server,
+        "sk-ant-oat01-rotated",
+        (ACCT, ORG),
+        json!({ "organization_type": "claude_max", "rate_limit_tier": tier }),
+    );
+
+    let mut fixture = expired_owned_without_a_plan(&server);
+    fixture.set("RUST_LOG", "agctl=debug");
+    let output = fixture
+        .cmd()
+        .args(["claude", "status", "--json", "--refresh", "--account", EMAIL])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr = common::strip_ansi(&String::from_utf8(output.stderr).expect("stderr is UTF-8"));
+
+    assert_eq!(profile.calls(), 1);
+    let blob = stored_blob(&fixture);
+    assert_eq!(blob["claudeAiOauth"]["subscriptionType"], json!("max"), "the plan is stored");
+    assert_eq!(blob["claudeAiOauth"].get("rateLimitTier"), None, "the tier is not");
+    assert!(stderr.contains("len=65"), "the refusal names the length:\n{stderr}");
+    assert!(!stderr.contains(sentinel), "and never the value:\n{stderr}");
+}
+
+#[test]
+fn a_pass_too_short_for_the_plan_saves_the_refresh_without_asking() {
+    // S24c-R1 (1) from outside. `--timeout 3s` is a 9 s pass, less than the
+    // profile's own 10 s budget plus the last look, so the plan is not asked
+    // at all — and the refreshed pair is saved exactly as before S24c.
+    let server = MockServer::start();
+    let _usage = usage_ok(&server);
+    let token = token_ok(&server, 28_800);
+    let profile = common::mock_profile(&server, "sk-ant-oat01-rotated", (ACCT, ORG));
+
+    let fixture = expired_owned_without_a_plan(&server);
+    let output = fixture
+        .cmd()
+        .args(["claude", "status", "--json", "--refresh", "--timeout", "3s", "--account", EMAIL])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+
+    assert_eq!(token.calls(), 1);
+    assert_eq!(profile.calls(), 0, "a 9 s pass does not ask for the plan");
+    assert_eq!(only_row(&stdout)["state"], json!("ok"), "{stdout}");
+    let blob = stored_blob(&fixture);
+    assert_eq!(blob["claudeAiOauth"]["accessToken"], json!("sk-ant-oat01-rotated"));
+    assert_eq!(blob["claudeAiOauth"]["refreshToken"], json!("sk-ant-ort01-rotated"));
+    assert_eq!(blob["claudeAiOauth"].get("subscriptionType"), None);
+    assert_eq!(blob["claudeAiOauth"].get("rateLimitTier"), None);
+}

@@ -45,6 +45,8 @@ use crate::provider::claude::account::AccountState;
 use crate::provider::claude::credentials::Credentials;
 use crate::provider::claude::namespace::export_spelling;
 use crate::provider::claude::namespace::sha8;
+use crate::provider::claude::oauth::OauthError;
+use crate::provider::claude::oauth::Profile;
 use crate::provider::claude::oauth::TokenResponse;
 use crate::provider::claude::usage::RefreshError;
 use crate::provider::claude::usage::USAGE_PATH;
@@ -145,6 +147,13 @@ struct NeverRefresher;
 impl TokenRefresher for NeverRefresher {
     fn refresh(&self, _: &Credentials, _: &Cancel) -> Result<TokenResponse, RefreshError> {
         panic!("a fresh credential must not be refreshed")
+    }
+}
+
+/// The plan is asked only after a refresh, so it is never reached either.
+impl ProfileSource for NeverRefresher {
+    fn profile_of(&self, _: &Credentials, _: &Cancel) -> Result<Profile, OauthError> {
+        panic!("a credential that was not refreshed must not ask for its plan")
     }
 }
 
@@ -831,6 +840,7 @@ fn a_pass_whose_registry_cannot_be_read_reports_nothing_rather_than_no_accounts(
             UsageClient::new("http://127.0.0.1:1", "agctl/test", Duration::from_secs(1))
         }),
         refresher: Arc::new(NeverRefresher),
+        profiles: Arc::new(NeverRefresher),
         fault: Fault::none(),
     };
 
@@ -928,6 +938,7 @@ fn a_keychain_that_locks_between_passes_is_reported_on_the_next_one() {
             UsageClient::new(&base_url, "agctl/test", Duration::from_secs(5))
         }),
         refresher: Arc::new(NeverRefresher),
+        profiles: Arc::new(NeverRefresher),
         fault: Fault::none(),
     };
 

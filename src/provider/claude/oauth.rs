@@ -76,6 +76,7 @@ use crate::provider::claude::credentials::CLIENT_ID;
 use crate::provider::claude::credentials::Credentials;
 use crate::provider::claude::credentials::CredentialsError;
 use crate::provider::claude::credentials::DEFAULT_SCOPES;
+use crate::provider::claude::credentials::Identity;
 use crate::provider::claude::credentials::TokenAccount;
 use crate::runtime::coordinator::Cancel;
 
@@ -850,6 +851,103 @@ impl Profile {
     pub fn organization_name(&self) -> Option<&str> {
         self.document.get("organization")?.get("name")?.as_str()
     }
+
+    /// Whose profile this is, as an [`Identity`]: the two ids and nothing else.
+    ///
+    /// The email and the organization name stay `None`, so comparing a profile
+    /// with an exchange or a record copies no personal data into the value.
+    pub fn identity(&self) -> Identity {
+        Identity {
+            account_uuid: self.account_uuid.clone(),
+            organization_uuid: Some(self.organization_uuid.clone()),
+            email: None,
+            org_name: None,
+        }
+    }
+}
+
+/// Claude Code's `organization_type` → `subscriptionType` map, in its order.
+///
+/// From the S24c bundle lookup (ruling G10): the `dhe` map of Claude Code
+/// 2.1.270, which 2.1.152 writes as a `switch` over the same four entries.
+/// These four words are the only `subscriptionType` values Claude Code's own
+/// readers accept, so anything else maps to nothing rather than to a guess.
+const ORGANIZATION_PLANS: [(&str, &str); 4] = [
+    ("claude_max", "max"),
+    ("claude_pro", "pro"),
+    ("claude_enterprise", "enterprise"),
+    ("claude_team", "team"),
+];
+
+/// The plan a profile names, in Claude Code's own words (ruling G10).
+///
+/// `organization.organization_type`, matched exactly (case-sensitive, never
+/// trimmed) against [`ORGANIZATION_PLANS`]. Anything else, absent, `null` or
+/// not a string is `None`, as Claude Code 2.1.152 and 2.1.270 map it. Nothing
+/// is read in its place: not `seat_tier`, not `billing_type`, and no other
+/// endpoint's plan flags.
+pub fn plan_of(profile: &Profile) -> Option<String> {
+    let kind = profile.document.get("organization")?.get("organization_type")?.as_str()?;
+    ORGANIZATION_PLANS.iter().find(|(from, _)| *from == kind).map(|(_, plan)| (*plan).to_owned())
+}
+
+/// The rate-limit tier a profile names, when it is in Claude Code's own shape
+/// (ruling G9).
+///
+/// `organization.rate_limit_tier` of the same GET, verbatim, but only when
+/// [`plan_word`] admits it. The bound is what keeps `refresh_in_place`'s
+/// keychain line far inside `SECURITY_STDIN_LIMIT`, so a long server string
+/// cannot turn a refresh into refusal D after its POST has spent the grant.
+/// A refused value is logged by its length only: it is server text agctl did
+/// not validate, and no log line may be where it gets printed.
+pub fn rate_limit_tier_of(profile: &Profile) -> Option<String> {
+    let tier = profile.document.get("organization")?.get("rate_limit_tier")?.as_str()?;
+    if plan_word(tier) {
+        return Some(tier.to_owned());
+    }
+    tracing::debug!(
+        len = tier.len(),
+        "the rate-limit tier is not in Claude Code's shape; it was not recorded"
+    );
+    None
+}
+
+/// Whether a credential still lacks half of its plan, which is Claude Code's
+/// own gate for asking the profile at a refresh (ruling G2).
+///
+/// Either field absent asks. Both present never ask again (ruling G3), so a
+/// stored pair costs no GET at any later refresh.
+pub fn needs_plan(credentials: &Credentials) -> bool {
+    credentials.subscription_type.is_none() || credentials.rate_limit_tier.is_none()
+}
+
+/// Folds a profile's plan into a credential, per field `new ?? old`, as
+/// Claude Code's `aV` merges it (S24c bundle lookup).
+///
+/// A `Some` replaces what is stored. A `None` keeps it: an unmapped type, a
+/// refused tier or an absent organization never clears a plan, and nothing is
+/// invented (no default tier, and none derived from the plan). Both words are
+/// stored only through [`plan_word`].
+pub fn fill_plan(credentials: &mut Credentials, profile: &Profile) {
+    let plan = plan_of(profile).filter(|plan| plan_word(plan));
+    credentials.subscription_type = plan.or(credentials.subscription_type.take());
+    credentials.rate_limit_tier =
+        rate_limit_tier_of(profile).or(credentials.rate_limit_tier.take());
+}
+
+/// Whether `value` matches `^[a-z][a-z0-9_]{0,63}$`, Claude Code's own `vV`
+/// sanitiser for these words (ruling G9).
+///
+/// A byte check rather than a regex: one fixed pattern is not worth a
+/// dependency. A lowercase ASCII letter, then at most 63 lowercase letters,
+/// digits or underscores; 1 to 64 bytes in all.
+fn plan_word(value: &str) -> bool {
+    let Some((first, rest)) = value.as_bytes().split_first() else { return false };
+    rest.len() < 64
+        && first.is_ascii_lowercase()
+        && rest
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
 }
 
 impl std::fmt::Debug for Profile {

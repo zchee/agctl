@@ -44,7 +44,10 @@ use crate::config::new_record;
 use crate::provider::claude::credentials::CLIENT_ID;
 use crate::provider::claude::namespace::export_spelling;
 use crate::provider::claude::namespace::sha8;
+use crate::provider::claude::oauth::OauthError;
+use crate::provider::claude::oauth::Profile;
 use crate::provider::claude::oauth::TokenResponse;
+use crate::provider::claude::oauth::parse_profile;
 use crate::provider::claude::usage::USAGE_PATH;
 use crate::secret::KeychainStatus;
 use crate::secret::fake_reader::FakeReader;
@@ -196,6 +199,10 @@ fn discover_with(
 /// How a pass should be configured.
 struct Setup {
     refresher: Arc<dyn TokenRefresher>,
+    /// The profile endpoint. Unanswered by default, which is what an
+    /// unmatched mock does: every pre-S24c test refreshes a store whose blob
+    /// names no tier, so its one plan GET fails and changes nothing.
+    profiles: Arc<dyn ProfileSource>,
     readers: ReaderFactory,
     fault: Fault,
     options: Options,
@@ -206,6 +213,7 @@ impl Setup {
     fn new(server: &MockServer) -> Self {
         Self {
             refresher: Arc::new(HttpRefresher::new(server.url(TOKEN_PATH))),
+            profiles: Arc::new(CountingProfiles::unanswered()),
             readers: readers(Vec::new()),
             fault: Fault::none(),
             options: Options { refresh: false, no_cache: false },
@@ -226,6 +234,7 @@ fn pass(
         env: EnvView::with_home(store.home.clone()),
         client: UsageClient::new(&server.base_url(), "agctl/test", setup.timeout),
         refresher: setup.refresher,
+        profiles: setup.profiles,
         reader_factory: setup.readers,
         listing: found.listing,
         fault: setup.fault,
@@ -379,6 +388,105 @@ fn token_response(value: &Value) -> TokenResponse {
         organization: None,
         workspace: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// A `ProfileSource` that counts (S24c)
+// ---------------------------------------------------------------------------
+
+/// What a scripted profile endpoint answers, asked once per GET.
+type ProfileAnswer = Box<dyn Fn() -> Result<Profile, OauthError> + Send + Sync>;
+
+/// A profile endpoint that answers from a script and records, for every GET,
+/// the bearer it was asked with and what `observe` saw at that moment.
+///
+/// The bearer is what proves the call came after the POST: only the refresh
+/// can have handed it the rotated token. `observe` is how a test asks, from
+/// inside the call, whether a lock was held or a hold artefact existed.
+struct CountingProfiles {
+    answer: ProfileAnswer,
+    observe: Box<dyn Fn() -> bool + Send + Sync>,
+    seen: std::sync::Mutex<Vec<(String, bool)>>,
+}
+
+impl CountingProfiles {
+    fn new(answer: impl Fn() -> Result<Profile, OauthError> + Send + Sync + 'static) -> Self {
+        Self { answer: Box::new(answer), observe: Box::new(|| false), seen: Default::default() }
+    }
+
+    /// What an unmatched mock answers: a 404, which fills nothing.
+    fn unanswered() -> Self {
+        Self::new(|| Err(OauthError::Http { status: 404, body: "no profile mock".to_owned() }))
+    }
+
+    /// V14's document naming `acct`/`org`, whose `organization` block is
+    /// `organization` plus that `uuid`.
+    fn naming(acct: &'static str, org: &'static str, organization: Value) -> Self {
+        Self::new(move || {
+            let mut organization = organization.clone();
+            organization["uuid"] = json!(org);
+            Ok(parse_profile(json!({
+                "account": { "uuid": acct, "email": "profile@example.com" },
+                "organization": organization,
+            }))
+            .expect("the scripted document names V14's three members"))
+        })
+    }
+
+    /// The same, answering with the fixture's own plan.
+    fn with_the_plan() -> Self {
+        Self::naming(
+            ACCT,
+            ORG,
+            json!({ "organization_type": "claude_max", "rate_limit_tier": "default_claude_max_20x" }),
+        )
+    }
+
+    fn observing(mut self, observe: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.observe = Box::new(observe);
+        self
+    }
+
+    fn seen(&self) -> Vec<(String, bool)> {
+        self.seen.lock().expect("no GET panicked while recording").clone()
+    }
+
+    fn calls(&self) -> usize {
+        self.seen().len()
+    }
+}
+
+impl ProfileSource for CountingProfiles {
+    fn profile_of(
+        &self,
+        credentials: &Credentials,
+        _cancel: &Cancel,
+    ) -> Result<Profile, OauthError> {
+        let record = (credentials.authorization_header(), (self.observe)());
+        self.seen.lock().expect("no GET panicked while recording").push(record);
+        (self.answer)()
+    }
+}
+
+/// Whether an open file description other than this one holds the exclusive
+/// `flock` on `path` — the namespace lock's own primitive, and one a second
+/// description in this same process contends with like another process would.
+fn flock_is_held(path: &std::path::Path) -> bool {
+    let Ok(file) = fs::File::open(path) else { return false };
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {
+            let _ = rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+/// The blob on disk in the owned namespace, parsed.
+fn stored(store: &Store) -> Value {
+    let path = store.paths.namespace_dir(ACCT, ORG).join(CREDENTIALS_FILE);
+    serde_json::from_slice(&fs::read(&path).expect("the credential file should be readable"))
+        .expect("the credential file is JSON")
 }
 
 // ---------------------------------------------------------------------------
@@ -1318,6 +1426,7 @@ fn shared_listing(store: &Store, listing: Vec<ServiceEntry>) -> Shared {
         env: EnvView::with_home(store.home.clone()),
         client: UsageClient::new("http://127.0.0.1:1", "agctl/test", Duration::from_secs(1)),
         refresher: Arc::new(HttpRefresher::new("http://127.0.0.1:1/token".to_owned())),
+        profiles: Arc::new(CountingProfiles::unanswered()),
         reader_factory: readers(Vec::new()),
         listing,
         fault: Fault::none(),
@@ -1771,6 +1880,7 @@ fn a_cancelled_pass_returns_without_fetching() {
         env: EnvView::with_home(store.home.clone()),
         client: UsageClient::new(&server.base_url(), "agctl/test", Duration::from_secs(5)),
         refresher: Arc::new(HttpRefresher::new(server.url(TOKEN_PATH))),
+        profiles: Arc::new(CountingProfiles::unanswered()),
         reader_factory: readers(Vec::new()),
         listing: found.listing,
         fault: Fault::none(),
@@ -2111,4 +2221,569 @@ fn xq8_a_failing_live_row_is_never_folded_away() {
 
     let folded = status_rows(&outcomes, true);
     assert_eq!(kinds(&folded), ["live", "live+owned"], "the failing live row is still rendered");
+}
+
+// ---------------------------------------------------------------------------
+// S24c — the plan, asked once per credential after a refresh (`3ws`)
+// ---------------------------------------------------------------------------
+
+/// [`blob`] with no plan at all, the shape of a store logged in before S24c:
+/// neither `subscriptionType` nor `rateLimitTier`.
+fn blob_without_a_plan(access: &str, refresh: &str, expires_at_ms: i64) -> String {
+    let mut document: Value =
+        serde_json::from_str(&blob(access, refresh, expires_at_ms)).expect("the fixture is JSON");
+    if let Some(inner) = document["claudeAiOauth"].as_object_mut() {
+        inner.shift_remove("subscriptionType");
+    }
+    document.to_string()
+}
+
+/// [`blob`] with both fields stored, which no refresh has to ask about.
+fn blob_with_the_plan(access: &str, refresh: &str, expires_at_ms: i64) -> String {
+    let mut document: Value =
+        serde_json::from_str(&blob(access, refresh, expires_at_ms)).expect("the fixture is JSON");
+    document["claudeAiOauth"]["rateLimitTier"] = json!("default_claude_max_5x");
+    document.to_string()
+}
+
+/// A refresh mock whose token lands inside the refresh margin, so the pass
+/// after it refreshes again.
+fn token_inside_the_margin(server: &MockServer) -> Mock<'_> {
+    server.mock(|when, then| {
+        when.method(POST).path(TOKEN_PATH);
+        then.status(200).json_body(json!({
+            "access_token": "sk-ant-oat01-rotated",
+            "refresh_token": "sk-ant-ort01-rotated",
+            "token_type": "Bearer",
+            "expires_in": 60,
+            "scope": "user:inference user:profile",
+        }));
+    })
+}
+
+/// A per-request budget whose pass (three of them, 30 s) leaves the plan GET
+/// room well past S24c-R1's gate, so no row here is decided by the deadline.
+const ROOMY: Duration = Duration::from_secs(10);
+
+/// One `--refresh` pass over the store with `profiles` answering the plan.
+fn refresh_pass(
+    store: &Store,
+    server: &MockServer,
+    config: &AgctlConfig,
+    profiles: &Arc<CountingProfiles>,
+) -> Vec<RowOutcome> {
+    let found = discover_with(store, config, &FakeReader::unlocked());
+    let mut setup = Setup::new(server);
+    setup.profiles = Arc::clone(profiles) as Arc<dyn ProfileSource>;
+    setup.options = Options { refresh: true, no_cache: false };
+    setup.timeout = ROOMY;
+    pass(store, server, found, setup)
+}
+
+#[test]
+fn a_refresh_asks_the_profile_once_under_the_namespace_lock_and_saves_the_plan() {
+    // Ruling R-J's order on the file path, read off the call itself. The
+    // bearer it was asked with is the rotated token, so the POST came first;
+    // the namespace lock was held while it answered, so it ran under the
+    // guard; and the blob on disk carries both fields, so the save came after.
+    let store = store();
+    let server = MockServer::start();
+    usage_ok(&server);
+    let token = token_inside_the_margin(&server);
+
+    write_credential_file(
+        &store,
+        &blob_without_a_plan("sk-ant-oat01-stale", "sk-ant-ort01-stale", expired_at()),
+    );
+    let config = owned_config(&store);
+    let lock = store.paths.lock_path(ACCT, ORG);
+    let profiles =
+        Arc::new(CountingProfiles::with_the_plan().observing(move || flock_is_held(&lock)));
+
+    let rows = refresh_pass(&store, &server, &config, &profiles);
+    let row = owned_row(&rows);
+
+    token.assert_calls(1);
+    assert_eq!(
+        profiles.seen(),
+        vec![("Bearer sk-ant-oat01-rotated".to_owned(), true)],
+        "one GET, with the rotated token, while this namespace's lock was held"
+    );
+    assert_eq!(row.state, AccountState::Ok);
+    assert_eq!(row.plan, "max", "the Plan cell shows the filled value in the same pass");
+    let written = stored(&store);
+    assert_eq!(written["claudeAiOauth"]["accessToken"], json!("sk-ant-oat01-rotated"));
+    assert_eq!(written["claudeAiOauth"]["subscriptionType"], json!("max"));
+    assert_eq!(written["claudeAiOauth"]["rateLimitTier"], json!("default_claude_max_20x"));
+
+    // The token landed inside the margin, so this pass refreshes again; the
+    // plan it stored is not asked for a second time.
+    let rows = refresh_pass(&store, &server, &config, &profiles);
+    token.assert_calls(2);
+    assert_eq!(profiles.calls(), 1, "a credential whose plan is stored never asks again");
+    assert_eq!(owned_row(&rows).plan, "max");
+}
+
+/// What one refresh pass over an expired [`blob`] store left behind.
+struct FillOutcome {
+    calls: usize,
+    state: AccountState,
+    note: Option<String>,
+    lock_state: &'static str,
+    written: Value,
+}
+
+/// Runs one pass over an expired [`blob`] store — plan `max`, no tier — whose
+/// profile endpoint is `profiles`.
+fn one_refresh(profiles: CountingProfiles) -> FillOutcome {
+    let store = store();
+    let server = MockServer::start();
+    usage_ok(&server);
+    let token = token_ok(&server);
+    write_credential_file(&store, &blob("sk-ant-oat01-stale", "sk-ant-ort01-stale", expired_at()));
+    let config = owned_config(&store);
+    let profiles = Arc::new(profiles);
+
+    let rows = refresh_pass(&store, &server, &config, &profiles);
+    let row = owned_row(&rows);
+    token.assert_calls(1);
+    FillOutcome {
+        calls: profiles.calls(),
+        state: row.state.clone(),
+        note: row.note.clone(),
+        lock_state: row.lock_state,
+        written: stored(&store)["claudeAiOauth"].clone(),
+    }
+}
+
+/// One way a profile GET fails, built fresh for each row.
+type FailedGet = fn() -> OauthError;
+
+#[test]
+fn a_failed_plan_fetch_never_costs_the_save() {
+    // Ruling R-J: POST, then the plan best effort, then the save. Every way the
+    // GET can fail keeps both fields, saves the rotated pair all the same, and
+    // leaves the row exactly as a refresh whose profile named no plan leaves
+    // it: no state and no note of its own (ruling G5).
+    let baseline = one_refresh(CountingProfiles::naming(ACCT, ORG, json!({ "name": "Acme" })));
+    assert_eq!(baseline.calls, 1);
+    assert_eq!(baseline.state, AccountState::Ok, "the baseline is an ordinary refresh");
+    assert_eq!(baseline.note, None);
+
+    let failures: [(&str, FailedGet); 7] = [
+        ("401", || OauthError::Http { status: 401, body: "unauthorized".to_owned() }),
+        ("403", || OauthError::Http { status: 403, body: "forbidden".to_owned() }),
+        ("500", || OauthError::Http { status: 500, body: "internal".to_owned() }),
+        ("a timeout", || OauthError::Timeout),
+        ("a transport failure", || OauthError::Transport("connection refused".to_owned())),
+        ("a malformed body", || OauthError::Http {
+            status: 200,
+            body: "the profile response could not be parsed: `account.uuid` is missing".to_owned(),
+        }),
+        ("cancellation", || OauthError::Cancelled),
+    ];
+    for (row, error) in failures {
+        let outcome = one_refresh(CountingProfiles::new(move || Err(error())));
+        assert_eq!(outcome.calls, 1, "{row}: one GET, never retried");
+        assert_eq!(
+            outcome.written["accessToken"],
+            json!("sk-ant-oat01-rotated"),
+            "{row}: the rotated access token was saved"
+        );
+        assert_eq!(
+            outcome.written["refreshToken"],
+            json!("sk-ant-ort01-rotated"),
+            "{row}: and the rotated refresh token"
+        );
+        assert_eq!(outcome.written["subscriptionType"], json!("max"), "{row}: the plan is kept");
+        assert_eq!(outcome.written.get("rateLimitTier"), None, "{row}: and no tier appears");
+        assert_eq!(outcome.state, baseline.state, "{row}: the row's state is the baseline's");
+        assert_eq!(outcome.note, baseline.note, "{row}: and so is its note");
+        assert_eq!(outcome.lock_state, baseline.lock_state, "{row}: and its lock state");
+    }
+}
+
+#[test]
+fn a_refresh_that_needs_no_plan_asks_nothing() {
+    // Ruling G2's other half: a credential whose plan is stored, and every
+    // path that makes no POST, ask the profile nothing.
+
+    // Both fields stored: the refresh happens, the GET does not.
+    {
+        let store = store();
+        let server = MockServer::start();
+        usage_ok(&server);
+        let token = token_ok(&server);
+        write_credential_file(
+            &store,
+            &blob_with_the_plan("sk-ant-oat01-stale", "sk-ant-ort01-stale", expired_at()),
+        );
+        let profiles = Arc::new(CountingProfiles::with_the_plan());
+        let rows = refresh_pass(&store, &server, &owned_config(&store), &profiles);
+        token.assert_calls(1);
+        assert_eq!(profiles.calls(), 0, "both fields stored");
+        assert_eq!(
+            stored(&store)["claudeAiOauth"]["rateLimitTier"],
+            json!("default_claude_max_5x")
+        );
+        assert_eq!(owned_row(&rows).state, AccountState::Ok);
+    }
+
+    // `adopted` twice over: busy with a fresh re-read, and fresh already under
+    // the lock. Discovery sees the expired credential; a peer then replaces it
+    // with a fresh one before the pass reaches the lock.
+    for held in [true, false] {
+        let store = store();
+        let server = MockServer::start();
+        usage_ok(&server);
+        let token = token_ok(&server);
+        write_credential_file(
+            &store,
+            &blob_without_a_plan("sk-ant-oat01-stale", "sk-ant-ort01-stale", expired_at()),
+        );
+        let config = owned_config(&store);
+        let found = discover_with(&store, &config, &FakeReader::unlocked());
+        write_credential_file(
+            &store,
+            &blob_without_a_plan("sk-ant-oat01-peer", "sk-ant-ort01-peer", fresh_at()),
+        );
+        let holder = held.then(|| {
+            namespace_lock::acquire(
+                &store.paths,
+                ACCT,
+                ORG,
+                Instant::now() + Duration::from_secs(30),
+                &Cancel::new(),
+                Fault::none(),
+            )
+            .expect("an uncontended lock should be acquirable")
+        });
+
+        let profiles = Arc::new(CountingProfiles::with_the_plan());
+        let mut setup = Setup::new(&server);
+        setup.profiles = Arc::clone(&profiles) as Arc<dyn ProfileSource>;
+        setup.timeout = Duration::from_millis(300);
+        let rows = pass(&store, &server, found, setup);
+        drop(holder);
+
+        let row = owned_row(&rows);
+        assert_eq!(row.lock_state, "adopted", "held {held}: the peer's credential was adopted");
+        token.assert_calls(0);
+        assert_eq!(profiles.calls(), 0, "held {held}: no POST, so no GET");
+    }
+
+    // The pending-only call, which never refreshes even an expired credential.
+    let store = store();
+    write_credential_file(
+        &store,
+        &blob_without_a_plan("sk-ant-oat01-stale", "sk-ant-ort01-stale", expired_at()),
+    );
+    let config = owned_config(&store);
+    let record = config.accounts.first().expect("the fixture registers one account");
+    let profiles = Arc::new(CountingProfiles::with_the_plan());
+    let shared = Shared {
+        profiles: Arc::clone(&profiles) as Arc<dyn ProfileSource>,
+        ..shared_listing(&store, Vec::new())
+    };
+    let ctx = PassCtx::standalone(Cancel::new(), Instant::now() + Duration::from_secs(30));
+    let ns_dir = store.paths.namespace_dir(ACCT, ORG);
+    let result = under_namespace_lock(&ctx, &shared, record, &ns_dir, false);
+    assert!(result.credentials.is_some(), "the file's credential is handed back");
+    assert_eq!(profiles.calls(), 0, "a call that only resolves a pending asks nothing");
+    assert_eq!(stored(&store)["claudeAiOauth"]["accessToken"], json!("sk-ant-oat01-stale"));
+}
+
+#[test]
+fn a_profile_naming_another_account_fills_nothing() {
+    // Ruling G6 on the file path: the refreshed credential is saved, and a
+    // profile about somebody else — another account, or this account in
+    // another organization — puts nothing of its plan into it.
+    let elsewhere = "77777777-7777-4777-8777-777777777777";
+    for (row, profiles) in [
+        ("another account", CountingProfiles::naming(elsewhere, ORG, plan_json())),
+        ("another organization", CountingProfiles::naming(ACCT, elsewhere, plan_json())),
+    ] {
+        let outcome = one_refresh(profiles);
+        assert_eq!(outcome.calls, 1, "{row}");
+        assert_eq!(outcome.written["accessToken"], json!("sk-ant-oat01-rotated"), "{row}: saved");
+        assert_eq!(outcome.written["subscriptionType"], json!("max"), "{row}: not its `pro`");
+        assert_eq!(outcome.written.get("rateLimitTier"), None, "{row}: not its tier");
+        assert_eq!(outcome.state, AccountState::Ok, "{row}: never a refusal");
+    }
+}
+
+/// An organization naming a plan different from every fixture's `max`.
+fn plan_json() -> Value {
+    json!({ "organization_type": "claude_pro", "rate_limit_tier": "default_claude_max_5x" })
+}
+
+#[test]
+fn a_migrated_items_plan_is_asked_in_phase_b_with_nothing_held() {
+    // Ruling B6: `refresh_in_place` holds no agctl lock, and its Phase C is
+    // Claude Code's three-lock hold, where no network call may run
+    // (invariant I17). So the GET sits in Phase B: after the POST, with none
+    // of the hold's artefacts in existence and the namespace lock free. The
+    // pass then ends `busy` at the acquire — `lock_contended` is what a live
+    // session holding the primary looks like — so `write_item` is never
+    // reached and no `security` child is spawned.
+    let store = store();
+    let server = MockServer::start();
+    usage_ok(&server);
+    let token = token_ok(&server);
+
+    let ns_dir = store.paths.namespace_dir(ACCT, ORG);
+    fs::create_dir_all(&ns_dir).expect("the namespace directory should be creatable");
+    let service = migration_service(&store);
+    let items = vec![(
+        service.clone(),
+        blob("sk-ant-oat01-migrated", "sk-ant-ort01-migrated", expired_at()),
+    )];
+    let config = owned_config(&store);
+    let found = discover_with(&store, &config, &reader_with(&items));
+
+    let artefacts = [
+        ns_dir.join(".oauth_refresh.lock"),
+        store.paths.namespace_dir(ACCT, ORG).with_file_name(format!("{ORG}.lock")),
+        ns_dir.join(".storage-write"),
+    ];
+    let lock = store.paths.lock_path(ACCT, ORG);
+    let watched = artefacts.clone();
+    let profiles = Arc::new(CountingProfiles::with_the_plan().observing(move || {
+        watched.iter().all(|path| fs::symlink_metadata(path).is_err()) && !flock_is_held(&lock)
+    }));
+
+    let mut setup = Setup::new(&server);
+    setup.readers = readers(items);
+    setup.profiles = Arc::clone(&profiles) as Arc<dyn ProfileSource>;
+    setup.fault = Fault::from_list("lock_contended");
+    setup.timeout = ROOMY;
+    let rows = pass(&store, &server, found, setup);
+    let row = owned_row(&rows);
+
+    token.assert_calls(1);
+    assert_eq!(
+        profiles.seen(),
+        vec![("Bearer sk-ant-oat01-rotated".to_owned(), true)],
+        "one GET, after the POST, with nothing held"
+    );
+    assert_eq!(row.state, AccountState::Busy, "the acquire, not the plan, ended the pass");
+    assert_eq!(row.lock_state, "busy");
+    for artefact in &artefacts {
+        assert!(fs::symlink_metadata(artefact).is_err(), "`{}` was released", artefact.display());
+    }
+    assert!(namespace_entries(&store).is_empty(), "and no plaintext store was created");
+}
+
+// ---------------------------------------------------------------------------
+// S24c-R1 — the plan never costs the refreshed credential
+// ---------------------------------------------------------------------------
+
+/// The migrated item of this store, expired, planned `max` with no tier, and
+/// what discovery makes of it.
+fn expired_migrated_item(
+    store: &Store,
+) -> (Vec<(String, String)>, crate::provider::claude::discovery::Discovery) {
+    fs::create_dir_all(store.paths.namespace_dir(ACCT, ORG))
+        .expect("the namespace directory should be creatable");
+    let items = vec![(
+        migration_service(store),
+        blob("sk-ant-oat01-migrated", "sk-ant-ort01-migrated", expired_at()),
+    )];
+    let found = discover_with(store, &owned_config(store), &reader_with(&items));
+    (items, found)
+}
+
+/// One file-path refresh with `left` of the pass remaining: the profile GETs it
+/// made, and the blob it saved — which it always saves, whatever the gate did.
+fn file_path_refresh_with(left: Duration) -> (usize, Value) {
+    let store = store();
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    write_credential_file(
+        &store,
+        &blob_without_a_plan("sk-ant-oat01-stale", "sk-ant-ort01-stale", expired_at()),
+    );
+    let config = owned_config(&store);
+    let record = config.accounts.first().expect("the fixture registers one account");
+    let profiles = Arc::new(CountingProfiles::with_the_plan());
+    let shared = Shared {
+        refresher: Arc::new(HttpRefresher::new(server.url(TOKEN_PATH))),
+        profiles: Arc::clone(&profiles) as Arc<dyn ProfileSource>,
+        ..shared_listing(&store, Vec::new())
+    };
+    let ctx = PassCtx::standalone(Cancel::new(), Instant::now() + left);
+    let ns_dir = store.paths.namespace_dir(ACCT, ORG);
+
+    let result = under_namespace_lock(&ctx, &shared, record, &ns_dir, true);
+
+    token.assert_calls(1);
+    assert_eq!(result.state, None, "{left:?} left: an ordinary refresh, nothing refused");
+    let written = stored(&store)["claudeAiOauth"].clone();
+    assert_eq!(written["accessToken"], json!("sk-ant-oat01-rotated"), "{left:?}: saved");
+    assert_eq!(written["refreshToken"], json!("sk-ant-ort01-rotated"), "{left:?}: saved");
+    (profiles.calls(), written)
+}
+
+/// One migrated-item pass whose per-request budget is `timeout` — the pass
+/// gets three of them, as `status --timeout` does — ending `busy` at the
+/// acquire under `lock_contended`: the profile GETs it made.
+fn migrated_pass_with(timeout: Duration) -> usize {
+    let store = store();
+    let server = MockServer::start();
+    usage_ok(&server);
+    let token = token_ok(&server);
+    let (items, found) = expired_migrated_item(&store);
+    let profiles = Arc::new(CountingProfiles::with_the_plan());
+    let mut setup = Setup::new(&server);
+    setup.readers = readers(items);
+    setup.profiles = Arc::clone(&profiles) as Arc<dyn ProfileSource>;
+    setup.fault = Fault::from_list("lock_contended");
+    setup.timeout = timeout;
+    let rows = pass(&store, &server, found, setup);
+
+    token.assert_calls(1);
+    assert_eq!(owned_row(&rows).state, AccountState::Busy, "{timeout:?}: went on to the acquire");
+    profiles.calls()
+}
+
+#[test]
+fn a_refresh_too_close_to_its_deadline_saves_without_asking_the_plan() {
+    // S24c-R1 (1). The writer discards a staged file once the pass should stop,
+    // so a profile GET that ran the pass into its deadline would cost the
+    // refreshed credential. The plan is asked only with room for the whole GET
+    // and what follows it: on the file path `PROFILE_TIMEOUT` plus the last
+    // look's keychain read (`security_cli::READ_TIMEOUT`), 12 s. With 5 s left
+    // the refresh is saved and nothing is asked; with 30 s the same call asks.
+    for (left, asked) in [(Duration::from_secs(5), 0), (Duration::from_secs(30), 1)] {
+        let (calls, written) = file_path_refresh_with(left);
+        assert_eq!(calls, asked, "{left:?} left");
+        assert_eq!(written.get("rateLimitTier").is_some(), asked == 1, "{left:?} left");
+    }
+
+    // The migrated path keeps `claude_lock::HOLD_BUDGET` for its hold, 13 s in
+    // all. A 2 s per-request budget is a 6 s pass: the plan is not asked and
+    // the pass goes on to the acquire.
+    assert_eq!(migrated_pass_with(Duration::from_secs(2)), 0, "a 6 s pass asks nothing");
+}
+
+#[test]
+fn the_plan_gate_keeps_each_paths_own_allowance() {
+    // S24c-R1 (1)'s two thresholds, each pinned from both sides by half a
+    // second: 12 s on the file path (`PROFILE_TIMEOUT` + `security_cli::
+    // READ_TIMEOUT`), 13 s on the migrated path (`PROFILE_TIMEOUT` +
+    // `claude_lock::HOLD_BUDGET`). A gate that dropped the allowance, swapped
+    // the two, or inflated either would move a threshold across a row here.
+    for (left, asked) in [(Duration::from_secs(11), 0), (Duration::from_millis(12_500), 1)] {
+        assert_eq!(file_path_refresh_with(left).0, asked, "file path, {left:?} left");
+    }
+    // `--timeout 4200ms` is a 12.6 s pass, `--timeout 4500ms` a 13.5 s one.
+    for (timeout, asked) in [(Duration::from_millis(4200), 0), (Duration::from_millis(4500), 1)] {
+        assert_eq!(migrated_pass_with(timeout), asked, "migrated path, --timeout {timeout:?}");
+    }
+}
+
+#[test]
+fn a_plan_that_would_overflow_the_keychain_line_is_dropped_not_refused() {
+    // S24c-R1 (2). The two keys add up to 115 bytes of blob, 230 hex digits of
+    // fact F42's line. A credential whose line fits without the plan and not
+    // with it is written without it: the plan is never why a refresh ends in
+    // refusal D after its POST.
+    const ACCOUNT: &str = "example";
+    const SERVICE: &str = "Claude Code-credentials-0123abcd";
+    let sized = |padding: usize| {
+        let blob = json!({
+            "claudeAiOauth": {
+                "accessToken": format!("sk-ant-oat01-{}", "a".repeat(padding)),
+                "refreshToken": "sk-ant-ort01-sized",
+                "expiresAt": 1_900_000_000_000_i64,
+                "scopes": ["user:inference"],
+            }
+        });
+        Credentials::parse_blob(blob.to_string().as_bytes()).expect("the sized blob parses")
+    };
+    let planned = |padding: usize| {
+        let mut credentials = sized(padding);
+        credentials.subscription_type = Some("max".to_owned());
+        credentials.rate_limit_tier = Some("default_claude_max_20x".to_owned());
+        credentials
+    };
+    let fits =
+        |credentials: &Credentials| credentials.to_keychain_stdin_line(ACCOUNT, SERVICE).is_ok();
+    let padding = (0..keychain_write::SECURITY_STDIN_LIMIT)
+        .find(|&padding| fits(&sized(padding)) && !fits(&planned(padding)))
+        .expect("a size whose line fits without the plan and not with it");
+
+    let mut current = planned(padding);
+    let line = keychain_line(&mut current, (None, None), ACCOUNT, SERVICE);
+    assert!(line.is_ok(), "the line is built without the plan: {:?}", line.err());
+    assert_eq!(current.subscription_type, None, "the fill is reverted");
+    assert_eq!(current.rate_limit_tier, None, "both halves of it");
+
+    let mut current = planned(0);
+    assert!(keychain_line(&mut current, (None, None), ACCOUNT, SERVICE).is_ok());
+    assert_eq!(
+        current.rate_limit_tier.as_deref(),
+        Some("default_claude_max_20x"),
+        "a plan that fits stays"
+    );
+
+    let mut current = sized(padding + 200);
+    assert!(
+        matches!(
+            keychain_line(&mut current, (None, None), ACCOUNT, SERVICE),
+            Err(KeychainWriteError::LineTooLong { .. })
+        ),
+        "a line too long without any plan is still refusal D"
+    );
+
+    // Through a whole pass: the item names `max` and no tier, the profile adds
+    // the tier, and the refreshed line fits only without it. The pass goes on
+    // to the acquire (`busy` under `lock_contended`) instead of refusing D.
+    let store = store();
+    let server = MockServer::start();
+    usage_ok(&server);
+    let (items, found) = expired_migrated_item(&store);
+    let (service, item) = items[0].clone();
+    let account = crate::secret::current_account();
+    let answer = |padding: usize| {
+        json!({
+            "access_token": format!("sk-ant-oat01-{}", "a".repeat(padding)),
+            "refresh_token": "sk-ant-ort01-rotated",
+            "token_type": "Bearer",
+            "expires_in": 28_800,
+            "refresh_token_expires_in": 2_377_445,
+            "scope": "user:inference user:profile",
+        })
+    };
+    let refreshed_fits = |padding: usize, tier: Option<&str>| {
+        let mut credentials = Credentials::parse_blob(item.as_bytes()).expect("the item parses");
+        credentials
+            .merge_refresh(token_response(&answer(padding)), now_millis())
+            .expect("the answer merges");
+        credentials.rate_limit_tier = tier.map(str::to_owned);
+        credentials.to_keychain_stdin_line(&account, &service).is_ok()
+    };
+    let padding = (0..keychain_write::SECURITY_STDIN_LIMIT)
+        .find(|&padding| {
+            refreshed_fits(padding, None)
+                && !refreshed_fits(padding, Some("default_claude_max_20x"))
+        })
+        .expect("a token whose refreshed line fits without the tier and not with it");
+    let body = answer(padding);
+    let token = server.mock(|when, then| {
+        when.method(POST).path(TOKEN_PATH);
+        then.status(200).json_body(body);
+    });
+    let profiles = Arc::new(CountingProfiles::with_the_plan());
+    let mut setup = Setup::new(&server);
+    setup.readers = readers(items);
+    setup.profiles = Arc::clone(&profiles) as Arc<dyn ProfileSource>;
+    setup.fault = Fault::from_list("lock_contended");
+    setup.timeout = ROOMY;
+    let rows = pass(&store, &server, found, setup);
+    let row = owned_row(&rows);
+
+    token.assert_calls(1);
+    assert_eq!(profiles.calls(), 1, "the plan was asked, and filled");
+    assert_eq!(row.state, AccountState::Busy, "no refusal D: the line went on without the plan");
 }

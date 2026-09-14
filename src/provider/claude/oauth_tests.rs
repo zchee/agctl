@@ -914,3 +914,248 @@ fn deadline(seconds: u64) -> Instant {
     let now = Instant::now();
     now.checked_add(Duration::from_secs(seconds)).unwrap_or(now)
 }
+
+// ---------------------------------------------------------------------------
+// S24c: the plan a profile names (rulings G1–G10 of the S24c contract)
+// ---------------------------------------------------------------------------
+
+/// A profile whose `organization` block is `organization`, plus the `uuid`
+/// V14 requires, so the document still names the account.
+fn profile_with(organization: serde_json::Value) -> Profile {
+    let mut organization = organization;
+    organization["uuid"] = serde_json::json!("22222222-2222-4222-8222-222222222222");
+    parse_profile(serde_json::json!({
+        "account": { "uuid": "11111111-1111-4111-8111-111111111111", "email": "p@example.com" },
+        "organization": organization,
+    }))
+    .expect("the fixture names V14's three members")
+}
+
+/// A profile whose document has no `organization` block at all.
+///
+/// Built by hand: [`parse_profile`] requires `organization.uuid`, so a real
+/// fetch never hands one of these over, and the plan readers must still not
+/// trip on it.
+fn profile_without_an_organization() -> Profile {
+    Profile {
+        account_uuid: "11111111-1111-4111-8111-111111111111".to_owned(),
+        email: "p@example.com".to_owned(),
+        organization_uuid: "22222222-2222-4222-8222-222222222222".to_owned(),
+        document: serde_json::json!({ "account": { "uuid": "11111111-1111-4111-8111-111111111111" } }),
+    }
+}
+
+/// Stored credentials carrying exactly this plan.
+fn credentials_with(plan: Option<&str>, tier: Option<&str>) -> Credentials {
+    let mut credentials = stored_credentials();
+    credentials.subscription_type = plan.map(str::to_owned);
+    credentials.rate_limit_tier = tier.map(str::to_owned);
+    credentials
+}
+
+/// A tier of exactly `len` bytes from G9's alphabet, starting with a letter.
+fn tier_of_length(len: usize) -> String {
+    let body: String = "b0_".chars().cycle().take(len.saturating_sub(1)).collect();
+    format!("a{body}")
+}
+
+#[test]
+fn plan_of_maps_the_four_organization_types_and_nothing_else() {
+    // Claude Code's `dhe` map (the S24c bundle lookup, 2.1.152 and 2.1.270),
+    // matched exactly: the four types and their words, and `None` for every
+    // other spelling, including the ones that differ only in case or in
+    // whitespace, which a lenient match would take.
+    let mapped = [
+        ("claude_max", "max"),
+        ("claude_pro", "pro"),
+        ("claude_enterprise", "enterprise"),
+        ("claude_team", "team"),
+    ];
+    for (organization_type, plan) in mapped {
+        let profile = profile_with(serde_json::json!({ "organization_type": organization_type }));
+        assert_eq!(plan_of(&profile).as_deref(), Some(plan), "`{organization_type}`");
+    }
+    // Every word the map can produce is one G9's bound admits, so a future
+    // entry could not smuggle an unshaped word past `fill_plan`.
+    assert_eq!(ORGANIZATION_PLANS.len(), mapped.len(), "the map is exactly the four entries");
+    for (_, plan) in ORGANIZATION_PLANS {
+        assert!(plan_word(plan), "`{plan}` passes `plan_word`");
+    }
+
+    let unmapped = [
+        ("an unmapped type", serde_json::json!({ "organization_type": "claude_free" })),
+        ("an empty string", serde_json::json!({ "organization_type": "" })),
+        ("another case", serde_json::json!({ "organization_type": "CLAUDE_MAX" })),
+        ("a leading space", serde_json::json!({ "organization_type": " claude_max" })),
+        ("a number", serde_json::json!({ "organization_type": 7 })),
+        ("null", serde_json::json!({ "organization_type": null })),
+        ("an absent type", serde_json::json!({ "name": "Acme" })),
+    ];
+    for (row, organization) in unmapped {
+        assert_eq!(plan_of(&profile_with(organization)), None, "{row}");
+    }
+    assert_eq!(plan_of(&profile_without_an_organization()), None, "an absent organization");
+}
+
+#[test]
+fn rate_limit_tier_is_stored_only_in_claude_codes_own_shape() {
+    // Ruling G9: `^[a-z][a-z0-9_]{0,63}$`, Claude Code's own `vV`. A value in
+    // that shape is stored verbatim; anything else is `None`, never a
+    // truncated or lower-cased copy of what the server sent.
+    let longest = tier_of_length(64);
+    assert_eq!(longest.len(), 64, "the fixture is the maximum length");
+    for accepted in
+        [longest.as_str(), "default_claude_max_20x", "default_claude_max_5x", "default_claude_zero"]
+    {
+        let profile = profile_with(serde_json::json!({ "rate_limit_tier": accepted }));
+        assert_eq!(rate_limit_tier_of(&profile).as_deref(), Some(accepted), "`{accepted}`");
+    }
+
+    let too_long = tier_of_length(65);
+    assert_eq!(too_long.len(), 65, "one byte past the bound");
+    let refused = [
+        ("65 bytes", serde_json::json!(too_long)),
+        ("uppercase", serde_json::json!("Default_claude_max_20x")),
+        ("a slash", serde_json::json!("default/claude")),
+        ("empty", serde_json::json!("")),
+        ("a leading digit", serde_json::json!("1tier")),
+        ("a leading underscore", serde_json::json!("_tier")),
+        ("a space", serde_json::json!("default tier")),
+        ("a non-ASCII letter", serde_json::json!("défault")),
+        ("null", serde_json::json!(null)),
+        ("a number", serde_json::json!(20)),
+        ("an object", serde_json::json!({ "tier": "default" })),
+    ];
+    for (row, tier) in refused {
+        let profile = profile_with(serde_json::json!({ "rate_limit_tier": tier }));
+        assert_eq!(rate_limit_tier_of(&profile), None, "{row}");
+    }
+    assert_eq!(
+        rate_limit_tier_of(&profile_with(serde_json::json!({ "name": "Acme" }))),
+        None,
+        "an absent tier"
+    );
+    assert_eq!(rate_limit_tier_of(&profile_without_an_organization()), None, "no organization");
+
+    // An organization that names its plan and no tier gets no tier: nothing is
+    // derived from the plan and there is no default.
+    let plan_only = profile_with(serde_json::json!({ "organization_type": "claude_max" }));
+    assert_eq!(rate_limit_tier_of(&plan_only), None);
+    let mut credentials = credentials_with(None, None);
+    fill_plan(&mut credentials, &plan_only);
+    assert_eq!(credentials.subscription_type.as_deref(), Some("max"));
+    assert_eq!(credentials.rate_limit_tier, None, "no tier is invented");
+}
+
+#[test]
+fn a_profile_fills_the_plan_and_a_silent_one_clears_nothing() {
+    // Claude Code's `aV`: per field `new ?? old`. A `Some` replaces, a `None`
+    // keeps — so a profile that names nothing never costs a stored plan.
+    let full = profile_with(serde_json::json!({
+        "organization_type": "claude_max",
+        "rate_limit_tier": "default_claude_max_20x",
+    }));
+    let silent = profile_with(serde_json::json!({ "name": "Acme" }));
+    let over_long = profile_with(serde_json::json!({
+        "organization_type": "claude_free",
+        "rate_limit_tier": tier_of_length(65),
+    }));
+
+    let rows = [
+        (
+            "both absent, both filled",
+            (None, None),
+            &full,
+            (Some("max"), Some("default_claude_max_20x")),
+        ),
+        (
+            "a stored plan is replaced by the one the profile names",
+            (Some("pro"), Some("default_claude_max_5x")),
+            &full,
+            (Some("max"), Some("default_claude_max_20x")),
+        ),
+        (
+            "an empty organization keeps both",
+            (Some("pro"), Some("default_claude_max_5x")),
+            &silent,
+            (Some("pro"), Some("default_claude_max_5x")),
+        ),
+        (
+            "an unmapped type and an over-long tier keep both",
+            (Some("team"), Some("default_claude_zero")),
+            &over_long,
+            (Some("team"), Some("default_claude_zero")),
+        ),
+        ("nothing stored and nothing named stays nothing", (None, None), &silent, (None, None)),
+    ];
+    for (row, (plan, tier), profile, (want_plan, want_tier)) in rows {
+        let mut credentials = credentials_with(plan, tier);
+        fill_plan(&mut credentials, profile);
+        assert_eq!(credentials.subscription_type.as_deref(), want_plan, "{row}");
+        assert_eq!(credentials.rate_limit_tier.as_deref(), want_tier, "{row}");
+    }
+}
+
+#[test]
+fn needs_plan_asks_while_either_field_is_absent() {
+    // Ruling G2, Claude Code's refresh gate: either field null asks.
+    let rows = [
+        ((None, None), true),
+        ((Some("max"), None), true),
+        ((None, Some("default_claude_max_20x")), true),
+        ((Some("max"), Some("default_claude_max_20x")), false),
+    ];
+    for ((plan, tier), asks) in rows {
+        assert_eq!(needs_plan(&credentials_with(plan, tier)), asks, "plan {plan:?}, tier {tier:?}");
+    }
+}
+
+#[test]
+fn a_profiles_identity_is_its_two_ids_and_nothing_else() {
+    let profile = profile_with(serde_json::json!({ "name": "Acme" }));
+    assert_eq!(profile.organization_name(), Some("Acme"), "the document names the organization");
+    assert_eq!(
+        profile.identity(),
+        Identity {
+            account_uuid: "11111111-1111-4111-8111-111111111111".to_owned(),
+            organization_uuid: Some("22222222-2222-4222-8222-222222222222".to_owned()),
+            email: None,
+            org_name: None,
+        },
+        "the email and the organization name are not copied into the identity"
+    );
+}
+
+#[test]
+fn the_exchange_fixture_is_byte_unchanged_and_names_no_plan() {
+    // The `3ws` acceptance (B17): the token endpoint supplies neither field,
+    // so the capture carries no plan, and S24c did not add one to make a test
+    // pass. The hash pins every byte.
+    let bytes = fixture_bytes();
+    assert_eq!(
+        hex::encode(Sha256::digest(&bytes)),
+        "21b5c5f0064acb5984ce43cc7c3f9817c14aa077ed7e7e8dc8f98919180d283d",
+        "fixtures/claude/exchange-response.json changed"
+    );
+
+    fn keys(value: &serde_json::Value, found: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, inner) in map {
+                    found.push(key.clone());
+                    keys(inner, found);
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|item| keys(item, found)),
+            _ => {}
+        }
+    }
+    let document: serde_json::Value = serde_json::from_slice(&bytes).expect("the fixture is JSON");
+    let mut found = Vec::new();
+    keys(&document, &mut found);
+    for key in &found {
+        for forbidden in ["subscription", "rate_limit", "organization_type"] {
+            assert!(!key.contains(forbidden), "the capture carries a `{key}` key");
+        }
+    }
+}

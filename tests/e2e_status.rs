@@ -16,6 +16,7 @@
 mod common;
 
 use std::fs;
+use std::time::Duration;
 
 use common::ACCT;
 use common::EMAIL;
@@ -35,6 +36,8 @@ use jiff::tz::TimeZone;
 use predicates::str::contains;
 use serde_json::Value;
 use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
 
 /// The mock that answers a usage GET with the captured body.
 fn usage_ok(server: &MockServer) -> Mock<'_> {
@@ -1081,4 +1084,262 @@ fn xq8_the_flag_does_not_change_the_json_report_at_all() {
         }
     }
     assert_eq!(plain, folded, "`--by-identity` is a table flag and nothing else");
+}
+
+// ---------------------------------------------------------------------------
+// The plan (`agctl-p3-plan-column-owned-accounts-3ws`, S24c)
+// ---------------------------------------------------------------------------
+
+/// How long a test waits for the plan GET once the POST has been seen: well
+/// under the fault's own 10 s `PAUSE_BUDGET`, so a GET that only comes after
+/// the pause gives up times this wait out instead of arriving inside it.
+const PAUSED_BUDGET: Duration = Duration::from_secs(5);
+
+/// A hand-built blob with no plan at all — neither `subscriptionType` nor
+/// `rateLimitTier` — the shape of a store logged in before S24c.
+fn blob_without_a_plan(access: &str, refresh: &str, expires_at_ms: i64) -> String {
+    json!({
+        "claudeAiOauth": {
+            "accessToken": access,
+            "refreshToken": refresh,
+            "expiresAt": expires_at_ms,
+            "scopes": ["user:inference", "user:profile"],
+            "tokenAccount": {
+                "uuid": ACCT,
+                "emailAddress": EMAIL,
+                "organizationUuid": ORG,
+                "organizationName": "Acme",
+            },
+        }
+    })
+    .to_string()
+}
+
+/// A refresh mock whose token lands inside the five-minute refresh margin, so
+/// every pass after it refreshes again.
+fn token_inside_the_margin(server: &MockServer) -> Mock<'_> {
+    server.mock(|when, then| {
+        when.method(POST).path(common::TOKEN_PATH);
+        then.status(200).json_body(json!({
+            "access_token": "sk-ant-oat01-rotated",
+            "refresh_token": "sk-ant-ort01-rotated",
+            "token_type": "Bearer",
+            "expires_in": 60,
+            "scope": "user:inference user:profile",
+        }));
+    })
+}
+
+/// The owned row's `Plan` cell in a rendered table.
+fn plan_cell(stdout: &str) -> String {
+    let headings = cells_of(stdout, "Weekly reset");
+    let plan = headings.iter().position(|h| h == "Plan").expect("`Plan` is a heading");
+    cells_of(stdout, EMAIL)[plan].clone()
+}
+
+/// One table pass over the owned row, which must succeed.
+fn table_pass(fixture: &Fixture, refresh: bool) -> String {
+    let mut command = fixture.cmd();
+    command.args(["claude", "status", "--account", EMAIL]);
+    if refresh {
+        command.arg("--refresh");
+    }
+    let output = command.assert().success().get_output().clone();
+    String::from_utf8(output.stdout).expect("stdout is UTF-8")
+}
+
+/// The owned namespace's credential file, parsed.
+fn stored_blob(fixture: &Fixture) -> Value {
+    let text = fs::read_to_string(fixture.credentials_path(ACCT, ORG)).expect("readable");
+    serde_json::from_str(&text).expect("the credential file is JSON")
+}
+
+/// `sha256` of the exchange capture, which S24c must leave byte-identical.
+fn exchange_fixture_sha256() -> String {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/claude/exchange-response.json");
+    hex::encode(Sha256::digest(fs::read(path).expect("the exchange fixture is readable")))
+}
+
+/// Plants the live `.claude.json` through its link, with no `oauthAccount` —
+/// so no live row can answer the owned row's `--account` — and returns it.
+fn plant_claude_json(fixture: &Fixture) -> std::path::PathBuf {
+    let mut document = common::live_config_document();
+    document.as_object_mut().expect("the document is an object").shift_remove("oauthAccount");
+    fixture.live_through_link();
+    fixture.live_claude_json_js(&document)
+}
+
+#[test]
+fn an_owned_row_shows_its_plan_after_one_refresh() {
+    // The `3ws` acceptance: an Owned row shows its plan after one refresh,
+    // and the exchange fixture is unchanged. The token lands inside the
+    // refresh margin, so the second pass refreshes too — and asks nothing,
+    // which is the once-per-credential proof.
+    let server = MockServer::start();
+    let _usage = usage_ok(&server);
+    let token = token_inside_the_margin(&server);
+    let profile = common::mock_profile(&server, "sk-ant-oat01-rotated", (ACCT, ORG));
+
+    let mut fixture = Fixture::new();
+    fixture.endpoints(&server.base_url());
+    fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
+    let config = plant_claude_json(&fixture);
+    let config_before = fs::read(&config).expect("the planted `.claude.json` is readable");
+    let exchange_before = exchange_fixture_sha256();
+
+    // Before any refresh: a store logged in before S24c renders no plan.
+    fixture.write_credentials(
+        ACCT,
+        ORG,
+        &blob_without_a_plan("sk-ant-oat01-fresh", "sk-ant-ort01-fresh", common::fresh_at()),
+    );
+    let stdout = table_pass(&fixture, false);
+    assert_eq!(plan_cell(&stdout), "—", "no refresh, no plan:\n{stdout}");
+    assert_eq!((token.calls(), profile.calls()), (0, 0));
+
+    // Pass 1: the refresh asks the profile once and the cell shows its plan.
+    fixture.write_credentials(
+        ACCT,
+        ORG,
+        &blob_without_a_plan("sk-ant-oat01-stale", "sk-ant-ort01-stale", common::expired_at()),
+    );
+    let stdout = table_pass(&fixture, true);
+    assert_eq!(plan_cell(&stdout), "max", "the plan shows after one refresh:\n{stdout}");
+    assert_eq!(token.calls(), 1);
+    assert_eq!(profile.calls(), 1);
+    let blob = stored_blob(&fixture);
+    assert_eq!(blob["claudeAiOauth"]["subscriptionType"], json!("max"));
+    assert_eq!(blob["claudeAiOauth"]["rateLimitTier"], json!("default_claude_max_20x"));
+
+    // Pass 2: refreshed again, not asked again.
+    let stdout = table_pass(&fixture, true);
+    assert_eq!(plan_cell(&stdout), "max", "{stdout}");
+    assert_eq!(token.calls(), 2, "the second pass refreshed too");
+    assert_eq!(profile.calls(), 1, "and did not ask for a plan it already stores");
+
+    assert_eq!(exchange_fixture_sha256(), exchange_before, "the exchange fixture is unchanged");
+    assert_eq!(
+        exchange_before, "21b5c5f0064acb5984ce43cc7c3f9817c14aa077ed7e7e8dc8f98919180d283d",
+        "and is the capture the `3ws` acceptance names"
+    );
+    assert_eq!(fs::read(&config).expect("readable"), config_before, "`.claude.json` untouched");
+}
+
+#[test]
+fn an_unmapped_organization_is_asked_again_at_each_refresh() {
+    // Ruling G1: an `organization_type` outside Claude Code's four stays
+    // `None` and is asked again at every refresh, as Claude Code's own gate
+    // does; the well-shaped tier that came with it is stored.
+    let server = MockServer::start();
+    let _usage = usage_ok(&server);
+    let token = token_inside_the_margin(&server);
+    let profile = common::mock_profile_organization(
+        &server,
+        "sk-ant-oat01-rotated",
+        (ACCT, ORG),
+        json!({ "organization_type": "claude_free", "rate_limit_tier": "default_claude_max_5x" }),
+    );
+
+    let mut fixture = Fixture::new();
+    fixture.endpoints(&server.base_url());
+    fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
+    fixture.write_credentials(
+        ACCT,
+        ORG,
+        &blob_without_a_plan("sk-ant-oat01-stale", "sk-ant-ort01-stale", common::expired_at()),
+    );
+
+    for pass in 1..=2 {
+        let stdout = table_pass(&fixture, true);
+        assert_eq!(plan_cell(&stdout), "—", "pass {pass}: no plan to show:\n{stdout}");
+        assert_eq!(token.calls(), pass, "pass {pass} refreshed");
+        assert_eq!(profile.calls(), pass, "pass {pass} asked again");
+    }
+    let blob = stored_blob(&fixture);
+    assert_eq!(blob["claudeAiOauth"].get("subscriptionType"), None);
+    assert_eq!(blob["claudeAiOauth"]["rateLimitTier"], json!("default_claude_max_5x"));
+}
+
+#[test]
+fn a_migrated_items_plan_is_asked_before_the_hold_and_written_with_the_refresh() {
+    // Ruling B6 on the migrated path, from outside the process. The GET runs
+    // in Phase B, holding nothing: `pause_before_migrated_write` stops the
+    // process after the line is built and before the three locks, and the
+    // plan GET has to have arrived by then with no hold artefact in
+    // existence. A GET inside the hold would arrive only after the resume.
+    // The write that follows carries the plan into the item.
+    //
+    // This test is named in `common::KEYCHAIN_WRITE_TESTS`: it writes the
+    // namespaced item once, so it records nothing into the aggregate.
+    let server = MockServer::start();
+    let _usage = usage_ok(&server);
+    let token = token_ok(&server);
+    let profile = common::mock_profile(&server, "sk-ant-oat01-rotated", (ACCT, ORG));
+
+    let mut fixture = Fixture::new();
+    fixture.with_keychain().endpoints(&server.base_url());
+    fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
+    fs::create_dir_all(fixture.ns_dir(ACCT, ORG)).expect("the namespace should be creatable");
+    let service = common::migration_service(&fixture.ns_dir(ACCT, ORG));
+    fixture.dump(&[&service]);
+    fixture.keychain_item(
+        &service,
+        &blob_without_a_plan(
+            "sk-ant-oat01-migrated",
+            "sk-ant-ort01-migrated",
+            common::expired_at(),
+        ),
+    );
+    fixture.allow_write(&service);
+    let resume = fixture.scratch("resume");
+
+    let child = fixture
+        .raw()
+        .args(["claude", "status", "--refresh", "--timeout", "30s", "--account", EMAIL])
+        .env("AGCTL_FAULT", "pause_before_migrated_write")
+        .env("AGCTL_FAULT_RESUME", &resume)
+        .spawn()
+        .expect("agctl should start");
+
+    assert!(
+        common::wait_until(Duration::from_secs(20), || token.calls() == 1),
+        "the refresh POST should have gone out before the pause"
+    );
+    let asked = common::wait_until(PAUSED_BUDGET, || profile.calls() == 1);
+    let held: Vec<String> = fixture
+        .hold_artefacts(ACCT, ORG)
+        .iter()
+        .filter(|artefact| fs::symlink_metadata(artefact).is_ok())
+        .map(|artefact| artefact.display().to_string())
+        .collect();
+    fs::write(&resume, "go").expect("the resume file should be writable");
+    let finished = common::finish(child);
+
+    assert!(asked, "the plan GET should arrive before the hold, while the process waits");
+    assert!(held.is_empty(), "with no hold artefact in existence: {held:?}");
+    assert_eq!(finished.code(), 0, "stderr:\n{}", finished.stderr);
+    assert_eq!(token.calls(), 1);
+    assert_eq!(profile.calls(), 1, "asked once");
+
+    let item: Value = serde_json::from_str(
+        &fs::read_to_string(fixture.keychain_item_path(&service)).expect("the item is readable"),
+    )
+    .expect("the item holds a blob");
+    let inner = &item["claudeAiOauth"];
+    assert_eq!(inner["accessToken"], json!("sk-ant-oat01-rotated"), "the refresh was written");
+    assert_eq!(inner["subscriptionType"], json!("max"), "with the plan");
+    assert_eq!(inner["rateLimitTier"], json!("default_claude_max_20x"), "and the tier");
+
+    // Exactly what `security` was asked, as for the in-place refresh without
+    // a plan: one preflight, one listing, seven reads and the write, which the
+    // stand-in logs twice. The plan is a GET and adds no invocation.
+    let calls = fixture.security_log();
+    assert_eq!(calls.len(), 11, "the exact set of `security` invocations: {calls:?}");
+    let writes = calls.iter().filter(|line| line.starts_with("add-generic-password")).count();
+    assert_eq!(writes, 1, "one write, logged once as a parsed line: {calls:?}");
+    assert!(
+        fixture.namespace_entries(ACCT, ORG).is_empty(),
+        "the plaintext store was not resurrected: {:?}",
+        fixture.namespace_entries(ACCT, ORG)
+    );
 }

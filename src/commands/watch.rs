@@ -71,6 +71,7 @@ use crate::commands::status::RowOutcome;
 use crate::commands::status::Shared;
 use crate::commands::status::collect;
 use crate::commands::status::current_fault;
+use crate::commands::status::default_profile_source;
 use crate::commands::status::default_refresher;
 use crate::commands::status::production_readers;
 use crate::config::AgctlConfig;
@@ -78,6 +79,7 @@ use crate::config::paths::Paths;
 use crate::error::AppError;
 use crate::provider::claude::discovery;
 use crate::provider::claude::namespace::EnvView;
+use crate::provider::claude::usage::ProfileSource;
 use crate::provider::claude::usage::TokenRefresher;
 use crate::provider::claude::usage::UsageClient;
 use crate::runtime::cleanup;
@@ -190,6 +192,7 @@ pub struct Session {
     reader_factory: ReaderFactory,
     client_factory: ClientFactory,
     refresher: Arc<dyn TokenRefresher>,
+    profiles: Arc<dyn ProfileSource>,
     fault: Fault,
 }
 
@@ -217,6 +220,7 @@ impl Session {
             reader_factory: production_readers(),
             client_factory: Arc::new(|| UsageClient::from_env(REQUEST_TIMEOUT)),
             refresher: default_refresher()?,
+            profiles: default_profile_source()?,
             fault: current_fault(),
         })
     }
@@ -250,6 +254,7 @@ impl Pass for Session {
             env: self.env.clone(),
             client: (self.client_factory)(),
             refresher: Arc::clone(&self.refresher),
+            profiles: Arc::clone(&self.profiles),
             reader_factory: Arc::clone(&self.reader_factory),
             listing: found.listing,
             fault: self.fault.clone(),

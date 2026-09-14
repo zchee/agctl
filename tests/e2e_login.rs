@@ -492,3 +492,85 @@ fn m3m0_no_duplicate_lets_a_login_into_any_other_account_through() {
     // every owned account the same address (`agctl-p95`).
     assert_eq!(registry(&fixture)["accounts"][0]["account_uuid"], json!(EXCHANGE_ACCT));
 }
+
+// ---------------------------------------------------------------------------
+// The plan (`agctl-p3-plan-column-owned-accounts-3ws`, S24c)
+// ---------------------------------------------------------------------------
+
+/// The credential file the exchange's pair lands in, parsed.
+fn stored_blob(fixture: &Fixture) -> Value {
+    let path = fixture.ns_dir(EXCHANGE_ACCT, EXCHANGE_ORG).join(".credentials.json");
+    serde_json::from_str(&fs::read_to_string(&path).expect("the credential file should exist"))
+        .expect("the credential file is JSON")
+}
+
+#[test]
+fn login_records_the_plan_from_the_profile() {
+    // The `3ws` acceptance at login: one profile GET with the minted token,
+    // and the plan it names stored in the blob beside the pair. The exchange
+    // fixture carries neither field, and the live `.claude.json` is read for
+    // the identity notice and never written.
+    let server = MockServer::start();
+    let token = exchange(&server, Some(EXCHANGE_ORG));
+    let profile =
+        common::mock_profile(&server, "sk-ant-oat01-minted", (EXCHANGE_ACCT, EXCHANGE_ORG));
+
+    let mut fixture = Fixture::new();
+    fixture.endpoints(&server.base_url());
+    fixture.live_through_link();
+    let config = fixture.live_claude_json_js(&common::live_config_document());
+    let before = fs::read(&config).expect("the planted `.claude.json` is readable");
+
+    let mut session = common::start_login(&fixture, &[], &[]);
+    let state = session.state.clone();
+    session.paste(&format!("minted-code#{state}"));
+    let finished = session.finish();
+
+    assert_eq!(finished.code(), 0, "stderr:\n{}", finished.stderr);
+    assert_eq!(token.calls(), 1);
+    assert_eq!(profile.calls(), 1, "one GET, with the token the exchange minted");
+    let blob = stored_blob(&fixture);
+    assert_eq!(blob["claudeAiOauth"]["subscriptionType"], json!("max"));
+    assert_eq!(blob["claudeAiOauth"]["rateLimitTier"], json!("default_claude_max_20x"));
+    assert_eq!(
+        blob["claudeAiOauth"]["tokenAccount"]["emailAddress"],
+        json!("user@example.com"),
+        "the identity is still the exchange's"
+    );
+    assert_eq!(fs::read(&config).expect("readable"), before, "`.claude.json` is byte-identical");
+}
+
+#[test]
+fn login_with_the_profile_down_still_logs_in_and_records_no_plan() {
+    // Ruling G5: with an identity from the exchange, a profile that cannot
+    // answer costs the plan and nothing else — exit 0, the record, the
+    // credential, and no new sentence on stderr (the failure is an `info`
+    // line, under the default `warn` filter). The next refresh asks again.
+    let server = MockServer::start();
+    let _token = exchange(&server, Some(EXCHANGE_ORG));
+    let profile = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path(common::PROFILE_PATH);
+        then.status(500).body("upstream unavailable");
+    });
+
+    let mut fixture = Fixture::new();
+    fixture.endpoints(&server.base_url());
+
+    let mut session = common::start_login(&fixture, &[], &[]);
+    let state = session.state.clone();
+    session.paste(&format!("minted-code#{state}"));
+    let finished = session.finish();
+
+    assert_eq!(finished.code(), 0, "stderr:\n{}", finished.stderr);
+    assert_eq!(profile.calls(), 1, "asked once, never retried");
+    let blob = stored_blob(&fixture);
+    assert_eq!(blob["claudeAiOauth"]["accessToken"], json!("sk-ant-oat01-minted"));
+    assert_eq!(blob["claudeAiOauth"].get("subscriptionType"), None, "no plan was recorded");
+    assert_eq!(blob["claudeAiOauth"].get("rateLimitTier"), None, "and no tier");
+    assert_eq!(registry(&fixture)["accounts"][0]["account_uuid"], json!(EXCHANGE_ACCT));
+    assert!(
+        !finished.stderr.contains("could not read the account profile"),
+        "no stderr sentence for a plan that could not be read:\n{}",
+        finished.stderr
+    );
+}

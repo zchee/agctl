@@ -946,6 +946,34 @@ pub fn mock_profile<'a>(
     })
 }
 
+/// [`mock_profile`] with its `organization` block replaced by `organization`,
+/// plus the `uuid` naming `org`, so the document still names the account.
+///
+/// For S24c's plan rows the fixture's own block cannot state: an unmapped
+/// `organization_type`, an over-long or badly shaped `rate_limit_tier`, or
+/// neither at all. Matched the same way, on the bearer and `cache-control`.
+#[must_use]
+pub fn mock_profile_organization<'a>(
+    server: &'a MockServer,
+    access_token: &str,
+    (acct, org): (&str, &str),
+    organization: Value,
+) -> Mock<'a> {
+    let bearer = format!("Bearer {access_token}");
+    let mut organization = organization;
+    organization["uuid"] = json!(org);
+    server.mock(|when, then| {
+        when.method(GET)
+            .path(PROFILE_PATH)
+            .header("authorization", bearer.as_str())
+            .header("cache-control", "no-cache");
+        then.status(200).json_body(json!({
+            "account": { "uuid": acct, "email": "profile@example.com" },
+            "organization": organization,
+        }));
+    })
+}
+
 /// A live `.claude.json` document in the shape Claude Code keeps it (S24b):
 /// thirty top-level members, among them the five caches the config step
 /// deletes, `userID`, `mcpServers`, `projects`, and a twenty-key `oauthAccount`
@@ -1357,7 +1385,7 @@ pub fn finish(child: Child) -> Output {
 /// write lines in it is a failure, not a pass, because "the write path did
 /// nothing" is exactly the way this criterion could otherwise be satisfied
 /// (critic M8).
-pub const KEYCHAIN_WRITE_TESTS: [&str; 68] = [
+pub const KEYCHAIN_WRITE_TESTS: [&str; 69] = [
     "ac59_the_write_transport_reads_one_line_from_stdin_and_redacts_the_hex",
     "ac60_a_service_no_test_registered_is_refused_and_stores_nothing",
     "ac61_what_the_write_path_stores_is_what_the_binary_reads",
@@ -1466,6 +1494,9 @@ pub const KEYCHAIN_WRITE_TESTS: [&str; 68] = [
     "rerunning_a_live_swap_whose_config_write_was_skipped_catches_it_up",
     "an_undo_whose_config_write_was_skipped_is_caught_up_by_use_live_of_the_restored_account",
     "a_catch_up_with_a_refused_audit_log_takes_no_lock_and_writes_nothing_at_every_live_return",
+    // S24c (the plan column). Refreshes a migrated namespace's item in place,
+    // which writes that item once, with the plan in the line.
+    "a_migrated_items_plan_is_asked_before_the_hold_and_written_with_the_refresh",
 ];
 
 /// Fact F42's keychain update line, for a test that means to write one.

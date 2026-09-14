@@ -68,12 +68,15 @@ use crate::provider::claude::account::AccountState;
 use crate::provider::claude::account::Source;
 use crate::provider::claude::credentials::Credentials;
 use crate::provider::claude::credentials::Digests;
+use crate::provider::claude::credentials::KeychainStdinLine;
 use crate::provider::claude::credentials::REFRESH_MARGIN_MS;
 use crate::provider::claude::discovery;
 use crate::provider::claude::namespace;
 use crate::provider::claude::namespace::EnvView;
+use crate::provider::claude::oauth;
 use crate::provider::claude::oauth::OauthClient;
 use crate::provider::claude::swap;
+use crate::provider::claude::usage::ProfileSource;
 use crate::provider::claude::usage::RefreshError;
 use crate::provider::claude::usage::TokenRefresher;
 use crate::provider::claude::usage::UsageClient;
@@ -121,6 +124,7 @@ use crate::secret::location;
 use crate::secret::location::Resolved;
 use crate::secret::namespace_lock;
 use crate::secret::namespace_lock::LockError;
+use crate::secret::security_cli;
 use crate::usage::cache;
 use crate::usage::model::UsageSnapshot;
 
@@ -168,6 +172,7 @@ pub fn run(cli: &Cli, args: &StatusArgs, cancel: &Cancel) -> Result<(), AppError
         env: env.clone(),
         client: UsageClient::from_env(args.timeout),
         refresher: default_refresher()?,
+        profiles: default_profile_source()?,
         reader_factory: production_readers(),
         listing: found.listing,
         fault: current_fault(),
@@ -512,6 +517,9 @@ pub struct Shared {
     pub client: UsageClient,
     /// What mints a new access token from a stored refresh token.
     pub refresher: Arc<dyn TokenRefresher>,
+    /// What names the plan a refreshed credential lacks (S24c): one profile
+    /// GET, asked by [`ask_plan`] and by nothing else in the pass.
+    pub profiles: Arc<dyn ProfileSource>,
     /// How a worker builds its own keychain reader.
     pub reader_factory: ReaderFactory,
     /// The `dump-keychain` listing this pass took, attributes only.
@@ -1162,6 +1170,11 @@ pub(crate) fn under_namespace_lock(
             "none",
         );
     }
+    // The plan, best effort, under this namespace's lock and nothing else:
+    // after the POST, before the last look and the write, which proceed
+    // whatever it answers (ruling R-J). The last look's keychain read is what
+    // the pass must still have time for after it.
+    ask_plan(shared, record, &mut current, ctx, security_cli::READ_TIMEOUT);
 
     // The last look before anything is written. The pause point is what lets
     // a test occupy this window, which is otherwise microseconds wide (plan
@@ -1248,6 +1261,47 @@ fn write_failure_state(err: &FileStoreError) -> AccountState {
 /// A refusal carrying no credentials.
 fn refused(state: AccountState, lock_state: &'static str) -> LockedResult {
     LockedResult { state: Some(state), lock_state, ..LockedResult::default() }
+}
+
+/// Fills the plan a just-refreshed credential lacks, best effort (S24c).
+///
+/// Both refresh paths call this between the POST and the save, and the rule
+/// lives here once. Only while either field is absent (ruling G2), so a
+/// stored pair costs nothing; and only from a profile naming `record`'s own
+/// account (ruling G6). Every failure — a status, a timeout, a malformed body,
+/// cancellation — keeps both fields, writes one `debug` line and nothing else:
+/// no row state, no note, no stderr, no retry (ruling G5). The save proceeds
+/// either way (ruling R-J), and the next refresh asks again.
+///
+/// And only while the pass has room for the whole GET plus `save`, the
+/// caller's own allowance for what follows it (S24c-R1 (1)). A GET that ran
+/// the pass into its deadline would cost the refreshed credential: the writer
+/// discards a staged file once the pass should stop, and the watchdog kills
+/// `security` children. With less left, the plan is simply not asked.
+fn ask_plan(
+    shared: &Shared,
+    record: &AccountRecord,
+    current: &mut Credentials,
+    ctx: &PassCtx,
+    save: Duration,
+) {
+    if !oauth::needs_plan(current) {
+        return;
+    }
+    if ctx.remaining() <= oauth::PROFILE_TIMEOUT.saturating_add(save) {
+        tracing::debug!("the plan was not asked: the pass has too little time left for it");
+        return;
+    }
+    match shared.profiles.profile_of(current, ctx.cancel()) {
+        Ok(profile) if swap::identity_is(Some(&profile.identity()), record) => {
+            oauth::fill_plan(current, &profile);
+        }
+        Ok(_) => tracing::debug!("the profile names another account; the plan was not recorded"),
+        Err(err) => tracing::debug!(
+            error = %err,
+            "the plan could not be read; it is asked again at the next refresh"
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1467,6 +1521,12 @@ fn refresh_in_place(
             "none",
         );
     }
+    // The plan, best effort, here in Phase B with nothing held, and never
+    // under the locks below: a GET inside Claude Code's hold would spend its
+    // budget on the network (invariant I17). The line built below carries it,
+    // and the hold after it is what the pass must still have time for.
+    let unplanned = (current.subscription_type.clone(), current.rate_limit_tier.clone());
+    ask_plan(shared, &item.owner, &mut current, ctx, claude_lock::HOLD_BUDGET);
     let after = current.digests();
 
     // The audit entry's own precondition, before anything else can refuse: a
@@ -1489,7 +1549,7 @@ fn refresh_in_place(
 
     // Refusal D, before anything is held: a line that cannot be written costs
     // nothing to refuse here.
-    let line = match current.to_keychain_stdin_line(&item.account, service) {
+    let line = match keychain_line(&mut current, unplanned, &item.account, service) {
         Ok(line) => line,
         Err(KeychainWriteError::LineTooLong { .. }) => {
             return refused(
@@ -1685,6 +1745,30 @@ fn refresh_in_place(
         lock_state: "migrated_refreshed",
         ..LockedResult::default()
     }
+}
+
+/// Fact F42's line for a refreshed item, giving way to the plan (S24c-R1 (2)).
+///
+/// The plan never costs the write it rides on. When a plan the fill just
+/// added puts the line over `SECURITY_STDIN_LIMIT`, the pair goes back to what
+/// the refresh left (`unplanned`) and the line is built without it, as before
+/// S24c; the next refresh asks again. A line too long without the plan is
+/// still refusal D.
+fn keychain_line(
+    current: &mut Credentials,
+    unplanned: (Option<String>, Option<String>),
+    account: &str,
+    service: &str,
+) -> Result<KeychainStdinLine, KeychainWriteError> {
+    let line = current.to_keychain_stdin_line(account, service);
+    let filled =
+        (&current.subscription_type, &current.rate_limit_tier) != (&unplanned.0, &unplanned.1);
+    if !filled || !matches!(line, Err(KeychainWriteError::LineTooLong { .. })) {
+        return line;
+    }
+    tracing::debug!("plan not stored: line too long");
+    (current.subscription_type, current.rate_limit_tier) = unplanned;
+    current.to_keychain_stdin_line(account, service)
 }
 
 /// Refusal A, or a hold that outlasted its budget: release and write nothing.

@@ -59,6 +59,7 @@ use crate::provider::claude::oauth;
 use crate::provider::claude::oauth::OauthClient;
 use crate::provider::claude::oauth::OauthError;
 use crate::provider::claude::oauth::Redirect;
+use crate::provider::claude::swap;
 use crate::runtime::coordinator::Cancel;
 use crate::runtime::coordinator::PassCtx;
 use crate::runtime::fault::Fault;
@@ -271,14 +272,19 @@ pub fn run_with(
     let mut credentials =
         oauth::to_credentials(response, now_ms, &scopes).map_err(|err| fatal(err.into()))?;
 
-    if credentials.identity().is_none() {
-        // Fact F26's fallback. A failure here is not a failed login: it just
-        // leaves the identity as unknown as it already was, and the check
-        // below is what turns that into an error.
-        match oauth::profile(client, &credentials, login.cancel) {
-            Ok(document) => apply_profile(&mut credentials, document),
-            Err(err) => tracing::warn!("could not read the account profile: {err}"),
+    // One profile GET after every exchange, where fact F26's fallback sat: it
+    // names the plan (S24c), and the account as well when the exchange did
+    // not. It rotates nothing, so it may come before the prompt, and it is
+    // never inside the lock. A failure is not a failed login. With an identity
+    // in hand it costs only the plan, which the next refresh asks for again,
+    // so it is logged below the default filter (ruling G5); without one the
+    // check below turns it into an error, and phase 1's warning stays.
+    match oauth::profile(client, &credentials, login.cancel) {
+        Ok(document) => apply_profile(&mut credentials, document),
+        Err(err) if credentials.identity().is_none() => {
+            tracing::warn!("could not read the account profile: {err}");
         }
+        Err(err) => tracing::info!("could not read the account profile: {err}"),
     }
 
     let Some(identity) = credentials.identity() else {
@@ -514,14 +520,22 @@ fn fault() -> Fault {
     }
 }
 
-/// Fills in an identity from a profile response (fact F26).
+/// Fills in the plan, and the identity when the exchange named none, from a
+/// profile response (fact F26, S24c).
 ///
 /// Through V14's schema ([`oauth::parse_profile`]), which the live swap reads
 /// too: `account.uuid`, `account.email` — or the exchange's `email_address` —
 /// and `organization.uuid`. A document missing any of them leaves the
 /// credentials as they were, and the caller's "named no account" check is what
 /// turns that into an error. The failure is logged by member name only.
+///
+/// An identity the exchange named is never replaced, and an organization it
+/// did not name is never added. The profile then supplies the plan alone, and
+/// only when it names the same account ([`swap::identities_agree`]); one that
+/// names another account records nothing and refuses nothing (ruling G6),
+/// because the credential is the exchange's either way.
 fn apply_profile(credentials: &mut Credentials, document: serde_json::Value) {
+    let exchanged = credentials.identity();
     let profile = match oauth::parse_profile(document) {
         Ok(profile) => profile,
         Err(err) => {
@@ -529,6 +543,17 @@ fn apply_profile(credentials: &mut Credentials, document: serde_json::Value) {
             return;
         }
     };
+    if let Some(exchanged) = exchanged {
+        if swap::identities_agree(&exchanged, &profile.identity()) {
+            oauth::fill_plan(credentials, &profile);
+        } else {
+            tracing::warn!("the account profile names another account; the plan was not recorded");
+        }
+        return;
+    }
+    // The profile names the account it is about to fill in, so its plan is
+    // this credential's.
+    oauth::fill_plan(credentials, &profile);
     let org_name = profile.organization_name().map(str::to_owned);
     let token_account = credentials.token_account.get_or_insert_with(Default::default);
     token_account.uuid = Some(profile.account_uuid);

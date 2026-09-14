@@ -239,8 +239,8 @@ fn a_login_without_an_organization_lands_in_the_unknown_org_namespace() {
         when.method(Method::POST).path("/v1/oauth/token");
         then.status(200).json_body(exchange_response(Some(ACCOUNT), None));
     });
-    // The profile fallback is only consulted when the account itself is
-    // unknown, so this must not reach it.
+    // Every login asks the profile once; a 500 costs the plan and nothing
+    // else. The account the exchange named keeps its missing organization.
     let profile = server.mock(|when, then| {
         when.method(Method::GET).path("/api/oauth/profile");
         then.status(500);
@@ -262,7 +262,7 @@ fn a_login_without_an_organization_lands_in_the_unknown_org_namespace() {
     run_with(&login, &client_for(&server), &mut FakeIo::new("CODE-A"))
         .expect("the login should succeed");
 
-    assert_eq!(profile.calls(), 0);
+    assert_eq!(profile.calls(), 1);
     let ns_dir = paths.namespace_dir(ACCOUNT, UNKNOWN_ORG);
     assert_eq!(mode_of(&ns_dir.join(file_store::CREDENTIALS_FILE)), Some(0o600));
 
@@ -745,6 +745,123 @@ fn login_still_names_the_account_from_a_profile_that_uses_email() {
         blob["claudeAiOauth"]["tokenAccount"]["emailAddress"],
         serde_json::json!("v14@example.com")
     );
+}
+
+/// A V14 profile naming `account`/`organization`, with a plan and with an
+/// email and an organization name the exchange does not use, so a test can
+/// tell which of the two an identity came from.
+fn profile_naming(account: &str, organization: &str) -> serde_json::Value {
+    serde_json::json!({
+        "account": { "uuid": account, "email": "profile@example.com" },
+        "organization": {
+            "uuid": organization,
+            "name": "Profile Org",
+            "organization_type": "claude_max",
+            "rate_limit_tier": "default_claude_max_20x",
+        },
+    })
+}
+
+/// One manual login whose exchange answers `exchange` and whose profile
+/// answers `profile` for the exchanged token only; returns the store and the
+/// profile's GET count.
+fn login_with_profile(
+    exchange: serde_json::Value,
+    profile: serde_json::Value,
+) -> (TempDir, Paths, usize) {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(Method::POST).path("/v1/oauth/token");
+        then.status(200).json_body(exchange);
+    });
+    let asked = server.mock(|when, then| {
+        when.method(Method::GET)
+            .path("/api/oauth/profile")
+            .header("authorization", "Bearer sk-ant-oat01-fake-access")
+            .header("cache-control", "no-cache");
+        then.status(200).json_body(profile);
+    });
+
+    let home = TempDir::new().expect("a temporary directory should be creatable");
+    let paths = Paths::with_config_dir(home.path().to_path_buf());
+    let cancel = Cancel::new();
+    let login = Login {
+        paths: &paths,
+        manual: true,
+        label: None,
+        live_identity: None,
+        live_identity_source: PathBuf::new(),
+        no_duplicate: false,
+        cancel: &cancel,
+    };
+    run_with(&login, &client_for(&server), &mut FakeIo::new("CODE-A"))
+        .expect("the login should succeed");
+    let calls = asked.calls();
+    (home, paths, calls)
+}
+
+#[test]
+fn login_records_the_plan_only_from_a_profile_naming_the_exchanged_account() {
+    // S24c's login half. One GET after every exchange; the plan is taken only
+    // from a profile naming the account the exchange named (ruling G6), and
+    // the identity the exchange named is never replaced or completed by it.
+
+    // The same account: both fields, and the exchange's own identity.
+    let (_home, paths, calls) = login_with_profile(
+        exchange_response(Some(ACCOUNT), Some(ORGANIZATION)),
+        profile_naming(ACCOUNT, ORGANIZATION),
+    );
+    assert_eq!(calls, 1, "one GET after the exchange");
+    let blob = stored_blob(&paths.namespace_dir(ACCOUNT, ORGANIZATION));
+    let inner = &blob["claudeAiOauth"];
+    assert_eq!(inner["subscriptionType"], serde_json::json!("max"));
+    assert_eq!(inner["rateLimitTier"], serde_json::json!("default_claude_max_20x"));
+    assert_eq!(inner["tokenAccount"]["emailAddress"], serde_json::json!("user@example.com"));
+    assert_eq!(inner["tokenAccount"]["organizationName"], serde_json::json!("Example Org"));
+    let config = AgctlConfig::load(&paths).expect("the config should load");
+    let record = config.get(ACCOUNT, ORGANIZATION).expect("the exchange's pair is the key");
+    assert_eq!(record.email.as_deref(), Some("user@example.com"), "not the profile's address");
+
+    // Another account: neither field, and the exchange's identity unchanged.
+    let other = "33333333-3333-4333-8333-333333333333";
+    let (_home, paths, calls) = login_with_profile(
+        exchange_response(Some(ACCOUNT), Some(ORGANIZATION)),
+        profile_naming(other, ORGANIZATION),
+    );
+    assert_eq!(calls, 1);
+    let blob = stored_blob(&paths.namespace_dir(ACCOUNT, ORGANIZATION));
+    let inner = &blob["claudeAiOauth"];
+    assert_eq!(inner.get("subscriptionType"), None, "another account's plan is not recorded");
+    assert_eq!(inner.get("rateLimitTier"), None, "nor its tier");
+    assert_eq!(inner["tokenAccount"]["uuid"], serde_json::json!(ACCOUNT));
+    assert_eq!(inner["tokenAccount"]["emailAddress"], serde_json::json!("user@example.com"));
+
+    // An account-only exchange: the plan, and still no organization — the
+    // login stays in `UNKNOWN_ORG` even though the profile names one.
+    let (_home, paths, calls) = login_with_profile(
+        exchange_response(Some(ACCOUNT), None),
+        profile_naming(ACCOUNT, ORGANIZATION),
+    );
+    assert_eq!(calls, 1);
+    let blob = stored_blob(&paths.namespace_dir(ACCOUNT, UNKNOWN_ORG));
+    let inner = &blob["claudeAiOauth"];
+    assert_eq!(inner["subscriptionType"], serde_json::json!("max"));
+    assert_eq!(inner["rateLimitTier"], serde_json::json!("default_claude_max_20x"));
+    assert!(inner["tokenAccount"]["organizationUuid"].is_null(), "no organization was added");
+    let config = AgctlConfig::load(&paths).expect("the config should load");
+    assert!(config.get(ACCOUNT, UNKNOWN_ORG).is_some(), "the record is still the placeholder");
+    assert!(config.get(ACCOUNT, ORGANIZATION).is_none(), "and not the profile's organization");
+
+    // An identity-less exchange: the identity and the plan, from one GET.
+    let (_home, paths, calls) =
+        login_with_profile(exchange_response(None, None), profile_naming(ACCOUNT, ORGANIZATION));
+    assert_eq!(calls, 1, "one GET serves both halves");
+    let blob = stored_blob(&paths.namespace_dir(ACCOUNT, ORGANIZATION));
+    let inner = &blob["claudeAiOauth"];
+    assert_eq!(inner["tokenAccount"]["uuid"], serde_json::json!(ACCOUNT));
+    assert_eq!(inner["tokenAccount"]["emailAddress"], serde_json::json!("profile@example.com"));
+    assert_eq!(inner["subscriptionType"], serde_json::json!("max"));
+    assert_eq!(inner["rateLimitTier"], serde_json::json!("default_claude_max_20x"));
 }
 
 // ---------------------------------------------------------------------------
