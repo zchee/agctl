@@ -30,7 +30,9 @@
 //!   artefact class.
 //!
 //! What happens under the hold is [`claude_json`]'s; this module only takes,
-//! checks and gives back the lock.
+//! checks and gives back the lock. A session seed's read takes it through
+//! [`try_once`] instead — one `mkdir`, no ladder — and reads without it when it
+//! is not free (M6, ruling Q5).
 //!
 //! [`claude_json`]: crate::provider::claude::claude_json
 
@@ -256,23 +258,7 @@ pub fn acquire(
     fs: Arc<dyn LockFs>,
     ctx: &PassCtx,
 ) -> Result<ConfigHold, ConfigLockError> {
-    let (Some(parent), Some(name)) =
-        (config_path.parent(), namespace::config_lock_name(config_path))
-    else {
-        return Err(ConfigLockError::Unreachable {
-            path: config_path.to_path_buf(),
-            message: "the configuration path has no directory and file name".to_owned(),
-        });
-    };
-    let shown = parent.join(&name);
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let dir = rustix::fs::open(parent, flags, Mode::empty()).map_err(|errno| {
-        ConfigLockError::Unreachable {
-            path: parent.to_path_buf(),
-            message: format!("its directory could not be opened: {errno}"),
-        }
-    })?;
-    let dir = Arc::new(dir);
+    let (parent, dir, name, shown) = open_parent(config_path)?;
     let slot = LockSlot { dir: dir.as_fd(), name: &name, shown: &shown };
 
     let mut rungs = CONTENTION_LADDER.iter();
@@ -297,7 +283,7 @@ pub fn acquire(
             },
             Err(FsError::NotFound) => {
                 return Err(ConfigLockError::Unreachable {
-                    path: parent.to_path_buf(),
+                    path: parent,
                     message: "the directory went away".to_owned(),
                 });
             }
@@ -314,7 +300,97 @@ pub fn acquire(
             return Err(ConfigLockError::Cancelled);
         }
     }
+    Ok(held(dir, name, shown, clock, fs))
+}
 
+/// One attempt at the configuration lock, for a read that must never wait:
+/// the session seed's (M6, ruling Q5).
+///
+/// Exactly one `mkdir` of `<file name>.lock` beside the **literal** path,
+/// through the same parent descriptor [`acquire`] opens. No ladder, no sleep,
+/// no retry and no removal — a lock that is not free is reported and left
+/// exactly as it was (ruling G5), and the caller reads without it.
+///
+/// # Errors
+///
+/// [`ConfigLockError::Busy`] when the lock exists and is not stale, or
+/// vanished between the `mkdir` and its `stat`; [`ConfigLockError::Stale`]
+/// when it is older than the peer's staleness window;
+/// [`ConfigLockError::Unreachable`] and [`ConfigLockError::Io`] as for
+/// [`acquire`]. Never `Cancelled` or `Compromised`.
+pub fn try_once(
+    config_path: &Path,
+    clock: &Clock,
+    fs: Arc<dyn LockFs>,
+) -> Result<ConfigHold, ConfigLockError> {
+    let (parent, dir, name, shown) = open_parent(config_path)?;
+    let slot = LockSlot { dir: dir.as_fd(), name: &name, shown: &shown };
+    match fs.mkdir(slot) {
+        Ok(()) => {}
+        Err(FsError::Exists) => {
+            return Err(match fs.mtime(slot) {
+                Some(mtime) => {
+                    let age = clock.wall().duration_since(mtime).unwrap_or(Duration::ZERO);
+                    if age >= CONFIG_PROFILE.stale {
+                        ConfigLockError::Stale { age_ms: millis(age) }
+                    } else {
+                        ConfigLockError::Busy
+                    }
+                }
+                None => ConfigLockError::Busy,
+            });
+        }
+        Err(FsError::NotFound) => {
+            return Err(ConfigLockError::Unreachable {
+                path: parent,
+                message: "the directory went away".to_owned(),
+            });
+        }
+        Err(FsError::Other(message)) => {
+            return Err(ConfigLockError::Io {
+                context: format!("could not create `{}`", shown.display()),
+                message,
+            });
+        }
+    }
+    Ok(held(dir, name, shown, clock, fs))
+}
+
+/// The literal parent of `config_path`, opened once `O_DIRECTORY` following
+/// the links on the way to it, with the lock's name and its shown path.
+fn open_parent(
+    config_path: &Path,
+) -> Result<(PathBuf, Arc<OwnedFd>, OsString, PathBuf), ConfigLockError> {
+    let (Some(parent), Some(name)) =
+        (config_path.parent(), namespace::config_lock_name(config_path))
+    else {
+        return Err(ConfigLockError::Unreachable {
+            path: config_path.to_path_buf(),
+            message: "the configuration path has no directory and file name".to_owned(),
+        });
+    };
+    let shown = parent.join(&name);
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let dir = rustix::fs::open(parent, flags, Mode::empty()).map_err(|errno| {
+        ConfigLockError::Unreachable {
+            path: parent.to_path_buf(),
+            message: format!("its directory could not be opened: {errno}"),
+        }
+    })?;
+    Ok((parent.to_path_buf(), Arc::new(dir), name, shown))
+}
+
+/// The hold a successful `mkdir` makes: its time on `clock`, the directory's
+/// modification time for [`ConfigHold::drift_check`], and the release
+/// registered with the emergency cleanup registry.
+fn held(
+    dir: Arc<OwnedFd>,
+    name: OsString,
+    shown: PathBuf,
+    clock: &Clock,
+    fs: Arc<dyn LockFs>,
+) -> ConfigHold {
+    let slot = LockSlot { dir: dir.as_fd(), name: &name, shown: &shown };
     let acquired_at = clock.monotonic();
     let mtime = fs.mtime(slot);
     let temp: TrackedTemp = Arc::new(Mutex::new(None));
@@ -329,7 +405,7 @@ pub fn acquire(
             let _ = fs.rmdir(LockSlot { dir: dir.as_fd(), name: &name, shown: &shown });
         }))
     };
-    Ok(ConfigHold {
+    ConfigHold {
         dir,
         name,
         shown,
@@ -340,7 +416,7 @@ pub fn acquire(
         temp,
         cleanup: Some(token),
         released: false,
-    })
+    }
 }
 
 /// One rung's wait: `rung + rand·rung`, in whole milliseconds, so it lies in

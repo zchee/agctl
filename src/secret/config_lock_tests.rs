@@ -354,3 +354,63 @@ fn the_config_lock_is_released_on_drop_and_on_cancellation() {
         assert!(renamed.exists(), "an untracked name is left alone");
     }
 }
+
+#[test]
+fn try_once_makes_one_mkdir_and_never_waits() {
+    // Ruling Q5 (M6): one `mkdir` of the literal lock, no ladder, no sleep and no
+    // removal — a lock that is not free is reported and left as it was.
+    let sleeps = |seen: &[Op]| seen.iter().filter(|op| matches!(op, Op::Sleep(_))).count();
+
+    // Free: taken beside the link, never beside its target, and released on drop.
+    let (home, link, target) = linked_home();
+    let lock = home.path().join(".claude.json.lock");
+    let mut beside_target = target.as_os_str().to_os_string();
+    beside_target.push(".lock");
+    let (timeline, clock, fs) = seams(None);
+    let hold = try_once(&link, &clock, fs).expect("a free lock is taken");
+    assert!(lock.is_dir(), "`$HOME/.claude.json.lock` while held");
+    assert!(!PathBuf::from(&beside_target).exists(), "never beside the target");
+    assert_eq!(hold.shown(), lock.as_path());
+    assert_eq!(ops(&timeline), vec![Op::Mkdir(lock.clone(), true)], "one mkdir");
+    drop(hold);
+    assert!(!lock.exists(), "released on drop");
+    assert_eq!(ops(&timeline), vec![Op::Mkdir(lock.clone(), true), Op::Rmdir(lock)]);
+
+    // Fresh and held by a peer: busy at once.
+    let (home, link, _target) = linked_home();
+    let planted = home.path().join(".claude.json.lock");
+    fs::create_dir(&planted).expect("a peer's fresh lock");
+    let planted_mtime = modified(&planted);
+    let (timeline, clock, fs) = seams(None);
+    assert_eq!(try_once(&link, &clock, fs).expect_err("busy"), ConfigLockError::Busy);
+    let seen = ops(&timeline);
+    assert_eq!(seen, vec![Op::Mkdir(planted.clone(), false)], "one attempt, nothing else");
+    assert_eq!(sleeps(&seen), 0, "no sleep: {seen:?}");
+    assert!(planted.is_dir(), "the peer's lock is there");
+    assert_eq!(modified(&planted), planted_mtime, "and its mtime unchanged");
+
+    // A minute old: stale, reported, never removed.
+    let (home, link, _target) = linked_home();
+    let planted = home.path().join(".claude.json.lock");
+    fs::create_dir(&planted).expect("an abandoned lock");
+    let aged = SystemTime::now().checked_sub(Duration::from_secs(60)).expect("an instant");
+    set_mtime(&planted, aged);
+    let (timeline, clock, fs) = seams(None);
+    let err = try_once(&link, &clock, fs).expect_err("stale");
+    let ConfigLockError::Stale { age_ms } = err else { panic!("expected Stale, got {err:?}") };
+    assert!(age_ms >= 59_000, "the planted age: {age_ms}");
+    let seen = ops(&timeline);
+    assert_eq!(seen, vec![Op::Mkdir(planted.clone(), false)], "one attempt: {seen:?}");
+    assert_eq!(sleeps(&seen), 0);
+    assert!(planted.is_dir(), "still present");
+    assert_eq!(modified(&planted), aged, "not re-stamped");
+
+    // A parent that does not exist: unreachable, and nothing attempted.
+    let (home, _link, _target) = linked_home();
+    let (timeline, clock, fs) = seams(None);
+    let missing = home.path().join("gone").join(".claude.json");
+    let err = try_once(&missing, &clock, fs).expect_err("unreachable");
+    assert!(matches!(err, ConfigLockError::Unreachable { .. }), "{err:?}");
+    assert!(ops(&timeline).is_empty(), "no mkdir: {:?}", ops(&timeline));
+    assert!(!home.path().join("gone").exists(), "nothing created");
+}

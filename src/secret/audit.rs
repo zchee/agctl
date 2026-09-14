@@ -207,7 +207,8 @@ pub enum AuditEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigWriteRecord {
     /// The [`AuditId`] of the `write` entry this pass appended, as its
-    /// `Display` renders it.
+    /// `Display` renders it; `None` on a catch-up, which follows no write of
+    /// its own (S24b-2, ruling Q7).
     #[serde(default)]
     pub after: Option<String>,
     /// How the step ended.
@@ -290,6 +291,15 @@ pub enum ConfigReason {
     ProfileUnavailable,
     /// The swap's own outcome is `unknown`.
     SwapUnknown,
+    /// A catch-up found the file already naming the live item's account, by
+    /// its two ids (S24b-2, ruling Q4).
+    AlreadyCurrent,
+    /// A catch-up's rewrite was not confirmed, or there was nobody to ask.
+    /// Never written: a declined catch-up appends no line (ruling Q3).
+    Declined,
+    /// A catch-up met an audit log agctl refuses, so nothing was read or
+    /// locked. Never written: there is no log to write it to.
+    AuditRefused,
     /// A word a later build writes; read-only.
     #[serde(other)]
     Unrecognized,

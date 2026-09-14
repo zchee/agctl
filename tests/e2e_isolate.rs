@@ -603,3 +603,103 @@ fn ac79_forget_an_account_with_no_session_is_a_no_op() {
         .success()
         .stdout(predicates::str::contains("nothing to forget"));
 }
+
+// ---------------------------------------------------------------------------
+// M6 — the seed's read under the configuration lock (S24b-2)
+// ---------------------------------------------------------------------------
+
+/// An isolated store whose live `.claude.json` is a link into `.claude-real/`,
+/// JS-shaped, carrying three seed keys among account state. Returns the fixture
+/// and the planted bytes.
+fn linked_config_store() -> (Fixture, Vec<u8>) {
+    let fixture = Fixture::new();
+    fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
+    fixture.live_through_link();
+    let link = fixture.live_claude_json_js(&json!({
+        "numStartups": 3,
+        "hasCompletedOnboarding": true,
+        "theme": "dark",
+        "editorMode": "vim",
+        "oauthAccount": { "accountUuid": ACCT, "organizationUuid": ORG },
+        "userID": "u-1",
+    }));
+    let bytes = fs::read(&link).expect("the planted file");
+    (fixture, bytes)
+}
+
+/// The seeded session file's key set.
+fn seed_keys(fixture: &Fixture) -> std::collections::BTreeSet<String> {
+    let seed = fixture.session_dir(ACCT, ORG).join(".claude.json");
+    let seeded: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&seed).expect("the seed exists")).expect("JSON");
+    seeded.as_object().expect("an object").keys().cloned().collect()
+}
+
+#[test]
+fn a_session_seed_is_read_under_the_config_lock_and_releases_it() {
+    // Rulings G12 and Q5: a free lock is taken for the one read and given back;
+    // the live file is read, never written, and the seed carries only its keys.
+    let (fixture, bytes) = linked_config_store();
+
+    fixture.cmd().args(["claude", "env", ACCT]).assert().success();
+
+    assert_eq!(
+        seed_keys(&fixture),
+        ["editorMode", "hasCompletedOnboarding", "theme"].map(str::to_owned).into_iter().collect(),
+        "exactly the three seed keys, the floor among them"
+    );
+    assert!(!fixture.config_lock_path().exists(), "`$HOME/.claude.json.lock` released");
+    assert_eq!(fs::read(fixture.home().join(".claude.json")).expect("readable"), bytes);
+    assert!(!fixture.backups_dir().exists(), "no `backups/`");
+    let real = fixture.home().join(".claude-real");
+    let beside_target: Vec<String> = fs::read_dir(&real)
+        .expect("listable")
+        .map(|entry| entry.expect("an entry").file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".lock") || name.contains(".tmp."))
+        .collect();
+    assert!(beside_target.is_empty(), "nothing beside the target: {beside_target:?}");
+
+    // I18: once the seed exists the live file is not read at all — so a second
+    // run succeeds even over a file no seed could be taken from, and the seed it
+    // wrote stands. (This is what makes the early return load-bearing: without
+    // it the lock would be taken and the parse attempted on every session.)
+    let seeded = fs::read(fixture.session_dir(ACCT, ORG).join(".claude.json")).expect("the seed");
+    fs::write(fixture.home().join(".claude-real").join(".claude.json"), "{not json")
+        .expect("the live file is writable");
+    fixture.cmd().args(["claude", "env", ACCT]).assert().success();
+    assert_eq!(
+        fs::read(fixture.session_dir(ACCT, ORG).join(".claude.json")).expect("the seed"),
+        seeded,
+        "the seed is what the first run wrote"
+    );
+    assert!(!fixture.config_lock_path().exists(), "and no lock was left behind");
+}
+
+#[test]
+fn a_held_config_lock_never_blocks_seeding_and_is_left_alone() {
+    // Rulings G5 and Q5: a lock a session holds — fresh, or past the peer's
+    // staleness window — is never waited on and never broken; the seed reads
+    // through today's twice-and-compare instead.
+    for age in [std::time::Duration::ZERO, std::time::Duration::from_secs(60)] {
+        let (fixture, bytes) = linked_config_store();
+        let lock = fixture.plant_config_lock(age);
+        let mtime = fs::metadata(&lock).and_then(|meta| meta.modified()).expect("stat");
+
+        let started = std::time::Instant::now();
+        fixture.cmd().args(["claude", "env", ACCT]).assert().success();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{age:?}: no wait");
+
+        assert!(seed_keys(&fixture).contains("theme"), "{age:?}: seeded through the fallback");
+        assert!(lock.is_dir(), "{age:?}: the planted lock still exists");
+        assert_eq!(
+            fs::metadata(&lock).and_then(|meta| meta.modified()).expect("stat"),
+            mtime,
+            "{age:?}: with its mtime unchanged"
+        );
+        assert_eq!(
+            fs::read(fixture.home().join(".claude.json")).expect("readable"),
+            bytes,
+            "{age:?}: the live file byte-identical"
+        );
+    }
+}

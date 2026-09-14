@@ -1609,15 +1609,44 @@ fn the_config_step_runs_only_after_an_applied_live_write() {
 }
 
 #[test]
-fn the_not_applied_warning_is_d030s_sentence_for_every_reason_and_both_directions() {
-    // Decision D-030: while S24b-2's catch-up is absent the sentence names no
-    // command and promises no re-run. It takes no direction, so a swap and an
-    // undo print the same words; both are checked so a later edit that adds one
-    // cannot make them diverge unnoticed.
+fn the_not_applied_notice_names_the_recovery_for_its_direction_and_absent_is_a_note() {
+    // §D2, replacing D-030's placeholder now that the catch-up exists: every
+    // reason × both directions. A forward swap's warning says to run the same
+    // `use --live` again; an undo's says `use --live` of the restored account and
+    // never `--undo`, which would reverse the undo. `absent` is a softer note
+    // with no recovery clause (ruling (i)), and a file already current or a
+    // declined rewrite owes no sentence at all.
     let home = std::path::PathBuf::from("/Users/example");
     let config_path = home.join(".claude.json");
+    let absent_note = "no `~/.claude.json` to update; Claude Code writes `oauthAccount` at its \
+                       next start";
+    let absent = claude_json::config_notice(
+        ConfigReason::Absent,
+        &config_path,
+        &home,
+        Recovery::SameAgain { id: "acct-t" },
+    );
+    assert_eq!(absent, Some(Notice::Note(absent_note.to_owned())), "absent is a note");
+    for recovery in [
+        Recovery::SameAgain { id: "acct-t" },
+        Recovery::Live { id: "acct-p" },
+        Recovery::AfterMessage { id: "acct-t", same: true },
+    ] {
+        assert_eq!(
+            claude_json::config_notice(ConfigReason::Absent, &config_path, &home, recovery),
+            Some(Notice::Note(absent_note.to_owned())),
+            "{recovery:?}: absent names no command in either direction"
+        );
+        for quiet in [ConfigReason::AlreadyCurrent, ConfigReason::Declined] {
+            assert_eq!(
+                claude_json::config_notice(quiet, &config_path, &home, recovery),
+                None,
+                "{recovery:?} {quiet:?}: nothing to say"
+            );
+        }
+    }
+    assert!(!absent_note.contains("was not updated") && !absent_note.contains("run "));
     let phrases = [
-        (ConfigReason::Absent, "there is no such file"),
         (ConfigReason::Unreadable, "it could not be read as a regular file"),
         (ConfigReason::Unparseable, "it is not valid JSON"),
         (ConfigReason::NotAnObject, "its top level is not a JSON object"),
@@ -1638,42 +1667,82 @@ fn the_not_applied_warning_is_d030s_sentence_for_every_reason_and_both_direction
             "the server could not be asked for that account's profile",
         ),
         (ConfigReason::SwapUnknown, "the swap's own outcome could not be confirmed"),
+        (
+            ConfigReason::AuditRefused,
+            "agctl's audit log is refused, and agctl rewrites nothing unrecorded",
+        ),
+        (ConfigReason::Unrecognized, "for a reason this build does not know"),
     ];
-    for direction in [Direction::Forward, Direction::Reverse] {
+    // (the recovery, its clause) — forward for T, the undo for P, and C1's
+    // message-first forms of each.
+    let recoveries = [
+        (
+            Recovery::SameAgain { id: "acct-t" },
+            "run the same `agctl claude use --live acct-t` again to update it",
+        ),
+        (Recovery::Live { id: "acct-p" }, "run `agctl claude use --live acct-p` to update it"),
+        (
+            Recovery::AfterMessage { id: "acct-t", same: true },
+            "send one message in Claude Code, which refreshes the live credential, then run the \
+             same `agctl claude use --live acct-t` again to update it",
+        ),
+        (
+            Recovery::AfterMessage { id: "acct-p", same: false },
+            "send one message in Claude Code, which refreshes the live credential, then run \
+             `agctl claude use --live acct-p` to update it",
+        ),
+    ];
+    for (recovery, clause) in recoveries {
         for (reason, phrase) in phrases {
             let report = ConfigReport::not_attempted(reason);
             let reason = report.not_updated().expect("a step that did not apply has a reason");
-            let text = claude_json::not_updated_warning(reason, &config_path, &home);
+            let Some(Notice::Warning(text)) =
+                claude_json::config_notice(reason, &config_path, &home, recovery)
+            else {
+                panic!("{recovery:?} {reason:?}: a warning");
+            };
             let expected = format!(
                 "`~/.claude.json` was not updated ({phrase}); running sessions keep showing the \
-                 previous account until the next swap or undo, or a Claude Code `/login`"
+                 previous account — {clause}"
             );
-            assert_eq!(text, expected, "{direction:?} {reason:?}: equals D-030's sentence");
-            // `cancelled`'s frozen phrase says "the run was cancelled", so the
-            // `run ` check reads the sentence around the phrase: that is where a
-            // command, or a promise to run one again, would be.
-            let frame = text.replacen(phrase, "", 1);
-            assert!(
-                !frame.contains("run "),
-                "{direction:?} {reason:?}: contains no `run `: {text}"
-            );
-            for forbidden in ["run the", "run `", "agctl claude", "--undo", "@"] {
+            assert_eq!(text, expected, "{recovery:?} {reason:?}: §D2's sentence");
+            for forbidden in ["--undo", "@", "/login", "until the next swap"] {
                 assert!(
                     !text.contains(forbidden),
-                    "{direction:?} {reason:?}: contains no `{forbidden}`: {text}"
+                    "{recovery:?} {reason:?}: contains no `{forbidden}`: {text}"
                 );
             }
+            let is_undo = matches!(
+                recovery,
+                Recovery::Live { .. } | Recovery::AfterMessage { same: false, .. }
+            );
+            assert_eq!(text.contains("the same"), !is_undo, "{recovery:?}: {text}");
+            assert_eq!(
+                text.contains("send one message in Claude Code"),
+                matches!(recovery, Recovery::AfterMessage { .. }),
+                "{recovery:?}: {text}"
+            );
         }
     }
 
     // A `CLAUDE_CONFIG_DIR` outside `$HOME` is shown in full; control
-    // characters from the environment are escaped.
+    // characters from the environment are escaped, in the path and in the id.
+    let busy = |path: &std::path::Path, id: &str| match claude_json::config_notice(
+        ConfigReason::LockBusy,
+        path,
+        &home,
+        Recovery::SameAgain { id },
+    ) {
+        Some(Notice::Warning(text)) => text,
+        other => panic!("a warning: {other:?}"),
+    };
     let outside = std::path::Path::new("/opt/claude-config/.claude.json");
-    let text = claude_json::not_updated_warning(ConfigReason::LockBusy, outside, &home);
+    let text = busy(outside, "acct-t");
     assert!(text.starts_with("`/opt/claude-config/.claude.json` was not updated ("), "{text}");
     let hostile = std::path::Path::new("/opt/x\u{1b}[2J/.claude.json");
-    let text = claude_json::not_updated_warning(ConfigReason::LockBusy, hostile, &home);
+    let text = busy(hostile, "acct\u{1b}[2J-t");
     assert!(!text.contains('\u{1b}'), "the escape character is escaped: {text:?}");
+    assert_eq!(text.matches("\\u{1b}").count(), 2, "in the path and in the id: {text:?}");
 
     // An applied step owes no warning at all.
     let applied = ConfigReport {
@@ -1682,6 +1751,188 @@ fn the_not_applied_warning_is_d030s_sentence_for_every_reason_and_both_direction
         ..ConfigReport::not_attempted(ConfigReason::Io)
     };
     assert_eq!(applied.not_updated(), None);
+}
+
+/// How many times each of `catch_up_step`'s effects ran: the log's open, the
+/// check, the plan, the question and the write.
+type StepCalls = [usize; 5];
+
+/// Drives `catch_up_step` once with counting closures: `log_opens` decides
+/// whether the audit log opens, `checked` is what the read-only check answers
+/// and `answer` is the operator's.
+fn drive_catch_up(
+    profile: Option<&Profile>,
+    yes: bool,
+    log_opens: bool,
+    checked: Result<(), Box<ConfigReport>>,
+    answer: bool,
+) -> (ConfigReport, bool, StepCalls) {
+    let calls: [AtomicUsize; 5] = Default::default();
+    let count = |at: usize| calls[at].fetch_add(1, Ordering::SeqCst);
+    let applied = ConfigReport {
+        outcome: crate::secret::audit::ConfigOutcome::Applied,
+        reason: None,
+        ..ConfigReport::not_attempted(ConfigReason::Io)
+    };
+    let (report, log) = catch_up_step(
+        profile,
+        yes,
+        || {
+            count(0);
+            if log_opens {
+                Ok(tempfile::tempfile().expect("a scratch file stands in for the log"))
+            } else {
+                Err(AppError::Config("the audit log is a symbolic link".to_owned()))
+            }
+        },
+        |seen| {
+            count(1);
+            assert_eq!(seen.account_uuid, "acct-t", "the check is handed the item's profile");
+            checked
+        },
+        |_: &()| {
+            count(2);
+        },
+        || {
+            count(3);
+            answer
+        },
+        |(), seen| {
+            count(4);
+            assert_eq!(seen.account_uuid, "acct-t", "the write is handed the same profile");
+            applied.clone()
+        },
+    );
+    let seen = calls.map(|at| at.load(Ordering::SeqCst));
+    (report, log.is_some(), seen)
+}
+
+#[test]
+fn the_catch_up_asks_before_it_writes_and_records_what_it_did() {
+    // §D1's C1–C6 as a decision table (rulings Q2, Q3, (a), (f)). Each row pins
+    // which effects ran, in order of the gates that decide them, and whether a
+    // `config_write` line is owed — the descriptor comes back only then.
+    let profile = parse_profile(serde_json::json!({
+        "account": { "uuid": "acct-t", "email": "t@example.com" },
+        "organization": { "uuid": "org-t" },
+    }))
+    .expect("a V14 document");
+    let ended = |outcome, reason| ConfigReport { outcome, ..ConfigReport::not_attempted(reason) };
+    use crate::secret::audit::ConfigOutcome as O;
+    let applied =
+        ConfigReport { outcome: O::Applied, reason: None, ..ended(O::Applied, ConfigReason::Io) };
+    let ok = || Ok(());
+    // (row, profile, yes, log opens, check answers, operator answers,
+    //  report, line owed, [open_log, check, plan, consent, write])
+    type Row<'a> = (
+        &'a str,
+        Option<&'a Profile>,
+        bool,
+        bool,
+        Result<(), Box<ConfigReport>>,
+        bool,
+        ConfigReport,
+        bool,
+        StepCalls,
+    );
+    let rows: Vec<Row<'_>> = vec![
+        (
+            "C1: no profile of the item — nothing opened, nothing asked",
+            None,
+            true,
+            true,
+            ok(),
+            true,
+            ended(O::NotAttempted, ConfigReason::ProfileUnavailable),
+            false,
+            [0, 0, 0, 0, 0],
+        ),
+        (
+            "C2: a refused log — nothing read, nothing locked, no line",
+            Some(&profile),
+            true,
+            false,
+            ok(),
+            true,
+            ended(O::Refused, ConfigReason::AuditRefused),
+            false,
+            [1, 0, 0, 0, 0],
+        ),
+        (
+            "C3: an absent file ends the step with a line and no question",
+            Some(&profile),
+            false,
+            true,
+            Err(Box::new(ended(O::Skipped, ConfigReason::Absent))),
+            true,
+            ended(O::Skipped, ConfigReason::Absent),
+            true,
+            [1, 1, 0, 0, 0],
+        ),
+        (
+            "C3: a file already naming the account",
+            Some(&profile),
+            false,
+            true,
+            Err(Box::new(ended(O::Skipped, ConfigReason::AlreadyCurrent))),
+            true,
+            ended(O::Skipped, ConfigReason::AlreadyCurrent),
+            true,
+            [1, 1, 0, 0, 0],
+        ),
+        (
+            "C3: a file the guard refuses",
+            Some(&profile),
+            false,
+            true,
+            Err(Box::new(ended(O::Refused, ConfigReason::NotReproducible))),
+            true,
+            ended(O::Refused, ConfigReason::NotReproducible),
+            true,
+            [1, 1, 0, 0, 0],
+        ),
+        (
+            "C5: confirmed — the plan, the question, then the write",
+            Some(&profile),
+            false,
+            true,
+            ok(),
+            true,
+            applied.clone(),
+            true,
+            [1, 1, 1, 1, 1],
+        ),
+        (
+            "C5: declined — no write and no line",
+            Some(&profile),
+            false,
+            true,
+            ok(),
+            false,
+            ended(O::NotAttempted, ConfigReason::Declined),
+            false,
+            [1, 1, 1, 1, 0],
+        ),
+        (
+            "`--yes` — the plan still prints, nobody is asked, the write runs",
+            Some(&profile),
+            true,
+            true,
+            ok(),
+            false,
+            applied.clone(),
+            true,
+            [1, 1, 1, 0, 1],
+        ),
+    ];
+    for (row, profile, yes, log_opens, checked, answer, report, owed, calls) in rows {
+        let (got, line_owed, seen) = drive_catch_up(profile, yes, log_opens, checked, answer);
+        assert_eq!(got, report, "{row}");
+        assert_eq!(line_owed, owed, "{row}: a line is owed");
+        assert_eq!(seen, calls, "{row}: [open_log, check, plan, consent, write]");
+        assert_eq!(got.record(None).after, None, "{row}: a catch-up line names no write");
+        assert_ne!(got.outcome, O::Unrecognized, "{row}");
+    }
 }
 
 #[test]
@@ -1723,15 +1974,18 @@ fn a_live_swaps_identity_comes_from_the_profile_then_from_agctls_own_write() {
     let refused_log = || Err(AppError::Config("the audit log is a symbolic link".to_owned()));
     type Log<'a> = &'a dyn Fn() -> Result<Tail, AppError>;
     // (row, the item, what the profile answers, the log, the identity, GETs)
-    type Row<'a> =
-        (&'a str, &'a Credentials, Answer, Log<'a>, Result<Identity, Unidentified>, usize);
+    // S24b-2 (ruling Q2): a verified identity comes back with the item's profile,
+    // compared here by its ids; one agctl's own write resolved comes back with
+    // `None`, and those rows issue no GET.
+    type Found<'a> = Result<(Identity, Option<(&'a str, &'a str)>), Unidentified>;
+    type Row<'a> = (&'a str, &'a Credentials, Answer, Log<'a>, Found<'a>, usize);
     let rows: [Row<'_>; 8] = [
         (
             "an identity-less credential the profile names",
             &item,
             Answer::Names("acct-p", "org-p"),
             &log_never_read,
-            Ok(named("acct-p", Some("org-p"))),
+            Ok((named("acct-p", Some("org-p")), Some(("acct-p", "org-p")))),
             1,
         ),
         (
@@ -1739,7 +1993,7 @@ fn a_live_swaps_identity_comes_from_the_profile_then_from_agctls_own_write() {
             &named_p,
             Answer::Names("acct-p", "org-p"),
             &log_never_read,
-            Ok(named("acct-p", Some("org-p"))),
+            Ok((named("acct-p", Some("org-p")), Some(("acct-p", "org-p")))),
             1,
         ),
         (
@@ -1759,7 +2013,7 @@ fn a_live_swaps_identity_comes_from_the_profile_then_from_agctls_own_write() {
             &expired,
             Answer::Names("acct-q", "org-q"),
             &own_write,
-            Ok(named("acct-t", Some("org-t"))),
+            Ok((named("acct-t", Some("org-t")), None)),
             0,
         ),
         (
@@ -1798,7 +2052,7 @@ fn a_live_swaps_identity_comes_from_the_profile_then_from_agctls_own_write() {
             &expired,
             Answer::Status(401),
             &own_write,
-            Ok(named("acct-t", Some("org-t"))),
+            Ok((named("acct-t", Some("org-t")), None)),
             0,
         ),
     ];
@@ -1806,6 +2060,19 @@ fn a_live_swaps_identity_comes_from_the_profile_then_from_agctls_own_write() {
         let profiles = ScriptedProfiles::answering(answer);
         let item8 = item8_of(credentials);
         let got = identify(&profiles, credentials, Some(&item8), log, NOW, &Cancel::new());
+        if let Ok((identity, Some(profile))) = &got {
+            assert_eq!(
+                profile.account_uuid, identity.account_uuid,
+                "{row}: the item's own profile"
+            );
+        }
+        let got = got.map(|(identity, profile)| {
+            let ids = profile.map(|p| (p.account_uuid, p.organization_uuid));
+            (identity, ids)
+        });
+        let expected = expected.map(|(identity, ids)| {
+            (identity, ids.map(|(acct, org)| (acct.to_owned(), org.to_owned())))
+        });
         assert_eq!(got, expected, "{row}");
         assert_eq!(profiles.asked(), gets, "{row}: the GETs issued");
     }
@@ -1829,7 +2096,7 @@ fn a_live_swaps_identity_comes_from_the_profile_then_from_agctls_own_write() {
     };
     assert_eq!(
         identify(&profiles, &revoked, Some(&revoked8), &log, NOW, &Cancel::new()),
-        Ok(named("acct-p", Some("org-p"))),
+        Ok((named("acct-p", Some("org-p")), None)),
         "a revoked token's bytes, written by an undo that ended unknown"
     );
     assert_eq!(profiles.asked(), 1);
@@ -1925,7 +2192,8 @@ fn an_undo_decides_by_the_items_identity() {
         let fresh = claude_code_item("sk-ant-oat01-fresh", NOW + 60_000);
         let profiles = ScriptedProfiles::answering(Answer::Names(acct, org));
         let item = identify(&profiles, &fresh, None, &log_never_read, NOW, &Cancel::new())
-            .unwrap_or_else(|err| panic!("{row}: the profile names the item: {err:?}"));
+            .unwrap_or_else(|err| panic!("{row}: the profile names the item: {err:?}"))
+            .0;
         assert_eq!(undo_arm(&undone, &owner, &item), expected, "{row}, by the profile");
 
         let expired = claude_code_item("sk-ant-oat01-expired", NOW - 1);
@@ -1944,7 +2212,8 @@ fn an_undo_decides_by_the_items_identity() {
         };
         let never = ScriptedProfiles::answering(Answer::Names("acct-z", "org-z"));
         let item = identify(&never, &expired, Some(&expired8), &log, NOW, &Cancel::new())
-            .unwrap_or_else(|err| panic!("{row}: agctl's own write names the item: {err:?}"));
+            .unwrap_or_else(|err| panic!("{row}: agctl's own write names the item: {err:?}"))
+            .0;
         assert_eq!(undo_arm(&undone, &owner, &item), expected, "{row}, by agctl's own write");
         assert_eq!(never.asked(), 0, "{row}: an expired token is never asked");
     }

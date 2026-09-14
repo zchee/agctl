@@ -14,6 +14,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::commands::Prompt;
 use crate::config::AccountKind;
@@ -27,6 +28,11 @@ use crate::provider::claude::discovery;
 use crate::provider::claude::namespace;
 use crate::provider::claude::namespace::EnvView;
 use crate::runtime::coordinator::PassCtx;
+use crate::secret::claude_lock::CONFIG_HOLD_BUDGET;
+use crate::secret::claude_lock::Clock;
+use crate::secret::claude_lock::LockFs;
+use crate::secret::claude_lock::RealFs;
+use crate::secret::config_lock;
 use crate::secret::file_store;
 use crate::secret::file_store::ReadOutcome;
 
@@ -66,6 +72,10 @@ pub const SEED_KEYS: &[&str] = &[
 
 /// Account/subscription-scoped keys that must never be seeded (plan AC54's
 /// leak test; also `doctor`'s vocabulary).
+///
+/// `overageCreditGrantCache`, `s1mAccessCache` and `s1mNonSubscriberAccessCache`
+/// are **dead** in Claude Code 2.1.266 — no reader or writer in its bundle
+/// (S13 V9) — and stay listed because a later build could revive them.
 pub const NEVER_SEED: &[&str] = &[
     "oauthAccount",
     "userID",
@@ -536,6 +546,12 @@ fn link_mcp_config(session_dir: &Path, env: &EnvView) -> Result<PathBuf, AppErro
 
 /// Seeds `<session_dir>/.claude.json` from the live file, once (plan AC54).
 ///
+/// The live file is Claude Code's global configuration file
+/// ([`namespace::global_config_path`], `.config.json` when it exists), read
+/// under its configuration lock when that lock is free and through
+/// [`read_twice_and_compare`] when it is not ([`read_live_under_config_lock`],
+/// M6).
+///
 /// Skips entirely when the seed already exists as a plain file: this never
 /// rewrites it after the first run (invariant I18). Uses
 /// [`std::fs::symlink_metadata`] rather than [`Path::exists`], which follows
@@ -568,8 +584,14 @@ fn seed_claude_json(session_dir: &Path, env: &EnvView, ctx: &PassCtx) -> Result<
         }
     }
 
-    let live_path = namespace::claude_json_path(env);
-    let live_bytes = read_twice_and_compare(&live_path, ctx, read_live_claude_json)?;
+    let live_path = namespace::global_config_path(env);
+    let live_bytes = read_live_under_config_lock(
+        &live_path,
+        &Clock::system(),
+        Arc::new(RealFs),
+        ctx,
+        read_live_claude_json,
+    )?;
 
     let live_obj = match live_bytes {
         Some(bytes) => {
@@ -657,6 +679,47 @@ fn write_seed_file(path: &Path, text: &str) -> Result<(), AppError> {
         context: format!("could not write `{}`", path.display()),
         source: err,
     })
+}
+
+/// Reads the live configuration file for a seed under its configuration lock
+/// (M6, rulings G12 and Q5).
+///
+/// An absent file — a dangling link included — takes no lock and reads as
+/// `None`. Otherwise one [`config_lock::try_once`]: when it is free, one
+/// `read` under it and the release; when it is busy, stale, unreachable or
+/// failing, the lock is left exactly as it was — never broken, never waited
+/// on — and the read falls back to [`read_twice_and_compare`].
+fn read_live_under_config_lock<R>(
+    path: &Path,
+    clock: &Clock,
+    fs: Arc<dyn LockFs>,
+    ctx: &PassCtx,
+    mut read: R,
+) -> Result<Option<Vec<u8>>, AppError>
+where
+    R: FnMut(&Path) -> Result<Option<Vec<u8>>, AppError>,
+{
+    if std::fs::metadata(path).is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound) {
+        return Ok(None);
+    }
+    match config_lock::try_once(path, clock, fs) {
+        Ok(hold) => {
+            let bytes = read(path);
+            let held = hold.elapsed();
+            hold.release();
+            if held > CONFIG_HOLD_BUDGET {
+                tracing::warn!(
+                    hold_ms = u64::try_from(held.as_millis()).unwrap_or(u64::MAX),
+                    "the session seed's read outlasted the configuration lock's budget"
+                );
+            }
+            bytes
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "the configuration lock is not free; reading twice");
+            read_twice_and_compare(path, ctx, read)
+        }
+    }
 }
 
 /// Reads `path` through `read` twice and compares the results, retrying up

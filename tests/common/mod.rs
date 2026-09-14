@@ -353,6 +353,22 @@ impl Fixture {
         self.home().join(".claude-real").join("backups")
     }
 
+    /// Plants agctl's audit log holding `entries`, one line each, at the 0600
+    /// mode agctl's own writer leaves, so every gate that opens it accepts it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the log cannot be written or its mode set.
+    pub fn plant_audit_lines(&self, entries: &[Value]) -> PathBuf {
+        let log = self.audit_log_path();
+        fs::create_dir_all(log.parent().expect("the audit log has a parent"))
+            .expect("the namespace root is creatable");
+        let text: String = entries.iter().map(|entry| format!("{entry}\n")).collect();
+        fs::write(&log, text).expect("the audit log is writable");
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o600)).expect("mode 0600");
+        log
+    }
+
     /// Plants the configuration lock as a Claude Code session holding it would
     /// leave it, with its modification time `age` in the past, and returns it.
     ///
@@ -1005,6 +1021,16 @@ pub fn live_config_document() -> Value {
     })
 }
 
+/// [`live_config_document`] with its `oauthAccount` naming `acct`/`org`: the
+/// file a session leaves once it has logged in as that account (S24b-2).
+#[must_use]
+pub fn live_config_document_naming(acct: &str, org: &str) -> Value {
+    let mut document = live_config_document();
+    document["oauthAccount"]["accountUuid"] = json!(acct);
+    document["oauthAccount"]["organizationUuid"] = json!(org);
+    document
+}
+
 /// An expiry far enough in the past to be expired under any margin.
 #[must_use]
 pub fn expired_at() -> i64 {
@@ -1331,7 +1357,7 @@ pub fn finish(child: Child) -> Output {
 /// write lines in it is a failure, not a pass, because "the write path did
 /// nothing" is exactly the way this criterion could otherwise be satisfied
 /// (critic M8).
-pub const KEYCHAIN_WRITE_TESTS: [&str; 65] = [
+pub const KEYCHAIN_WRITE_TESTS: [&str; 68] = [
     "ac59_the_write_transport_reads_one_line_from_stdin_and_redacts_the_hex",
     "ac60_a_service_no_test_registered_is_refused_and_stores_nothing",
     "ac61_what_the_write_path_stores_is_what_the_binary_reads",
@@ -1435,6 +1461,11 @@ pub const KEYCHAIN_WRITE_TESTS: [&str; 65] = [
     "one_config_write_line_follows_each_live_write_and_none_follows_a_refusal",
     "a_namespace_swap_never_touches_claude_json",
     "a_compact_claude_json_is_refused_as_not_reproducible_and_left_byte_identical",
+    // S24b-2 (the `already_active` catch-up). Each swaps once before its
+    // catch-up — the undo test swaps and undoes — and pins its own count.
+    "rerunning_a_live_swap_whose_config_write_was_skipped_catches_it_up",
+    "an_undo_whose_config_write_was_skipped_is_caught_up_by_use_live_of_the_restored_account",
+    "a_catch_up_with_a_refused_audit_log_takes_no_lock_and_writes_nothing_at_every_live_return",
 ];
 
 /// Fact F42's keychain update line, for a test that means to write one.

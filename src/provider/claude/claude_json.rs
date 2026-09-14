@@ -32,6 +32,17 @@
 //! else — `userID`, `mcpServers`, `projects`, every setting — is carried over
 //! as the bytes it was.
 //!
+//! # The catch-up (S24b-2)
+//!
+//! A live `use` whose item already holds the account ends `already_active`,
+//! and a file an earlier pass could not rewrite is caught up from there, in
+//! two halves with the prompt between them: [`catch_up_check`] reads only —
+//! no descriptor kept, no `backups/`, no lock — and [`catch_up_write`] then
+//! takes exactly [`rmw`]'s locked write. Only the catch-up skips a file whose
+//! `oauthAccount` already carries the account's two ids (`already_current`),
+//! before the lock and again under it; an applied swap or undo always writes
+//! (plan AC75).
+//!
 //! # What never leaves this file
 //!
 //! A document value. `serde_json`'s errors quote their input, so every
@@ -203,6 +214,53 @@ pub fn rmw(env: &EnvView, profile: &Profile, ctx: &PassCtx) -> ConfigReport {
     report
 }
 
+/// A catch-up's read-only pre-flight that found a file to rewrite: opaque, and
+/// holding no descriptor, so dropping it leaves nothing behind.
+#[derive(Debug)]
+pub struct CatchUpCheck(Checked);
+
+/// The catch-up's first half (S24b-2): P1 read, P2 parse, P3
+/// `already_current`, P4 the guard — and nothing else. It keeps no
+/// descriptor, opens or creates no `backups/` and takes no lock, so a
+/// catch-up the operator then declines has created nothing.
+///
+/// P3 precedes P4 here only: a file that already names the account needs
+/// nothing, even when the guard could not reproduce it.
+///
+/// # Errors
+///
+/// The report the step ends with: `skipped` / `absent` or `already_current`,
+/// or `refused` / `unreadable`, `unparseable`, `not_an_object` or
+/// `not_reproducible`.
+pub fn catch_up_check(env: &EnvView, profile: &Profile) -> Result<CatchUpCheck, Box<ConfigReport>> {
+    preflight(env, profile, true).map(CatchUpCheck)
+}
+
+/// The catch-up's second half, after the prompt: [`rmw`]'s own P5–P6 and
+/// locked write, with `already_current` checked again under the lock. It never
+/// fails: every way it can end is an outcome the caller records.
+pub fn catch_up_write(
+    check: CatchUpCheck,
+    env: &EnvView,
+    profile: &Profile,
+    ctx: &PassCtx,
+) -> ConfigReport {
+    let now_ms = jiff::Timestamp::now().as_millisecond();
+    let report = match resolve(check.0, env, profile, now_ms, true) {
+        Ok(prepared) => {
+            write_with(prepared, ctx, &Clock::system(), Arc::new(RealFs), &HoldHooks::default())
+        }
+        Err(stopped) => *stopped,
+    };
+    tracing::debug!(
+        outcome = ?report.outcome,
+        reason = ?report.reason,
+        hold_ms = ?report.hold_ms,
+        "the configuration catch-up ended"
+    );
+    report
+}
+
 /// The guard: the document as a key-ordered map, if and only if
 /// `to_string_pretty` of the **unmodified** document reproduces `bytes`.
 ///
@@ -217,14 +275,39 @@ pub fn rmw(env: &EnvView, profile: &Profile, ctx: &PassCtx) -> ConfigReport {
 /// [`ConfigReason::Unparseable`], [`ConfigReason::NotAnObject`] or
 /// [`ConfigReason::NotReproducible`].
 pub fn reproduce(bytes: &[u8]) -> Result<Map<String, Value>, ConfigReason> {
+    reproduces(parse_object(bytes)?, bytes)
+}
+
+/// The document as a key-ordered map: [`ConfigReason::Unparseable`] or
+/// [`ConfigReason::NotAnObject`] otherwise.
+fn parse_object(bytes: &[u8]) -> Result<Map<String, Value>, ConfigReason> {
     let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
         return Err(ConfigReason::Unparseable);
     };
     let Value::Object(map) = value else { return Err(ConfigReason::NotAnObject) };
+    Ok(map)
+}
+
+/// [`reproduce`]'s comparison, on a map already parsed from `bytes`.
+fn reproduces(map: Map<String, Value>, bytes: &[u8]) -> Result<Map<String, Value>, ConfigReason> {
     match serde_json::to_string_pretty(&map) {
         Ok(text) if text.as_bytes() == bytes => Ok(map),
         _ => Err(ConfigReason::NotReproducible),
     }
+}
+
+/// Whether the document's `oauthAccount` already names `ids`: its
+/// `accountUuid` **and** its `organizationUuid` are strings equal to them
+/// (ruling Q4). Nothing else is read — not the key count, not a cache, not
+/// `profileFetchedAt`, which a running session re-stamps within minutes
+/// (ruling (c)).
+fn already_current(document: &Map<String, Value>, ids: &IncomingIdentity) -> bool {
+    let Some(Value::Object(account)) = document.get(OAUTH_ACCOUNT) else { return false };
+    let names = |key: &str, id: Option<&str>| {
+        id.is_some_and(|id| account.get(key).and_then(Value::as_str) == Some(id))
+    };
+    names("accountUuid", Some(&ids.account_uuid))
+        && names("organizationUuid", ids.organization_uuid.as_deref())
 }
 
 /// The `oauthAccount` object Claude Code's start-up refresh builds from a
@@ -280,6 +363,48 @@ pub fn build_oauth_account(profile: &Profile, now_ms: i64) -> Value {
     Value::Object(object)
 }
 
+/// Which account the live configuration file names, by its two ids alone —
+/// `doctor`'s side of the config row's comparison (ruling Q6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigIds {
+    /// There is no file.
+    Absent,
+    /// It could not be read, or is not JSON.
+    Unreadable,
+    /// It has no `oauthAccount` carrying an account uuid.
+    NoAccount,
+    /// The ids its `oauthAccount` carries.
+    Ids {
+        /// `accountUuid`.
+        account_uuid: String,
+        /// `organizationUuid`, when it is a string.
+        organization_uuid: Option<String>,
+    },
+}
+
+/// The ids the live configuration file's `oauthAccount` carries: a read of
+/// [`namespace::global_config_path`] following links, with no lock and no
+/// guard, so any JSON reads. The email and every other member are never read.
+pub fn oauth_account_ids(env: &EnvView) -> ConfigIds {
+    let path = namespace::global_config_path(env);
+    let bytes = match file_store::read_file_following(&path, MAX_CLAUDE_JSON_BYTES) {
+        Ok(ReadOutcome::Absent) => return ConfigIds::Absent,
+        Ok(ReadOutcome::Present { bytes, .. }) => bytes,
+        Err(_) => return ConfigIds::Unreadable,
+    };
+    let Ok(document) = serde_json::from_slice::<Value>(&bytes) else {
+        return ConfigIds::Unreadable;
+    };
+    let account = document.get(OAUTH_ACCOUNT);
+    let id = |key: &str| account.and_then(|account| account.get(key)?.as_str().map(str::to_owned));
+    match id("accountUuid") {
+        Some(account_uuid) => {
+            ConfigIds::Ids { account_uuid, organization_uuid: id("organizationUuid") }
+        }
+        None => ConfigIds::NoAccount,
+    }
+}
+
 /// JavaScript truthiness for a JSON value: `false`, `0`, `""` and `null` are
 /// falsy; everything else, empty arrays and objects included, is truthy.
 fn is_truthy(value: &Value) -> bool {
@@ -308,18 +433,99 @@ pub fn completion_clause() -> &'static str {
     "running sessions show the new account within a second; "
 }
 
-/// Decision D-030's sentence for an applied swap or undo whose config step did
-/// not apply, without the `warning: ` prefix the terminal adds.
-///
-/// It names no command and promises no re-run: S24b-1 has no catch-up, so the
-/// file stays as it is until something else rewrites it.
-pub fn not_updated_warning(reason: ConfigReason, config_path: &Path, home: &Path) -> String {
+/// The catch-up's question (S24b-2, ruling (f)), which is also its text-mode
+/// plan: `who` is the record's email, else its account uuid — the swap
+/// prompt's rule, and the terminal only.
+pub fn catch_up_question(who: &str, shown: &str) -> String {
     format!(
-        "`{}` was not updated ({}); running sessions keep showing the previous account until the \
-         next swap or undo, or a Claude Code `/login`",
-        shown_path(config_path, home),
-        reason_phrase(&reason)
+        "`{who}`'s credential is already the one the live store holds; rewrite the account \
+         `{shown}` names to match it? Running sessions show it within a second; run `/model` once \
+         afterwards to refresh model access"
     )
+}
+
+/// What an applied catch-up adds to the `already_active` sentence.
+pub fn catch_up_clause(shown: &str) -> String {
+    format!(
+        "`{shown}` now names that account too — running sessions show it within a second; run \
+         `/model` once to refresh model access"
+    )
+}
+
+/// How a config step that did not apply tells the operator to recover
+/// (ruling G4). `id` is the incoming record's account uuid (ruling (h)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery<'a> {
+    /// A forward swap: the same `use --live` again catches the file up.
+    SameAgain {
+        /// The account uuid the command names.
+        id: &'a str,
+    },
+    /// An undo: `use --live` of the account it put back — never `--undo`, which
+    /// would reverse the undo itself (ruling (g)).
+    Live {
+        /// The account uuid the command names.
+        id: &'a str,
+    },
+    /// An item agctl could identify only by its own write: its token must be
+    /// refreshed by the session before the server can be asked for a profile.
+    AfterMessage {
+        /// The account uuid the command names.
+        id: &'a str,
+        /// Whether the command is the forward pass's own, run again.
+        same: bool,
+    },
+}
+
+/// A config step's sentence, and the tone it is printed in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notice {
+    /// `warning:` on stderr, and an entry in `--json`'s `warnings`.
+    Warning(String),
+    /// `note:` on stderr only: nothing needs doing (ruling (i)).
+    Note(String),
+}
+
+/// The sentence for a config step that did not apply, without the prefix the
+/// terminal adds — or `None` when there is nothing to say: the file already
+/// names the account, or the operator declined the rewrite.
+///
+/// An absent file is a [`Notice::Note`] with no recovery clause: Claude Code
+/// writes `oauthAccount` itself at its next start (S24b-R3). Every other reason
+/// is a [`Notice::Warning`] naming the command that catches the file up.
+pub fn config_notice(
+    reason: ConfigReason,
+    config_path: &Path,
+    home: &Path,
+    recovery: Recovery<'_>,
+) -> Option<Notice> {
+    let shown = shown_path(config_path, home);
+    let run = |id: &str, same: bool| {
+        if same {
+            format!("run the same `agctl claude use --live {}` again", escape_controls(id))
+        } else {
+            format!("run `agctl claude use --live {}`", escape_controls(id))
+        }
+    };
+    let clause = match recovery {
+        Recovery::SameAgain { id } => run(id, true),
+        Recovery::Live { id } => run(id, false),
+        Recovery::AfterMessage { id, same } => format!(
+            "send one message in Claude Code, which refreshes the live credential, then {}",
+            run(id, same)
+        ),
+    };
+    match reason {
+        ConfigReason::Absent => Some(Notice::Note(format!(
+            "no `{shown}` to update; Claude Code writes `{OAUTH_ACCOUNT}` at its next start"
+        ))),
+        ConfigReason::AlreadyCurrent | ConfigReason::Declined => None,
+        _ => Some(Notice::Warning(format!(
+            "`{shown}` was not updated ({}); running sessions keep showing the previous account — \
+             {clause} to update it",
+            reason_phrase(&reason)
+        ))),
+    }
 }
 
 /// `path` with a leading `$HOME/` shown as `~/`, and control characters
@@ -329,6 +535,11 @@ pub fn shown_path(path: &Path, home: &Path) -> String {
         Ok(rest) if !home.as_os_str().is_empty() => format!("~/{}", rest.display()),
         _ => path.display().to_string(),
     };
+    escape_controls(&text)
+}
+
+/// `text` with every control character escaped.
+fn escape_controls(text: &str) -> String {
     let mut shown = String::with_capacity(text.len());
     for c in text.chars() {
         if c.is_control() {
@@ -362,6 +573,11 @@ fn reason_phrase(reason: &ConfigReason) -> &'static str {
             "the server could not be asked for that account's profile"
         }
         ConfigReason::SwapUnknown => "the swap's own outcome could not be confirmed",
+        ConfigReason::AlreadyCurrent => "it already names that account",
+        ConfigReason::Declined => "the rewrite was not confirmed",
+        ConfigReason::AuditRefused => {
+            "agctl's audit log is refused, and agctl rewrites nothing unrecorded"
+        }
         ConfigReason::Unrecognized => "for a reason this build does not know",
     }
 }
@@ -386,47 +602,86 @@ struct Prepared {
     account: Value,
     /// The step's report so far: the ids, and the digest of step P's read.
     report: ConfigReport,
+    /// Whether this is a catch-up, which H3 re-checks for `already_current`;
+    /// an applied swap's or undo's rewrite always writes (plan AC75).
+    catch_up: bool,
 }
 
-/// Step P1–P6: read, guard, resolve, open, build. A document the guard cannot
-/// reproduce is refused here, before any lock, so it costs a peer nothing.
+/// Step P1–P4's result: the literal path and the report so far.
+#[derive(Debug)]
+struct Checked {
+    /// `Lt()`'s path, literal.
+    config_path: PathBuf,
+    /// The ids, and the digest of P1's read.
+    report: ConfigReport,
+}
+
+/// Step P1–P6: [`preflight`], then [`resolve`] — [`rmw`]'s order, with no P3.
 fn prepare(env: &EnvView, profile: &Profile, now_ms: i64) -> Result<Prepared, Box<ConfigReport>> {
+    resolve(preflight(env, profile, false)?, env, profile, now_ms, false)
+}
+
+/// Step P1–P4, which only read: the file, its parse, `already_current` on a
+/// catch-up, and the guard. A document the guard cannot reproduce is refused
+/// here, before any lock, so it costs a peer nothing.
+fn preflight(
+    env: &EnvView,
+    profile: &Profile,
+    catch_up: bool,
+) -> Result<Checked, Box<ConfigReport>> {
     let ids = IncomingIdentity {
         account_uuid: profile.account_uuid.clone(),
         organization_uuid: Some(profile.organization_uuid.clone()),
     };
     // `Applied` is a placeholder every path below overwrites: step P and L set
     // their own outcome, and the hold sets `Applied` only after the rename.
-    let mut report = ConfigReport::about(Some(ids), ConfigOutcome::Applied);
-    let stop = |mut report: ConfigReport, outcome, reason| {
-        report.outcome = outcome;
-        report.reason = Some(reason);
-        Box::new(report)
-    };
+    let mut report = ConfigReport::about(Some(ids.clone()), ConfigOutcome::Applied);
 
     let config_path = namespace::global_config_path(env);
     let bytes = match file_store::read_file_following(&config_path, MAX_CLAUDE_JSON_BYTES) {
         Ok(ReadOutcome::Absent) => {
-            return Err(stop(report, ConfigOutcome::Skipped, ConfigReason::Absent));
+            return Err(stopped(report, ConfigOutcome::Skipped, ConfigReason::Absent));
         }
         Ok(ReadOutcome::Present { bytes, .. }) => bytes,
-        Err(_) => return Err(stop(report, ConfigOutcome::Refused, ConfigReason::Unreadable)),
+        Err(_) => return Err(stopped(report, ConfigOutcome::Refused, ConfigReason::Unreadable)),
     };
     report.from_sha8 = sha8(&bytes);
-    if let Err(reason) = reproduce(&bytes) {
-        return Err(stop(report, ConfigOutcome::Refused, reason));
+    let guarded = parse_object(&bytes).and_then(|map| {
+        if catch_up && already_current(&map, &ids) {
+            return Err(ConfigReason::AlreadyCurrent);
+        }
+        reproduces(map, &bytes)
+    });
+    match guarded {
+        Ok(_) => Ok(Checked { config_path, report }),
+        Err(ConfigReason::AlreadyCurrent) => {
+            Err(stopped(report, ConfigOutcome::Skipped, ConfigReason::AlreadyCurrent))
+        }
+        Err(reason) => Err(stopped(report, ConfigOutcome::Refused, reason)),
     }
+}
 
+/// Step P5–P6: the canonical target and its directory, `backups/` opened or
+/// created, and the new object built. The first step that can create
+/// anything, so a catch-up reaches it only after the prompt.
+fn resolve(
+    checked: Checked,
+    env: &EnvView,
+    profile: &Profile,
+    now_ms: i64,
+    catch_up: bool,
+) -> Result<Prepared, Box<ConfigReport>> {
+    let Checked { config_path, report } = checked;
     let target = namespace::canonical(&config_path).ok();
     let target_parts = target.as_deref().and_then(|target| {
         let dir = open_dir(target.parent()?).ok()?;
         Some((Arc::new(dir), target.file_name()?.to_os_string()))
     });
     let Some((target_dir, target_name)) = target_parts else {
-        return Err(stop(report, ConfigOutcome::Refused, ConfigReason::Unreadable));
+        return Err(stopped(report, ConfigOutcome::Refused, ConfigReason::Unreadable));
     };
     let Ok(backups) = open_backups(&namespace::backups_dir(env)) else {
-        return Err(stop(report, ConfigOutcome::Refused, ConfigReason::BackupUnwritable));
+        return Err(stopped(report, ConfigOutcome::Refused, ConfigReason::BackupUnwritable));
     };
     Ok(Prepared {
         config_path,
@@ -435,7 +690,19 @@ fn prepare(env: &EnvView, profile: &Profile, now_ms: i64) -> Result<Prepared, Bo
         backups,
         account: build_oauth_account(profile, now_ms),
         report,
+        catch_up,
     })
+}
+
+/// `report`, ended with `outcome` and `reason`.
+fn stopped(
+    mut report: ConfigReport,
+    outcome: ConfigOutcome,
+    reason: ConfigReason,
+) -> Box<ConfigReport> {
+    report.outcome = outcome;
+    report.reason = Some(reason);
+    Box::new(report)
 }
 
 /// A directory, opened following links: the live layout reaches both the
@@ -629,6 +896,11 @@ fn under_lock(
     // `swap_remove`, which moves the last top-level key into the hole (drift 9).
     gate(p, lock, hooks, Term::Transform)?;
     let mut document = reproduce(&before).map_err(|reason| stop(ConfigOutcome::Refused, reason))?;
+    // A catch-up checks `already_current` again on the file as it is under the
+    // lock: a session may have written the account since the prompt.
+    if p.catch_up && p.report.account.as_ref().is_some_and(|ids| already_current(&document, ids)) {
+        return Err(stop(ConfigOutcome::Skipped, ConfigReason::AlreadyCurrent));
+    }
     document.insert(OAUTH_ACCOUNT.to_owned(), p.account.clone());
     for key in STALE_CACHES {
         document.shift_remove(key);

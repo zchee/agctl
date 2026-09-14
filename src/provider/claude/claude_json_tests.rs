@@ -1194,3 +1194,245 @@ fn an_absent_config_file_is_skipped_without_a_lock() {
     );
     assert_eq!(names(bare.path()), [".claude"], "nothing created beside it");
 }
+
+// ---------------------------------------------------------------------------
+// S24b-2: the catch-up's two halves, and `doctor`'s ids
+// ---------------------------------------------------------------------------
+
+/// A JS-shaped document whose `oauthAccount` names `acct`/`org` as a running
+/// session leaves it after AC75's readings: eighteen keys, and four of the five
+/// caches regenerated beside it.
+fn current_document(acct: &str, org: &str) -> String {
+    let value = serde_json::json!({
+        "numStartups": 12,
+        "oauthAccount": {
+            "accountUuid": acct,
+            "emailAddress": "t@example.com",
+            "organizationUuid": org,
+            "hasExtraUsageEnabled": false,
+            "billingType": "stripe_subscription",
+            "accountCreatedAt": "2026-01-01T00:00:00Z",
+            "subscriptionCreatedAt": "2026-02-01T00:00:00Z",
+            "ccOnboardingFlags": {},
+            "claudeCodeTrialEndsAt": null,
+            "claudeCodeTrialDurationDays": null,
+            "seatTier": null,
+            "displayName": "Tee",
+            "fullName": "T Person",
+            "profileFetchedAt": 1_789_000_000_001_i64,
+            "organizationRole": "admin",
+            "workspaceRole": "developer",
+            "organizationName": "Acme",
+            "organizationType": "claude_max",
+        },
+        "modelAccessCache": { "claude-opus-5": true },
+        "orgModelDefaultCache": { "org": "claude-opus-5" },
+        "cachedUsageUtilization": { "five_hour": 0.25 },
+        "passesEligibilityCache": { "eligible": false },
+        "userID": "u-1",
+    });
+    serde_json::to_string_pretty(&value).expect("renderable")
+}
+
+/// Asserts a step created nothing: no `backups/`, no lock, no temporary file.
+fn nothing_created(home: &LiveHome, row: &str) {
+    assert!(!home.backups().exists(), "{row}: no `backups/` directory");
+    assert!(!home.lock_dir().exists(), "{row}: no lock directory");
+    assert!(home.temps().is_empty(), "{row}: no `.tmp.`: {:?}", home.temps());
+}
+
+#[test]
+fn a_catch_up_skips_an_oauth_account_whose_ids_already_match() {
+    // Ruling Q4 and (c): ids only, at step P and again under the lock, on the
+    // catch-up only.
+    let profile = t_profile();
+    let skipped = |report: &ConfigReport| {
+        (report.outcome, report.reason)
+            == (ConfigOutcome::Skipped, Some(ConfigReason::AlreadyCurrent))
+    };
+
+    // P, ids equal on an eighteen-key object with four caches present: skipped
+    // before anything is opened.
+    let home = LiveHome::new();
+    let current = current_document("acct-t", "org-t");
+    assert_eq!(reproduce(current.as_bytes()).map(|_| ()), Ok(()), "the premise: reproducible");
+    home.plant(&current);
+    let report = catch_up_check(&home.env(), &profile).expect_err("already current");
+    assert!(skipped(&report), "18 keys and four caches, ids equal: {report:?}");
+    assert_eq!(report.account.as_ref().map(|a| a.account_uuid.as_str()), Some("acct-t"));
+    assert_eq!(home.contents(), current.as_bytes(), "byte-identical");
+    nothing_created(&home, "ids equal");
+
+    // P, ids equal over a compact document the guard could not reproduce: P3
+    // precedes P4 on the catch-up, so nothing needs doing.
+    let home = LiveHome::new();
+    let compact = serde_json::to_string(
+        &serde_json::from_str::<Value>(&current).expect("the document parses"),
+    )
+    .expect("renderable");
+    assert_eq!(reproduce(compact.as_bytes()), Err(ConfigReason::NotReproducible), "the premise");
+    home.plant(&compact);
+    let report = catch_up_check(&home.env(), &profile).expect_err("already current");
+    assert!(skipped(&report), "compact but current: {report:?}");
+    nothing_created(&home, "compact and current");
+
+    // P, anything else goes on to the write.
+    let rows = [
+        ("the account equal, the organization differs", current_document("acct-t", "org-other")),
+        ("the organization equal, the account differs", current_document("acct-other", "org-t")),
+        ("no `oauthAccount`", document(&[chunk("numStartups", "12")])),
+        ("`oauthAccount` not an object", document(&[chunk("oauthAccount", "\"acct-t\"")])),
+        (
+            "`organizationUuid` missing",
+            document(&[chunk("oauthAccount", "{\n    \"accountUuid\": \"acct-t\"\n  }")]),
+        ),
+    ];
+    for (row, text) in rows {
+        let home = LiveHome::new();
+        home.plant(&text);
+        assert!(catch_up_check(&home.env(), &profile).is_ok(), "{row}: not current");
+        assert_eq!(home.contents(), text.as_bytes(), "{row}: byte-identical");
+        nothing_created(&home, row);
+    }
+
+    // H3: the file named P at step P, and a session wrote T into it before
+    // agctl's read under the lock. The hook runs at H1's gate, the last point
+    // before that read (H2 and H3 work on H1's bytes).
+    let home = LiveHome::new();
+    let (before, _) = small_pair();
+    home.plant(&before);
+    let check = catch_up_check(&home.env(), &profile).expect("P's file needs the rewrite");
+    let target = home.target();
+    let written = current.clone();
+    let hooks = HoldHooks {
+        before_term: Some(Box::new(move |term| {
+            if term == Term::Read {
+                fs::write(&target, &written).expect("a session's save");
+            }
+        })),
+        ..HoldHooks::default()
+    };
+    let prepared = resolve(check.0, &home.env(), &profile, NOW, true).expect("P5 and P6");
+    let report = write_with(prepared, &ctx(), &Clock::system(), Arc::new(RealFs), &hooks);
+    assert!(skipped(&report), "H3: already current under the lock: {report:?}");
+    assert!(report.hold_ms.is_some(), "the lock was taken: {report:?}");
+    assert_eq!(report.backup, None, "no backup");
+    assert!(home.backup_names().is_empty(), "no backup file");
+    assert!(home.temps().is_empty(), "no temp");
+    assert!(!home.lock_dir().exists(), "released");
+    assert_eq!(home.contents(), current.as_bytes(), "the session's bytes stand");
+
+    // AC75: the applied path has no P3 and no H3 — `rmw` over the same current
+    // file writes, and backs up first.
+    let home = LiveHome::new();
+    home.plant(&current);
+    let report = rmw(&home.env(), &profile, &ctx());
+    assert_eq!(report.outcome, ConfigOutcome::Applied, "rmw always writes: {report:?}");
+    assert_eq!(home.backup_names().len(), 1, "one backup");
+    assert_eq!(
+        fs::read(home.backups().join(&home.backup_names()[0])).expect("readable"),
+        current.as_bytes()
+    );
+}
+
+#[test]
+fn a_catch_up_check_reads_only_and_creates_nothing() {
+    // Ruling B3: the check keeps no descriptor and creates nothing — not even
+    // `backups/` — so a catch-up declined at the prompt leaves no trace. Only
+    // the write, after it, resolves P5–P6.
+    let profile = t_profile();
+    let (stale, _) = small_pair();
+    let compact =
+        serde_json::to_string(&serde_json::from_str::<Value>(&stale).expect("the document parses"))
+            .expect("renderable");
+    // (row, the planted text or none, what the check answers)
+    type Answer = Result<(), (ConfigOutcome, ConfigReason)>;
+    let rows: [(&str, Option<&str>, Answer); 3] = [
+        ("absent", None, Err((ConfigOutcome::Skipped, ConfigReason::Absent))),
+        (
+            "compact",
+            Some(compact.as_str()),
+            Err((ConfigOutcome::Refused, ConfigReason::NotReproducible)),
+        ),
+        ("stale and reproducible", Some(stale.as_str()), Ok(())),
+    ];
+    for (row, planted, expected) in rows {
+        let home = LiveHome::new();
+        if let Some(text) = planted {
+            home.plant(text);
+        }
+        let checked = catch_up_check(&home.env(), &profile);
+        let answered = checked
+            .as_ref()
+            .map(|_| ())
+            .map_err(|report| (report.outcome, report.reason.expect("a reason")));
+        assert_eq!(answered, expected, "{row}");
+        nothing_created(&home, &format!("{row}, after the check"));
+        drop(checked);
+        nothing_created(&home, &format!("{row}, after dropping it"));
+        match planted {
+            Some(text) => assert_eq!(home.contents(), text.as_bytes(), "{row}: byte-identical"),
+            None => assert!(!home.target().exists(), "{row}: nothing created"),
+        }
+        assert_link_intact(&home);
+    }
+
+    // The `Ok` check, written: `rmw`'s write, from the check's path.
+    let home = LiveHome::new();
+    home.plant(&stale);
+    let check = catch_up_check(&home.env(), &profile).expect("a stale file");
+    nothing_created(&home, "before the write");
+    let report = catch_up_write(check, &home.env(), &profile, &ctx());
+    assert_eq!(report.outcome, ConfigOutcome::Applied, "{report:?}");
+    let account = report.account.as_ref().expect("the ids written");
+    assert_eq!(
+        (account.account_uuid.as_str(), account.organization_uuid.as_deref()),
+        ("acct-t", Some("org-t")),
+        "the profile's ids"
+    );
+    let written: Value = serde_json::from_slice(&home.contents()).expect("JSON");
+    assert_eq!(written["oauthAccount"]["accountUuid"], "acct-t", "{written}");
+    assert!(written.get("modelAccessCache").is_none(), "the caches go as in `rmw`");
+    let backups = home.backup_names();
+    assert_eq!(backups.len(), 1, "one backup: {backups:?}");
+    assert_eq!(fs::read(home.backups().join(&backups[0])).expect("readable"), stale.as_bytes());
+    assert!(!home.lock_dir().exists(), "released");
+    assert!(home.temps().is_empty());
+}
+
+#[test]
+fn oauth_account_ids_reads_the_two_ids_and_nothing_else() {
+    // `doctor`'s side of ruling Q6: any JSON, no guard, no lock; the email is
+    // never read, so no answer's `Debug` can carry one.
+    let (js, _) = small_pair();
+    let compact = serde_json::to_string(&serde_json::from_str::<Value>(&js).expect("parses"))
+        .expect("renderable");
+    let p_ids = ConfigIds::Ids {
+        account_uuid: "acct-p".to_owned(),
+        organization_uuid: Some("org-p".to_owned()),
+    };
+    let rows: [(&str, Option<&str>, ConfigIds); 7] = [
+        ("absent", None, ConfigIds::Absent),
+        ("not JSON", Some("{\"oauthAccount\": "), ConfigIds::Unreadable),
+        ("no `oauthAccount`", Some("{\"numStartups\": 1}"), ConfigIds::NoAccount),
+        ("an account with no uuid", Some("{\"oauthAccount\": {\"x\": 1}}"), ConfigIds::NoAccount),
+        (
+            "no organization",
+            Some("{\"oauthAccount\": {\"accountUuid\": \"acct-p\"}}"),
+            ConfigIds::Ids { account_uuid: "acct-p".to_owned(), organization_uuid: None },
+        ),
+        ("JS-shaped", Some(js.as_str()), p_ids.clone()),
+        ("compact", Some(compact.as_str()), p_ids),
+    ];
+    for (row, planted, expected) in rows {
+        let home = LiveHome::new();
+        if let Some(text) = planted {
+            home.plant(text);
+        }
+        let got = oauth_account_ids(&home.env());
+        assert_eq!(got, expected, "{row}");
+        assert!(!format!("{got:?}").contains('@'), "{row}: no email: {got:?}");
+        nothing_created(&home, row);
+    }
+    assert!(js.contains("p@example.com"), "the premise: the file does carry an email");
+}

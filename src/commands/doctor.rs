@@ -78,6 +78,8 @@ use crate::config::paths::Paths;
 use crate::config::paths::UNKNOWN_ORG;
 use crate::error::AppError;
 use crate::provider::claude::account::AccountState;
+use crate::provider::claude::claude_json;
+use crate::provider::claude::claude_json::ConfigIds;
 use crate::provider::claude::credentials::Credentials;
 use crate::provider::claude::discovery;
 use crate::provider::claude::namespace;
@@ -198,6 +200,7 @@ pub fn report(
         audit::log_path(doctor.paths).display(),
         audit::log_state(doctor.paths).note()
     ));
+    out.push(config_row(doctor));
     out.push(format!("  accounts         {} recorded", config.accounts.len()));
 
     out.push(String::new());
@@ -258,6 +261,96 @@ pub fn report(
 
     io.tell(&out.join("\n"));
     Ok(())
+}
+
+/// The store block's `claude config` row (ruling G14): the live configuration
+/// file and its lock, both as the literal path spells them, and what the
+/// newest config step recorded against what the file names now.
+fn config_row(doctor: &Doctor<'_>) -> String {
+    let path = namespace::global_config_path(doctor.env);
+    let lock = namespace::config_lock_name(&path)
+        .map_or_else(|| path.clone(), |name| path.with_file_name(name));
+    let tail = audit::tail(doctor.paths, usize::MAX).map_err(|err| err.to_string());
+    let file = claude_json::oauth_account_ids(doctor.env);
+    format!(
+        "  claude config    {} (lock {}); {}",
+        path.display(),
+        lock.display(),
+        config_verdict(tail.as_ref().map_err(String::clone), &file)
+    )
+}
+
+/// What the newest config step did, in words only (rulings Q6 and R-G): audit
+/// ids, outcome and reason words, and whether the account it recorded agrees
+/// with the one the file names — compared in memory, so no account id, email
+/// or path of the file's is ever printed.
+fn config_verdict(tail: Result<&audit::Tail, String>, file: &ConfigIds) -> String {
+    let tail = match tail {
+        Ok(tail) => tail,
+        Err(err) => return format!("config writes unknown ({})", err.escape_debug()),
+    };
+    let mut newest = tail.entries.iter().enumerate().rev();
+    let live_write = newest.clone().find(|(_, entry)| {
+        matches!(
+            entry.event,
+            audit::AuditEvent::Write {
+                target: audit::Target::Live,
+                outcome: audit::WriteOutcome::Applied | audit::WriteOutcome::Unknown,
+                ..
+            }
+        )
+    });
+    // The newest config step counts only when no live write came after it: a
+    // catch-up line (no `after`) following that write covers it too.
+    let config_write = newest
+        .find_map(|(at, entry)| match &entry.event {
+            audit::AuditEvent::ConfigWrite(record) => Some((at, entry, record)),
+            _ => None,
+        })
+        .filter(|(at, ..)| live_write.is_none_or(|(write_at, _)| write_at < *at));
+    let Some((_, entry, record)) = config_write else {
+        return match live_write {
+            Some((_, write)) => {
+                format!("the newest live write ({}) has no config write after it", write.id())
+            }
+            None => "no config write recorded".to_owned(),
+        };
+    };
+    let word = |value: serde_json::Result<Value>| {
+        value.ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_default()
+    };
+    let reason = record
+        .reason
+        .map(|reason| format!(" ({})", word(serde_json::to_value(reason))))
+        .unwrap_or_default();
+    let after = record
+        .after
+        .as_deref()
+        .map(|after| format!(" after {}", after.escape_debug()))
+        .unwrap_or_default();
+    let against = match (&record.account, file) {
+        (None, _) => "it recorded no account",
+        (Some(_), ConfigIds::Absent) => "the file is absent",
+        (Some(_), ConfigIds::Unreadable) => "the file cannot be read",
+        (Some(_), ConfigIds::NoAccount) => "the file names no account",
+        (Some(recorded), ConfigIds::Ids { account_uuid, organization_uuid }) => {
+            if recorded.account_uuid == *account_uuid
+                && recorded
+                    .organization_uuid
+                    .as_ref()
+                    .is_none_or(|org| organization_uuid.as_ref() == Some(org))
+            {
+                "its account agrees with the file"
+            } else {
+                "its account differs from the file"
+            }
+        }
+    };
+    format!(
+        "last config write {}{reason} at {}{after}; {against}",
+        word(serde_json::to_value(record.outcome)),
+        entry.id()
+    )
 }
 
 /// The credentials on this machine that belong to something else.

@@ -253,10 +253,10 @@ pub fn live_store_dir(env: &EnvView) -> PathBuf {
 ///
 /// This is Claude Code's `OQt()`, **without** `Lt()`'s `.config.json`
 /// precedence. The display-only callers (`discovery::live_identity`, `login`,
-/// `doctor`'s isolation section) read this path; every writer, lock and backup
-/// derivation — `claude_json`, `config_lock`, and later M6 and `doctor`'s
-/// config row — must use [`global_config_path`], or the lock and the rewrite
-/// would target a file the peer does not (ruling Q9).
+/// `doctor`'s isolation section, `link_mcp_config`) read this path; every
+/// writer, lock and backup derivation — `claude_json`, `config_lock`, the M6
+/// seed read and `doctor`'s config row — uses [`global_config_path`], or the
+/// lock and the rewrite would target a file the peer does not (ruling Q9).
 pub fn claude_json_path(env: &EnvView) -> PathBuf {
     match env.config_dir.as_deref() {
         Some(value) if !value.is_empty() => PathBuf::from(normalize(value)).join(".claude.json"),

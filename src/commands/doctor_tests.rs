@@ -1489,3 +1489,219 @@ fn the_report_reports_unregistered_for_a_session_with_no_matching_record() {
         "an unregistered session is forgotten by path:\n{text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// S24b-2: the store block's `claude config` row
+// ---------------------------------------------------------------------------
+
+/// Whether `text` holds anything shaped like a UUID (8-4-4-4-12 hex digits).
+fn has_uuid_shape(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let groups = [8, 4, 4, 4, 12];
+    let span = groups.iter().sum::<usize>() + groups.len() - 1;
+    bytes.windows(span).any(|window| {
+        let mut at = 0;
+        groups.iter().enumerate().all(|(index, len)| {
+            let hex = window[at..at + len].iter().all(u8::is_ascii_hexdigit);
+            at += len;
+            let dash = index + 1 == groups.len() || window.get(at) == Some(&b'-');
+            at += 1;
+            hex && dash
+        })
+    })
+}
+
+/// One audit entry at `second`, as the log would hold it.
+fn logged(second: i64, event: audit::AuditEvent) -> audit::AuditEntry {
+    let mut entry = audit::AuditEntry::new(event);
+    entry.ts = jiff::Timestamp::from_second(1_800_000_000 + second).expect("a valid instant");
+    entry.agctl_pid = 4242;
+    entry
+}
+
+/// A live write that may have landed, or not.
+fn live_write(second: i64, outcome: audit::WriteOutcome) -> audit::AuditEntry {
+    logged(
+        second,
+        audit::AuditEvent::Write {
+            target: audit::Target::Live,
+            from_digest8: Some("0a0b0c0d".to_owned()),
+            to_digest8: "1a1b1c1d".to_owned(),
+            outcome,
+            direction: audit::WriteDirection::Forward,
+            incoming_identity: Some(audit::IncomingIdentity {
+                account_uuid: ACCT.to_owned(),
+                organization_uuid: Some(ORG.to_owned()),
+            }),
+        },
+    )
+}
+
+/// A config step's line, naming `account` and following `after`.
+fn config_line(
+    second: i64,
+    outcome: audit::ConfigOutcome,
+    reason: Option<audit::ConfigReason>,
+    after: Option<&audit::AuditEntry>,
+    account: Option<(&str, Option<&str>)>,
+) -> audit::AuditEntry {
+    logged(
+        second,
+        audit::AuditEvent::ConfigWrite(audit::ConfigWriteRecord {
+            after: after.map(|write| write.id().to_string()),
+            outcome,
+            reason,
+            account: account.map(|(acct, org)| audit::IncomingIdentity {
+                account_uuid: acct.to_owned(),
+                organization_uuid: org.map(str::to_owned),
+            }),
+            from_sha8: Some("0123abcd".to_owned()),
+            to_sha8: None,
+            backup: None,
+            hold_ms: Some(3),
+        }),
+    )
+}
+
+#[test]
+fn the_config_row_says_what_the_last_config_write_did_in_words_only() {
+    // Rulings G14, Q6, (d) and R-G: the newest config step, against the ids the
+    // file names today, compared in memory — and no id, email or uuid-shaped
+    // string in any verdict.
+    use audit::ConfigOutcome as O;
+    use audit::ConfigReason as R;
+    const OTHER: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let file_names = |acct: &str, org: Option<&str>| ConfigIds::Ids {
+        account_uuid: acct.to_owned(),
+        organization_uuid: org.map(str::to_owned),
+    };
+    let write = live_write(1, audit::WriteOutcome::Applied);
+    let applied = config_line(2, O::Applied, None, Some(&write), Some((ACCT, Some(ORG))));
+    let (write_id, applied_id) = (write.id().to_string(), applied.id().to_string());
+    let applied_prefix = format!("last config write applied at {applied_id} after {write_id}; ");
+    let later_write = live_write(3, audit::WriteOutcome::Unknown);
+    let catch_up = config_line(4, O::Skipped, Some(R::Absent), None, Some((ACCT, Some(ORG))));
+    let namespace_write = logged(
+        5,
+        audit::AuditEvent::Write {
+            target: audit::Target::Namespace("77777777".to_owned()),
+            from_digest8: None,
+            to_digest8: "2a2b2c2d".to_owned(),
+            outcome: audit::WriteOutcome::Applied,
+            direction: audit::WriteDirection::Forward,
+            incoming_identity: None,
+        },
+    );
+    let discarded = live_write(6, audit::WriteOutcome::Discarded);
+    let unattempted =
+        config_line(2, O::NotAttempted, Some(R::ProfileUnavailable), Some(&write), None);
+
+    // (row, the log's entries, the file's ids, the verdict)
+    let rows: Vec<(&str, Vec<audit::AuditEntry>, ConfigIds, String)> = vec![
+        (
+            "an empty log",
+            vec![],
+            file_names(ACCT, Some(ORG)),
+            "no config write recorded".to_owned(),
+        ),
+        (
+            "a live write with no step after it",
+            vec![write.clone()],
+            file_names(ACCT, Some(ORG)),
+            format!("the newest live write ({write_id}) has no config write after it"),
+        ),
+        (
+            "a newer live write than the newest step",
+            vec![write.clone(), applied.clone(), later_write.clone()],
+            file_names(ACCT, Some(ORG)),
+            format!("the newest live write ({}) has no config write after it", later_write.id()),
+        ),
+        (
+            "a catch-up line after the newest write covers it",
+            vec![write.clone(), applied.clone(), later_write.clone(), catch_up.clone()],
+            ConfigIds::Absent,
+            format!("last config write skipped (absent) at {}; the file is absent", catch_up.id()),
+        ),
+        (
+            "applied, and the file agrees",
+            vec![write.clone(), applied.clone()],
+            file_names(ACCT, Some(ORG)),
+            format!("{applied_prefix}its account agrees with the file"),
+        ),
+        (
+            "a namespace write or a discarded live write after it changes nothing",
+            vec![write.clone(), applied.clone(), namespace_write, discarded],
+            file_names(ACCT, Some(ORG)),
+            format!("{applied_prefix}its account agrees with the file"),
+        ),
+        (
+            "the file names another account",
+            vec![write.clone(), applied.clone()],
+            file_names(OTHER, Some(ORG)),
+            format!("{applied_prefix}its account differs from the file"),
+        ),
+        (
+            "the file names the account in another organization",
+            vec![write.clone(), applied.clone()],
+            file_names(ACCT, Some(OTHER)),
+            format!("{applied_prefix}its account differs from the file"),
+        ),
+        (
+            "the file names no organization, the record does",
+            vec![write.clone(), applied.clone()],
+            file_names(ACCT, None),
+            format!("{applied_prefix}its account differs from the file"),
+        ),
+        (
+            "the record names no organization",
+            vec![write.clone(), config_line(2, O::Applied, None, Some(&write), Some((ACCT, None)))],
+            file_names(ACCT, Some(ORG)),
+            format!("{applied_prefix}its account agrees with the file"),
+        ),
+        (
+            "the file is absent",
+            vec![write.clone(), applied.clone()],
+            ConfigIds::Absent,
+            format!("{applied_prefix}the file is absent"),
+        ),
+        (
+            "the file cannot be read",
+            vec![write.clone(), applied.clone()],
+            ConfigIds::Unreadable,
+            format!("{applied_prefix}the file cannot be read"),
+        ),
+        (
+            "the file names no account",
+            vec![write.clone(), applied.clone()],
+            ConfigIds::NoAccount,
+            format!("{applied_prefix}the file names no account"),
+        ),
+        (
+            "a step that recorded no account",
+            vec![write.clone(), unattempted],
+            file_names(ACCT, Some(ORG)),
+            format!(
+                "last config write not_attempted (profile_unavailable) at {applied_id} after \
+                 {write_id}; it recorded no account"
+            ),
+        ),
+    ];
+    for (row, entries, file, expected) in rows {
+        let tail = audit::Tail { entries, unreadable: Vec::new() };
+        let verdict = config_verdict(Ok(&tail), &file);
+        assert_eq!(verdict, expected, "{row}");
+        for id in [ACCT, ORG, OTHER] {
+            assert!(!verdict.contains(id), "{row}: no fixture id: {verdict}");
+        }
+        assert!(!has_uuid_shape(&verdict), "{row}: no uuid-shaped string: {verdict}");
+        assert!(!verdict.contains('@'), "{row}: no email: {verdict}");
+    }
+
+    let verdict =
+        config_verdict(Err("the audit log is a symbolic link".to_owned()), &ConfigIds::Absent);
+    assert_eq!(verdict, "config writes unknown (the audit log is a symbolic link)");
+    assert!(
+        has_uuid_shape(ACCT) && !has_uuid_shape("2027-01-15T08:00:01Z#4242"),
+        "the probe works"
+    );
+}

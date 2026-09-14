@@ -944,7 +944,13 @@ fn config_write_carries_ids_only_and_parses_old_lines() {
             "profile_unavailable",
         ),
         (ConfigOutcome::NotAttempted, ConfigReason::SwapUnknown, "not_attempted", "swap_unknown"),
+        // S24b-2's three: a catch-up's words, which `7a325d8` reads as
+        // `Unrecognized` (forward-compatible by ruling Q7).
+        (ConfigOutcome::Skipped, ConfigReason::AlreadyCurrent, "skipped", "already_current"),
+        (ConfigOutcome::NotAttempted, ConfigReason::Declined, "not_attempted", "declined"),
+        (ConfigOutcome::Refused, ConfigReason::AuditRefused, "refused", "audit_refused"),
     ];
+    assert_eq!(words.len(), 18, "every reason but `unrecognized`, one row each");
     for (outcome, reason, outcome_word, reason_word) in words {
         let entry = AuditEntry::new(AuditEvent::ConfigWrite(config_record(outcome, Some(reason))));
         let line = entry_line(&entry).expect("a valid entry serialises");

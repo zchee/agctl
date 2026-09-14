@@ -777,6 +777,143 @@ fn read_twice_and_compare_stops_retrying_once_cancelled() {
     );
 }
 
+/// What M6's locked read did, in one timeline: the lock's `mkdir`s and
+/// `rmdir`s and the `read` seam's calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Seen {
+    Mkdir(bool),
+    Read,
+    Rmdir,
+}
+
+type SeenLog = std::sync::Arc<std::sync::Mutex<Vec<Seen>>>;
+
+fn note(log: &SeenLog, seen: Seen) {
+    log.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(seen);
+}
+
+fn seen(log: &SeenLog) -> Vec<Seen> {
+    log.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+/// The real directory operations, recorded into the shared timeline.
+struct RecordingFs(SeenLog);
+
+impl LockFs for RecordingFs {
+    fn mkdir(
+        &self,
+        at: crate::secret::claude_lock::LockSlot<'_>,
+    ) -> Result<(), crate::secret::claude_lock::FsError> {
+        let result = RealFs.mkdir(at);
+        note(&self.0, Seen::Mkdir(result.is_ok()));
+        result
+    }
+
+    fn rmdir(
+        &self,
+        at: crate::secret::claude_lock::LockSlot<'_>,
+    ) -> Result<(), crate::secret::claude_lock::FsError> {
+        note(&self.0, Seen::Rmdir);
+        RealFs.rmdir(at)
+    }
+
+    fn mtime(&self, at: crate::secret::claude_lock::LockSlot<'_>) -> Option<std::time::SystemTime> {
+        RealFs.mtime(at)
+    }
+}
+
+#[test]
+fn the_seed_read_takes_the_config_lock_and_falls_back_to_twice_and_compare_when_busy() {
+    // M6 under the configuration lock (rulings G12, Q5): a free lock is one read
+    // under it; a lock a peer holds — fresh or stale — is left exactly as it was
+    // and the read falls back to today's twice-and-compare; an absent file takes
+    // no lock at all.
+    let fx = fixture();
+    let path = fx.env.home.join(".claude.json");
+    let lock = fx.env.home.join(".claude.json.lock");
+    let run = |fail: bool| {
+        let log: SeenLog = std::sync::Arc::default();
+        let reads = std::sync::Arc::clone(&log);
+        let got = read_live_under_config_lock(
+            &path,
+            &Clock::system(),
+            std::sync::Arc::new(RecordingFs(std::sync::Arc::clone(&log))),
+            &ctx_with_deadline(),
+            move |_| {
+                note(&reads, Seen::Read);
+                if fail {
+                    Err(AppError::Config("the read failed".to_owned()))
+                } else {
+                    Ok(Some(b"{}\n".to_vec()))
+                }
+            },
+        );
+        (got, seen(&log))
+    };
+
+    // Free: taken, one read, released.
+    let (got, timeline) = run(false);
+    assert_eq!(got.expect("read"), Some(b"{}\n".to_vec()));
+    assert_eq!(timeline, [Seen::Mkdir(true), Seen::Read, Seen::Rmdir], "free");
+    assert!(!lock.exists(), "released");
+
+    // A read that fails under the lock still releases it first.
+    let (got, timeline) = run(true);
+    assert!(got.is_err(), "the read's error comes back");
+    assert_eq!(timeline, [Seen::Mkdir(true), Seen::Read, Seen::Rmdir], "released before the error");
+    assert!(!lock.exists(), "released");
+
+    // Fresh and then stale, both a peer's: no removal, two reads, no wait.
+    for age in [Duration::ZERO, Duration::from_secs(60)] {
+        std::fs::create_dir(&lock).expect("a peer's lock");
+        if !age.is_zero() {
+            let at = std::time::SystemTime::now().checked_sub(age).expect("an instant");
+            std::fs::File::open(&lock)
+                .and_then(|dir| dir.set_modified(at))
+                .expect("the lock's mtime is settable");
+        }
+        let before = std::fs::metadata(&lock).and_then(|m| m.modified()).expect("stat");
+        let (got, timeline) = run(false);
+        assert_eq!(got.expect("read"), Some(b"{}\n".to_vec()), "{age:?}: the bytes");
+        assert_eq!(timeline, [Seen::Mkdir(false), Seen::Read, Seen::Read], "{age:?}: fallback");
+        assert!(lock.is_dir(), "{age:?}: the peer's lock is left");
+        assert_eq!(
+            std::fs::metadata(&lock).and_then(|m| m.modified()).expect("stat"),
+            before,
+            "{age:?}: and not re-stamped"
+        );
+        std::fs::remove_dir(&lock).expect("the test's own cleanup");
+    }
+
+    // Absent — here a link that dangles: no lock, no read.
+    std::fs::remove_file(&path).expect("removable");
+    std::os::unix::fs::symlink(fx.env.home.join("gone.json"), &path).expect("a dangling link");
+    let (got, timeline) = run(false);
+    assert_eq!(got.expect("absent is not an error"), None);
+    assert_eq!(timeline, [], "no lock is taken for an absent file");
+    assert!(!lock.exists());
+}
+
+#[test]
+fn never_seed_documents_its_three_dead_keys() {
+    // Plan AC54's dead-key note (S13 V9), pinned on the source text so it cannot
+    // silently go, and the keys stay listed.
+    let source =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands/isolate.rs"))
+            .expect("the module's own source is readable");
+    let (before, _) = source.split_once("pub const NEVER_SEED").expect("the constant is there");
+    let doc: Vec<&str> =
+        before.lines().rev().take_while(|line| line.trim_start().starts_with("///")).collect();
+    let doc = doc.into_iter().rev().collect::<Vec<_>>().join("\n");
+    assert!(doc.contains("dead"), "the doc names the keys as dead:\n{doc}");
+    assert!(doc.contains("2.1.266"), "and the build it read:\n{doc}");
+    for key in ["overageCreditGrantCache", "s1mAccessCache", "s1mNonSubscriberAccessCache"] {
+        assert!(doc.contains(&format!("`{key}`")), "the doc names `{key}` as dead:\n{doc}");
+        assert!(NEVER_SEED.contains(&key), "`{key}` is still never seeded");
+    }
+    assert_eq!(NEVER_SEED.len(), 19, "no key added or removed");
+}
+
 // ---------------------------------------------------------------------------
 // `forget_session` (AC79)
 // ---------------------------------------------------------------------------

@@ -73,10 +73,16 @@
 //! [`claude_json::rmw`] of the live configuration file, from the profile
 //! document Phase B's second GET already fetched — never a third GET — and by
 //! one `config_write` audit line. An `unknown` write records that the step was
-//! not attempted; every other outcome, a namespace target and every
-//! `already_active` return run no step at all. A step that does not apply never
-//! changes the swap's outcome or exit code: the swap did apply, and the caller
-//! is told on stderr and in `--json`'s `warnings` that the file was not updated.
+//! not attempted; every other outcome and a namespace target run no step at
+//! all. A step that does not apply never changes the swap's outcome or exit
+//! code: the swap did apply, and the caller is told on stderr and in `--json`'s
+//! `warnings` that the file was not updated, and which `use --live` updates it.
+//!
+//! That command is the recovery because every **live** `already_active` return
+//! runs the catch-up (S24b-2, [`catch_up`]): with nothing held, from Phase A's
+//! own profile of the item — never a GET of its own — it checks the file,
+//! asks, and rewrites it through the same locked write, appending one
+//! `config_write` line with no `after`.
 //!
 //! ## The one thing this file must never do
 //!
@@ -109,6 +115,8 @@ use crate::error::EXIT_OK;
 use crate::provider::claude::adopt;
 use crate::provider::claude::claude_json;
 use crate::provider::claude::claude_json::ConfigReport;
+use crate::provider::claude::claude_json::Notice;
+use crate::provider::claude::claude_json::Recovery;
 use crate::provider::claude::credentials::Credentials;
 use crate::provider::claude::credentials::Digests;
 use crate::provider::claude::credentials::Identity;
@@ -132,6 +140,7 @@ use crate::secret::KeychainReader;
 use crate::secret::audit;
 use crate::secret::audit::AuditEntry;
 use crate::secret::audit::AuditEvent;
+use crate::secret::audit::ConfigOutcome;
 use crate::secret::audit::ConfigReason;
 use crate::secret::audit::Target;
 use crate::secret::claude_lock;
@@ -244,9 +253,10 @@ struct Report {
     /// A sentence for the terminal.
     note: Option<String>,
     /// The config step that followed Phase C on the live target (S24b): the
-    /// rewrite's outcome, or `not_attempted` after an `unknown` write. `None`
-    /// wherever no step belongs — a namespace target, `already_active`, and
-    /// every outcome that wrote nothing.
+    /// rewrite's outcome, or `not_attempted` after an `unknown` write — or, on
+    /// a live `already_active`, the catch-up's (S24b-2). `None` wherever no
+    /// step belongs — a namespace target, and every other outcome that wrote
+    /// nothing.
     config: Option<ConfigReport>,
 }
 
@@ -805,10 +815,13 @@ fn swap_phases(
     // `Parties.identity`, `decide_adoption` and the no-record sentence.
     //
     // The profile source is kept for Phase B, which asks it once more about
-    // the credential being installed.
-    let (identity, profiles) = match (displaced.as_ref(), which) {
-        (None, _) => (None, None),
-        (Some(p), Which::Namespace) => (p.identity(), None),
+    // the credential being installed. The item's own profile is kept for the
+    // catch-up at the live `already_active` returns below (S24b-2, ruling Q2):
+    // `None` when the item was identified by agctl's own write, which the
+    // catch-up never refreshes or re-asks.
+    let (identity, profiles, item_profile) = match (displaced.as_ref(), which) {
+        (None, _) => (None, None, None),
+        (Some(p), Which::Namespace) => (p.identity(), None, None),
         (Some(p), Which::Live) => {
             let profiles = match status::default_profile_source() {
                 Ok(profiles) => profiles,
@@ -823,10 +836,22 @@ fn swap_phases(
             let log = || audit::tail(paths, usize::MAX);
             let now = now_ms();
             match identify(profiles.as_ref(), p, from_digest8.as_deref(), &log, now, ctx.cancel()) {
-                Ok(identity) => (Some(identity), Some(profiles)),
+                Ok((identity, item_profile)) => (Some(identity), Some(profiles), item_profile),
                 Err(unidentified) => return unidentified.report(&service),
             }
         }
+    };
+    // Everything the catch-up needs, for the three live `already_active`
+    // returns below. Each sits before step 10's namespace locks and step 10b's
+    // log, so the catch-up runs with nothing held.
+    let catching_up = CatchUp {
+        paths,
+        env,
+        ctx,
+        args,
+        record: incoming.record,
+        direction,
+        item_profile: item_profile.as_ref(),
     };
 
     // A live reversal's three arms (§D1), from the identity just resolved:
@@ -837,7 +862,7 @@ fn swap_phases(
         match undo_arm(undone, incoming.record, item) {
             UndoArm::Proceed => {}
             UndoArm::AlreadyActive => {
-                return already_active(
+                let report = already_active(
                     &service,
                     from_digest8.clone(),
                     format!(
@@ -848,6 +873,7 @@ fn swap_phases(
                         display_of(item)
                     ),
                 );
+                return catch_up(&catching_up, pass, report);
             }
             UndoArm::ForeignLogin => {
                 return Report::refused(
@@ -889,7 +915,7 @@ fn swap_phases(
         // on an unmigrated store); `to_digest8` names what is actually
         // active, which is the thing the caller asked about.
         let active = current.as_ref().and_then(|d| audit::digest8(&d.access_sha256));
-        return Report {
+        let report = Report {
             outcome: Outcome::AlreadyActive,
             target: None,
             service,
@@ -902,6 +928,8 @@ fn swap_phases(
             note: Some("that account's credential is already the one this store holds".to_owned()),
             config: None,
         };
+        // A namespace target has no `.claude.json` of its own: `config: null`.
+        return if which == Which::Live { catch_up(&catching_up, pass, report) } else { report };
     }
 
     // §D5, the live forward direction only: the item already holds a copy of
@@ -921,11 +949,12 @@ fn swap_phases(
             &incoming_credentials,
         )
     {
-        return already_active(
+        let report = already_active(
             &service,
             from_digest8,
             "that account's credential is already the one the live store holds".to_owned(),
         );
+        return catch_up(&catching_up, pass, report);
     }
 
     // Step 9, refusal D's first check: on the **stored** blob, outside every
@@ -1394,19 +1423,163 @@ fn swap_phases(
             &log_path,
             AuditEvent::ConfigWrite(config.record(report.audit_id.clone())),
         );
-        if let Some(reason) = config.not_updated() {
-            // Through `Pass`, because `swap_in` replaces `Report::warnings`
-            // with the pass's own (finding N1).
-            let warning = claude_json::not_updated_warning(
-                reason,
-                &namespace::global_config_path(env),
-                &env.home,
-            );
-            eprintln!("warning: {warning}");
-            pass.warnings.push(warning);
-        }
+        let id = incoming.record.account_uuid.as_str();
+        let recovery = match direction {
+            Direction::Forward => Recovery::SameAgain { id },
+            // A live reversal's incoming record is the owner it put back.
+            Direction::Reverse => Recovery::Live { id },
+        };
+        tell_config(pass, env, config, recovery);
     }
     report
+}
+
+/// Prints a config step's sentence, if it owes one (§D2): a warning on stderr
+/// **and** in `--json`'s `warnings`, through `Pass` because `swap_in` replaces
+/// `Report::warnings` with the pass's own (finding N1); a note on stderr only,
+/// because `config` already tells a `--json` consumer (ruling (i)).
+fn tell_config(pass: &mut Pass, env: &EnvView, config: &ConfigReport, recovery: Recovery<'_>) {
+    let Some(reason) = config.not_updated() else { return };
+    let path = namespace::global_config_path(env);
+    match claude_json::config_notice(reason, &path, &env.home, recovery) {
+        Some(Notice::Warning(text)) => {
+            eprintln!("warning: {text}");
+            pass.warnings.push(text);
+        }
+        Some(Notice::Note(text)) => eprintln!("note: {text}"),
+        None => {}
+    }
+}
+
+/// What the `already_active` catch-up needs from the pass (S24b-2).
+struct CatchUp<'a> {
+    paths: &'a Paths,
+    env: &'a EnvView,
+    ctx: &'a PassCtx,
+    args: &'a UseArgs,
+    /// The incoming record: the account the operator named, which on a live
+    /// reversal is the owner being put back.
+    record: &'a AccountRecord,
+    direction: Direction,
+    /// Phase A's profile of the item, or `None` when agctl's own write named
+    /// it (an expired or revoked token).
+    item_profile: Option<&'a Profile>,
+}
+
+/// The catch-up at a live `already_active` return (S24b-2, ruling G4): the
+/// file is brought to name the account the item holds, from Phase A's own
+/// document of it, so re-running `use --live` recovers a config step that did
+/// not apply.
+///
+/// Runs with **nothing held** — no namespace lock, no credential-store hold,
+/// no audit descriptor of the pass's own. The outcome stays `already_active`
+/// and exit 0 whatever the step did; the step's report becomes `config`.
+fn catch_up(c: &CatchUp<'_>, pass: &mut Pass, mut report: Report) -> Report {
+    let config_path = namespace::global_config_path(c.env);
+    let shown = claude_json::shown_path(&config_path, &c.env.home);
+    let log_path = audit::log_path(c.paths);
+    let who = c.record.email.as_deref().unwrap_or(&c.record.account_uuid);
+    let (config, log) = catch_up_step(
+        c.item_profile,
+        c.args.yes,
+        || audit::open_log(c.paths, &log_path),
+        |profile| claude_json::catch_up_check(c.env, profile),
+        |_check| {
+            if c.args.json
+                && let Some(profile) = c.item_profile
+            {
+                emit_config_plan(&shown, profile);
+            }
+        },
+        || Tty.confirm(&claude_json::catch_up_question(who, &shown)).unwrap_or(false),
+        |check, profile| claude_json::catch_up_write(check, c.env, profile, c.ctx),
+    );
+    if let Some(log) = &log {
+        // A catch-up follows no write of its own: `after` is `None` (ruling Q7).
+        audit_append_through(
+            c.paths,
+            Some(log),
+            &log_path,
+            AuditEvent::ConfigWrite(config.record(None)),
+        );
+    }
+    if config.not_updated().is_none()
+        && let Some(note) = report.note.take()
+    {
+        report.note = Some(format!("{note}; {}", claude_json::catch_up_clause(&shown)));
+    }
+    let id = c.record.account_uuid.as_str();
+    let recovery = match (c.item_profile, c.direction) {
+        (None, direction) => Recovery::AfterMessage { id, same: direction == Direction::Forward },
+        (Some(_), Direction::Forward) => Recovery::SameAgain { id },
+        (Some(_), Direction::Reverse) => Recovery::Live { id },
+    };
+    tell_config(pass, c.env, &config, recovery);
+    report.config = Some(config);
+    report
+}
+
+/// The catch-up's decisions, in §D1's order, over its effects as closures —
+/// so a test can count each one. Returns the step's report, and the audit log's
+/// descriptor when a `config_write` line is owed.
+///
+/// - **C1** no profile of the item: `not_attempted` / `profile_unavailable`,
+///   nothing opened.
+/// - **C2** the log refused: `refused` / `audit_refused`, nothing read or
+///   locked, and no line — there is no log to write it to.
+/// - **C3** the read-only check: a file absent, already current or refused
+///   ends the step with a line.
+/// - **C4** the plan; **C5** the prompt, unless `yes`: a decline is
+///   `not_attempted` / `declined` with no line, having created nothing.
+/// - **C6** the locked write, with a line.
+fn catch_up_step<C>(
+    profile: Option<&Profile>,
+    yes: bool,
+    open_log: impl FnOnce() -> Result<File, AppError>,
+    check: impl FnOnce(&Profile) -> Result<C, Box<ConfigReport>>,
+    plan: impl FnOnce(&C),
+    consent: impl FnOnce() -> bool,
+    write: impl FnOnce(C, &Profile) -> ConfigReport,
+) -> (ConfigReport, Option<File>) {
+    let Some(profile) = profile else {
+        return (ConfigReport::not_attempted(ConfigReason::ProfileUnavailable), None);
+    };
+    let log = match open_log() {
+        Ok(log) => log,
+        Err(err) => {
+            tracing::debug!(error = %err, "the configuration catch-up met a refused audit log");
+            let refused = ConfigReport::not_attempted(ConfigReason::AuditRefused);
+            return (ConfigReport { outcome: ConfigOutcome::Refused, ..refused }, None);
+        }
+    };
+    let checked = match check(profile) {
+        Ok(checked) => checked,
+        Err(report) => return (*report, Some(log)),
+    };
+    plan(&checked);
+    if !yes && !consent() {
+        return (ConfigReport::not_attempted(ConfigReason::Declined), None);
+    }
+    (write(checked, profile), Some(log))
+}
+
+/// The catch-up's plan, for `--json` (ruling (b)): its own four-member
+/// document, naming the file in its shown form and the account by the two ids
+/// the rewrite would write — never an email, never a resolved path.
+fn emit_config_plan(config_shown: &str, profile: &Profile) {
+    let doc = serde_json::json!({
+        "kind": "plan",
+        "direction": "config",
+        "config_path": config_shown,
+        "account": {
+            "account_uuid": profile.account_uuid,
+            "organization_uuid": profile.organization_uuid,
+        },
+    });
+    match serde_json::to_string_pretty(&doc) {
+        Ok(text) => println!("{text}"),
+        Err(err) => tracing::error!(error = %err, "the configuration plan could not be rendered"),
+    }
 }
 
 /// Whether the config step runs after Phase C, and what it records when it
@@ -1568,10 +1741,10 @@ fn read_profile(
 
 /// A profile's identity, ids only: the email and the rest of the document go
 /// no further than this (no PII leaves the profile).
-fn identity_of(profile: Profile) -> Identity {
+fn identity_of(profile: &Profile) -> Identity {
     Identity {
-        account_uuid: profile.account_uuid,
-        organization_uuid: Some(profile.organization_uuid),
+        account_uuid: profile.account_uuid.clone(),
+        organization_uuid: Some(profile.organization_uuid.clone()),
         email: None,
         org_name: None,
     }
@@ -1676,6 +1849,11 @@ fn profile_unavailable_note(error: &str) -> String {
 ///   says which.
 ///
 /// `item8` is the item's digest prefix, as step 7 read it.
+///
+/// The item's profile comes back beside the identity (S24b-2, ruling Q2) —
+/// `Some` when the server answered, `None` when agctl's own write named the
+/// account — because it is the document a live `already_active`'s catch-up
+/// writes, which therefore issues no GET of its own.
 fn identify(
     source: &dyn ProfileSource,
     item: &Credentials,
@@ -1683,9 +1861,9 @@ fn identify(
     log: &dyn Fn() -> Result<audit::Tail, AppError>,
     now: i64,
     cancel: &Cancel,
-) -> Result<Identity, Unidentified> {
-    let (resolved, by) = match read_profile(source, item, now, cancel) {
-        ProfileRead::Verified(profile) => (identity_of(profile), Resolver::Profile),
+) -> Result<(Identity, Option<Profile>), Unidentified> {
+    let (resolved, by, profile) = match read_profile(source, item, now, cancel) {
+        ProfileRead::Verified(profile) => (identity_of(&profile), Resolver::Profile, Some(profile)),
         ProfileRead::Unavailable(err) => {
             return Err(Unidentified::Gap(IdentityGap::ProfileUnavailable, Some(err.to_string())));
         }
@@ -1707,7 +1885,7 @@ fn identify(
             let Some(own) = own else {
                 return Err(Unidentified::Gap(IdentityGap::TokenExpired, None));
             };
-            (own, Resolver::OwnWrite)
+            (own, Resolver::OwnWrite, None)
         }
     };
     match item.identity() {
@@ -1718,7 +1896,7 @@ fn identify(
                 by,
             })
         }
-        _ => Ok(resolved),
+        _ => Ok((resolved, profile)),
     }
 }
 

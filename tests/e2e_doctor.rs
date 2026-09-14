@@ -150,3 +150,119 @@ fn the_store_block_names_an_audit_log_agctl_refuses_and_leaves_its_mode_alone() 
     assert!(stdout.contains("audit log"), "{stdout}");
     assert!(!stdout.contains("its mode is"), "a 0600 log is reported as present:\n{stdout}");
 }
+
+/// The `store` block of a `doctor` report: its header to the blank line after.
+fn store_block(stdout: &str) -> String {
+    stdout
+        .lines()
+        .skip_while(|line| *line != "store")
+        .take_while(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether `text` holds anything shaped like a UUID (8-4-4-4-12 hex digits).
+fn has_uuid_shape(text: &str) -> bool {
+    let groups = [8_usize, 4, 4, 4, 12];
+    let span = groups.iter().sum::<usize>() + groups.len() - 1;
+    text.as_bytes().windows(span).any(|window| {
+        let mut at = 0;
+        groups.iter().enumerate().all(|(index, len)| {
+            let hex = window[at..at + len].iter().all(u8::is_ascii_hexdigit);
+            at += len;
+            let dash = index + 1 == groups.len() || window.get(at) == Some(&b'-');
+            at += 1;
+            hex && dash
+        })
+    })
+}
+
+#[test]
+fn the_store_block_names_the_config_path_its_lock_and_whether_the_file_agrees() {
+    // Rulings G14, Q6 and R-G: one row after `audit log` naming the live
+    // configuration file and its lock by their literal paths, and what the newest
+    // config step did — against today's file, in words only.
+    const OTHER_ACCT: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const OTHER_ORG: &str = "ffffffff-0000-1111-2222-333333333333";
+    let write = json!({
+        "ts": "2026-09-11T00:00:01Z",
+        "monotonic_ms": 1,
+        "agctl_pid": 1,
+        "event": "write",
+        "target": "live",
+        "from_digest8": "0a0b0c0d",
+        "to_digest8": "1a1b1c1d",
+        "outcome": "applied",
+        "direction": "forward",
+        "incoming_identity": { "account_uuid": ACCT, "organization_uuid": ORG },
+    });
+    let config_write = json!({
+        "ts": "2026-09-11T00:00:02Z",
+        "monotonic_ms": 2,
+        "agctl_pid": 1,
+        "event": "config_write",
+        "after": "2026-09-11T00:00:01Z#1",
+        "outcome": "applied",
+        "reason": null,
+        "account": { "account_uuid": ACCT, "organization_uuid": ORG },
+        "from_sha8": "0123abcd",
+        "to_sha8": "89abcdef",
+        "backup": ".claude.json.backup.1789000000000",
+        "hold_ms": 4,
+    });
+    // (arm, the log, whom the file names, the verdict)
+    type Arm<'a> = (&'a str, bool, Option<(&'a str, &'a str)>, &'a str);
+    let arms: [Arm<'_>; 3] = [
+        ("no log", false, None, "no config write recorded"),
+        (
+            "the file names the recorded account",
+            true,
+            Some((ACCT, ORG)),
+            "last config write applied at 2026-09-11T00:00:02Z#1 after 2026-09-11T00:00:01Z#1; \
+             its account agrees with the file",
+        ),
+        (
+            "the file names another account",
+            true,
+            Some((OTHER_ACCT, OTHER_ORG)),
+            "last config write applied at 2026-09-11T00:00:02Z#1 after 2026-09-11T00:00:01Z#1; \
+             its account differs from the file",
+        ),
+    ];
+    for (arm, logged, names, verdict) in arms {
+        let fixture = Fixture::new();
+        fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
+        if logged {
+            fixture.plant_audit_lines(&[write.clone(), config_write.clone()]);
+        }
+        if let Some((acct, org)) = names {
+            fixture.live_through_link();
+            fixture.live_claude_json_js(&common::live_config_document_naming(acct, org));
+        }
+
+        let output =
+            fixture.cmd().args(["claude", "doctor"]).output().expect("`claude doctor` should run");
+        assert!(output.status.success(), "{arm}: {}", String::from_utf8_lossy(&output.stderr));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let block = store_block(&stdout);
+        let home = fixture.home();
+        let row = format!(
+            "  claude config    {} (lock {}); {verdict}",
+            home.join(".claude.json").display(),
+            home.join(".claude.json.lock").display()
+        );
+        assert!(block.lines().any(|line| line == row), "{arm}: the row `{row}` in:\n{block}");
+        let lines: Vec<&str> = block.lines().collect();
+        let audit_at = lines.iter().position(|l| l.starts_with("  audit log")).expect("audit log");
+        assert_eq!(
+            lines.get(audit_at + 1),
+            Some(&row.as_str()),
+            "{arm}: directly after `audit log`"
+        );
+        assert_eq!(block.matches('@').count(), 0, "{arm}: no email in the store block:\n{block}");
+        assert!(
+            !has_uuid_shape(&block),
+            "{arm}: no uuid-shaped string in the store block:\n{block}"
+        );
+    }
+}
