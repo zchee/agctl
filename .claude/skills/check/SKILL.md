@@ -34,8 +34,10 @@ binary is worse than one that fails.
 
 ## The two separate gates
 
-**AC38** and **AC37** are deliberately not folded into the three commands above. Check both
-whenever you touch the feature gating or the test seams.
+**AC38** and **AC37/AC78** are deliberately not folded into the three commands above. Check
+both whenever you touch the feature gating or the test seams. `scripts/release-gate.sh` also
+carries the two documentation gates (**AC77**, **AC83**), so run it whenever you touch
+`README.md`, `docs/` or `scripts/` as well — see "The documentation gates" below.
 
 **AC38** — the no-feature build must fail loudly rather than silently skipping the e2e
 suite:
@@ -47,14 +49,15 @@ direnv exec . cargo --config ~/.config/rust/config.dev.toml check --tests --keep
 Expected: it *fails*, and the only error listed is `tests/feature_guard.rs`'s
 `compile_error!`. Any other error means a test file lost its `#![cfg(feature = "testing")]`.
 
-**AC37** — a default-feature release artifact must contain no test-only environment-variable
-name, and must still contain the production ones. Run the script:
+**AC37 / AC78** — a default-feature release artifact must contain no test-only
+environment-variable name, and must still contain the production ones. Run the script:
 
 ```sh
 scripts/release-gate.sh
 ```
 
-It builds `cargo build --release` (default features, no `--config`, into a scratch
+It runs `scripts/docs-gate.sh` first (no build needed, so a prose failure is reported in
+seconds), then builds `cargo build --release` (default features, no `--config`, into a scratch
 `--target-dir` that is never `./target` and never the shared `~/.cache/rust/target`) and
 greps the artifact for two lists. The eleven seam names are one representative name per
 seam-owning module, not the whole test-only surface — `fixtures/fake-security.sh` alone
@@ -68,7 +71,7 @@ of which must be absent:**
 | `AGCTL_FAULT` | `src/runtime/fault.rs` |
 | `AGCTL_FAULT_RESUME` | `src/runtime/fault.rs` |
 | `AGCTL_KEYCHAIN_BACKEND` | `src/secret/mod.rs` |
-| `AGCTL_SECURITY_BIN` | `src/secret/mod.rs` |
+| `AGCTL_SECURITY_BIN` | declared `src/secret/mod.rs`; read by `src/secret/keychain_write.rs` (the write path) and `src/secret/mod.rs` (the read path) |
 | `AGCTL_CLAUDE_USAGE_URL` | `src/provider/claude/usage.rs` |
 | `AGCTL_CLAUDE_TOKEN_URL` | `src/provider/claude/oauth.rs` |
 | `AGCTL_CLAUDE_AUTHORIZE_URL` | `src/provider/claude/oauth.rs` |
@@ -88,7 +91,43 @@ If the gate fails, the build enabled `testing` — never `cargo build --release
 
 One representative name per seam-owning module: a new seam-owning module adds its
 representative to the `seams` array in `scripts/release-gate.sh` **and** to the table
-above, in the same change that introduces it.
+above, in the same change that introduces it. Three `AGCTL_*` names in the tree are
+deliberately outside the array — `AGCTL_LOCK_CHILD_ROLE` and `AGCTL_LOCK_CHILD_DIR`, which
+live only in a `#[cfg(test)]` sibling and are covered more strongly by `tests/e2e_lock.rs`,
+and `AGCTL_E2E_MARKER`, which a test sets on a child and the crate never reads. The script
+says so in a comment; do not "tidy" them in.
+
+## The documentation gates
+
+`scripts/docs-gate.sh` runs on its own as well as from the release gate, and needs no build:
+
+```sh
+scripts/docs-gate.sh
+```
+
+**AC77** — `README.md` must not carry the retired absolute claim that agctl never writes the
+keychain (true in phase 1, false from the moment `use --live` landed), and must name both
+`WriteTarget` constructors, `WriteTarget::migrated` and `WriteTarget::live`. Naming them is
+what makes the claim checkable: the set of keychain items agctl can write is exactly the set
+those two can name, so the README can be diffed against `src/secret/keychain_write.rs` by
+anyone who doubts it. Rewording that paragraph without keeping both names fails the gate.
+
+**AC83** — the two development wrappers this file documents (the direnv invocation and the
+dev-profile cargo config) must appear in **no** reader-facing surface: not `README.md`, not
+`docs/`, not `scripts/`, not `src/`. They belong here and in `AGENTS.md` (which `CLAUDE.md`
+symlinks to), and nowhere else: `.envrc` is untracked, so a fresh clone has no layout and no
+`RUSTFLAGS`, and a reader who copies a wrapped command gets an error rather than a build.
+
+Two things about that script a reviewer will want to "fix" and must not:
+
+- Its two patterns are spelled with a bracketed space and an escaped dot rather than as
+  plain literals. The script lives under `scripts/`, which AC83 scans, so a literal would
+  match itself and the gate could never pass.
+- The AC83 check runs **first against a planted temp file** that contains both strings and is
+  required to fail. That self-test is there because an earlier spelling of this rule joined
+  its two patterns with a backslash-pipe — an escaped literal pipe in ripgrep's regex, not
+  alternation — so the gate searched for a string containing a pipe character, found it
+  nowhere, and passed unconditionally. A gate that has never been seen to fail is not a gate.
 
 Benchmarks are not part of this gate. When you do run them, run them **bare** — `cargo bench`
 with no direnv — because `layout rust_stable` pins `-C target-cpu` to the host CPU.

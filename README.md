@@ -505,16 +505,20 @@ counted; `--all` shows them.
 - **agctl writes two classes of keychain item, and deletes none.** The `security(1)`
   subcommands it issues are `show-keychain-info`, `find-generic-password` and
   `dump-keychain` — all reads — plus `add-generic-password -U`, on standard input, for two
-  cases. The first is the item of a namespace agctl created, whose name is derived from the
-  account registry: `status` refreshes it in place once a Claude Code session has migrated
-  that namespace into the keychain, and `use --live` from that session's shell swaps it. The
-  second is the live item — `Claude Code-credentials`, or `Claude Code-credentials-<sha8>`
-  under a non-empty `CLAUDE_CONFIG_DIR`, derived from the environment the way Claude Code
-  derives it — which only `use --live` and `use --undo` write, once per run and only after
-  you confirm or pass `--yes`. Both are written under Claude Code's own lock protocol, and no
-  other item is nameable as a target. There is no `delete-generic-password` code path at
-  all, and no secret ever appears in a command line: the credential goes to `security -i`
-  over a pipe. Every write is appended to `~/.config/agctl/claude/keychain-writes.jsonl`,
+  cases. Those two cases are the two constructors of one type — `WriteTarget::migrated` and
+  `WriteTarget::live`, in `src/secret/keychain_write.rs` — which has no other constructor,
+  no public fields and none taking a service name as a string, so the set of items agctl
+  can write is exactly the set those two can name. The first is the item of a namespace
+  agctl created, whose name `WriteTarget::migrated` derives from the account registry:
+  `status` refreshes it in place once a Claude Code session has migrated that namespace into
+  the keychain, and `use --live` from that session's shell swaps it. The second is the live
+  item — `Claude Code-credentials`, or `Claude Code-credentials-<sha8>` under a non-empty
+  `CLAUDE_CONFIG_DIR` — which `WriteTarget::live` derives from the environment the way
+  Claude Code derives it, and which only `use --live` and `use --undo` write, once per run
+  and only after you confirm or pass `--yes`. Both are written under Claude Code's own lock
+  protocol, and no other item is nameable as a target. There is no `delete-generic-password`
+  code path at all, and no secret ever appears in a command line: the credential goes to
+  `security -i` over a pipe. Every write is appended to `~/.config/agctl/claude/keychain-writes.jsonl`,
   which records digest prefixes and never token material; the entry is written after the
   write, and a failure to append is reported rather than rolling the write back, so a
   process killed between the two leaves a write the log does not name. The `~/.claude.json`

@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# AC37 — the release-artifact gate.
+# AC37 and AC78 — the release-artifact gate.
 #
 # Builds agctl the way a release is built (default features, release profile)
 # into a scratch target directory, then proves two things about the artifact:
 #
 #   1. none of the eleven test-seam environment-variable names appear in it, and
 #   2. the three production-visible names do.
+#
+# It also runs scripts/docs-gate.sh first (AC77 and AC83), so that one command
+# covers everything a release must satisfy that the three check-skill commands
+# do not. That gate is cheap and needs no build; it is run before the build so
+# a prose failure is reported in seconds rather than after a release compile.
 #
 # It also checks, from cargo's normal-edge feature resolution, that the shipped
 # and the `testing` builds get `serde_json/float_roundtrip` (the live
@@ -19,6 +24,27 @@
 # seam-owning module adds its representative to the `seams` array below and to
 # the table in .claude/skills/check/SKILL.md, in the same change that
 # introduces it.
+#
+# Three AGCTL_* names in the tree are deliberately NOT in the array below,
+# because none of them is a crate seam and adding them would blur what the
+# array means:
+#
+#   AGCTL_LOCK_CHILD_ROLE, AGCTL_LOCK_CHILD_DIR
+#     Declared and read only inside src/secret/claude_lock_tests.rs, a
+#     `#[cfg(test)]` sibling, to tell a re-executed copy of the *test* binary
+#     to act as the lock child. They are not compiled into the crate at all,
+#     and tests/e2e_lock.rs already asserts that no non-test source mentions
+#     them — a stronger check than this artifact grep, since it fires the
+#     moment one moves into production code rather than only at release.
+#
+#   AGCTL_E2E_MARKER
+#     Set by tests/e2e_isolate.rs on a child it spawns, to prove the child's
+#     environment is passed through. The crate never reads it.
+#
+# Phase 2 added no other seam: AGCTL_SECURITY_BIN (the write transport) and
+# AGCTL_CLAUDE_PROFILE_URL (the live swap's profile GET) are both listed, and
+# `rg -o 'AGCTL_[A-Z0-9_]+' src --glob '!*_tests.rs'` enumerates nothing else
+# outside this array and the production list below.
 #
 # The first is the one that matters. The `testing` feature compiles overrides for
 # the OAuth token endpoint, the authorize endpoint, the profile endpoint and the
@@ -128,6 +154,20 @@ for tool in rg cargo; do
 	fi
 done
 
+failures=0
+
+# AC77 and AC83 first: no build needed, so a prose failure is reported in
+# seconds. Its failures join this script's count rather than exiting here, so
+# one run reports everything that is wrong rather than the first thing.
+echo "release-gate: running scripts/docs-gate.sh (AC77, AC83)"
+if "$repo_root/scripts/docs-gate.sh"; then
+	echo "release-gate: docs-gate PASS"
+else
+	echo "release-gate: docs-gate FAIL" >&2
+	failures=$((failures + 1))
+fi
+echo
+
 echo "release-gate: target-dir $target_dir"
 echo "release-gate: building default-feature release"
 cargo build --release --target-dir "$target_dir"
@@ -140,8 +180,6 @@ fi
 
 echo "release-gate: artifact $binary ($(wc -c <"$binary" | tr -d ' ') bytes)"
 echo
-
-failures=0
 
 echo "test seams (must be absent):"
 for name in "${seams[@]}"; do
@@ -190,7 +228,7 @@ done
 
 echo
 if [ "$failures" -eq 0 ]; then
-	echo "release-gate: PASS — ${#seams[@]} seams absent, ${#production[@]} production names present"
+	echo "release-gate: PASS — docs-gate clean, ${#seams[@]} seams absent, ${#production[@]} production names present"
 	exit 0
 fi
 
