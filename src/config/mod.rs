@@ -22,7 +22,20 @@
 //! The registry is small and rewritten whole. It is still written under a lock
 //! and through a temporary file, because two `agctl` processes racing to
 //! add an account must not leave a truncated document behind.
+//!
+//! # Two providers, two lists, one file
+//!
+//! Codex accounts live in [`AgctlConfig::codex_accounts`] as
+//! [`CodexAccountRecord`](codex::CodexAccountRecord)s, not as a fifth
+//! [`AccountKind`]. The reasons are in [`codex`]; the consequence here is the
+//! [`AgctlConfig::version`], which is **derived from the content at every
+//! write** rather than remembered: 1 while there are no Codex rows, 2 once
+//! there are, and back to 1 when the last one is removed. That is what lets a
+//! Claude-only registry stay byte-identical to what a phase-2 build wrote, and
+//! what makes such a build's refusal of a version-2 file truthful rather than
+//! a version bump nobody needed (plan D-038, AC99).
 
+pub mod codex;
 pub mod import;
 pub mod paths;
 
@@ -44,8 +57,24 @@ use crate::runtime::coordinator::Cancel;
 use crate::runtime::fault::Fault;
 use crate::secret::namespace_lock;
 
-/// The schema version this build writes and understands.
+/// The schema version of a registry with Claude accounts and nothing else.
+///
+/// The version is **derived at every write** from what the document holds, not
+/// remembered from what was read (plan decision D-038): a registry whose last
+/// Codex row was removed goes back to 1, and a phase-2 build can read it again.
+/// The two constants are therefore a property of the content, not a setting.
 pub const CONFIG_VERSION: u32 = 1;
+
+/// The schema version of a registry that holds at least one Codex account.
+///
+/// A phase-2 build refuses this file by version rather than ignoring the
+/// member it does not know (risk R50). That refusal is the honest answer: such
+/// a build would drop every `codex_accounts` row on its next write, and a
+/// silently emptied registry is worse than one that says it is too new.
+pub const CONFIG_VERSION_CODEX: u32 = 2;
+
+/// Every version this build reads.
+pub const SUPPORTED_VERSIONS: std::ops::RangeInclusive<u32> = CONFIG_VERSION..=CONFIG_VERSION_CODEX;
 
 /// How long `save` waits for the configuration lock before giving up.
 ///
@@ -72,11 +101,26 @@ pub struct AgctlConfig {
     /// keychain item itself is never touched (plan AC47, invariant I1).
     #[serde(default)]
     pub forgotten_services: Vec<String>,
+    /// Every Codex account this store knows about, in insertion order.
+    ///
+    /// A list of its own rather than more [`AccountRecord`]s, for the reasons
+    /// [`codex`] gives. It is **skipped when empty**, so a registry with no
+    /// Codex account serializes to exactly the bytes this build's predecessor
+    /// wrote — which, with the derived [`AgctlConfig::version`], is the whole
+    /// of what keeps a Claude-only store readable by a phase-2 binary
+    /// (plan AC99).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codex_accounts: Vec<codex::CodexAccountRecord>,
 }
 
 impl Default for AgctlConfig {
     fn default() -> Self {
-        Self { version: CONFIG_VERSION, accounts: Vec::new(), forgotten_services: Vec::new() }
+        Self {
+            version: CONFIG_VERSION,
+            accounts: Vec::new(),
+            forgotten_services: Vec::new(),
+            codex_accounts: Vec::new(),
+        }
     }
 }
 
@@ -199,11 +243,26 @@ impl AgctlConfig {
         let config: Self = serde_json::from_slice(&bytes).map_err(|err| {
             AppError::Config(format!("`{}` is not a valid agctl config: {err}", path.display()))
         })?;
-        if config.version != CONFIG_VERSION {
+        if !SUPPORTED_VERSIONS.contains(&config.version) {
             return Err(AppError::Config(format!(
-                "`{}` is version {}, but this build understands version {CONFIG_VERSION}",
+                "`{}` is version {}, but this build understands version {CONFIG_VERSION} and \
+                 version {CONFIG_VERSION_CODEX}",
                 path.display(),
                 config.version
+            )));
+        }
+        // A version-1 document with Codex rows in it was written by something
+        // that did not derive the version — a hand edit, or a merge of two
+        // files. Refused rather than accepted, because the two halves
+        // disagree about what the file is: a phase-2 build would read the
+        // same bytes, believe the version, and erase the rows on its next
+        // write (plan AC99, D-038).
+        if config.version == CONFIG_VERSION && !config.codex_accounts.is_empty() {
+            return Err(AppError::Config(format!(
+                "`{}` says version {CONFIG_VERSION} but holds {} Codex account(s); a registry \
+                 with Codex accounts is version {CONFIG_VERSION_CODEX}",
+                path.display(),
+                config.codex_accounts.len()
             )));
         }
         Ok(config)
@@ -250,6 +309,32 @@ impl AgctlConfig {
         Ok(value)
     }
 
+    /// The version this document *is*, from what it holds (plan D-038).
+    ///
+    /// Derived rather than stored, so the stamp cannot drift from the content:
+    /// an emptied `codex_accounts` returns the file to version 1 and a
+    /// phase-2 build can read it again, and no code path can add a Codex row
+    /// and forget to raise the version.
+    fn derived_version(&self) -> u32 {
+        if self.codex_accounts.is_empty() { CONFIG_VERSION } else { CONFIG_VERSION_CODEX }
+    }
+
+    /// The exact bytes [`AgctlConfig::write_locked`] renames into place.
+    ///
+    /// Split out so the derivation is testable without a store, a lock or a
+    /// filesystem: what a document serializes to is the whole of the
+    /// compatibility promise (AC99), and a test that had to take a lock to
+    /// check it would be testing the lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::Config`] when the document cannot be serialized.
+    fn document(&self) -> Result<String, AppError> {
+        let stamped = Self { version: self.derived_version(), ..self.clone() };
+        serde_json::to_string_pretty(&stamped)
+            .map_err(|err| AppError::Config(format!("could not serialize the config: {err}")))
+    }
+
     /// Writes the registry atomically. The caller holds the configuration
     /// lock, which is what the guard argument is there to prove.
     fn write_locked(
@@ -257,8 +342,7 @@ impl AgctlConfig {
         paths: &Paths,
         _guard: &namespace_lock::NamespaceLockGuard,
     ) -> Result<(), AppError> {
-        let document = serde_json::to_string_pretty(self)
-            .map_err(|err| AppError::Config(format!("could not serialize the config: {err}")))?;
+        let document = self.document()?;
 
         let target = paths.config_file();
         let tmp = target.with_extension(format!("json.tmp.{}", crate::secret::file_store::hex8()));

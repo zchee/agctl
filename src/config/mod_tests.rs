@@ -98,6 +98,115 @@ fn saving_twice_leaves_no_temporary_file() {
     assert!(strays.is_empty(), "left behind: {strays:?}");
 }
 
+// ---------------------------------------------------------------------------
+// D-038: the version is derived from the content (plan AC99, unit half)
+// ---------------------------------------------------------------------------
+
+/// A Codex record, enough of one to make the list non-empty.
+fn codex_row(user: &str, acct: &str) -> codex::CodexAccountRecord {
+    codex::CodexAccountRecord {
+        chatgpt_user_id: user.to_owned(),
+        chatgpt_account_id: acct.to_owned(),
+        email: Some(format!("{user}@example.com")),
+        plan_type: Some("plus".to_owned()),
+        label: None,
+        kind: codex::CodexKind::Live,
+        forgotten: false,
+        created_at: "2026-09-17T00:00:00Z".to_owned(),
+    }
+}
+
+#[test]
+fn a_registry_without_codex_rows_serializes_exactly_as_it_did_before_they_existed() {
+    // The compatibility promise, stated as bytes: a phase-2 binary reads this
+    // document, and a phase-3 binary that added and then removed a Codex row
+    // hands it back unchanged.
+    let mut config = AgctlConfig::default();
+    config.upsert(owned("acct-1", "org-1"));
+    let claude_only = config.document().expect("the document serializes");
+
+    assert!(
+        !claude_only.contains("codex_accounts"),
+        "an empty list is not written:\n{claude_only}"
+    );
+    assert!(claude_only.contains(r#""version": 1"#), "{claude_only}");
+
+    config.codex_accounts.push(codex_row("user-01", "acct-01"));
+    let with_codex = config.document().expect("the document serializes");
+    assert!(with_codex.contains(r#""version": 2"#), "{with_codex}");
+    assert!(with_codex.contains("codex_accounts"), "{with_codex}");
+
+    config.codex_accounts.clear();
+    assert_eq!(
+        config.document().expect("the document serializes"),
+        claude_only,
+        "removing the last Codex row returns the file to exactly what it was"
+    );
+}
+
+#[test]
+fn the_version_written_is_the_one_the_content_implies_whatever_the_field_held() {
+    // #134: the stamp is computed at the write, so neither a hand-edited
+    // field nor a stale one read from disk can survive a save.
+    let mut config = AgctlConfig { version: CONFIG_VERSION, ..AgctlConfig::default() };
+    config.codex_accounts.push(codex_row("user-01", "acct-01"));
+    assert_eq!(config.derived_version(), CONFIG_VERSION_CODEX);
+    assert!(
+        config.document().expect("serializes").contains(r#""version": 2"#),
+        "a Codex row raises a version-1 document to 2"
+    );
+
+    let claude_only = AgctlConfig { version: CONFIG_VERSION_CODEX, ..AgctlConfig::default() };
+    assert_eq!(claude_only.derived_version(), CONFIG_VERSION);
+    assert!(
+        claude_only.document().expect("serializes").contains(r#""version": 1"#),
+        "a document with no Codex rows goes back to 1 however it was stamped"
+    );
+}
+
+#[test]
+fn saving_stamps_the_version_on_disk_and_loading_accepts_both() {
+    let (_dir, paths) = store();
+    AgctlConfig::update(&paths, |registry| {
+        registry.upsert(owned("acct-1", "org-1"));
+        registry.codex_accounts.push(codex_row("user-01", "acct-01"));
+    })
+    .expect("the registry should save");
+
+    let loaded = AgctlConfig::load(&paths).expect("version 2 is readable");
+    assert_eq!(loaded.version, CONFIG_VERSION_CODEX);
+    assert_eq!(loaded.codex_accounts, vec![codex_row("user-01", "acct-01")]);
+
+    AgctlConfig::update(&paths, |registry| registry.codex_accounts.clear())
+        .expect("the registry should save");
+    let loaded = AgctlConfig::load(&paths).expect("version 1 is readable");
+    assert_eq!(loaded.version, CONFIG_VERSION);
+    assert!(loaded.codex_accounts.is_empty());
+}
+
+#[test]
+fn a_version_1_file_holding_codex_rows_is_refused() {
+    // The two halves of such a file disagree. Reading it as version 1 would
+    // mean a later write silently dropping the rows; reading it as version 2
+    // would mean trusting a stamp that is demonstrably wrong. Neither is an
+    // answer, so it is refused with both facts named.
+    let (_dir, paths) = store();
+    paths.ensure_dirs().expect("directories should be creatable");
+    let document = serde_json::json!({
+        "version": 1,
+        "accounts": [],
+        "forgotten_services": [],
+        "codex_accounts": [codex_row("user-01", "acct-01")],
+    });
+    std::fs::write(paths.config_file(), serde_json::to_vec_pretty(&document).expect("valid"))
+        .expect("the file should be writable");
+
+    let err = AgctlConfig::load(&paths).expect_err("the disagreement is not guessed at");
+    let message = err.to_string();
+    assert!(message.contains("version 1"), "{message}");
+    assert!(message.contains("Codex account"), "{message}");
+}
+
 #[test]
 fn a_future_version_is_refused_rather_than_misread() {
     let (_dir, paths) = store();
