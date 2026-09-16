@@ -31,6 +31,7 @@
 //! library's error type in beside it.
 
 pub mod claude;
+pub mod codex;
 
 use std::fmt;
 use std::time::Duration;
@@ -44,10 +45,6 @@ use crate::usage::model::UsageSnapshot;
 /// Names a provider where the choice decides a path or a label and nothing
 /// more, such as [`crate::config::paths::Paths::cache_dir_for`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "`Codex` is constructed from S30 (provider::codex) onward")
-)]
 pub enum Provider {
     /// Anthropic's Claude.
     Claude,
@@ -66,21 +63,11 @@ pub enum Provider {
 pub const USER_AGENT_DEFAULT: &str =
     concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
-/// The environment variable that replaces [`USER_AGENT_DEFAULT`] for Codex.
-///
-/// The Claude twin is [`claude::USER_AGENT_ENV`]. Both are production-visible
-/// on purpose (plan section 3.2): if a vendor starts refusing the honest
-/// agent, the user can put its own client's back without waiting for a
-/// release. Declared here rather than in `provider::codex` because
-/// [`user_agent`] is the only reader and that module does not exist yet;
-/// `provider::codex::USER_AGENT_ENV` re-exports it from S30.
-pub const CODEX_USER_AGENT_ENV: &str = "AGCTL_CODEX_USER_AGENT";
-
 /// Which environment variable overrides one provider's `User-Agent`.
 fn user_agent_env(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => claude::USER_AGENT_ENV,
-        Provider::Codex => CODEX_USER_AGENT_ENV,
+        Provider::Codex => codex::USER_AGENT_ENV,
     }
 }
 

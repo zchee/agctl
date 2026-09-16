@@ -33,6 +33,7 @@ sha2 = "0.11.0"
 signal-hook = "0.4"
 tabled = "0.22"
 thiserror = "2"
+toml = { version = "1.1.6", default-features = false, features = ["parse", "std"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-normalization = "0.1"

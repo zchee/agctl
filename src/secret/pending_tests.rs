@@ -339,6 +339,66 @@ fn an_unreadable_target_is_an_error_not_a_decision() {
     }
 }
 
+/// The Codex rule for unusable files (review S30 F1): nothing present is absent.
+struct NoUnusableDoc;
+
+impl PendingCredential for NoUnusableDoc {
+    const UNUSABLE_IS_ABSENT: bool = false;
+
+    fn validate(bytes: &[u8]) -> bool {
+        Doc::validate(bytes)
+    }
+
+    fn digests(bytes: &[u8]) -> Option<Digests> {
+        Doc::digests(bytes)
+    }
+}
+
+/// Sets `name`'s mode inside the namespace.
+fn chmod(ns: &Ns, name: &str, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(ns.path.join(name), std::fs::Permissions::from_mode(mode))
+        .unwrap_or_else(|err| panic!("`{name}` should be chmod-able: {err}"));
+}
+
+#[test]
+fn an_unopenable_file_keeps_everything_under_the_strict_rule_and_not_under_claude_s() {
+    // Review S30 F1. A mode-0000 target, pending file or meta: under the strict
+    // rule the resolution is an error and all three files stay; under the
+    // default (Claude's F40) rule an unopenable target is absent, so a derived
+    // pending file is discarded as `file removed` — phase 1's behaviour, kept.
+    let old = doc("at-old", "rt-old");
+    for unopenable in [AUTH, AUTH_PENDING, AUTH_META] {
+        let ns = new_ns();
+        put(&ns, AUTH, &old);
+        put(&ns, AUTH_PENDING, &doc("at-new", "rt-new"));
+        put(&ns, AUTH_META, &meta(Some(&digests(&old))));
+        chmod(&ns, unopenable, 0o000);
+
+        let err =
+            resolve_pending_with::<NoUnusableDoc>(ns.fd.as_fd(), &ns.path, &spec(None), false)
+                .expect_err(&format!("strict: a 0000 {unopenable} is an error"));
+        assert!(matches!(err, FileStoreError::Io { .. }), "{unopenable}: {err:?}");
+        for name in [AUTH, AUTH_PENDING, AUTH_META] {
+            assert!(ns.path.join(name).is_file(), "strict, 0000 {unopenable}: {name} is kept");
+        }
+        chmod(&ns, unopenable, 0o600);
+    }
+
+    let ns = new_ns();
+    put(&ns, AUTH, &old);
+    put(&ns, AUTH_PENDING, &doc("at-new", "rt-new"));
+    put(&ns, AUTH_META, &meta(Some(&digests(&old))));
+    chmod(&ns, AUTH, 0o000);
+    let (decision, _) = resolve::<Doc>(&ns, false);
+    chmod(&ns, AUTH, 0o600);
+    assert_eq!(
+        decision,
+        PendingDecision::Discarded(PendingDiscardReason::FileRemoved),
+        "the default rule is phase 1's, unchanged"
+    );
+}
+
 #[test]
 fn a_spec_with_an_escaping_or_aliased_name_is_refused_before_anything_is_touched() {
     // Review F2: `renameat`/`unlinkat` resolve `..` inside a name, so an

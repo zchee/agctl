@@ -172,3 +172,88 @@ fn the_help_text_does_not_spell_the_codex_home_variable() {
 
     assert!(!help.contains("CODEX_HOME"), "{help}");
 }
+
+/// Plan ledger #230: the S30 shapes S33/S34 will call, spelled from outside
+/// `provider::codex` with only what a command can reach.
+///
+/// Compiling this is the check — a `pub(super)` item or a private field in the
+/// way would be E0624/E0451 here, the same wall the real callers would hit —
+/// so neither function runs. The login tail is plan section 3.3's; the pass
+/// shape stops before the refresh steps, which only `provider/codex/refresh.rs`
+/// may take (plan AC122 clause 11).
+mod provider_boundary {
+    use crate::config::codex::CodexAccountRecord;
+    use crate::config::paths::Paths;
+    use crate::provider::codex::auth_store::InstallNamespace;
+    use crate::provider::codex::auth_store::NamespaceRead;
+    use crate::provider::codex::auth_store::OwnedNamespace;
+    use crate::provider::codex::auth_store::RefreshStateRead;
+    use crate::provider::codex::auth_store::WriteReceipt;
+    use crate::provider::codex::credentials::CodexIdentity;
+    use crate::provider::codex::lock;
+    use crate::provider::codex::lock::LockBudget;
+    use crate::provider::codex::proof;
+    use crate::provider::codex::proof::VerifiedLogin;
+    use crate::runtime::coordinator::Cancel;
+    use crate::runtime::fault::Fault;
+    use crate::secret::namespace_lock::COMMAND_LOCK_TIMEOUT;
+
+    #[expect(dead_code, reason = "a compile check of the provider boundary; S34 writes the caller")]
+    fn login_tail(
+        paths: &Paths,
+        login: VerifiedLogin,
+        cancel: &Cancel,
+        fault: &Fault,
+    ) -> Result<(WriteReceipt, CodexIdentity), String> {
+        let identity = login.identity();
+        let guard = lock::acquire_codex_for_install(
+            paths,
+            &login,
+            LockBudget::Command(COMMAND_LOCK_TIMEOUT),
+            cancel,
+            fault,
+        )
+        .map_err(|err| err.to_string())?;
+        let install = InstallNamespace::open_for_install(paths, login, &guard)
+            .map_err(|err| err.to_string())?;
+        let (receipt, installed) = install.install(fault).map_err(|err| err.to_string())?;
+        if installed != identity {
+            return Err("the installed identity is not the verified one".to_owned());
+        }
+        Ok((receipt, installed))
+    }
+
+    #[expect(dead_code, reason = "a compile check of the provider boundary; S33 writes the caller")]
+    fn owned_pass(
+        paths: &Paths,
+        record: &CodexAccountRecord,
+        cancel: &Cancel,
+        fault: &Fault,
+    ) -> Result<Option<WriteReceipt>, String> {
+        let owned = proof::owned(record).ok_or("not an owned record")?;
+        let guard = lock::acquire_codex(
+            paths,
+            owned,
+            LockBudget::Pass(COMMAND_LOCK_TIMEOUT),
+            cancel,
+            fault,
+        )
+        .map_err(|err| err.to_string())?;
+        let ns = OwnedNamespace::open(paths, owned, &guard).map_err(|err| err.to_string())?;
+        let (_decision, receipt, _evidence) =
+            ns.resolve_pending(cancel).map_err(|err| err.to_string())?;
+        if let RefreshStateRead::Unavailable(reason) = ns.refresh_state().load() {
+            return Err(reason);
+        }
+        match ns.read().map_err(|err| err.to_string())? {
+            NamespaceRead::Credentials(credentials) => {
+                let _snapshot = ns.snapshot_for_post().map_err(|err| err.to_string())?;
+                let _expired = credentials
+                    .credentials()
+                    .access_expired(jiff::Timestamp::now(), std::time::Duration::ZERO);
+            }
+            NamespaceRead::Absent | NamespaceRead::Torn => {}
+        }
+        Ok(receipt)
+    }
+}

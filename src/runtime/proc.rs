@@ -173,10 +173,30 @@ pub fn start_time(pid: u32, _cancel: &Cancel) -> Option<String> {
 /// profile of this project (constraint C-006), so a nonsensical value from
 /// the kernel must not be allowed to wrap into a plausible timestamp.
 fn render_start_time(tvsec: u64, tvusec: u64) -> Option<String> {
+    start_instant(tvsec, tvusec).map(|at| at.to_string())
+}
+
+/// When a process started, as a typed instant, to microsecond resolution.
+///
+/// [`start_time`]'s string is compared, never parsed; this is the value for a
+/// caller that has to *order* a start against another instant. Phase 3's
+/// daemon probe is that caller (decision D-032, plan AC93): a pid file whose
+/// process started more than a second after the file was written names a
+/// recycled id, not the daemon that wrote it. The same kernel read as
+/// [`start_time`], with the same signature, so neither can drift from the
+/// other.
+pub fn start_timestamp(pid: u32, _cancel: &Cancel) -> Option<jiff::Timestamp> {
+    let info = ffi::bsd_info(pid).ok()?;
+    start_instant(info.pbi_start_tvsec, info.pbi_start_tvusec)
+}
+
+/// `pbi_start_tvsec`/`pbi_start_tvusec` as one instant, with checked
+/// arithmetic (constraint C-006).
+fn start_instant(tvsec: u64, tvusec: u64) -> Option<jiff::Timestamp> {
     let secs = i64::try_from(tvsec).ok()?;
     let usecs = i64::try_from(tvusec).ok()?;
     let total = secs.checked_mul(1_000_000)?.checked_add(usecs)?;
-    jiff::Timestamp::from_microsecond(total).ok().map(|at| at.to_string())
+    jiff::Timestamp::from_microsecond(total).ok()
 }
 
 /// This process's start time, read once and remembered.

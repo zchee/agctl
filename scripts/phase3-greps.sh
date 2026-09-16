@@ -52,6 +52,34 @@
 #                 Vacuous until S30 creates that file; the planted violation
 #                 creates it, so the check itself is proven now.
 #
+# S30 appends nine more:
+#
+#   exposed (tightened)  once both credentials.rs exist, exactly two
+#                 `expose_secret` lines in the crate (AC96: "exactly 2")
+#   auth_json     `auth.json` on a code line                               → only
+#                 provider/codex/auth_store.rs, the one opener (I23)
+#   account_header  `ChatGPT-Account-Id`                                   → only
+#                 provider/codex/credentials.rs
+#   toml          `toml::`                                                 → only
+#                 provider/codex/home.rs (I31)
+#   locked_read   callers of `from_locked_read(` (not its `fn`)            → only
+#                 provider/codex/auth_store.rs (I26)
+#   marker_mutators  `.write_inflight(` `.write_resend(` `.clear_inflight(`
+#                 `.mark_interrupted(` `.mark_unknown(` `.reset_floor(`    → only
+#                 provider/codex/refresh.rs (seeded at S30, re-run at S32)
+#   stop_policy   `StopPolicy::Complete` only in secret_file.rs and
+#                 provider/codex/auth_store.rs, and in auth_store.rs exactly one
+#                 `None, StopPolicy::Complete` write (the install) and one
+#                 `Some(spec), StopPolicy::Complete` write (writer 1) — review
+#                 ruling 3: no pending fallback is reachable only from install
+#   codex_debug_assert  `debug_assert` in src/provider/codex             → none
+#   state_path    `codex_refresh_state_path` / `.state/`                   → only
+#                 config/paths.rs and provider/codex/auth_store.rs
+#   codex_flock   `flock` on a code line in src/provider/codex, src/commands/codex → none
+#                 (plan §9.3; review S30 F12). The marker mutators are also pinned
+#                 in their `RefreshStateFile::name(` spelling (review S30 F5), and
+#                 the `Bearer ` log needle is `(?i)bearer(?:\s|%20)`.
+#
 # With `--log <file>...` the leak needles (the four sentinels, `eyJ`, `Bearer `
 # and `sk-ant-`) are also counted in each named file — a nextest trace log, a
 # `--json` document (plan §9.4) — and every count must be zero. The needles
@@ -122,6 +150,36 @@ REMOVE_DIR_UNDER_ROOT_ALLOWED=(
 # list, so a second reader of it would be a second way into a release artifact.
 CODEX_BIN_ALLOWED=(
     src/provider/codex/login_child.rs
+)
+
+AUTH_JSON_ALLOWED=(
+    src/provider/codex/auth_store.rs
+)
+
+ACCOUNT_HEADER_ALLOWED=(
+    src/provider/codex/credentials.rs
+)
+
+TOML_ALLOWED=(
+    src/provider/codex/home.rs
+)
+
+LOCKED_READ_ALLOWED=(
+    src/provider/codex/auth_store.rs
+)
+
+MARKER_MUTATOR_ALLOWED=(
+    src/provider/codex/refresh.rs
+)
+
+STOP_COMPLETE_ALLOWED=(
+    src/secret/secret_file.rs
+    src/provider/codex/auth_store.rs
+)
+
+STATE_PATH_ALLOWED=(
+    src/config/paths.rs
+    src/provider/codex/auth_store.rs
 )
 
 # The file that must not read the process environment (invariant I25).
@@ -244,7 +302,14 @@ check_logs() {
         [[ -f $file && -r $file ]] || { printf '  %s is not a readable file\n' "$file"; bad=1; continue; }
         for needle in "${LEAK_NEEDLES[@]}"; do
             status=0
-            count=$(rg --count-matches --fixed-strings --no-filename -e "$needle" "$file") || status=$?
+            # Review N4 / S30 F12: `Bearer ` is counted as the code check counts
+            # it — any case, followed by whitespace or `%20` — so a trace line
+            # spelling `authorization: bearer …` or `bearer%20…` is caught too.
+            if [[ $needle == 'Bearer ' ]]; then
+                count=$(rg --count-matches --no-filename -e '(?i)bearer(?:\s|%20)' "$file") || status=$?
+            else
+                count=$(rg --count-matches --fixed-strings --no-filename -e "$needle" "$file") || status=$?
+            fi
             if [[ $status -gt 1 ]]; then
                 phase3_die "rg could not read ${file} (exit ${status}); an unread log proves nothing"
             fi
@@ -295,6 +360,116 @@ check_exposed() {
         bad=1
     fi
     return "$bad"
+}
+
+# check_exposure_count: once both exposure sites exist, exactly two lines.
+check_exposure_count() {
+    local root=$1 hits count
+    [[ -f $root/src/provider/codex/credentials.rs && -f $root/src/provider/claude/credentials.rs ]] || return 0
+    hits=$(code_hits "$root" '\bexpose_secret\b') || scan_failed check_exposure_count
+    count=$(printf '%s' "$hits" | grep -c . || true)
+    [[ $count -eq 2 ]] && return 0
+    printf '  %s `expose_secret` line(s); the crate has exactly two exposure sites:\n%s\n' "$count" "$hits"
+    return 1
+}
+
+check_auth_json() {
+    check_helper_callers "$1" 'auth\.json' '`auth.json`' "${AUTH_JSON_ALLOWED[@]}"
+}
+
+check_account_header() {
+    check_helper_callers "$1" 'ChatGPT-Account-Id' 'ChatGPT-Account-Id' "${ACCOUNT_HEADER_ALLOWED[@]}"
+}
+
+check_toml() {
+    check_helper_callers "$1" '\btoml::' 'toml::' "${TOML_ALLOWED[@]}"
+}
+
+# check_callers_not_fn <root> <prefix> <names> <what> <allowed...>: callers of
+# the `|`-separated <names> — <prefix> (`\b` for any call, `\.` for a method
+# call), a name, then `(` — where a line that defines one of them (`fn <name>`)
+# is not a call. Only a definition of a pinned name is excluded: a call inside
+# some other `fn` still counts. The marker mutators are pinned as method calls,
+# so S34's `refresh::reset_floor(ns, consent)` (a different function) is not
+# mistaken for one.
+check_callers_not_fn() {
+    local root=$1 prefix=$2 names=$3 what=$4 hits file bad=0 status=0
+    shift 4
+    hits=$(code_hits "$root" "${prefix}(?:${names})\\(") || scan_failed "check_callers_not_fn ($what)"
+    hits=$(printf '%s\n' "$hits" | rg -v -e "\\bfn\\s+(?:${names})\\b") || status=$?
+    [[ $status -gt 1 ]] && phase3_die "check_callers_not_fn ($what): rg failed filtering definitions"
+    while IFS= read -r file; do
+        [[ -z $file ]] && continue
+        if ! contains "$file" "$@"; then
+            printf '  %s calls %s and is not in its allow-list\n' "$file" "$what"
+            bad=1
+        fi
+    done < <(printf '%s\n' "$hits" | cut -d: -f1 | LC_ALL=C sort -u)
+    return "$bad"
+}
+
+check_locked_read() {
+    check_callers_not_fn "$1" '\b' 'from_locked_read' 'from_locked_read' "${LOCKED_READ_ALLOWED[@]}"
+}
+
+MARKER_MUTATORS='write_inflight|write_resend|clear_inflight|mark_interrupted|mark_unknown|reset_floor'
+
+check_marker_mutators() {
+    local bad=0
+    check_callers_not_fn "$1" '\.' "$MARKER_MUTATORS" \
+        'a refresh-marker mutator' "${MARKER_MUTATOR_ALLOWED[@]}" || bad=1
+    # Review S30 F5: the associated-function spelling reaches the same method.
+    check_callers_not_fn "$1" 'RefreshStateFile::' "$MARKER_MUTATORS" \
+        'a refresh-marker mutator (associated-function call)' "${MARKER_MUTATOR_ALLOWED[@]}" || bad=1
+    return "$bad"
+}
+
+# check_codex_flock: plan §9.3 — no `flock` on a code line in the Codex trees.
+# agctl takes its Codex locks through `namespace_lock::acquire_at`, and never
+# contends for a lock inside a Codex home (invariant I21).
+check_codex_flock() {
+    local root=$1 dir hits status=0 found=""
+    for dir in src/provider/codex src/commands/codex; do
+        [[ -d $root/$dir ]] || continue
+        status=0
+        hits=$(cd "$root" && rg --line-number --no-heading --color never --glob '!*_tests.rs' \
+            -e '^\s*(?:[^/\s].*)?\bflock\b' "$dir") || status=$?
+        [[ $status -gt 1 ]] && phase3_die "check_codex_flock: rg could not read $dir"
+        [[ -n $hits ]] && found+="$hits"$'\n'
+    done
+    [[ -z $found ]] && return 0
+    printf '  `flock` in Codex code; take locks through namespace_lock only:\n%s' "$found"
+    return 1
+}
+
+check_stop_policy() {
+    local root=$1 bad=0 store=$1/src/provider/codex/auth_store.rs none some
+    check_helper_callers "$root" 'StopPolicy::Complete' 'StopPolicy::Complete' "${STOP_COMPLETE_ALLOWED[@]}" || bad=1
+    if [[ -f $store ]]; then
+        none=$(rg -c -e '^\s*(?:[^/\s].*)?\bNone,\s*StopPolicy::Complete' "$store" || true)
+        some=$(rg -c -e '^\s*(?:[^/\s].*)?\bSome\(spec\),\s*StopPolicy::Complete' "$store" || true)
+        if [[ ${none:-0} -ne 1 || ${some:-0} -ne 1 ]]; then
+            printf '  auth_store.rs: %s write(s) with no pending fallback and %s with one; expected exactly 1 and 1 (ruling 3)\n' \
+                "${none:-0}" "${some:-0}"
+            bad=1
+        fi
+    fi
+    return "$bad"
+}
+
+check_codex_debug_assert() {
+    local dir=$1/src/provider/codex hits status=0
+    [[ -d $dir ]] || return 0
+    hits=$(rg --line-number --no-heading --color never --glob '!*_tests.rs' \
+        -e '^\s*(?:[^/\s].*)?debug_assert' "$dir") || status=$?
+    [[ $status -gt 1 ]] && phase3_die "check_codex_debug_assert: rg could not read src/provider/codex"
+    [[ -z $hits ]] && return 0
+    printf '  debug assertions are off in every build (AGENTS.md); use a real check:\n%s\n' "$hits"
+    return 1
+}
+
+check_state_path() {
+    check_helper_callers "$1" '\bcodex_refresh_state_path\b|\.state/' 'the refresh-marker path' "${STATE_PATH_ALLOWED[@]}"
 }
 
 check_codex_bin() {
@@ -358,6 +533,34 @@ plant_codex_env() {
         >>"$1/$CODEX_HOME_MODULE"
 }
 
+plant_expose_third() {
+    mkdir -p "$1/src/provider/codex"
+    [[ -f $1/src/provider/codex/credentials.rs ]] || printf 'fn exposed() { s.expose_secret() }\n' >"$1/src/provider/codex/credentials.rs"
+    plant_line "$1" 'fn _phase3_plant(s: &SecretString) -> String { s.expose_secret().to_owned() }' src/provider/claude/usage.rs
+}
+plant_auth_json() { plant_line "$1" 'const _PHASE3_PLANT: &str = "auth.json";'; }
+plant_account_header() { plant_line "$1" 'const _PHASE3_PLANT: &str = "ChatGPT-Account-Id";'; }
+plant_toml() { plant_line "$1" 'fn _phase3_plant(t: &str) { let _ = toml::de::DeTable::parse(t); }'; }
+plant_locked_read() { plant_line "$1" 'fn _phase3_plant(c: Credentials, g: &Guard) { let _ = LockedCredentials::from_locked_read(c, g); }'; }
+plant_locked_read_fmt() { plant_line "$1" $'fn _phase3_plant(c: Credentials, g: &Guard) {\n    from_locked_read(\n        c, g,\n    );\n}'; }
+plant_marker_mutator() { plant_line "$1" 'fn _phase3_plant(ns: &OwnedNamespace<'"'"'_>) { let _ = ns.refresh_state().clear_inflight(DefiniteOutcome::Applied); }'; }
+plant_marker_mutator_fmt() { plant_line "$1" $'fn _phase3_plant(s: &RefreshStateFile) {\n    s\n        .reset_floor();\n}'; }
+plant_stop_complete_elsewhere() { plant_line "$1" 'fn _phase3_plant() -> StopPolicy<'"'"'static> { StopPolicy::Complete }'; }
+plant_stop_second_none() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" '    let _ = self.ns.auth_file().write(&bytes, None, StopPolicy::Complete, &faults);' src/provider/codex/auth_store.rs
+}
+plant_codex_debug_assert() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'fn _phase3_plant(a: &Path, b: &Path) { debug_assert_eq!(a, b); }' src/provider/codex/lock.rs
+}
+plant_marker_mutator_ufcs() { plant_line "$1" 'fn _phase3_plant(s: &RefreshStateFile) { let _ = RefreshStateFile::clear_inflight(s, DefiniteOutcome::Applied); }'; }
+plant_codex_flock() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'fn _phase3_plant(f: &std::fs::File) { let _ = rustix::fs::flock(f, rustix::fs::FlockOperation::LockExclusive); }' src/provider/codex/home.rs
+}
+plant_state_path() { plant_line "$1" 'fn _phase3_plant(p: &Paths) { let _ = p.codex_state_dir().join(".state/x"); }'; }
+
 # rustfmt-shaped plants: the match begins the line's code text (review F1).
 plant_unwrap_fmt() { plant_line "$1" $'fn _phase3_plant() {\n    let _ = Some(1)\n        .unwrap();\n}'; }
 plant_remove_set_fmt() { plant_line "$1" $'fn _phase3_plant(d: &str) {\n    unlinkat(d);\n}'; }
@@ -365,7 +568,9 @@ plant_codex_home_fmt() { plant_line "$1" $'const _PHASE3_PLANT: [&str; 1] = [\n 
 plant_unlink_helper_fmt() { plant_line "$1" $'fn _phase3_plant(d: BorrowedFd<\'_>) {\n    unlink_at(d, "x");\n}'; }
 plant_remove_dir_under_fmt() { plant_line "$1" $'fn _phase3_plant(a: &Path, p: &Path) {\n    remove_dir_under(\n        a, p,\n    );\n}'; }
 
-CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers exposed codex_bin codex_env)
+CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers exposed codex_bin codex_env
+    exposure_count auth_json account_header toml locked_read marker_mutators stop_policy
+    codex_debug_assert state_path codex_flock)
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
@@ -389,6 +594,20 @@ PLANTS=(
     "exposed plant_expose_twice"
     "codex_bin plant_codex_bin"
     "codex_env plant_codex_env"
+    "exposure_count plant_expose_third"
+    "auth_json plant_auth_json"
+    "account_header plant_account_header"
+    "toml plant_toml"
+    "locked_read plant_locked_read"
+    "locked_read plant_locked_read_fmt"
+    "marker_mutators plant_marker_mutator"
+    "marker_mutators plant_marker_mutator_fmt"
+    "stop_policy plant_stop_complete_elsewhere"
+    "stop_policy plant_stop_second_none"
+    "codex_debug_assert plant_codex_debug_assert"
+    "state_path plant_state_path"
+    "marker_mutators plant_marker_mutator_ufcs"
+    "codex_flock plant_codex_flock"
 )
 
 main() {
@@ -442,6 +661,20 @@ main() {
             plant_unreadable_src "$status" >&2
         failed=1
     fi
+
+    # Review N4 / S30 F12: each spelling of a bearer line must be counted.
+    local bearer_index=0 bearer_line bearer_log
+    for bearer_line in 'authorization: bearer <-here' 'authorization: bearer%20<-here' $'authorization: BEARER\t<-here'; do
+        bearer_log="$WORK/planted-needle-bearer-$bearer_index.log"
+        printf '%s\n' "$bearer_line" >"$bearer_log"
+        if check_logs "$bearer_log" >"$bearer_log.txt"; then
+            printf 'planted %-26s NOT CAUGHT: %q was not counted\n' "needle-bearer-$bearer_index" "$bearer_line" >&2
+            failed=1
+        else
+            printf 'planted %-26s caught: %q\n' "needle-bearer-$bearer_index" "$bearer_line"
+        fi
+        bearer_index=$((bearer_index + 1))
+    done
 
     local index=0 needle planted_log
     for needle in "${LEAK_NEEDLES[@]}"; do

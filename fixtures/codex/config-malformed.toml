@@ -1,0 +1,4 @@
+model = 'gpt-test'
+
+[mcp_servers.x.env]
+KEY = "agctl-test-codex-ak-0002

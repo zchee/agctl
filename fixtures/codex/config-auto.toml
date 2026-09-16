@@ -1,0 +1,2 @@
+cli_auth_credentials_store = "auto"
+chatgpt_base_url = "https://chatgpt.example.invalid/backend-api/"

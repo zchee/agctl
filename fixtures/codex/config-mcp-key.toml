@@ -1,0 +1,7 @@
+cli_auth_credentials_store = 'file'
+
+[mcp_servers.x]
+command = 'x'
+
+[mcp_servers.x.env]
+KEY = "agctl-test-codex-ak-0003"

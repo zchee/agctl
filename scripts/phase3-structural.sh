@@ -25,7 +25,8 @@
 #
 # A clause runs only when its plant file exists in the snapshot: each clause
 # belongs to the step that creates its file (plan §4), so an earlier step skips
-# it and says so. S29a lands the harness and clause 6.
+# it and says so. S29a lands the harness and clause 6; S30 clauses 1-5, 7, 9,
+# 11 and the re-run of 6 in auth_store.rs.
 #
 # Usage: scripts/phase3-structural.sh
 #
@@ -215,6 +216,62 @@ main() {
     clause 6 src/secret/pending.rs E0451 \
         "fn _phase3_plant(root: &'static std::path::Path, dir: std::os::fd::BorrowedFd<'static>, name: &'static str, shown: &'static std::path::Path) -> crate::secret::secret_file::SecretFile<'static> { crate::secret::secret_file::SecretFile { root, dir, name, shown } }" \
         "SecretFile literal outside secret_file.rs"
+
+    # S30's clauses. The plan places clauses 1, 3, 4, 5, 7 and 11 in
+    # commands/codex/{login,status}.rs and clause 9 in provider/codex/refresh.rs;
+    # none of those files exists at S30 (S33/S34 and S32 create them), so each
+    # plant goes into an existing file on the same side of the same boundary —
+    # commands/codex/mod.rs is outside `provider::codex` exactly as login.rs and
+    # status.rs will be, and lock.rs is a sibling of refresh.rs inside it — and
+    # the owning step moves it to the plan's file. Every plant is path-qualified,
+    # so the only error it can raise is the privacy one it is there to prove.
+    local cmd=src/commands/codex/mod.rs codex=src/provider/codex
+
+    # Clause 1: a `VerifiedLogin` cannot be built outside `proof.rs`.
+    clause 1 "$cmd" E0451 \
+        "fn _phase3_plant(doc: crate::provider::codex::credentials::Credentials, user: String, acct: String) -> crate::provider::codex::proof::VerifiedLogin { crate::provider::codex::proof::VerifiedLogin { doc, user, acct } }" \
+        "VerifiedLogin literal outside provider::codex"
+
+    # Clause 2: `LockedCredentials::new` is private to credentials.rs, even
+    # from a sibling (refresh.rs from S32; auth_store.rs now).
+    clause 2 "$codex/auth_store.rs" E0624 \
+        "fn _phase3_plant(inner: super::credentials::Credentials) -> super::credentials::LockedCredentials<'static> { super::credentials::LockedCredentials::new(inner, (String::new(), String::new()), None) }" \
+        "LockedCredentials::new from a sibling module"
+
+    # Clause 3: the credential file's name is private to auth_store.rs.
+    clause 3 "$cmd" E0603 \
+        "const _PHASE3_PLANT: &str = crate::provider::codex::auth_store::AUTH_FILE;" \
+        "AUTH_FILE outside auth_store.rs"
+
+    # Clause 4: a registry record is not an owned-record proof.
+    clause 4 "$cmd" E0308 \
+        "fn _phase3_plant(paths: &crate::config::paths::Paths, record: &crate::config::codex::CodexAccountRecord, guard: &crate::provider::codex::proof::CodexNamespaceGuard) { let _ = crate::provider::codex::auth_store::OwnedNamespace::open(paths, record, guard); }" \
+        "OwnedNamespace::open with a CodexAccountRecord"
+
+    # Clause 5: a namespace lock proof cannot be wrapped outside provider::codex.
+    clause 5 "$cmd" E0603 \
+        "fn _phase3_plant(g: crate::secret::namespace_lock::NamespaceLockGuard) -> crate::provider::codex::proof::CodexNamespaceGuard { crate::provider::codex::proof::CodexNamespaceGuard(g) }" \
+        "CodexNamespaceGuard tuple constructor outside provider::codex"
+
+    # Clause 6 (re-run from S30): a `SecretFile` literal in auth_store.rs.
+    clause 6r "$codex/auth_store.rs" E0451 \
+        "fn _phase3_plant(root: &'static std::path::Path, dir: std::os::fd::BorrowedFd<'static>, name: &'static str, shown: &'static std::path::Path) -> crate::secret::secret_file::SecretFile<'static> { crate::secret::secret_file::SecretFile { root, dir, name, shown } }" \
+        "SecretFile literal in provider/codex/auth_store.rs"
+
+    # Clause 7: a login child's report cannot be forged outside proof.rs.
+    clause 7 "$cmd" E0451 \
+        "fn _phase3_plant(gained_codex_auth: Vec<String>, survivors: Vec<std::path::PathBuf>, daemon_dir: bool, lock_files: Vec<std::path::PathBuf>, exit: std::process::ExitStatus) -> crate::provider::codex::proof::PostExitReport { crate::provider::codex::proof::PostExitReport { gained_codex_auth, survivors, daemon_dir, lock_files, exit } }" \
+        "PostExitReport literal outside provider::codex"
+
+    # Clause 9: the token a POST consumes cannot be built by a sibling.
+    clause 9 "$codex/lock.rs" E0451 \
+        "fn _phase3_plant(digest8: String) -> super::auth_store::InflightToken<'static> { super::auth_store::InflightToken { digest8, _guard: std::marker::PhantomData } }" \
+        "InflightToken literal in a sibling of auth_store.rs"
+
+    # Clause 11: a command cannot clear a refresh marker.
+    clause 11 "$cmd" E0624 \
+        "fn _phase3_plant(ns: &crate::provider::codex::auth_store::OwnedNamespace<'_>) { let _ = ns.refresh_state().clear_inflight(crate::provider::codex::auth_store::DefiniteOutcome::Applied); }" \
+        "RefreshStateFile::clear_inflight from commands/"
 
     if [[ $FAILED -gt 0 ]]; then
         phase3_die "$FAILED clause(s) failed"

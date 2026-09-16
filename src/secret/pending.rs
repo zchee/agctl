@@ -19,8 +19,12 @@
 //! | the namespace was taken over by somebody else | discarded, `namespace taken over` |
 //! | target present, its digests equal the meta's `derived_from_*` | replayed |
 //! | target present, digests differ | discarded, `file changed` |
-//! | target absent (or unparseable), meta has no `derived_from_*` | replayed, first write |
-//! | target absent (or unparseable), meta has `derived_from_*` | discarded, `file removed` |
+//! | target absent (or unparseable†), meta has no `derived_from_*` | replayed, first write |
+//! | target absent (or unparseable†), meta has `derived_from_*` | discarded, `file removed` |
+//!
+//! † Only when [`PendingCredential::UNUSABLE_IS_ABSENT`] is `true`,
+//! as it is for Claude. Otherwise an unparseable target is an error and both
+//! files are kept.
 //!
 //! The order of the rows is the order of the checks, and it is Claude's
 //! phase-1 order unchanged: validity first, then foreign activity, then the
@@ -47,6 +51,7 @@ use crate::secret::file_store::ReadOutcome;
 use crate::secret::file_store::chmod_0600_at;
 use crate::secret::file_store::entry_at;
 use crate::secret::file_store::read_file_at;
+use crate::secret::file_store::read_file_at_strict;
 use crate::secret::file_store::unlink_at;
 
 /// Fingerprints of the token material, safe to write to disk and to compare.
@@ -80,6 +85,22 @@ pub trait PendingCredential {
     /// pending behaviour byte-identical. A vendor whose credential has no
     /// expiry to record leaves this `false`.
     const META_REQUIRES_EXPIRY: bool = false;
+
+    /// Whether a file that is present but unusable counts as absent: a
+    /// target that does not parse, or a target, pending file or meta that
+    /// exists and cannot be opened.
+    ///
+    /// Claude's phase-1 table says it does (`true`, the default, which keeps
+    /// Claude byte-identical: its reads go through `read_file_at`, whose F40
+    /// rule reads an unopenable file as absent). A vendor whose own writer
+    /// rewrites the file in place can leave it torn for a moment, and whose
+    /// pending file may be the only copy of a rotated grant, says `false`: the
+    /// resolver then reads with `read_file_at_strict` and returns an error for
+    /// any such file, keeping both the pending file and the target for the
+    /// next run (reviews S29a F8, S30 F1). A pending file that is a link, not a
+    /// regular file, or oversized is still `invalid` either way — no writer of
+    /// ours leaves one.
+    const UNUSABLE_IS_ABSENT: bool = true;
 
     /// Whether `bytes` are a credential this vendor's writer would have written.
     fn validate(bytes: &[u8]) -> bool;
@@ -275,15 +296,26 @@ pub(crate) fn resolve_pending_with<C: PendingCredential>(
         return Ok((PendingDecision::NoPending, None));
     }
 
-    // Absent here means the path is a directory or unreadable, which is as
+    // The reader follows the vendor's rule. Under Claude's (`read_file_at`),
+    // absent here means the path is a directory or unreadable, which is as
     // invalid as a corrupt file; so is a symlink, so every failure collapses.
-    let pending = match read_file_at(dir, spec.pending_name, MAX_CREDENTIALS_BYTES, &pending_path) {
+    // Under the strict rule an open failure is an error that keeps every file.
+    let read = |name: &str, limit: u64, shown: &Path| {
+        if C::UNUSABLE_IS_ABSENT {
+            read_file_at(dir, name, limit, shown)
+        } else {
+            read_file_at_strict(dir, name, limit, shown)
+        }
+    };
+    let pending = match read(spec.pending_name, MAX_CREDENTIALS_BYTES, &pending_path) {
         Ok(ReadOutcome::Present { bytes, .. }) => Some(bytes),
+        Err(err) if !C::UNUSABLE_IS_ABSENT && is_open_failure(&err) => return Err(err),
         _ => None,
     };
     let pending_digests = pending.as_deref().and_then(C::digests);
-    let meta = match read_file_at(dir, spec.meta_name, MAX_META_BYTES, &meta_path) {
+    let meta = match read(spec.meta_name, MAX_META_BYTES, &meta_path) {
         Ok(ReadOutcome::Present { bytes, .. }) => serde_json::from_slice::<MetaIn>(&bytes).ok(),
+        Err(err) if !C::UNUSABLE_IS_ABSENT && is_open_failure(&err) => return Err(err),
         _ => None,
     };
 
@@ -304,8 +336,17 @@ pub(crate) fn resolve_pending_with<C: PendingCredential>(
         ));
     }
 
-    let current = match read_file_at(dir, spec.target_name, MAX_CREDENTIALS_BYTES, &current_path) {
-        Ok(ReadOutcome::Present { bytes, .. }) => C::digests(&bytes),
+    let current = match read(spec.target_name, MAX_CREDENTIALS_BYTES, &current_path) {
+        Ok(ReadOutcome::Present { bytes, .. }) => match C::digests(&bytes) {
+            Some(digests) => Some(digests),
+            None if C::UNUSABLE_IS_ABSENT => None,
+            None => {
+                return Err(FileStoreError::Json(format!(
+                    "`{}` is present but does not parse; the pending credential is kept for the next run",
+                    current_path.display()
+                )));
+            }
+        },
         Ok(ReadOutcome::Absent) => None,
         // An unreadable current file is not something to overwrite blindly.
         Err(err) => return Err(err),
@@ -335,6 +376,12 @@ pub(crate) fn resolve_pending_with<C: PendingCredential>(
         }
         None => Ok(discard(dir, spec, PendingDiscardReason::FileRemoved, None, pending_digests)),
     }
+}
+
+/// Whether a strict read failed to open or read a file that is there, as
+/// opposed to finding a link, a non-regular file or an oversized one.
+fn is_open_failure(err: &FileStoreError) -> bool {
+    matches!(err, FileStoreError::Io { .. })
 }
 
 /// Moves the pending file into place and clears the metadata.

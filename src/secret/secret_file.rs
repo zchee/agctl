@@ -50,6 +50,7 @@ use crate::secret::file_store::create_new_file_at;
 use crate::secret::file_store::entry_at;
 use crate::secret::file_store::hex8;
 use crate::secret::file_store::read_file_at;
+use crate::secret::file_store::read_file_at_strict;
 use crate::secret::file_store::snapshot_at;
 use crate::secret::file_store::unlink_at;
 use crate::secret::pending;
@@ -133,6 +134,19 @@ impl<'a> SecretFile<'a> {
     pub fn read(&self, limit: u64) -> Result<ReadOutcome, FileStoreError> {
         self.check()?;
         read_file_at(self.dir, self.name, limit, self.shown)
+    }
+
+    /// [`SecretFile::read`], but a file that exists and cannot be opened is an
+    /// error rather than absent ([`read_file_at_strict`]). For a caller whose
+    /// "absent" decides whether a credential is discarded.
+    ///
+    /// # Errors
+    ///
+    /// [`FileStoreError::OutsideNamespaceRoot`] when the root check fails, and
+    /// otherwise as [`read_file_at_strict`].
+    pub fn read_strict(&self, limit: u64) -> Result<ReadOutcome, FileStoreError> {
+        self.check()?;
+        read_file_at_strict(self.dir, self.name, limit, self.shown)
     }
 
     /// Removes the file, returning whether one was there.

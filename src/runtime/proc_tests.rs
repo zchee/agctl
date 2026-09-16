@@ -403,3 +403,44 @@ fn this_module_names_no_process_argument_or_environment_api() {
         assert!(!source.contains(banned), "`{banned}` must not appear in runtime/proc.rs");
     }
 }
+
+#[test]
+fn start_timestamp_types_the_same_kernel_read_start_time_renders() {
+    // Plan AC93 (unit half): the typed start of this very process lies within
+    // a second before "now", and agrees exactly with the string `start_time`
+    // renders from the same `proc_bsdinfo` read.
+    let cancel = Cancel::new();
+    let pid = std::process::id();
+    let started = start_timestamp(pid, &cancel).expect("our own start time is readable");
+    let now = jiff::Timestamp::now();
+    assert!(started <= now, "a process cannot start in the future: {started} > {now}");
+    assert_eq!(
+        start_time(pid, &cancel),
+        Some(started.to_string()),
+        "the typed and the compared spellings must come from one read"
+    );
+}
+
+#[test]
+fn start_timestamp_of_a_child_is_within_a_second_of_its_spawn() {
+    // AC93's recycled-pid rule tolerates one second between a daemon's start
+    // and its pid file's mtime; the measurement it rests on must be that good.
+    let before = jiff::Timestamp::now();
+    let mut child = Command::new("/bin/sleep").arg("5").spawn().expect("spawn sleep");
+    let started = start_timestamp(child.id(), &Cancel::new());
+    let _ = child.kill();
+    let _ = child.wait();
+    let started = started.expect("a live child's start time is readable");
+    let gap = started.duration_since(before).abs();
+    assert!(
+        gap <= jiff::SignedDuration::from_secs(1),
+        "start {started} is {gap:?} away from the spawn at {before}"
+    );
+}
+
+#[test]
+fn start_timestamp_refuses_an_overflowing_or_absent_process() {
+    assert_eq!(start_instant(u64::MAX, 0), None);
+    assert_eq!(start_instant(0, u64::MAX), None);
+    assert_eq!(start_timestamp(IMPOSSIBLE_PID, &Cancel::new()), None);
+}

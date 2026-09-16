@@ -151,7 +151,7 @@ fn each_provider_has_its_own_user_agent_override() {
     assert_eq!(user_agent_env(Provider::Claude), "AGCTL_CLAUDE_USER_AGENT");
     assert_eq!(user_agent_env(Provider::Claude), claude::USER_AGENT_ENV);
     assert_eq!(user_agent_env(Provider::Codex), "AGCTL_CODEX_USER_AGENT");
-    assert_eq!(user_agent_env(Provider::Codex), CODEX_USER_AGENT_ENV);
+    assert_eq!(user_agent_env(Provider::Codex), codex::USER_AGENT_ENV);
 }
 
 #[test]

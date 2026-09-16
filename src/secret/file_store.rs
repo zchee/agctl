@@ -385,6 +385,40 @@ pub fn read_file_at(
     read_opened(File::from(fd), display, limit)
 }
 
+/// [`read_file_at`], except that only `ENOENT` is absence.
+///
+/// Phase 1's rule (fact F40) reads a credential file that exists and cannot be
+/// opened — `EACCES`, `EPERM`, `EISDIR` — as absent, which is right for
+/// Claude's store and wrong for a Codex namespace: there an unreadable
+/// `auth.json` or pending file can sit beside the only copy of a rotated grant,
+/// and "absent" would discard it (review S30 F1). A link is still
+/// [`FileStoreError::RefusedSymlink`]; every other open failure is
+/// [`FileStoreError::Io`] naming the path. Claude's callers keep
+/// [`read_file_at`], which is unchanged.
+///
+/// # Errors
+///
+/// As [`read_file_at`], plus [`FileStoreError::Io`] for an open failure other
+/// than `ENOENT`.
+pub fn read_file_at_strict(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    limit: u64,
+    display: &Path,
+) -> Result<ReadOutcome, FileStoreError> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    match rustix::fs::openat(dir, name, flags, Mode::empty()) {
+        Ok(fd) => read_opened(File::from(fd), display, limit),
+        Err(errno) if errno == Errno::NOENT => Ok(ReadOutcome::Absent),
+        Err(errno) if is_symlink_errno(errno) => {
+            Err(FileStoreError::RefusedSymlink(display.to_path_buf()))
+        }
+        Err(errno) => {
+            Err(FileStoreError::errno(format!("could not open `{}`", display.display()), errno))
+        }
+    }
+}
+
 /// Applies the regular-file and size rules to an open descriptor.
 fn read_opened(mut file: File, path: &Path, limit: u64) -> Result<ReadOutcome, FileStoreError> {
     let meta = file

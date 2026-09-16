@@ -1,0 +1,28 @@
+{
+  "x_agctl_first": {
+    "nested": [
+      1,
+      2.5,
+      true,
+      null
+    ]
+  },
+  "auth_mode": "chatgpt",
+  "x_agctl_between": "kept verbatim",
+  "OPENAI_API_KEY": null,
+  "tokens": {
+    "id_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImFnY3RsLXRlc3QifQ.eyJhY3IiOiJhZ2N0bC10ZXN0LWNvZGV4LWp3dC1hY3IiLCJhbXIiOlsicHdkIl0sImF1ZCI6WyJhcHBfYWdjdGxfdGVzdCJdLCJhdXRoX3Byb3ZpZGVyIjoicGFzc3dvcmQiLCJhdXRoX3RpbWUiOjE3ODg3MzA4NTAsImVtYWlsIjoiY29kZXgtdXNlckBleGFtcGxlLmludmFsaWQiLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfYWNjb3VudF9pZCI6IjExMTExMTExLTIyMjItNDMzMy04NDQ0LTU1NTU1NTU1NTU1NSIsImNoYXRncHRfcGxhbl90eXBlIjoicHJvIiwiY2hhdGdwdF91c2VyX2lkIjoidXNlci0wMDAxIiwiZ3JvdXBzIjpbXSwibG9jYWxob3N0IjpmYWxzZSwib3JnYW5pemF0aW9ucyI6W3siaWQiOiJvcmctYWdjdGwtdGVzdC1jb2RleC1qd3Qtb3JnIiwiaXNfZGVmYXVsdCI6dHJ1ZSwicm9sZSI6Im93bmVyIiwidGl0bGUiOiJhZ2N0bC10ZXN0LWNvZGV4LWp3dC10aXRsZSJ9XSwidXNlcl9pZCI6InVzZXItMDAwMSJ9LCJpc3MiOiJodHRwczovL2F1dGgub3BlbmFpLmNvbSIsIm5hbWUiOiJhZ2N0bC10ZXN0LWNvZGV4LWp3dC1uYW1lIiwic2lkIjoiYWdjdGwtdGVzdC1jb2RleC1qd3Qtc2lkIiwic3ViIjoiYWdjdGwtdGVzdC1jb2RleC1qd3Qtc3ViIiwiaWF0IjoxNzg4NzMwODUwLCJleHAiOjE3ODg3MzQ0NTAsImp0aSI6ImFnY3RsLXRlc3QtY29kZXgtand0LWp0aSJ9.agctl-test-codex-jwt-signature0001",
+    "x_agctl_inside_tokens": {
+      "a": 1
+    },
+    "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImFnY3RsLXRlc3QifQ.eyJhdWQiOlsiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS92MSJdLCJjbGllbnRfaWQiOiJhcHBfYWdjdGxfdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfYWNjb3VudF9pZCI6IjExMTExMTExLTIyMjItNDMzMy04NDQ0LTU1NTU1NTU1NTU1NSIsImNoYXRncHRfdXNlcl9pZCI6InVzZXItMDAwMSIsInVzZXJfaWQiOiJ1c2VyLTAwMDEifSwiaWF0IjoxNzg4NzMwODUwLCJqdGkiOiJhZ2N0bC10ZXN0LWNvZGV4LWF0LWp0aSJ9.agctl-test-codex-at-signature0001",
+    "refresh_token": "agctl-test-codex-rt-0001",
+    "account_id": "11111111-2222-4333-8444-555555555555",
+    "x_agctl_token_last": [
+      3,
+      "four"
+    ]
+  },
+  "last_refresh": "2026-09-06T21:40:50.123456Z",
+  "x_agctl_last": null
+}
