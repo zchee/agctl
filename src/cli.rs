@@ -346,6 +346,12 @@ pub enum Command {
         #[command(subcommand)]
         command: ClaudeCommand,
     },
+    /// Work with Codex (ChatGPT) subscription accounts.
+    Codex {
+        /// The `codex` subcommand to run.
+        #[command(subcommand)]
+        command: CodexCommand,
+    },
     /// Print a shell completion script for agctl to stdout.
     Completions(CompletionsArgs),
 }
@@ -643,6 +649,208 @@ pub struct EnvArgs {
     /// Which shell's syntax to print.
     #[arg(long, value_enum, default_value_t = Shell::Zsh)]
     pub shell: Shell,
+}
+
+// ---------------------------------------------------------------------------
+// `agctl codex` (plan section 3.2)
+// ---------------------------------------------------------------------------
+//
+// The whole Codex surface is parsed here, including the flags the commands
+// that will read them do not exist yet: this file is the single CLI contract
+// (plan principle P4), and a flag added beside its implementation is a flag
+// nobody reviewed as part of the command line. Every subcommand below is
+// dispatched to a stub until its wave lands, and a stub exits non-zero
+// without touching a file or the network.
+//
+// One name is deliberately absent: the environment variable naming the Codex
+// home. It is spelled in exactly one place in the crate (`provider::codex::
+// home`), and a copy of it here — even in help text — would make that claim
+// false, so the help below says "the Codex home directory" instead.
+
+/// Subcommands under `agctl codex`.
+#[derive(Debug, Subcommand)]
+pub enum CodexCommand {
+    /// Show subscription usage for every known Codex account.
+    Status(CodexStatusArgs),
+    /// Watch Codex subscription usage in a terminal UI.
+    Watch(CodexWatchArgs),
+    /// Log in to a ChatGPT account and store its credentials.
+    Login(CodexLoginArgs),
+    /// Inspect and manage the Codex accounts agctl knows about.
+    Accounts {
+        /// The `accounts` subcommand to run.
+        #[command(subcommand)]
+        command: CodexAccountsCommand,
+    },
+    /// Record the accounts another Codex home holds.
+    Import(CodexImportArgs),
+    /// Report on Codex store health, locks, refresh state and stray files.
+    Doctor(CodexDoctorArgs),
+}
+
+/// Arguments for `agctl codex status`.
+#[derive(Debug, Args)]
+pub struct CodexStatusArgs {
+    /// Emit the report as JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Include the untouched upstream response body in the output.
+    #[arg(long)]
+    pub raw: bool,
+
+    /// Refresh expired credentials even when a cached value would do.
+    #[arg(long)]
+    pub refresh: bool,
+
+    /// Ignore the on-disk usage cache for this run.
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Show rows that are hidden by default, such as stale siblings.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Limit the report to this account; repeat to name several.
+    #[arg(long = "account", value_name = "ID")]
+    pub account: Vec<String>,
+
+    /// Per-request HTTP timeout, such as `10s` or `5m`.
+    ///
+    /// The budget for one request, not for the pass: when an owned account is
+    /// due a refresh the pass may take up to `1s + 19s + 1s + 2 × --timeout`,
+    /// because a refresh POST has its own budget and is never cut short.
+    #[arg(long, value_name = "DUR", default_value = "10s", value_parser = duration_value_parser)]
+    pub timeout: Duration,
+}
+
+/// Arguments for `agctl codex watch`.
+#[derive(Debug, Args)]
+pub struct CodexWatchArgs {
+    /// How often to refetch usage; must be at least 60s.
+    #[arg(long, value_name = "DUR", default_value = "300s", value_parser = watch_interval_value_parser)]
+    pub interval: Duration,
+}
+
+/// Arguments for `agctl codex login`.
+#[derive(Debug, Args)]
+pub struct CodexLoginArgs {
+    /// Give the resulting account a human-readable label.
+    #[arg(long, value_name = "NAME")]
+    pub label: Option<String>,
+
+    /// Record the account with refreshing switched off, so agctl never sends
+    /// its refresh token.
+    #[arg(long)]
+    pub no_refresh: bool,
+}
+
+/// Subcommands under `agctl codex accounts`.
+#[derive(Debug, Subcommand)]
+pub enum CodexAccountsCommand {
+    /// List known Codex accounts.
+    List {
+        /// Include rows that are hidden by default.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show one Codex account in full.
+    Show {
+        /// Account id, email or label.
+        id: String,
+    },
+    /// Forget a Codex account, optionally deleting its stored credentials.
+    Remove {
+        /// Account id, email or label.
+        id: String,
+        /// Also delete the credential file agctl wrote for this account.
+        #[arg(long)]
+        delete_secret: bool,
+        /// Do not prompt for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Hide a Codex account from reports.
+    Forget {
+        /// Account id, email or label.
+        id: String,
+    },
+    /// Stop hiding a previously forgotten Codex account.
+    Unforget {
+        /// Account id, email or label.
+        id: String,
+    },
+    /// Change whether agctl may refresh an owned account's grant.
+    Set {
+        /// Account id, email or label.
+        id: String,
+        /// Whether agctl refreshes this account on its own.
+        #[arg(long, value_enum, value_name = "MODE")]
+        refresh: RefreshMode,
+    },
+    /// Act on an account whose refresh outcome is unknown, or whose 401 floor
+    /// has become terminal.
+    Refresh {
+        /// Account id, email or label.
+        id: String,
+        /// Send the stored refresh token once more. Only for a row whose last
+        /// refresh outcome is unknown, only an hour after that send, and only
+        /// once per marker.
+        #[arg(long, conflicts_with = "reset_floor")]
+        resend: bool,
+        /// Lift the terminal state a repeatedly unhelpful refresh left behind.
+        #[arg(long)]
+        reset_floor: bool,
+        /// Do not prompt for confirmation. Refused without a terminal.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Whether agctl refreshes an owned Codex account on its own.
+///
+/// The command line's spelling of
+/// [`RefreshPolicy`](crate::config::codex::RefreshPolicy). Separate from it so
+/// the registry's serialized vocabulary and the flag's accepted values can be
+/// reviewed — and changed — independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RefreshMode {
+    /// Refresh when the access token is expired or rejected.
+    Auto,
+    /// Never send a refresh token.
+    Never,
+}
+
+/// Where `agctl codex import` should read accounts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CodexImportSource {
+    /// A Codex home directory holding a credential file.
+    CodexHome,
+}
+
+/// Arguments for `agctl codex import`.
+#[derive(Debug, Args)]
+pub struct CodexImportArgs {
+    /// Which source to import from.
+    #[arg(long = "from", value_name = "SOURCE")]
+    pub from: CodexImportSource,
+
+    /// The Codex home directory to read, instead of the one this environment
+    /// names.
+    #[arg(long = "codex-home", value_name = "DIR")]
+    pub codex_home: Option<PathBuf>,
+
+    /// Report what would be imported without changing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Arguments for `agctl codex doctor`.
+#[derive(Debug, Args)]
+pub struct CodexDoctorArgs {
+    /// Emit the report as JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[cfg(test)]

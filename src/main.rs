@@ -26,6 +26,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::cli::ClaudeCommand;
 use crate::cli::Cli;
+use crate::cli::CodexCommand;
 use crate::cli::Command;
 use crate::commands::status;
 use crate::error::AppError;
@@ -86,11 +87,21 @@ fn init_tracing() {
 fn dispatch(cli: &Cli, cancel: &Cancel) -> Result<i32, AppError> {
     match &cli.command {
         Command::Claude { command } => dispatch_claude(cli, command, cancel),
+        Command::Codex { command } => dispatch_codex(cli, command, cancel),
         Command::Completions(args) => {
             let mut stdout = std::io::stdout().lock();
             commands::completions::run(args, &mut stdout).map(|()| EXIT_OK)
         }
     }
+}
+
+/// Routes a parsed `agctl codex` subcommand.
+///
+/// One arm, because every Codex command is a stub until its wave lands and
+/// each one refuses the same way (`commands::codex`). It fans out into a
+/// table of its own as those commands arrive.
+fn dispatch_codex(cli: &Cli, command: &CodexCommand, cancel: &Cancel) -> Result<i32, AppError> {
+    commands::codex::run(cli, command, cancel)
 }
 
 /// Routes a parsed `agctl claude` subcommand.

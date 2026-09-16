@@ -7,6 +7,7 @@
 //! unit test that never spawns a process.
 
 pub mod accounts;
+pub mod codex;
 pub mod completions;
 pub mod doctor;
 pub mod export;
