@@ -33,7 +33,14 @@
 #                 `remove_dir_under` and `remove_dir_under_root` only in file_store.rs
 #                 and commands/doctor.rs (their base-tree caller)
 #
-# S29b appends two more:
+# S29b appends three more:
+#
+#   exposed       `expose_secret` on a code line                           → at most one
+#                 line per file, only in the two providers' credentials.rs, and
+#                 no `pub`/`pub(crate)`/`pub(super)` `fn exposed` anywhere. The
+#                 whole crate reaches a token's plaintext through those two
+#                 one-line functions; a third site, or a public one, is how a
+#                 token reaches a log (AC96, invariant I20).
 #
 #   codex_bin     the `AGCTL_CODEX_BIN` name (the test-only `codex` override) →
 #                 only in provider/codex/login_child.rs, the one module that
@@ -76,6 +83,14 @@ REMOVE_ALLOWED=(
 )
 
 BEARER_ALLOWED=(
+    src/provider/claude/credentials.rs
+    src/provider/codex/credentials.rs
+)
+
+# The only files that may reach a `SecretString`'s plaintext, one line each
+# (AC96). The Codex half arrives at S30; until then this is a one-file rule and
+# the plants below prove it can fail.
+EXPOSE_ALLOWED=(
     src/provider/claude/credentials.rs
     src/provider/codex/credentials.rs
 )
@@ -257,6 +272,31 @@ check_helper_callers() {
     return "$bad"
 }
 
+check_exposed() {
+    local hits file count bad=0 public
+    hits=$(code_hits "$1" '\bexpose_secret\b') || scan_failed check_exposed
+    while IFS= read -r file; do
+        [[ -z $file ]] && continue
+        count=$(printf '%s\n' "$hits" | cut -d: -f1 | grep -cxF "$file")
+        if ! contains "$file" "${EXPOSE_ALLOWED[@]}" || [[ $count -gt 1 ]]; then
+            printf '  %s reaches a secret'"'"'s plaintext (%s line(s)); only the two credentials.rs may, once each\n' \
+                "$file" "$count"
+            bad=1
+        fi
+    done < <(printf '%s\n' "$hits" | cut -d: -f1 | LC_ALL=C sort -u)
+    [[ $bad -eq 1 ]] && printf '%s\n' "$hits"
+
+    # `fn exposed` is the exposure site itself: public, it would be callable
+    # from anywhere in the crate and the count above would stop meaning
+    # anything.
+    public=$(code_hits "$1" 'pub(?:\([^)]*\))?\s+fn\s+exposed\b') || scan_failed check_exposed
+    if [[ -n $public ]]; then
+        printf '  the exposure site is public:\n%s\n' "$public"
+        bad=1
+    fi
+    return "$bad"
+}
+
 check_codex_bin() {
     check_helper_callers "$1" '\bAGCTL_CODEX_BIN\b' 'AGCTL_CODEX_BIN' "${CODEX_BIN_ALLOWED[@]}"
 }
@@ -289,7 +329,9 @@ check_removal_helpers() {
 
 # Each plant_<name> <root> adds exactly one violation of its check.
 PLANT_FILE=src/main.rs
-plant_line() { printf '\n%s\n' "$2" >>"$1/$PLANT_FILE"; }
+# plant_line <root> <line> [file]: appends one line to <file> (default the
+# plant file) under <root>.
+plant_line() { printf '\n%s\n' "$2" >>"$1/${3:-$PLANT_FILE}"; }
 
 # Inline plants: the match follows code on the same line.
 plant_unwrap() { plant_line "$1" 'fn _phase3_plant() { let _ = Some(1).unwrap(); }'; }
@@ -303,6 +345,11 @@ plant_unlink_alias() { plant_line "$1" 'use crate::secret::file_store::unlink_at
 plant_remove_dir_under_root() { plant_line "$1" 'fn _phase3_plant(p: &Paths, d: &Path) { let _ = file_store::remove_dir_under_root(p, d); }'; }
 plant_remove_dir_under() { plant_line "$1" 'fn _phase3_plant(a: &Path, p: &Path) { let _ = file_store::remove_dir_under(a, p); }'; }
 plant_codex_bin() { plant_line "$1" 'const _PHASE3_PLANT: &str = "AGCTL_CODEX_BIN";'; }
+plant_expose_elsewhere() { plant_line "$1" 'fn _phase3_plant(s: &SecretString) -> String { s.expose_secret().to_owned() }'; }
+plant_expose_public() { plant_line "$1" 'pub(crate) fn exposed<R>(s: &SecretString, f: impl FnOnce(&str) -> R) -> R { f("") }'; }
+# A second exposure line inside an allowed file: the allow-list alone would
+# pass it, the per-file count is what does not.
+plant_expose_twice() { plant_line "$1/src/provider/claude" 'fn _phase3_plant(s: &SecretString) -> String { s.expose_secret().to_owned() }' credentials.rs; }
 # Creates the module as well as the violation: until S30 writes it, this is
 # also what proves the check can fail at all.
 plant_codex_env() {
@@ -318,7 +365,7 @@ plant_codex_home_fmt() { plant_line "$1" $'const _PHASE3_PLANT: [&str; 1] = [\n 
 plant_unlink_helper_fmt() { plant_line "$1" $'fn _phase3_plant(d: BorrowedFd<\'_>) {\n    unlink_at(d, "x");\n}'; }
 plant_remove_dir_under_fmt() { plant_line "$1" $'fn _phase3_plant(a: &Path, p: &Path) {\n    remove_dir_under(\n        a, p,\n    );\n}'; }
 
-CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers codex_bin codex_env)
+CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers exposed codex_bin codex_env)
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
@@ -337,6 +384,9 @@ PLANTS=(
     "removal_helpers plant_remove_dir_under_fmt"
     "removal_helpers plant_unlink_alias"
     "removal_helpers plant_remove_dir_under_root"
+    "exposed plant_expose_elsewhere"
+    "exposed plant_expose_public"
+    "exposed plant_expose_twice"
     "codex_bin plant_codex_bin"
     "codex_env plant_codex_env"
 )
