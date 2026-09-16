@@ -825,8 +825,7 @@ fn run_account(ctx: &PassCtx, index: usize, row: AccountRow, shared: &Shared) ->
     loop {
         // The borrow of `current` ends with this statement, so the 401 arm
         // below can move it into the refresh.
-        let fetched =
-            shared.client.fetch(&AccountRef { id: &id, credentials: &current }, ctx.cancel());
+        let fetched = shared.client.fetch(&AccountRef { id: &id, auth: &current }, ctx.cancel());
 
         match fetched {
             Ok(usage) => {

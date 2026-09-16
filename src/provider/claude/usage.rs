@@ -5,7 +5,7 @@
 //!
 //! `GET <base>/api/oauth/usage` with a bearer token, `anthropic-beta:
 //! oauth-2025-04-20`, `Accept: application/json` and the
-//! [`USER_AGENT_DEFAULT`](super::USER_AGENT_DEFAULT) header. The endpoint is
+//! [`USER_AGENT_DEFAULT`](crate::provider::USER_AGENT_DEFAULT) header. The endpoint is
 //! undocumented, so every one of those was observed rather than assumed, and
 //! the base is overridable only under the `testing` feature — a
 //! production-visible override of an endpoint that receives a bearer token
@@ -42,10 +42,11 @@
 //!
 //! # No token is exposed here
 //!
-//! The bearer header comes from
-//! [`Credentials::authorization_header`](crate::provider::claude::credentials::Credentials::authorization_header),
-//! which routes through the crate's single `SecretString` exposure site
-//! (invariant I6). Nothing in this module reads a token's plaintext.
+//! The bearer header arrives finished, through
+//! [`UsageAuth`](crate::provider::UsageAuth), whose Claude implementation
+//! routes to that provider's one private `exposed` (invariant I20). Nothing in
+//! this module reads a token's plaintext, and nothing here holds a
+//! `SecretString` to read.
 //!
 //! # Refreshing is somebody else's job
 //!
@@ -190,14 +191,15 @@ impl UsageProvider for UsageClient {
         let response = self
             .agent
             .get(self.usage_url())
-            // Through `Credentials`, never by unwrapping the `SecretString`
-            // here: that keeps the crate at the single exposure site
-            // invariant I6 asks for, and keeps the audit grep's answer at one
-            // line. The value goes straight into the header map and is
+            // Through `UsageAuth`, which hands out a finished header value and
+            // never a `SecretString`: the plaintext is taken out only at each
+            // provider's private `exposed` (invariant I20), which is what the
+            // audit grep counts — one line per provider, so two once Codex
+            // lands. The value goes straight into the header map and is
             // dropped with the request; it is never logged, because the span
             // for a fetch records the status and the retry hint, never a
             // header.
-            .header("authorization", account.credentials.authorization_header())
+            .header("authorization", account.auth.authorization_header())
             .header(BETA_HEADER, BETA_VALUE)
             .header("accept", "application/json")
             .call()

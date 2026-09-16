@@ -639,7 +639,7 @@ fn the_request_carries_exactly_the_headers_the_endpoint_needs() {
 
     let client = client(&server);
     let credentials = credentials("sk-ant-oat01-observed");
-    let account = AccountRef { id: "acct", credentials: &credentials };
+    let account = AccountRef { id: "acct", auth: &credentials };
     let snapshot =
         client.fetch(&account, &Cancel::new()).expect("a 200 with the captured body should parse");
 
@@ -665,7 +665,7 @@ fn a_401_is_reported_as_unauthorized_so_the_pass_can_refresh_once() {
 
     let credentials = credentials("sk-ant-oat01-expired");
     let error = client(&server)
-        .fetch(&AccountRef { id: "acct", credentials: &credentials }, &Cancel::new())
+        .fetch(&AccountRef { id: "acct", auth: &credentials }, &Cancel::new())
         .expect_err("a 401 is not a snapshot");
 
     mock.assert_calls(1);
@@ -683,7 +683,7 @@ fn a_429_carries_its_retry_hint_through() {
 
     let credentials = credentials("sk-ant-oat01-limited");
     let error = client(&server)
-        .fetch(&AccountRef { id: "acct", credentials: &credentials }, &Cancel::new())
+        .fetch(&AccountRef { id: "acct", auth: &credentials }, &Cancel::new())
         .expect_err("a 429 is not a snapshot");
 
     mock.assert_calls(1);
@@ -701,7 +701,7 @@ fn a_429_without_a_hint_is_still_a_rate_limit() {
 
     let credentials = credentials("sk-ant-oat01-limited");
     let error = client(&server)
-        .fetch(&AccountRef { id: "acct", credentials: &credentials }, &Cancel::new())
+        .fetch(&AccountRef { id: "acct", auth: &credentials }, &Cancel::new())
         .expect_err("a 429 is not a snapshot");
     assert_eq!(error, FetchError::RateLimited { retry_after: None });
 }
@@ -716,7 +716,7 @@ fn other_statuses_are_reported_with_their_code_and_no_body() {
 
     let credentials = credentials("sk-ant-oat01-ok");
     let error = client(&server)
-        .fetch(&AccountRef { id: "acct", credentials: &credentials }, &Cancel::new())
+        .fetch(&AccountRef { id: "acct", auth: &credentials }, &Cancel::new())
         .expect_err("a 503 is not a snapshot");
 
     assert_eq!(error, FetchError::Http { status: 503 });
@@ -734,7 +734,7 @@ fn a_body_that_is_not_a_usage_document_is_a_parse_failure() {
 
     let credentials = credentials("sk-ant-oat01-ok");
     let error = client(&server)
-        .fetch(&AccountRef { id: "acct", credentials: &credentials }, &Cancel::new())
+        .fetch(&AccountRef { id: "acct", auth: &credentials }, &Cancel::new())
         .expect_err("HTML is not a usage document");
     assert!(matches!(error, FetchError::Parse(_)), "got {error:?}");
     assert!(!error.is_transient());
@@ -753,7 +753,7 @@ fn a_cancelled_pass_makes_no_request_at_all() {
 
     let credentials = credentials("sk-ant-oat01-ok");
     let error = client(&server)
-        .fetch(&AccountRef { id: "acct", credentials: &credentials }, &cancel)
+        .fetch(&AccountRef { id: "acct", auth: &credentials }, &cancel)
         .expect_err("a cancelled pass does not fetch");
 
     assert_eq!(error, FetchError::Cancelled);
