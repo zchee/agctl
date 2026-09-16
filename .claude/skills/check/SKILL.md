@@ -59,11 +59,11 @@ scripts/release-gate.sh
 It runs `scripts/docs-gate.sh` first (no build needed, so a prose failure is reported in
 seconds), then builds `cargo build --release` (default features, no `--config`, into a scratch
 `--target-dir` that is never `./target` and never the shared `~/.cache/rust/target`) and
-greps the artifact for two lists. The twelve seam names are one representative name per
+greps the artifact for two lists. The thirteen seam names are one representative name per
 seam-owning module, not the whole test-only surface — `fixtures/fake-security.sh` alone
 defines ten `AGCTL_FAKE_SECURITY_*` names on its own. The fake's **write** knob is the
 one exception to "one per owner": the keychain write path is the only seam that can change
-a keychain, so it is gated by name rather than by family. **Twelve seam names, every one
+a keychain, so it is gated by name rather than by family. **Thirteen seam names, every one
 of which must be absent:**
 
 | name | owner |
@@ -80,6 +80,7 @@ of which must be absent:**
 | `AGCTL_FAKE_SECURITY_WRITE_EXIT` | `fixtures/fake-security.sh` (the `-i` write path) |
 | `AGCTL_NO_BROWSER` | `src/commands/login.rs` |
 | `AGCTL_CODEX_BIN` | `src/provider/codex/login_child.rs` (phase 3; listed from S29b, which introduces the name — the module that reads it lands at S34, and `scripts/phase3-greps.sh` pins it to that one file) |
+| `AGCTL_CODEX_USAGE_URL` | `src/provider/codex/usage.rs` (phase 3, S31; `scripts/phase3-greps.sh` pins it to that one file) |
 
 **Three production names, every one of which must be present:** `AGCTL_CONFIG_DIR`,
 `AGCTL_CLAUDE_USER_AGENT`, `AGCTL_CLAUDE_OAUTH_SCOPES`. (The presence half is there so

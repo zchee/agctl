@@ -1,0 +1,23 @@
+{
+  "user_id": "<str:29>",
+  "account_id": "<str:36>",
+  "email": "agctl-test-codex-email-0001",
+  "plan_type": "pro",
+  "rate_limit": {
+    "allowed": true,
+    "limit_reached": false,
+    "primary_window": {
+      "used_percent": 9,
+      "limit_window_seconds": 604800,
+      "reset_after_seconds": 551972,
+      "reset_at": 1790120247
+    },
+    "secondary_window": null
+  },
+  "additional_rate_limits": [],
+  "credits": {
+    "has_credits": false,
+    "unlimited": false,
+    "balance": "12.34"
+  }
+}

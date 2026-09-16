@@ -72,6 +72,13 @@ pub const ACCESS_REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
 /// counts as expired (fact F65).
 pub const LAST_REFRESH_INTERVAL: SignedDuration = SignedDuration::from_hours(8 * 24);
 
+/// The header naming the workspace a usage request reads (fact F67).
+///
+/// The one spelling of the name in the crate (plan section 9.3): this type
+/// builds the pair, and the usage client requires it by this constant
+/// (ledger #277).
+pub(crate) const ACCOUNT_ID_HEADER: &str = "ChatGPT-Account-Id";
+
 /// The `tokens` object's name.
 const TOKENS: &str = "tokens";
 
@@ -461,7 +468,7 @@ impl UsageAuth for Credentials {
     fn extra_headers(&self) -> Vec<(&'static str, String)> {
         let mut headers = Vec::new();
         if let Some(account) = self.view.account_id.as_deref().filter(|id| is_header_safe(id)) {
-            headers.push(("ChatGPT-Account-Id", account.to_owned()));
+            headers.push((ACCOUNT_ID_HEADER, account.to_owned()));
         }
         if self.view.claims.as_ref().is_some_and(|claims| claims.is_fedramp) {
             headers.push(("X-OpenAI-Fedramp", "true".to_owned()));

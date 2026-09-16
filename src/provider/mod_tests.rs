@@ -162,6 +162,27 @@ fn a_blank_override_yields_the_default_rather_than_an_empty_header() {
     assert_eq!(user_agent_or_default(Some("   \t ")), USER_AGENT_DEFAULT);
 }
 
+/// Review S31 F3: `ureq` unwraps the header value built from the agent, so an
+/// override it cannot send must fall back rather than reach it.
+#[test]
+fn an_override_that_is_not_a_header_value_yields_the_default() {
+    let cases = [
+        ("a control byte", "agctl\u{7}"),
+        ("CR/LF", "agctl\r\nX-Injected: 1"),
+        ("a tab", "agctl\t1.0"),
+        ("a DEL", "agctl\u{7f}"),
+        ("non-ASCII", "agctl/\u{e9}"),
+    ];
+    for (case, value) in cases {
+        assert_eq!(user_agent_or_default(Some(value)), USER_AGENT_DEFAULT, "{case}");
+    }
+    assert_eq!(
+        user_agent_or_default(Some("Mozilla/5.0 (Macintosh; arm64) agctl/1.0")),
+        "Mozilla/5.0 (Macintosh; arm64) agctl/1.0",
+        "spaces and visible ASCII are a usable agent"
+    );
+}
+
 #[test]
 fn error_messages_name_the_status_without_a_body() {
     // Bodies are never interpolated into an error: a token can appear in an

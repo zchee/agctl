@@ -1,0 +1,42 @@
+{
+  "user_id": "<str:29>",
+  "account_id": "<str:36>",
+  "email": "<str:18>",
+  "plan_type": "enterprise",
+  "rate_limit": {
+    "allowed": false,
+    "limit_reached": true,
+    "primary_window": {
+      "used_percent": 100.0,
+      "limit_window_seconds": 604800,
+      "reset_after_seconds": 3600,
+      "reset_at": 1790120247
+    },
+    "secondary_window": null
+  },
+  "code_review_rate_limit": null,
+  "additional_rate_limits": [],
+  "model_usage": {},
+  "credits": {
+    "has_credits": true,
+    "unlimited": true,
+    "overage_limit_reached": false,
+    "balance": null,
+    "approx_local_messages": [
+      0,
+      0
+    ],
+    "approx_cloud_messages": [
+      0,
+      0
+    ]
+  },
+  "spend_control": {
+    "reached": false,
+    "individual_limit": null
+  },
+  "rate_limit_reached_type": {
+    "type": "rate_limit_reached"
+  },
+  "promo": null
+}

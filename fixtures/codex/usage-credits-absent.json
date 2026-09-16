@@ -1,0 +1,31 @@
+{
+  "user_id": "<str:29>",
+  "account_id": "<str:36>",
+  "email": "<str:18>",
+  "plan_type": "plus",
+  "rate_limit": {
+    "allowed": true,
+    "limit_reached": false,
+    "primary_window": {
+      "used_percent": 41,
+      "limit_window_seconds": 604800,
+      "reset_after_seconds": 240000,
+      "reset_at": 1790120247
+    },
+    "secondary_window": {
+      "used_percent": 7,
+      "limit_window_seconds": 18000,
+      "reset_after_seconds": 9000,
+      "reset_at": 1789586276
+    }
+  },
+  "code_review_rate_limit": null,
+  "additional_rate_limits": [],
+  "model_usage": {},
+  "spend_control": {
+    "reached": false,
+    "individual_limit": null
+  },
+  "rate_limit_reached_type": null,
+  "promo": null
+}

@@ -4,7 +4,7 @@
 # Builds agctl the way a release is built (default features, release profile)
 # into a scratch target directory, then proves two things about the artifact:
 #
-#   1. none of the twelve test-seam environment-variable names appear in it, and
+#   1. none of the thirteen test-seam environment-variable names appear in it, and
 #   2. the three production-visible names do.
 #
 # It also runs scripts/docs-gate.sh first (AC77 and AC83), so that one command
@@ -16,7 +16,7 @@
 # and the `testing` builds get `serde_json/float_roundtrip` (the live
 # `.claude.json` guard's exact float parsing).
 #
-# The twelve are one representative name per seam-owning module, not the whole
+# The thirteen are one representative name per seam-owning module, not the whole
 # test-only surface — fixtures/fake-security.sh alone defines ten
 # AGCTL_FAKE_SECURITY_* names on its own. The fake's write knob is the one
 # exception to "one per owner": the keychain *write* path is the only seam that
@@ -47,6 +47,14 @@
 # gated. Production resolves `codex` on PATH and refuses with `codex not on
 # PATH`; a release binary that honoured the override would run whatever an
 # environment variable pointed at, with the user's browser session behind it.
+#
+# S31 adds AGCTL_CODEX_USAGE_URL: the Codex usage endpoint's base URL, read
+# only by src/provider/codex/usage.rs under `testing`. A release binary that
+# honoured it would send a ChatGPT bearer token and the account id header
+# wherever an environment variable pointed them. AGCTL_CODEX_USER_AGENT is not
+# yet on the production list: at S31 nothing outside tests constructs the
+# Codex client, so the name is folded out of a release artifact (ledger #268);
+# the step whose command first reads it adds the presence check.
 #
 # Phase 2 added no other seam: AGCTL_SECURITY_BIN (the write transport) and
 # AGCTL_CLAUDE_PROFILE_URL (the live swap's profile GET) are both listed, and
@@ -129,6 +137,7 @@ seams=(
 	AGCTL_FAKE_SECURITY_WRITE_EXIT
 	AGCTL_NO_BROWSER
 	AGCTL_CODEX_BIN
+	AGCTL_CODEX_USAGE_URL
 )
 
 # The production surface. Every one of these must be PRESENT.

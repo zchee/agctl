@@ -41,6 +41,7 @@ pub mod credentials;
 pub mod home;
 pub mod lock;
 pub mod proof;
+pub mod usage;
 
 #[cfg(test)]
 #[path = "testkit_tests.rs"]

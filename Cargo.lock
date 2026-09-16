@@ -19,6 +19,7 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "etcetera",
+ "flate2",
  "hex",
  "httpmock",
  "insta",

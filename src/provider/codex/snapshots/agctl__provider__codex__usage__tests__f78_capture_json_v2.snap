@@ -1,0 +1,53 @@
+---
+source: src/provider/codex/usage_tests.rs
+expression: rendered
+---
+{
+  "windows": [
+    {
+      "kind": "weekly_all",
+      "label": "weekly",
+      "percent": 9.0,
+      "percent_floor": 9,
+      "resets_at": "2026-09-22T23:37:27Z",
+      "is_active": false,
+      "limit_name": null,
+      "metered_feature": null,
+      "normal_model_slug": null
+    },
+    {
+      "kind": "unknown",
+      "label": "GPT-5.3-Codex-Spark:primary (unknown kind)",
+      "percent": 0.0,
+      "percent_floor": 0,
+      "resets_at": "2026-09-16T19:17:56Z",
+      "is_active": false,
+      "limit_name": "GPT-5.3-Codex-Spark",
+      "metered_feature": "codex_bengalfox",
+      "normal_model_slug": null
+    },
+    {
+      "kind": "unknown",
+      "label": "GPT-5.3-Codex-Spark:secondary (unknown kind)",
+      "percent": 0.0,
+      "percent_floor": 0,
+      "resets_at": "2026-09-23T14:17:56Z",
+      "is_active": false,
+      "limit_name": "GPT-5.3-Codex-Spark",
+      "metered_feature": "codex_bengalfox",
+      "normal_model_slug": null
+    }
+  ],
+  "credits": {
+    "kind": "balance",
+    "used_minor": null,
+    "currency": null,
+    "exponent": null,
+    "limit_minor": null,
+    "percent": null,
+    "balance": "12.34",
+    "unlimited": false,
+    "disabled_reason": null,
+    "scope": "organization"
+  }
+}

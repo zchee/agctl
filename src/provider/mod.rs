@@ -75,6 +75,10 @@ fn user_agent_env(provider: Provider) -> &'static str {
 ///
 /// An unset or blank override yields [`USER_AGENT_DEFAULT`]; a blank string
 /// would otherwise produce a header that some proxies drop and others reject.
+/// So does one with a byte outside visible ASCII and space: `ureq` unwraps
+/// the header value it builds from the agent string, so a stray control byte
+/// would panic — an abort in a release build — on the first request (review
+/// S31 F3).
 pub fn user_agent(provider: Provider) -> String {
     user_agent_or_default(std::env::var(user_agent_env(provider)).ok().as_deref())
 }
@@ -86,7 +90,12 @@ pub fn user_agent(provider: Provider) -> String {
 /// test that set it would race every other test in the binary.
 fn user_agent_or_default(override_value: Option<&str>) -> String {
     match override_value {
-        Some(value) if !value.trim().is_empty() => value.to_owned(),
+        Some(value)
+            if !value.trim().is_empty()
+                && value.bytes().all(|byte| byte == b' ' || byte.is_ascii_graphic()) =>
+        {
+            value.to_owned()
+        }
         _ => USER_AGENT_DEFAULT.to_owned(),
     }
 }
@@ -118,14 +127,6 @@ pub trait UsageAuth: fmt::Debug {
     ///
     /// Empty for Claude: `anthropic-beta` is a property of the endpoint, not
     /// of the credential, so it stays where the request is built.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Codex usage client (S31) is the first production caller; Claude's \
-                      endpoint headers are constants of the request"
-        )
-    )]
     fn extra_headers(&self) -> Vec<(&'static str, String)>;
 }
 

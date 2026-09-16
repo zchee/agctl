@@ -80,6 +80,36 @@
 #                 in their `RefreshStateFile::name(` spelling (review S30 F5), and
 #                 the `Bearer ` log needle is `(?i)bearer(?:\s|%20)`.
 #
+# S31 appends six more:
+#
+#   wham_usage    `wham/usage` on a code line                              → only
+#                 provider/codex/usage.rs, the one client of the endpoint
+#   codex_usage_url  the `AGCTL_CODEX_USAGE_URL` name (the test-only endpoint
+#                 override)                                                → only
+#                 provider/codex/usage.rs; it is also on the release gate's seam list
+#   codex_timeouts  `timeout_global`, `timeout_per_call`, `http_status_as_error(true)`
+#                 on a code line in src/provider/codex                     → none
+#                 (plan §9.3: a whole-request budget hides which phase timed out,
+#                 and a status-as-error agent cannot read a 401/403/429)
+#   codex_redirects  exactly one `.max_redirects(0)` code line in
+#                 provider/codex/usage.rs, and no other `max_redirects(` in
+#                 src/provider/codex (review S31 F1: a followed redirect sends the
+#                 account id to the Location host and turns its 401 into the
+#                 refresh trigger)
+#   codex_decoded_cap  a `.take(MAX_BODY_BYTES` code line in
+#                 provider/codex/usage.rs (review S31 F2/N1: the wire limit sits
+#                 under the gzip decoder, so the decoded bytes need their own cap)
+#   credits_state `CreditsState` on a code line in src/provider/codex,
+#                 src/commands/codex and src/render/json_v2.rs             → none
+#                 (plan §9.3 m2; ledger #274 (a): Codex credits are `CodexCredits`)
+#   account_header  unchanged (ledger #277): usage.rs requires the header through
+#                 `credentials::ACCOUNT_ID_HEADER`, so the literal keeps one site
+#
+# With `--log`, the `LOG_ONLY_NEEDLES` are counted too: the sentinel email a
+# usage fixture carries (ledger #274). They are deliberately not code needles
+# — the fixture that carries the sentinel is how a leak test proves anything —
+# so they apply to log, trace and `--json` output only.
+#
 # With `--log <file>...` the leak needles (the four sentinels, `eyJ`, `Bearer `
 # and `sk-ant-`) are also counted in each named file — a nextest trace log, a
 # `--json` document (plan §9.4) — and every count must be zero. The needles
@@ -182,6 +212,22 @@ STATE_PATH_ALLOWED=(
     src/provider/codex/auth_store.rs
 )
 
+# S31: the one client of the usage endpoint, and of its test-only override.
+WHAM_USAGE_ALLOWED=(
+    src/provider/codex/usage.rs
+)
+
+CODEX_USAGE_URL_ALLOWED=(
+    src/provider/codex/usage.rs
+)
+
+# Where `CreditsState` (Claude's credits) must not appear (plan §9.3 m2).
+CREDITS_STATE_FORBIDDEN=(
+    src/provider/codex
+    src/commands/codex
+    src/render/json_v2.rs
+)
+
 # The file that must not read the process environment (invariant I25).
 CODEX_HOME_MODULE=src/provider/codex/home.rs
 
@@ -193,6 +239,12 @@ LEAK_NEEDLES=(
     eyJ
     'Bearer '
     sk-ant-
+)
+
+# Counted in `--log` files only (ledger #274): the usage fixtures' sentinel
+# email, which lives in fixtures/codex/usage-sentinel-email.json and its test.
+LOG_ONLY_NEEDLES=(
+    agctl-test-codex-email-
 )
 
 # code_hits <root> <regex>: `path:line:text` for every non-test code line under
@@ -300,7 +352,7 @@ check_logs() {
     local file needle count status bad=0
     for file in "$@"; do
         [[ -f $file && -r $file ]] || { printf '  %s is not a readable file\n' "$file"; bad=1; continue; }
-        for needle in "${LEAK_NEEDLES[@]}"; do
+        for needle in "${LEAK_NEEDLES[@]}" "${LOG_ONLY_NEEDLES[@]}"; do
             status=0
             # Review N4 / S30 F12: `Bearer ` is counted as the code check counts
             # it — any case, followed by whitespace or `%20` — so a trace line
@@ -472,6 +524,80 @@ check_state_path() {
     check_helper_callers "$1" '\bcodex_refresh_state_path\b|\.state/' 'the refresh-marker path' "${STATE_PATH_ALLOWED[@]}"
 }
 
+check_wham_usage() {
+    check_helper_callers "$1" 'wham/usage' '`wham/usage`' "${WHAM_USAGE_ALLOWED[@]}"
+}
+
+check_codex_usage_url() {
+    check_helper_callers "$1" '\bAGCTL_CODEX_USAGE_URL\b' 'AGCTL_CODEX_USAGE_URL' "${CODEX_USAGE_URL_ALLOWED[@]}"
+}
+
+# scoped_code_hits <root> <regex> <path...>: code_hits limited to the named
+# directories or files (each skipped when absent). Like code_hits it runs
+# inside `$(…)`, so an unreadable path returns 2 for the caller's
+# `|| scan_failed` rather than dying in the subshell (re-review N1).
+scoped_code_hits() {
+    local root=$1 pattern=$2 path hits status found=""
+    shift 2
+    for path in "$@"; do
+        [[ -e $root/$path ]] || continue
+        status=0
+        hits=$(cd "$root" && rg --line-number --no-heading --color never --glob '!*_tests.rs' \
+            -e "^\\s*(?:[^/\\s].*)?(?:${pattern})" "$path") || status=$?
+        if [[ $status -gt 1 ]]; then
+            printf 'phase3: rg failed (%s) reading %s\n' "$status" "$path" >&2
+            return 2
+        fi
+        [[ -n $hits ]] && found+="$hits"$'\n'
+    done
+    printf '%s' "$found"
+    return 0
+}
+
+check_codex_timeouts() {
+    local hits
+    hits=$(scoped_code_hits "$1" '\btimeout_global\b|\btimeout_per_call\b|http_status_as_error\(\s*true\s*\)' \
+        src/provider/codex) || scan_failed check_codex_timeouts
+    [[ -z $hits ]] && return 0
+    printf '  a whole-request timeout or status-as-error agent in Codex code (plan §9.3):\n%s' "$hits"
+    return 1
+}
+
+CODEX_USAGE_MODULE=src/provider/codex/usage.rs
+
+check_codex_redirects() {
+    local root=$1 hits zero others count
+    # Vacuous before S31 writes the client; the plant below needs it to exist.
+    [[ -f $root/$CODEX_USAGE_MODULE ]] || return 0
+    hits=$(scoped_code_hits "$root" '\bmax_redirects\(' src/provider/codex) || scan_failed check_codex_redirects
+    zero=$(printf '%s' "$hits" | rg -e "^${CODEX_USAGE_MODULE}:[0-9]+:.*\.max_redirects\(0\)" || true)
+    others=$(printf '%s' "$hits" | rg -v -e "^${CODEX_USAGE_MODULE}:[0-9]+:.*\.max_redirects\(0\)" || true)
+    count=$(printf '%s' "$zero" | grep -c . || true)
+    [[ $count -eq 1 && -z $others ]] && return 0
+    printf '  the Codex usage client must follow no redirect: %s `.max_redirects(0)` line(s) in %s (expected 1)%s\n' \
+        "$count" "$CODEX_USAGE_MODULE" "${others:+, and other max_redirects settings:}"
+    [[ -n $others ]] && printf '%s\n' "$others"
+    return 1
+}
+
+check_codex_decoded_cap() {
+    local root=$1 hits
+    [[ -f $root/$CODEX_USAGE_MODULE ]] || return 0
+    hits=$(scoped_code_hits "$root" '\.take\(MAX_BODY_BYTES' "$CODEX_USAGE_MODULE") || scan_failed check_codex_decoded_cap
+    [[ -n $hits ]] && return 0
+    printf '  %s reads the body with no decoded-byte cap (`.take(MAX_BODY_BYTES…)`); gzip can expand past the wire limit\n' \
+        "$CODEX_USAGE_MODULE"
+    return 1
+}
+
+check_credits_state() {
+    local hits
+    hits=$(scoped_code_hits "$1" '\bCreditsState\b' "${CREDITS_STATE_FORBIDDEN[@]}") || scan_failed check_credits_state
+    [[ -z $hits ]] && return 0
+    printf '  Claude'"'"'s CreditsState in Codex code; Codex credits are CodexCredits (plan §9.3 m2):\n%s' "$hits"
+    return 1
+}
+
 check_codex_bin() {
     check_helper_callers "$1" '\bAGCTL_CODEX_BIN\b' 'AGCTL_CODEX_BIN' "${CODEX_BIN_ALLOWED[@]}"
 }
@@ -559,6 +685,32 @@ plant_codex_flock() {
     mkdir -p "$1/src/provider/codex"
     plant_line "$1" 'fn _phase3_plant(f: &std::fs::File) { let _ = rustix::fs::flock(f, rustix::fs::FlockOperation::LockExclusive); }' src/provider/codex/home.rs
 }
+plant_wham_usage() { plant_line "$1" 'const _PHASE3_PLANT: &str = "https://chatgpt.com/backend-api/wham/usage";'; }
+plant_codex_usage_url() { plant_line "$1" 'const _PHASE3_PLANT: &str = "AGCTL_CODEX_USAGE_URL";'; }
+plant_codex_timeouts() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'fn _phase3_plant(b: ConfigBuilder) -> ConfigBuilder { b.timeout_global(None) }' src/provider/codex/usage.rs
+}
+plant_codex_status_as_error() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" $'fn _phase3_plant(b: ConfigBuilder) -> ConfigBuilder {\n    b\n        .http_status_as_error(true)\n}' src/provider/codex/usage.rs
+}
+plant_codex_redirects_removed() {
+    [[ -f $1/$CODEX_USAGE_MODULE ]] || phase3_die "plant_codex_redirects_removed: $CODEX_USAGE_MODULE is missing from the snapshot"
+    perl -ni -e 'print unless /\.max_redirects\(0\)/' "$1/$CODEX_USAGE_MODULE"
+}
+plant_codex_redirects_followed() {
+    plant_line "$1" $'fn _phase3_plant(b: ConfigBuilder) -> ConfigBuilder {\n    b\n        .max_redirects(10)\n}' src/provider/codex/usage.rs
+}
+plant_codex_decoded_cap_removed() {
+    [[ -f $1/$CODEX_USAGE_MODULE ]] || phase3_die "plant_codex_decoded_cap_removed: $CODEX_USAGE_MODULE is missing from the snapshot"
+    perl -ni -e 'print unless /\.take\(MAX_BODY_BYTES/' "$1/$CODEX_USAGE_MODULE"
+}
+plant_credits_state() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'fn _phase3_plant(c: &crate::usage::model::CreditsState) {}' src/provider/codex/account.rs
+}
+plant_credits_state_json_v2() { plant_line "$1" $'fn _phase3_plant(\n    c: CreditsState,\n) {}' src/render/json_v2.rs; }
 plant_state_path() { plant_line "$1" 'fn _phase3_plant(p: &Paths) { let _ = p.codex_state_dir().join(".state/x"); }'; }
 
 # rustfmt-shaped plants: the match begins the line's code text (review F1).
@@ -570,7 +722,7 @@ plant_remove_dir_under_fmt() { plant_line "$1" $'fn _phase3_plant(a: &Path, p: &
 
 CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers exposed codex_bin codex_env
     exposure_count auth_json account_header toml locked_read marker_mutators stop_policy
-    codex_debug_assert state_path codex_flock)
+    codex_debug_assert state_path codex_flock wham_usage codex_usage_url codex_timeouts codex_redirects codex_decoded_cap credits_state)
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
@@ -608,6 +760,15 @@ PLANTS=(
     "state_path plant_state_path"
     "marker_mutators plant_marker_mutator_ufcs"
     "codex_flock plant_codex_flock"
+    "wham_usage plant_wham_usage"
+    "codex_usage_url plant_codex_usage_url"
+    "codex_timeouts plant_codex_timeouts"
+    "codex_timeouts plant_codex_status_as_error"
+    "codex_redirects plant_codex_redirects_removed"
+    "codex_redirects plant_codex_redirects_followed"
+    "codex_decoded_cap plant_codex_decoded_cap_removed"
+    "credits_state plant_credits_state"
+    "credits_state plant_credits_state_json_v2"
 )
 
 main() {
@@ -677,7 +838,7 @@ main() {
     done
 
     local index=0 needle planted_log
-    for needle in "${LEAK_NEEDLES[@]}"; do
+    for needle in "${LEAK_NEEDLES[@]}" "${LOG_ONLY_NEEDLES[@]}"; do
         planted_log="$WORK/planted-needle-$index.log"
         printf 'a trace line carrying %s<-here\n' "$needle" >"$planted_log"
         check_logs "$planted_log" >"$WORK/planted-needle-$index.txt" || true
