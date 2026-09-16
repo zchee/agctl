@@ -1115,3 +1115,105 @@ fn an_unrecognised_event_kind_lands_in_entries_not_unreadable() {
     assert!(matches!(refused, AppError::Config(_)), "{refused}");
     assert_eq!(std::fs::read_to_string(&path).expect("readable"), planted, "the log is unchanged");
 }
+
+// ---------------------------------------------------------------------------
+// The rooted primitives phase 3's Codex log uses (plan §3.8, ledger #133)
+// ---------------------------------------------------------------------------
+
+/// The Codex tree, and its root opened through the same `O_NOFOLLOW` walk a
+/// caller would use.
+fn codex_root_fd(paths: &Paths) -> OwnedFd {
+    paths.ensure_codex_dirs().expect("the Codex tree should be creatable");
+    file_store::open_dir_under(paths.config_dir(), &paths.codex_root()).expect("walkable")
+}
+
+#[test]
+fn open_log_at_appends_a_codex_log_under_open_log_s_rules_and_read_log_at_reads_it() {
+    let (_dir, paths) = store();
+    let root = codex_root_fd(&paths);
+    let shown = paths.codex_root().join("writes.jsonl");
+
+    assert_eq!(read_log_at(root.as_fd(), "writes.jsonl", &shown).expect("readable"), None);
+    for line in ["{\"n\":1}\n", "{\"n\":2}\n"] {
+        let file = open_log_at(root.as_fd(), "writes.jsonl", &shown).expect("appendable");
+        write_line(&file, &shown, line).expect("written");
+    }
+
+    assert_eq!(mode_of(&shown), FILE_MODE, "created 0600, as Claude's log is");
+    assert_eq!(
+        read_log_at(root.as_fd(), "writes.jsonl", &shown).expect("readable").as_deref(),
+        Some("{\"n\":1}\n{\"n\":2}\n"),
+        "O_APPEND, one line per call"
+    );
+    assert!(!paths.namespace_root().exists(), "the Codex log creates no claude/ directory");
+    assert!(!log_path(&paths).exists(), "and does not touch Claude's log");
+}
+
+#[test]
+fn open_log_at_refuses_what_open_log_refuses() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, paths) = store();
+    let root = codex_root_fd(&paths);
+    let shown = paths.codex_root().join("writes.jsonl");
+
+    let elsewhere = dir.path().join("somebody-elses.jsonl");
+    std::fs::write(&elsewhere, "planted\n").expect("writable");
+    std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    std::os::unix::fs::symlink(&elsewhere, &shown).expect("plantable");
+    let err = open_log_at(root.as_fd(), "writes.jsonl", &shown).expect_err("a link is refused");
+    assert!(err.to_string().contains("symbolic link"), "{err}");
+    let err = read_log_at(root.as_fd(), "writes.jsonl", &shown).expect_err("on read as well");
+    assert!(err.to_string().contains("symbolic link"), "{err}");
+    assert_eq!(std::fs::read_to_string(&elsewhere).expect("readable"), "planted\n");
+
+    std::fs::remove_file(&shown).expect("removable");
+    std::fs::write(&shown, "").expect("writable");
+    std::fs::set_permissions(&shown, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let err = open_log_at(root.as_fd(), "writes.jsonl", &shown).expect_err("0644 is refused");
+    assert!(err.to_string().contains("mode is 0644"), "{err}");
+    assert_eq!(mode_of(&shown), 0o644, "refused, never repaired");
+    assert_eq!(
+        read_log_at(root.as_fd(), "writes.jsonl", &shown).expect("a reader still reports it"),
+        Some(String::new())
+    );
+}
+
+#[test]
+fn the_rooted_log_primitives_refuse_a_name_that_is_not_one_component() {
+    let (_dir, paths) = store();
+    let root = codex_root_fd(&paths);
+    std::fs::create_dir(paths.codex_root().join("sub")).expect("a subdirectory");
+    for name in ["sub/writes.jsonl", "..", ".", "writes.jsonl/", ""] {
+        let shown = paths.codex_root().join("writes.jsonl");
+        let err = open_log_at(root.as_fd(), name, &shown)
+            .expect_err(&format!("`{name}` must be refused for append"));
+        assert!(err.to_string().contains("single path component"), "`{name}`: {err}");
+        let err = read_log_at(root.as_fd(), name, &shown)
+            .expect_err(&format!("`{name}` must be refused for read"));
+        assert!(err.to_string().contains("single path component"), "`{name}`: {err}");
+    }
+    assert!(!paths.codex_root().join("sub").join("writes.jsonl").exists());
+}
+
+#[test]
+fn open_log_is_still_the_rooted_open_of_claude_s_log() {
+    // The wrapper the W4b live-swap gate holds (tests/e2e_swap.rs pins the
+    // end-to-end path): same file, same refusal sentence.
+    let (_dir, paths) = store_with_root();
+    let path = log_path(&paths);
+    let file = open_log(&paths, &path).expect("appendable");
+    write_line(&file, &path, "{}\n").expect("written");
+    assert_eq!(std::fs::read_to_string(&path).expect("readable"), "{}\n");
+
+    std::fs::remove_file(&path).expect("removable");
+    std::os::unix::fs::symlink("/nonexistent", &path).expect("plantable");
+    let err = open_log(&paths, &path).expect_err("a link is refused");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "the audit log `{}` is refused: a symbolic link, which agctl will not append through",
+            path.display()
+        )
+    );
+}

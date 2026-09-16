@@ -26,6 +26,22 @@ use crate::provider::claude::credentials::Credentials;
 use crate::runtime::coordinator::Cancel;
 use crate::usage::model::UsageSnapshot;
 
+/// The vendors agctl reads usage for.
+///
+/// Names a provider where the choice decides a path or a label and nothing
+/// more, such as [`crate::config::paths::Paths::cache_dir_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "`Codex` is constructed from S30 (provider::codex) onward")
+)]
+pub enum Provider {
+    /// Anthropic's Claude.
+    Claude,
+    /// OpenAI's Codex CLI.
+    Codex,
+}
+
 /// The one account a [`UsageProvider::fetch`] call is about.
 ///
 /// Borrowed rather than owned so a pass can hand a worker a view of a row it

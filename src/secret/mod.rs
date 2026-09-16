@@ -19,6 +19,10 @@
 //! - [`audit`] is the append-only log of every write and every lock break.
 //! - [`file_store`] is agctl's own credential file, in Claude Code's
 //!   on-disk shape (fact F40).
+//! - [`secret_file`] is the one primitive that replaces a credential file
+//!   atomically, bound to the root it must stay under; [`pending`] is the
+//!   vendor-neutral table that replays or discards a credential parked by a
+//!   failed rename. `file_store` is a thin Claude caller of both.
 //! - [`namespace_lock`] is the `flock` that makes a namespace single-writer.
 //! - [`held_locks`] reads the records agctl writes while it holds a Claude
 //!   Code lock, which is how `doctor` finds a leaked one.
@@ -46,6 +50,8 @@ pub mod held_locks;
 pub mod keychain_write;
 pub mod location;
 pub mod namespace_lock;
+pub mod pending;
+pub mod secret_file;
 pub mod security_cli;
 
 #[cfg(feature = "testing")]

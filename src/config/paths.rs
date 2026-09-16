@@ -20,6 +20,27 @@
 //!   cache/claude/                       0700   cache_dir()
 //! ```
 //!
+//! Phase 3 adds a sibling tree for Codex, which Claude commands never create
+//! ([`Paths::ensure_codex_dirs`] is the only creator):
+//!
+//! ```text
+//! <config_dir>/
+//!   codex/                              0700   codex_root()
+//!     .locks/                           0700   codex_locks_dir()
+//!       <user>+<acct>.lock              0600, never unlinked
+//!     .state/                           0700   codex_state_dir()
+//!       <user>+<acct>.refresh           0600   codex_refresh_state_path()
+//!     .scratch/                         0700   codex_scratch_root()
+//!     <user>/<acct>/                    0700   codex_namespace_dir()
+//!       auth.json                       0600
+//!   cache/codex/                        0700   cache_dir_for(Provider::Codex)
+//! ```
+//!
+//! The three dot-directories share the namespace tree with `<user>`
+//! directories, which is why a Codex id may not begin with `.`
+//! ([`validate_codex_segment`]): an id of `.locks` would otherwise name the
+//! lock directory as a namespace.
+//!
 //! The lock files live *outside* the namespace directory on purpose (plan
 //! section 3.5): `flock` is an inode lock, so a lock file inside a directory
 //! that another tool may delete and recreate is a lock two processes can hold
@@ -38,6 +59,7 @@ use std::path::PathBuf;
 use etcetera::BaseStrategy;
 
 use crate::error::AppError;
+use crate::provider::Provider;
 
 /// The organization placeholder used when a login could not name one
 /// (decision D-008). `accounts relocate` moves such a namespace afterwards.
@@ -172,8 +194,24 @@ impl Paths {
     }
 
     /// Where usage responses are cached between passes.
+    ///
+    /// Claude's cache: [`Paths::cache_dir_for`] with [`Provider::Claude`].
     pub fn cache_dir(&self) -> PathBuf {
-        self.config_dir.join("cache").join("claude")
+        self.cache_dir_for(Provider::Claude)
+    }
+
+    /// The directory every provider's usage cache lives under.
+    pub fn cache_root(&self) -> PathBuf {
+        self.config_dir.join("cache")
+    }
+
+    /// Where one provider's usage responses are cached between passes.
+    pub fn cache_dir_for(&self, provider: Provider) -> PathBuf {
+        let segment = match provider {
+            Provider::Claude => "claude",
+            Provider::Codex => "codex",
+        };
+        self.cache_root().join(segment)
     }
 
     /// Creates the store's directories, each level at mode 0700.
@@ -260,6 +298,117 @@ impl Paths {
     }
 }
 
+/// The Codex tree (phase 3). A separate block only so the dead-code
+/// expectation below names exactly the items whose callers arrive with
+/// `provider::codex`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the Codex paths are consumed from S30 (provider::codex) onward")
+)]
+impl Paths {
+    /// The root under which every Codex namespace, lock, refresh marker and
+    /// login scratch home lives.
+    pub fn codex_root(&self) -> PathBuf {
+        self.config_dir.join("codex")
+    }
+
+    /// The namespace directory for one `(ChatGPT user, ChatGPT account)` pair.
+    ///
+    /// Both ids arrive from a token's claims, so both are validated here
+    /// rather than trusted, before any caller can create the path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::Config`] when either id fails
+    /// [`validate_codex_segment`].
+    pub fn codex_namespace_dir(&self, user: &str, acct: &str) -> Result<PathBuf, AppError> {
+        validate_codex_segment(user)?;
+        validate_codex_segment(acct)?;
+        Ok(self.codex_root().join(user).join(acct))
+    }
+
+    /// Where the Codex namespace locks live — beside the namespaces, never
+    /// inside one, for the reason the Claude locks do (module documentation).
+    pub fn codex_locks_dir(&self) -> PathBuf {
+        self.codex_root().join(".locks")
+    }
+
+    /// The lock file for one Codex namespace. Created once and never unlinked.
+    ///
+    /// Named `<user>+<acct>.lock`: `+` is outside the id alphabet, so two
+    /// different pairs cannot spell the same name — `("a.b", "c")` and
+    /// `("a", "b.c")` would collide under Claude's `.` separator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::Config`] when either id fails
+    /// [`validate_codex_segment`].
+    pub fn codex_lock_path(&self, user: &str, acct: &str) -> Result<PathBuf, AppError> {
+        validate_codex_segment(user)?;
+        validate_codex_segment(acct)?;
+        Ok(self.codex_locks_dir().join(format!("{user}+{acct}.lock")))
+    }
+
+    /// Where `codex login` scratch homes are created, one per login.
+    pub fn codex_scratch_root(&self) -> PathBuf {
+        self.codex_root().join(".scratch")
+    }
+
+    /// Where the per-namespace refresh markers live.
+    pub fn codex_state_dir(&self) -> PathBuf {
+        self.codex_root().join(".state")
+    }
+
+    /// The refresh marker for one Codex namespace, `<user>+<acct>.refresh`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::Config`] when either id fails
+    /// [`validate_codex_segment`].
+    pub fn codex_refresh_state_path(&self, user: &str, acct: &str) -> Result<PathBuf, AppError> {
+        validate_codex_segment(user)?;
+        validate_codex_segment(acct)?;
+        Ok(self.codex_state_dir().join(format!("{user}+{acct}.refresh")))
+    }
+
+    /// Whether `p` *spells* a path strictly below [`Paths::codex_root`].
+    ///
+    /// Lexical, exactly as [`Paths::is_under_namespace_root`] is, with the same
+    /// limit: it answers what the path says, and the `O_NOFOLLOW` walk answers
+    /// where it leads.
+    pub fn is_under_codex_root(&self, p: &Path) -> bool {
+        let root = lexical_normalize(&self.codex_root());
+        let target = lexical_normalize(p);
+        target != root && target.starts_with(&root)
+    }
+
+    /// Creates the Codex tree, each level at mode 0700.
+    ///
+    /// Only Codex commands call this, so a Claude-only store never grows a
+    /// `codex/` directory (plan AC97). It does **not** create the Claude tree
+    /// either; a Codex command that reaches [`Paths::ensure_dirs`] through the
+    /// registry update or the Claude audit log still creates that one, which
+    /// the plan accepts rather than changing those shared paths (ledger #138).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::Io`] naming the directory that could not be made.
+    pub fn ensure_codex_dirs(&self) -> Result<(), AppError> {
+        for dir in [
+            self.config_dir.clone(),
+            self.codex_root(),
+            self.codex_locks_dir(),
+            self.codex_state_dir(),
+            self.codex_scratch_root(),
+            self.cache_root(),
+            self.cache_dir_for(Provider::Codex),
+        ] {
+            create_dir_mode(&dir)?;
+        }
+        Ok(())
+    }
+}
+
 /// Creates one directory at [`DIR_MODE`], tolerating one that already exists.
 fn create_dir_mode(dir: &Path) -> Result<(), AppError> {
     use std::os::unix::fs::DirBuilderExt;
@@ -304,6 +453,21 @@ pub(crate) fn lexical_normalize(p: &Path) -> PathBuf {
     out
 }
 
+/// Whether `name` is exactly one plain path component.
+///
+/// Refuses the empty string, `.` and `..`, anything with a separator, and a
+/// trailing separator (`a/`, which `Path::components` would silently fold into
+/// `a`). Every `*at` call that is handed a name relative to a walked directory
+/// asks this first: `openat`, `renameat` and `unlinkat` resolve `..` and `/`
+/// inside the name, so a name that is not one component undoes the walk.
+pub(crate) fn is_single_component(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(first)), None) if first == name
+    )
+}
+
 /// Checks that `s` is usable as a single path segment.
 ///
 /// Account and organization identifiers arrive from an OAuth response and end
@@ -326,6 +490,30 @@ pub fn validate_segment(s: &str) -> Result<(), AppError> {
     {
         return Err(AppError::Config(format!(
             "the id `{s}` contains `{bad}`, which is not allowed in a namespace directory name"
+        )));
+    }
+    Ok(())
+}
+
+/// [`validate_segment`], plus: a Codex id may not begin with `.`.
+///
+/// A Codex namespace directory sits beside `.locks`, `.state` and `.scratch`
+/// under [`Paths::codex_root`], so an id of `.locks` would name the lock
+/// directory as somebody's namespace. No ChatGPT user or account id starts
+/// with a dot, so refusing every such id costs nothing.
+///
+/// # Errors
+///
+/// Returns [`AppError::Config`] describing which rule the value broke.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the Codex paths are consumed from S30 (provider::codex) onward")
+)]
+pub fn validate_codex_segment(s: &str) -> Result<(), AppError> {
+    validate_segment(s)?;
+    if s.starts_with('.') {
+        return Err(AppError::Config(format!(
+            "the id `{s}` begins with `.`, which is reserved for agctl's own directories"
         )));
     }
     Ok(())

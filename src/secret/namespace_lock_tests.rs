@@ -346,3 +346,72 @@ fn a_lock_file_that_is_a_symlink_is_still_refused_when_it_has_to_be_created_arou
         "the link's target was written through"
     );
 }
+
+// ---------------------------------------------------------------------------
+// acquire_at — the directory as a parameter (phase 3, plan §3.8)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn acquire_at_takes_a_codex_lock_with_acquire_s_rules() {
+    let (_dir, paths) = store();
+    let lock = paths.codex_lock_path("user-abc", "acct-123").expect("valid ids");
+    let name = lock.file_name().and_then(OsStr::to_str).expect("a name");
+    let locks_dir = paths.codex_locks_dir();
+
+    let guard = acquire_at(&locks_dir, name, soon(), &Cancel::new(), Fault::none())
+        .expect("an uncontended lock should be acquired");
+    assert_eq!(guard.path(), lock);
+    assert_eq!(read_body(guard.path()).expect("a body").pid, std::process::id());
+    let mode = std::fs::metadata(&lock).expect("present").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let dir_mode = std::fs::metadata(&locks_dir).expect("present").permissions().mode() & 0o777;
+    assert_eq!(dir_mode, crate::config::paths::DIR_MODE);
+    assert!(!paths.locks_dir().exists(), "no Claude lock directory is created");
+
+    // A second holder of the same file is excluded; a different pair is not.
+    let busy = acquire_at(
+        &locks_dir,
+        name,
+        Instant::now() + Duration::from_millis(50),
+        &Cancel::new(),
+        Fault::none(),
+    )
+    .expect_err("the lock is exclusive");
+    assert_eq!(busy, LockError::Busy);
+    let other = paths.codex_lock_path("user-abc", "acct-456").expect("valid ids");
+    let other_name = other.file_name().and_then(OsStr::to_str).expect("a name");
+    acquire_at(&locks_dir, other_name, soon(), &Cancel::new(), Fault::none())
+        .expect("another namespace's lock is independent");
+
+    drop(guard);
+    assert!(lock.exists(), "a lock file is never unlinked");
+}
+
+#[test]
+fn acquire_at_refuses_a_name_that_is_not_one_component_before_creating_anything() {
+    let (_dir, paths) = store();
+    let locks_dir = paths.codex_locks_dir();
+    for name in ["../escape.lock", "sub/x.lock", "..", ".", "", "x.lock/"] {
+        let err = acquire_at(&locks_dir, name, soon(), &Cancel::new(), Fault::none())
+            .expect_err(&format!("`{name}` must be refused"));
+        assert!(matches!(err, LockError::Unavailable(_)), "`{name}`: got {err:?}");
+    }
+    assert!(!locks_dir.exists(), "nothing was created on the way to a refusal");
+    assert!(!paths.config_dir().exists());
+}
+
+#[test]
+fn acquire_at_refuses_a_symlinked_locks_directory() {
+    let (dir, paths) = store();
+    paths.ensure_codex_dirs().expect("the Codex tree should be creatable");
+    let locks_dir = paths.codex_locks_dir();
+    std::fs::remove_dir(&locks_dir).expect("empty");
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("creatable");
+    std::os::unix::fs::symlink(&elsewhere, &locks_dir).expect("plantable");
+
+    let err = acquire_at(&locks_dir, "u+a.lock", soon(), &Cancel::new(), Fault::none())
+        .expect_err("a symlinked locks directory is refused");
+    assert!(matches!(err, LockError::RefusedSymlink(_)), "got {err:?}");
+    assert!(!elsewhere.join("u+a.lock").exists(), "no lock file was created through the link");
+}

@@ -56,6 +56,11 @@ use crate::provider::claude::oauth::TokenResponse;
 use crate::secret::keychain_write;
 use crate::secret::keychain_write::KeychainWriteError;
 
+/// Fingerprints of the token material; moved to [`crate::secret::pending`],
+/// which is its first vendor-neutral consumer, and re-exported here so every
+/// existing path keeps naming it.
+pub use crate::secret::pending::Digests;
+
 /// The key the blob object hangs under, in both the keychain item and the
 /// file (fact F4).
 pub const BLOB_ROOT: &str = "claudeAiOauth";
@@ -135,20 +140,6 @@ pub struct Identity {
     pub email: Option<String>,
     /// The organization's display name.
     pub org_name: Option<String>,
-}
-
-/// Fingerprints of the token material, safe to write to disk and to compare.
-///
-/// Used for two things that both need to answer "is this the same credential?"
-/// without holding the credential: folding a keychain entry into the live row
-/// (plan AC42) and deciding whether a `.credentials.json.pending` still
-/// applies to the file it was derived from (plan section 3.3).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Digests {
-    /// `sha256(access_token)`, hex.
-    pub access_sha256: String,
-    /// `sha256(refresh_token)`, hex, when there is one.
-    pub refresh_sha256: Option<String>,
 }
 
 /// Why a credential blob could not be used.

@@ -50,6 +50,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::config::paths::Paths;
+use crate::config::paths::is_single_component;
 use crate::config::paths::validate_segment;
 use crate::runtime::coordinator::Cancel;
 use crate::runtime::fault::Fault;
@@ -159,16 +160,47 @@ pub fn acquire(
     validate_segment(acct).map_err(|err| LockError::Unavailable(err.to_string()))?;
     validate_segment(org).map_err(|err| LockError::Unavailable(err.to_string()))?;
 
+    let path = paths.lock_path(acct, org);
+    let name = path.file_name().and_then(OsStr::to_str).ok_or_else(|| {
+        LockError::Unavailable(format!("`{}` does not name a lock file", path.display()))
+    })?;
+    acquire_at(&paths.locks_dir(), name, deadline, cancel, fault)
+}
+
+/// Takes the lock file `name` inside `locks_dir`, with [`acquire`]'s rules.
+///
+/// [`acquire`] is this with Claude's `<namespace_root>/.locks` and
+/// `<acct>.<org>.lock`; phase 3's Codex namespaces pass
+/// `<config_dir>/codex/.locks` and `<user>+<acct>.lock`, both derived and
+/// validated by [`Paths`]. The directory is created at 0700 when missing and
+/// opened `O_NOFOLLOW`, the file is taken relative to that descriptor and
+/// never unlinked, and the holder is recorded in its body.
+///
+/// # Errors
+///
+/// See [`LockError`]. A `name` that is not one plain path component is
+/// [`LockError::Unavailable`] before anything is created.
+pub fn acquire_at(
+    locks_dir: &Path,
+    name: &str,
+    deadline: Instant,
+    cancel: &Cancel,
+    fault: Fault,
+) -> Result<NamespaceLockGuard, LockError> {
+    if !is_single_component(name) {
+        return Err(LockError::Unavailable(format!(
+            "`{}` does not name a lock file",
+            locks_dir.join(name).display()
+        )));
+    }
+
     // The locks directory is opened `O_NOFOLLOW` and the lock file is taken
     // relative to that descriptor, so there is no second path resolution
     // between checking `.locks` and using it.
-    let dir = create_locks_dir(&paths.locks_dir())?;
+    let dir = create_locks_dir(locks_dir)?;
 
-    let path = paths.lock_path(acct, org);
-    let name = path.file_name().ok_or_else(|| {
-        LockError::Unavailable(format!("`{}` does not name a lock file", path.display()))
-    })?;
-    let mut guard = lock_at(dir.as_fd(), name, &path, deadline, cancel, &fault)?;
+    let path = locks_dir.join(name);
+    let mut guard = lock_at(dir.as_fd(), OsStr::new(name), &path, deadline, cancel, &fault)?;
     write_body(&mut guard, cancel)?;
 
     // Used by plan AC7 and AC35 to make a second process actually wait, and

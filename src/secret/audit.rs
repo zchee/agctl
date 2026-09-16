@@ -67,6 +67,7 @@ use serde::Serializer;
 
 use crate::config::paths::FILE_MODE;
 use crate::config::paths::Paths;
+use crate::config::paths::is_single_component;
 use crate::error::AppError;
 use crate::secret::file_store;
 use crate::secret::file_store::FileStoreError;
@@ -696,7 +697,15 @@ fn entry_line(entry: &AuditEntry) -> Result<String, AppError> {
 
 /// One `write` and one `fsync`, because the point of the record is to survive
 /// the crash that happens next.
-fn write_line(mut file: &File, path: &Path, line: &str) -> Result<(), AppError> {
+///
+/// `pub(crate)` so phase 3's Codex log (`<config_dir>/codex/writes.jsonl`)
+/// appends its own entry type through the same one-write-one-flush rule rather
+/// than a copy of it. `path` is for the error sentences only.
+///
+/// # Errors
+///
+/// Returns [`AppError::Io`] when the write or the flush fails.
+pub(crate) fn write_line(mut file: &File, path: &Path, line: &str) -> Result<(), AppError> {
     file.write_all(line.as_bytes()).map_err(|err| AppError::Io {
         context: format!("could not append to the audit log `{}`", path.display()),
         source: err,
@@ -761,7 +770,7 @@ impl LogState {
 /// appended.
 pub fn log_state(paths: &Paths) -> LogState {
     match open_log_dir(paths) {
-        Ok(dir) => state_at(dir.as_fd()),
+        Ok(dir) => state_at(dir.as_fd(), LOG_FILE),
         Err(err) if is_absent(&err) => LogState::Absent,
         Err(err) => LogState::Refused(format!("unreachable: {err}")),
     }
@@ -800,6 +809,29 @@ pub fn log_state(paths: &Paths) -> LogState {
 pub(crate) fn open_log(paths: &Paths, path: &Path) -> Result<File, AppError> {
     let dir = open_log_dir(paths)
         .map_err(|err| refused(path, &format!("its directory is unreachable: {err}")))?;
+    open_log_at(dir.as_fd(), LOG_FILE, path)
+}
+
+/// [`open_log`]'s open, relative to a directory the caller's own `O_NOFOLLOW`
+/// walk produced, for a log with any name.
+///
+/// Every rule is [`open_log`]'s — `O_APPEND | O_CREAT | O_NOFOLLOW |
+/// O_NONBLOCK`, a regular file, mode 0600 checked on the descriptor and refused
+/// rather than repaired — because it *is* that function's body: `open_log` is
+/// this plus the walk to [`Paths::namespace_root`]. Phase 3's Codex log reaches
+/// its own directory and opens its own name through here.
+///
+/// `name` must be one plain path component; `path` is the log as the user
+/// would recognise it, used only in the error sentences.
+///
+/// # Errors
+///
+/// As [`open_log`], plus [`AppError::Config`] for a `name` that is not one
+/// plain component.
+pub(crate) fn open_log_at(dir: BorrowedFd<'_>, name: &str, path: &Path) -> Result<File, AppError> {
+    if !is_single_component(name) {
+        return Err(refused(path, "its name is not a single path component"));
+    }
 
     // `O_NONBLOCK` is not decoration: without it a FIFO planted at this name
     // — one `mkfifo`, the same precondition as the symbolic link — blocks the
@@ -814,13 +846,13 @@ pub(crate) fn open_log(paths: &Paths, path: &Path) -> Result<File, AppError> {
         | OFlags::NOFOLLOW
         | OFlags::NONBLOCK
         | OFlags::CLOEXEC;
-    let fd = match rustix::fs::openat(&dir, LOG_FILE, flags, LOG_MODE) {
+    let fd = match rustix::fs::openat(dir, name, flags, LOG_MODE) {
         Ok(fd) => fd,
         // The open has already refused: `O_NOFOLLOW` followed nothing and
         // `O_CREAT` without `O_TRUNC` wrote nothing. All this second look
         // decides is which sentence the caller is handed — the reasoning
         // `file_store::open_dir_at` gives for its own `lstat`.
-        Err(errno) => return Err(refused(path, &why_open_failed(dir.as_fd(), errno))),
+        Err(errno) => return Err(refused(path, &why_open_failed(dir, name, errno))),
     };
 
     let file = File::from(fd);
@@ -853,12 +885,35 @@ fn read_log(paths: &Paths, path: &Path) -> Result<Option<String>, AppError> {
         Err(err) if is_absent(&err) => return Ok(None),
         Err(err) => return Err(refused(path, &format!("its directory is unreachable: {err}"))),
     };
+    read_log_at(dir.as_fd(), LOG_FILE, path)
+}
+
+/// [`read_log`]'s read, relative to a directory the caller's own `O_NOFOLLOW`
+/// walk produced, for a log with any name.
+///
+/// The same rules: a link at the name is refused, an absent file is `None`,
+/// and the mode is **not** checked, because a reader must still be able to
+/// report a log whose mode is wrong. Phase 3's `codex doctor` tails the Codex
+/// log through here.
+///
+/// # Errors
+///
+/// As [`read_log`], plus [`AppError::Config`] for a `name` that is not one
+/// plain component.
+pub(crate) fn read_log_at(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    path: &Path,
+) -> Result<Option<String>, AppError> {
+    if !is_single_component(name) {
+        return Err(refused(path, "its name is not a single path component"));
+    }
 
     let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let fd = match rustix::fs::openat(&dir, LOG_FILE, flags, Mode::empty()) {
+    let fd = match rustix::fs::openat(dir, name, flags, Mode::empty()) {
         Ok(fd) => fd,
         Err(errno) if errno == Errno::NOENT => return Ok(None),
-        Err(errno) => return Err(refused(path, &why_open_failed(dir.as_fd(), errno))),
+        Err(errno) => return Err(refused(path, &why_open_failed(dir, name, errno))),
     };
 
     let mut file = File::from(fd);
@@ -877,9 +932,10 @@ fn open_log_dir(paths: &Paths) -> Result<OwnedFd, FileStoreError> {
     file_store::open_dir_under(paths.config_dir(), &paths.namespace_root())
 }
 
-/// What is at [`LOG_FILE`] inside an already-opened directory.
-fn state_at(dir: BorrowedFd<'_>) -> LogState {
-    match rustix::fs::statat(dir, LOG_FILE, AtFlags::SYMLINK_NOFOLLOW) {
+/// What is at `name` — [`LOG_FILE`], for Claude's log — inside an
+/// already-opened directory.
+fn state_at(dir: BorrowedFd<'_>, name: &str) -> LogState {
+    match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
             FileType::Symlink => {
                 LogState::Refused("a symbolic link, which agctl will not append through".to_owned())
@@ -901,8 +957,8 @@ fn state_at(dir: BorrowedFd<'_>) -> LogState {
 /// `ELOOP`; the errno when the name says nothing useful — the open failed for
 /// a reason that is not about the shape of what is there, or lost a race with
 /// somebody changing it.
-fn why_open_failed(dir: BorrowedFd<'_>, errno: Errno) -> String {
-    let state = state_at(dir);
+fn why_open_failed(dir: BorrowedFd<'_>, name: &str, errno: Errno) -> String {
+    let state = state_at(dir, name);
     if state.is_appendable() { format!("it could not be opened: {errno}") } else { state.note() }
 }
 

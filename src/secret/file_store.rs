@@ -94,6 +94,15 @@ use crate::runtime::cleanup;
 use crate::runtime::coordinator::PassCtx;
 use crate::runtime::fault::Fault;
 use crate::secret::foreign_activity::ForeignActivity;
+use crate::secret::pending::PendingCredential;
+use crate::secret::pending::PendingSpec;
+use crate::secret::pending::resolve_pending_with;
+use crate::secret::secret_file::SecretFile;
+use crate::secret::secret_file::StopPolicy;
+use crate::secret::secret_file::WriteFaults;
+
+pub use crate::secret::pending::PendingDecision;
+pub use crate::secret::pending::PendingDiscardReason;
 
 /// The largest credentials file that will be read (fact F40).
 pub const MAX_CREDENTIALS_BYTES: u64 = 1 << 20;
@@ -214,18 +223,18 @@ pub enum FileStoreError {
 
 impl FileStoreError {
     /// Wraps an [`io::Error`] with what was being attempted.
-    fn io(context: impl Into<String>, source: io::Error) -> Self {
+    pub(crate) fn io(context: impl Into<String>, source: io::Error) -> Self {
         Self::Io { context: context.into(), source }
     }
 
     /// Wraps a `rustix` errno with what was being attempted.
-    fn errno(context: impl Into<String>, errno: Errno) -> Self {
+    pub(crate) fn errno(context: impl Into<String>, errno: Errno) -> Self {
         Self::io(context, as_io_error(errno))
     }
 }
 
 /// A `rustix` errno as the [`io::Error`] the rest of the crate speaks.
-fn as_io_error(errno: Errno) -> io::Error {
+pub(crate) fn as_io_error(errno: Errno) -> io::Error {
     io::Error::from_raw_os_error(errno.raw_os_error())
 }
 
@@ -477,119 +486,25 @@ pub fn write_credentials(
     }
 
     let dir = open_namespace_dir(req.paths, req.ns_dir)?;
-    let dir = dir.as_fd();
-
-    // Refuse before creating anything: a symlink at the target means somebody
-    // else is managing this path and the rename would land somewhere unknown.
-    match entry_at(dir, CREDENTIALS_FILE, &target)? {
-        Entry::Absent | Entry::Regular => {}
-        Entry::Symlink => return Err(FileStoreError::RefusedSymlink(target)),
-        Entry::Other => return Err(FileStoreError::NotRegular(target)),
-    }
-
-    let tmp_name = format!("{CREDENTIALS_FILE}.tmp.{}", hex8());
-    let tmp = req.ns_dir.join(&tmp_name);
-    let token = cleanup::register_tmp_path(tmp.clone());
-    if let Err(err) = create_new_file_at(dir, &tmp_name, req.blob_json.as_bytes()) {
-        let _ = unlink_at(dir, &tmp_name);
-        cleanup::unregister(token);
-        return Err(FileStoreError::io(format!("could not write `{}`", tmp.display()), err));
-    }
-
-    // The window plan AC21's third clause aims at: the POST has returned, the
-    // new credentials are on disk, and the namespace has not yet been
-    // replaced. A Claude Code session appearing here is the case the caller
-    // must re-check for before it renames.
-    req.fault.pause_point("before_rename");
-
-    // The same window is the last moment at which a cancelled pass can leave
-    // the namespace exactly as it found it: after the rename there is nothing
-    // left to undo, and before the write there is nothing to gain.
-    if ctx.should_stop() {
-        let _ = unlink_at(dir, &tmp_name);
-        cleanup::unregister(token);
-        return Err(FileStoreError::Cancelled(target));
-    }
-
-    let rename = if req.fault.is("rename_fail") {
-        Err(io::Error::new(
-            io::ErrorKind::CrossesDevices,
-            // The variable's name is deliberately not spelled here: this
-            // literal is in code the default-feature build compiles, so
-            // naming it would put a test-only environment variable into the
-            // release artifact (plan AC37). `crate::runtime::fault` documents
-            // which switch reaches this.
-            "rename failure injected by the test fault switch",
-        ))
-    } else {
-        rustix::fs::renameat(dir, tmp_name.as_str(), dir, CREDENTIALS_FILE).map_err(as_io_error)
+    let root = req.paths.namespace_root();
+    let spec = PendingSpec {
+        target_name: CREDENTIALS_FILE,
+        pending_name: PENDING_FILE,
+        meta_name: PENDING_META,
+        prior: req.prior,
+        expires_at_ms: Some(req.new_expires_at_ms),
     };
-
-    match rename {
-        Ok(()) => {
-            // The mode was set on the temporary file's inode, which the rename
-            // carries over, so there is nothing left to chmod here.
-            let snap = snapshot_at(dir, CREDENTIALS_FILE, &target);
-            cleanup::unregister(token);
-            match snap {
-                Ok(Some(snap)) => Ok(WriteOutcome::Written { snap }),
-                Ok(None) => Err(FileStoreError::io(
-                    format!("`{}` vanished immediately after being written", target.display()),
-                    io::Error::from(io::ErrorKind::NotFound),
-                )),
-                Err(err) => Err(err),
-            }
-        }
-        Err(err) => {
-            let outcome = save_to_pending(req, dir, &tmp_name, &err);
-            cleanup::unregister(token);
-            outcome
-        }
-    }
-}
-
-/// Parks a written temporary file as `.credentials.json.pending`.
-///
-/// The metadata goes first, deliberately. A crash between the two leaves a
-/// meta with no pending file, which [`resolve_pending`] reads as "nothing to
-/// replay"; the other order would leave credentials with no record of what
-/// they were derived from, which is unreplayable *and* indistinguishable from
-/// a valid pending.
-fn save_to_pending(
-    req: &WriteRequest<'_>,
-    dir: BorrowedFd<'_>,
-    tmp_name: &str,
-    cause: &io::Error,
-) -> Result<WriteOutcome, FileStoreError> {
-    let meta = PendingMeta {
-        derived_from_access_sha256: req.prior.map(|d| d.access_sha256.clone()),
-        derived_from_refresh_sha256: req.prior.and_then(|d| d.refresh_sha256.clone()),
-        created_at: jiff::Timestamp::now().to_string(),
-        new_expires_at: req.new_expires_at_ms,
+    let faults = WriteFaults {
+        fault: &req.fault,
+        before_rename: "before_rename",
+        rename_fail: "rename_fail",
     };
-    let meta_json = serde_json::to_string(&meta).map_err(|err| {
-        FileStoreError::Json(format!("could not serialize pending metadata: {err}"))
-    })?;
-
-    let meta_path = req.ns_dir.join(PENDING_META);
-    let _ = unlink_at(dir, PENDING_META);
-    if let Err(err) = create_new_file_at(dir, PENDING_META, meta_json.as_bytes()) {
-        let _ = unlink_at(dir, tmp_name);
-        return Err(FileStoreError::io(format!("could not write `{}`", meta_path.display()), err));
-    }
-
-    let pending = req.ns_dir.join(PENDING_FILE);
-    let _ = unlink_at(dir, PENDING_FILE);
-    if let Err(errno) = rustix::fs::renameat(dir, tmp_name, dir, PENDING_FILE) {
-        let _ = unlink_at(dir, tmp_name);
-        let _ = unlink_at(dir, PENDING_META);
-        return Err(FileStoreError::errno(
-            format!("could not park credentials at `{}`", pending.display()),
-            errno,
-        ));
-    }
-
-    Ok(WriteOutcome::SavedToPending { error: cause.to_string() })
+    SecretFile::open(&root, dir.as_fd(), CREDENTIALS_FILE, &target).write(
+        req.blob_json.as_bytes(),
+        Some(spec),
+        StopPolicy::DiscardStaged(ctx),
+        &faults,
+    )
 }
 
 /// Parks the credential a hot-swap displaced at
@@ -860,46 +775,21 @@ pub struct PendingMeta {
     pub new_expires_at: i64,
 }
 
-/// What resolving a pending file decided.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PendingDecision {
-    /// There was nothing pending.
-    NoPending,
-    /// The pending credentials were moved into place.
-    Replayed {
-        /// Whether they were parked before any file existed.
-        first_write: bool,
-    },
-    /// The pending credentials were deleted unused.
-    Discarded(PendingDiscardReason),
-}
+/// Claude's credential blob, as the pending protocol sees it.
+///
+/// `new_expires_at` has always been required in Claude's meta, so a meta
+/// without one stays `invalid`.
+struct ClaudeBlob;
 
-/// Why a pending file was discarded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PendingDiscardReason {
-    /// The metadata was missing, unparseable, or one of the files was not a
-    /// plain file of a sane size.
-    Invalid,
-    /// A Claude Code session or a keychain migration has taken the namespace
-    /// over since the pending file was written.
-    NamespaceTakenOver,
-    /// The credentials file changed since the pending file was derived from
-    /// it, so replaying would undo that change.
-    FileChanged,
-    /// The credentials file was removed, and the pending file was derived
-    /// from one that existed.
-    FileRemoved,
-}
+impl PendingCredential for ClaudeBlob {
+    const META_REQUIRES_EXPIRY: bool = true;
 
-impl PendingDiscardReason {
-    /// The reason as it appears in the state column.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Invalid => "invalid",
-            Self::NamespaceTakenOver => "namespace taken over",
-            Self::FileChanged => "file changed",
-            Self::FileRemoved => "file removed",
-        }
+    fn validate(bytes: &[u8]) -> bool {
+        Credentials::parse_blob(bytes).is_ok()
+    }
+
+    fn digests(bytes: &[u8]) -> Option<Digests> {
+        Credentials::parse_blob(bytes).ok().map(|credentials| credentials.digests())
     }
 }
 
@@ -917,98 +807,16 @@ pub fn resolve_pending(
     foreign: &ForeignActivity,
 ) -> Result<PendingDecision, FileStoreError> {
     let Some(dir) = open_ns_dir(ns_dir)? else { return Ok(PendingDecision::NoPending) };
-    let dir = dir.as_fd();
-
-    let pending_path = ns_dir.join(PENDING_FILE);
-    let meta_path = ns_dir.join(PENDING_META);
-    let current_path = ns_dir.join(CREDENTIALS_FILE);
-
-    // A meta with no pending file is the crash window described in
-    // `save_to_pending`: there is nothing to replay, so clear the marker.
-    if matches!(entry_at(dir, PENDING_FILE, &pending_path)?, Entry::Absent) {
-        let _ = unlink_at(dir, PENDING_META);
-        return Ok(PendingDecision::NoPending);
-    }
-
-    // Absent here means the path is a directory or unreadable, which is as
-    // invalid as a corrupt file; so is a symlink, so every failure collapses.
-    let pending = match read_file_at(dir, PENDING_FILE, MAX_CREDENTIALS_BYTES, &pending_path) {
-        Ok(ReadOutcome::Present { bytes, .. }) => Some(bytes),
-        _ => None,
+    let spec = PendingSpec {
+        target_name: CREDENTIALS_FILE,
+        pending_name: PENDING_FILE,
+        meta_name: PENDING_META,
+        prior: None,
+        expires_at_ms: None,
     };
-    let meta = match read_file_at(dir, PENDING_META, MAX_META_BYTES, &meta_path) {
-        Ok(ReadOutcome::Present { bytes, .. }) => {
-            serde_json::from_slice::<PendingMeta>(&bytes).ok()
-        }
-        _ => None,
-    };
-
-    let (Some(pending_bytes), Some(meta)) = (pending, meta) else {
-        return discard(dir, PendingDiscardReason::Invalid);
-    };
-    if Credentials::parse_blob(&pending_bytes).is_err() {
-        return discard(dir, PendingDiscardReason::Invalid);
-    }
-
-    if !matches!(foreign, ForeignActivity::None) {
-        return discard(dir, PendingDiscardReason::NamespaceTakenOver);
-    }
-
-    let current = match read_file_at(dir, CREDENTIALS_FILE, MAX_CREDENTIALS_BYTES, &current_path) {
-        Ok(ReadOutcome::Present { bytes, .. }) => Credentials::parse_blob(&bytes).ok(),
-        Ok(ReadOutcome::Absent) => None,
-        // An unreadable current file is not something to overwrite blindly.
-        Err(err) => return Err(err),
-    };
-
-    match current {
-        Some(current) => {
-            let digests = current.digests();
-            let matches = meta.derived_from_access_sha256.as_deref()
-                == Some(digests.access_sha256.as_str())
-                && meta.derived_from_refresh_sha256 == digests.refresh_sha256;
-            if matches {
-                replay(dir, ns_dir, false)
-            } else {
-                discard(dir, PendingDiscardReason::FileChanged)
-            }
-        }
-        None if meta.derived_from_access_sha256.is_none()
-            && meta.derived_from_refresh_sha256.is_none() =>
-        {
-            replay(dir, ns_dir, true)
-        }
-        None => discard(dir, PendingDiscardReason::FileRemoved),
-    }
-}
-
-/// Moves the pending file into place and clears the metadata.
-///
-/// The mode is set on the pending file *before* the rename, because a rename
-/// carries the inode and its mode across, and chmod-after-rename would be a
-/// second lookup of a name that is now the live credentials file.
-fn replay(
-    dir: BorrowedFd<'_>,
-    ns_dir: &Path,
-    first_write: bool,
-) -> Result<PendingDecision, FileStoreError> {
-    let pending_path = ns_dir.join(PENDING_FILE);
-    chmod_0600_at(dir, PENDING_FILE, &pending_path)?;
-    rustix::fs::renameat(dir, PENDING_FILE, dir, CREDENTIALS_FILE).map_err(|errno| {
-        FileStoreError::errno(format!("could not replay `{}`", pending_path.display()), errno)
-    })?;
-    let _ = unlink_at(dir, PENDING_META);
-    Ok(PendingDecision::Replayed { first_write })
-}
-
-/// Deletes both pending files and reports why.
-fn discard(
-    dir: BorrowedFd<'_>,
-    reason: PendingDiscardReason,
-) -> Result<PendingDecision, FileStoreError> {
-    let _ = unlink_at(dir, PENDING_FILE);
-    let _ = unlink_at(dir, PENDING_META);
-    Ok(PendingDecision::Discarded(reason))
+    let foreign_taken_over = !matches!(foreign, ForeignActivity::None);
+    resolve_pending_with::<ClaudeBlob>(dir.as_fd(), ns_dir, &spec, foreign_taken_over)
+        .map(|(decision, _)| decision)
 }
 
 /// Removes a namespace's files and then its directories.
@@ -1154,7 +962,7 @@ struct DirStep {
 
 /// What `lstat`ing one name inside a namespace directory found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Entry {
+pub(crate) enum Entry {
     /// Nothing is there.
     Absent,
     /// A regular file.
@@ -1493,7 +1301,7 @@ fn create_dir_at(
 }
 
 /// `lstat`s one name inside an already-opened namespace directory.
-fn entry_at<P: rustix::path::Arg>(
+pub(crate) fn entry_at<P: rustix::path::Arg>(
     dir: BorrowedFd<'_>,
     name: P,
     shown: &Path,
@@ -1512,7 +1320,7 @@ fn entry_at<P: rustix::path::Arg>(
 }
 
 /// The identity of one name inside an already-opened namespace directory.
-fn snapshot_at(
+pub(crate) fn snapshot_at(
     dir: BorrowedFd<'_>,
     name: &str,
     shown: &Path,
@@ -1538,12 +1346,16 @@ fn snapshot_at(
 }
 
 /// Removes one name from an already-opened namespace directory.
-fn unlink_at(dir: BorrowedFd<'_>, name: &str) -> io::Result<()> {
+pub(crate) fn unlink_at(dir: BorrowedFd<'_>, name: &str) -> io::Result<()> {
     rustix::fs::unlinkat(dir, name, AtFlags::empty()).map_err(as_io_error)
 }
 
 /// Sets one file's mode to 0600 without following a link at `name`.
-fn chmod_0600_at(dir: BorrowedFd<'_>, name: &str, shown: &Path) -> Result<(), FileStoreError> {
+pub(crate) fn chmod_0600_at(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    shown: &Path,
+) -> Result<(), FileStoreError> {
     // `fchmodat`'s `AT_SYMLINK_NOFOLLOW` is unimplemented on Linux, so the
     // link is refused by the open instead and the mode set on the descriptor.
     let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
