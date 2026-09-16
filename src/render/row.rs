@@ -30,7 +30,9 @@ use jiff::Timestamp;
 use crate::commands::status::RowOutcome;
 use crate::provider::claude::account::AccountState;
 use crate::provider::claude::usage::HEADLINE_SCOPE;
+use crate::render::json_v2::IntoJsonRowV2;
 use crate::render::table::EMPTY_CELL;
+use crate::runtime::coordinator::PassCtx;
 use crate::usage::model::CreditsState;
 use crate::usage::model::UsageSnapshot;
 use crate::usage::model::WindowKind;
@@ -84,6 +86,32 @@ pub trait TuiRow {
         )
     )]
     fn state_token(&self) -> &'static str;
+}
+
+/// Where one provider's rows for a pass come from.
+///
+/// The seam a combined `agctl status` would concatenate (plan ledger #103):
+/// each provider implements it once, and a caller that wants every row on the
+/// machine asks each source in turn rather than knowing how either of them
+/// produces rows. Its associated type must be renderable both ways —
+/// [`TuiRow`] for the display, [`IntoJsonRowV2`] for the document — so a
+/// provider cannot ship a row that only one presentation can show.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Codex pass implements it at S33, and the combined command is 3.2's \
+                  (U42 = no); S29b ships the seam so the row types are built against it"
+    )
+)]
+pub trait RowSource {
+    /// This source's row type.
+    type Row: TuiRow + IntoJsonRowV2 + Send;
+
+    /// One pass's rows, in discovery order, or `None` when the pass failed
+    /// before it could look — which is not the same as "no accounts", and is
+    /// why the display keeps the numbers already on screen.
+    fn rows(&self, ctx: &PassCtx) -> Option<Vec<Self::Row>>;
 }
 
 /// The badge for a Claude row, when its state has one.

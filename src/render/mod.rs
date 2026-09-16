@@ -13,6 +13,7 @@
 //! are settled before a row is built.
 
 pub mod json;
+pub mod json_v2;
 pub mod reset;
 pub mod row;
 pub mod table;

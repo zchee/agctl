@@ -1,0 +1,256 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/zchee/agctl/schemas/status.v2.json",
+  "title": "agctl status report, version 2",
+  "description": "The document `agctl codex status --json` writes to stdout, and the shape a multi-provider report takes. Version 1 remains what `agctl claude status --json` emits and is not replaced by this. Like version 1, this document carries no token material: it is built from a row's identity, state and usage figures.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "generated_at", "rows", "hidden"],
+  "properties": {
+    "version": {
+      "description": "The report version. A consumer must refuse a version it does not know.",
+      "const": 2
+    },
+    "generated_at": {
+      "description": "When the report was built, RFC 3339 in UTC. Every countdown in the document is relative to this instant.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "rows": {
+      "description": "The accounts the run displayed, in the order the table shows them. Rows hidden by default are present only when --all was given.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/row" }
+    },
+    "hidden": {
+      "description": "How many rows --all would have added. Zero when --all was given.",
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "$defs": {
+    "row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "id",
+        "identity",
+        "kind",
+        "source",
+        "state",
+        "state_label",
+        "lock_state",
+        "note",
+        "windows",
+        "credits",
+        "next_reset",
+        "session_reset",
+        "weekly_reset"
+      ],
+      "properties": {
+        "provider": {
+          "description": "Which vendor this row's usage came from. The same spelling the store's directories and the cache use.",
+          "enum": ["claude", "codex"]
+        },
+        "id": {
+          "description": "The identifier --account accepts for this row.",
+          "type": "string"
+        },
+        "identity": { "$ref": "#/$defs/identity" },
+        "kind": {
+          "description": "Where the credentials live and whether agctl may write them.",
+          "type": "string"
+        },
+        "source": {
+          "description": "Where this row's credentials were read from, when the provider distinguishes that from the kind; null when it does not.",
+          "type": ["string", "null"]
+        },
+        "state": {
+          "description": "The row state as a stable, machine-readable token. New tokens may be added; a consumer must not assume the set is closed.",
+          "type": "string"
+        },
+        "state_label": {
+          "description": "The same state as the sentence the table prints. Prose, and not stable across versions.",
+          "type": "string"
+        },
+        "lock_state": {
+          "description": "What the namespace lock did on this pass.",
+          "type": "string"
+        },
+        "note": {
+          "description": "The short explanation the table appends to the state, when there is one.",
+          "type": ["string", "null"]
+        },
+        "windows": {
+          "description": "Every usage window the response described, in the order it described them. A window's meaning comes from its kind and its label, never from its position here.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/window" }
+        },
+        "credits": { "$ref": "#/$defs/credits" },
+        "next_reset": {
+          "description": "The soonest reset across every window, RFC 3339 in UTC.",
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "session_reset": {
+          "description": "When the five-hour session window rolls over, RFC 3339 in UTC.",
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "weekly_reset": {
+          "description": "When the seven-day all-models window rolls over, RFC 3339 in UTC.",
+          "type": ["string", "null"],
+          "format": "date-time"
+        }
+      }
+    },
+    "identity": {
+      "description": "Who the row is, in terms both providers can answer: which person, and which workspace of theirs. A consumer that needs Anthropic's own spelling for a Claude row has version 1.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user_id", "account_id", "plan_type", "email", "org_name"],
+      "properties": {
+        "user_id": {
+          "description": "The Anthropic account UUID, or the ChatGPT user id. Empty when the row has no identity.",
+          "type": "string"
+        },
+        "account_id": {
+          "description": "The Anthropic organization UUID, or the ChatGPT account id.",
+          "type": "string"
+        },
+        "plan_type": {
+          "description": "The subscription tier, as the credential or the response spelled it.",
+          "type": ["string", "null"]
+        },
+        "email": {
+          "description": "The account's email address, when it is known.",
+          "type": ["string", "null"]
+        },
+        "org_name": {
+          "description": "The organization's display name, when the provider has one.",
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "label",
+        "percent",
+        "percent_floor",
+        "resets_at",
+        "is_active",
+        "limit_name",
+        "metered_feature",
+        "normal_model_slug"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Which window this is. `unknown` is not an error: a window this build has never seen is still reported, with its kind string in the label.",
+          "enum": ["session", "weekly_all", "weekly_scoped", "unknown"]
+        },
+        "label": {
+          "description": "The window's display label, which is where a scoped window's scope and an unrecognised window's raw kind string appear.",
+          "type": "string"
+        },
+        "percent": {
+          "description": "The percentage the server sent, clamped to 0..=100.",
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "percent_floor": {
+          "description": "The same figure floored, which is what the table and the vendors' own interfaces show.",
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "resets_at": {
+          "description": "When the window rolls over, RFC 3339 in UTC.",
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "is_active": {
+          "description": "Whether this is the window currently constraining the account.",
+          "type": "boolean"
+        },
+        "limit_name": {
+          "description": "The vendor's own name for the limit, when it sent one. Null for every Claude window.",
+          "type": ["string", "null"]
+        },
+        "metered_feature": {
+          "description": "Which metered feature the window covers, when the vendor said.",
+          "type": ["string", "null"]
+        },
+        "normal_model_slug": {
+          "description": "The model slug the window's ordinary requests are billed as, when the vendor said.",
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "credits": {
+      "description": "What is known about paid usage beyond the subscription. Tagged by `kind`, with every member present whatever the tag, so a consumer testing one gets an answer rather than having to tell an absent member from a null one.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "used_minor",
+        "currency",
+        "exponent",
+        "limit_minor",
+        "percent",
+        "balance",
+        "unlimited",
+        "disabled_reason",
+        "scope"
+      ],
+      "properties": {
+        "kind": {
+          "description": "`money` when the vendor reports minor units and a currency, `balance` when it reports a decimal amount, `off` when credits are switched off, `unavailable` when the response said nothing about them — which is not the same as switched off.",
+          "enum": ["money", "balance", "off", "unavailable"]
+        },
+        "used_minor": {
+          "description": "The amount spent, in minor units of `currency`. Only under `kind: money`.",
+          "type": ["integer", "null"]
+        },
+        "currency": {
+          "description": "The ISO 4217 code the minor units are in.",
+          "type": ["string", "null"]
+        },
+        "exponent": {
+          "description": "How many decimal places a minor unit represents.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "limit_minor": {
+          "description": "The monthly ceiling in minor units, absent for an uncapped account.",
+          "type": ["integer", "null"]
+        },
+        "percent": {
+          "description": "The server's own utilisation percentage, rounded.",
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "balance": {
+          "description": "The balance exactly as the wire spelled it, digits and all. A string rather than a number because the response sends one, and a decimal amount of money that has been through a binary float is no longer the amount that was sent. Only under `kind: balance`.",
+          "type": ["string", "null"]
+        },
+        "unlimited": {
+          "description": "Whether the plan's balance is uncapped.",
+          "type": ["boolean", "null"]
+        },
+        "disabled_reason": {
+          "description": "Why credits are switched off, when the server said.",
+          "type": ["string", "null"]
+        },
+        "scope": {
+          "description": "Whose figures these are. `organization` means two rows of one organization report the same number, and a consumer that summed them would double-count.",
+          "type": "string"
+        }
+      }
+    }
+  }
+}
