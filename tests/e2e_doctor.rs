@@ -96,6 +96,105 @@ fn ac58_the_isolation_section_flags_a_hand_seeded_leak_and_an_occupied_path() {
 }
 
 #[test]
+fn ac58_the_isolation_section_reports_both_exports_the_unexposed_entries_the_mcp_count_and_the_drift()
+ {
+    // The five fields of AC58's row that `ac58_the_isolation_section_reports_a_minimal_session`
+    // leaves alone: both exports by value, every live-config entry on neither
+    // allowlist, the MCP credential count, the live-file drift, and the
+    // migration state. They are the fields a reader acts on — "which
+    // directories is this session actually pointed at", "what is *not*
+    // exposed to it", "how many of my MCP servers carry a secret the linked
+    // file hands over" — and until now `doctor` could have rendered any of
+    // them wrong, or stopped rendering them at all, with the suite green.
+    //
+    // The live store is furnished so each field has a non-trivial answer: a
+    // tier-1 file and a tier-2 directory that must NOT be called unexposed, a
+    // `history.jsonl` that must not either (it is never linked by design),
+    // and two genuine tier-3 entries that must be.
+    let fixture = Fixture::new();
+    fixture.write_registry(vec![fixture.owned_record(ACCT, ORG)]);
+
+    let live_dir = fixture.home().join(".claude");
+    fs::create_dir_all(live_dir.join("projects")).expect("the tier-2 directory is creatable");
+    fs::write(live_dir.join("settings.json"), "{}").expect("the tier-1 file is writable");
+    fs::write(live_dir.join("history.jsonl"), "").expect("the never-linked file is writable");
+    fs::create_dir_all(live_dir.join("statsig")).expect("a tier-3 directory is creatable");
+    fs::write(live_dir.join("todos.json"), "[]").expect("a tier-3 file is writable");
+
+    // Three MCP servers, two of which carry credential material: one through
+    // `env`, one through `headers`. The third has an empty `env`, which is
+    // what makes the count a count rather than a server tally.
+    fs::write(
+        fixture.home().join(".claude.json"),
+        json!({
+            "hasCompletedOnboarding": true,
+            "mcpServers": {
+                "with-env": { "command": "a", "env": { "TOKEN": "secret-one" } },
+                "with-headers": { "type": "http", "headers": { "Authorization": "secret-two" } },
+                "plain": { "command": "b", "env": {} },
+            },
+        })
+        .to_string(),
+    )
+    .expect("the live `.claude.json` fixture should be writable");
+
+    fixture.cmd().args(["claude", "env", ACCT]).assert().success();
+
+    // The live file moves after the seed was taken, which is the whole point
+    // of the drift row: the session is running against a snapshot that no
+    // longer matches what a new session would get.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let live_json = fixture.home().join(".claude.json");
+    let text = fs::read_to_string(&live_json).expect("readable");
+    fs::write(&live_json, text).expect("the live file is rewritable");
+
+    let output =
+        fixture.cmd().args(["claude", "doctor"]).output().expect("`claude doctor` should run");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Both exports, by value: these are the two variables a user would paste
+    // into a shell, and a report naming the wrong directory for either is
+    // worse than one naming neither.
+    assert!(
+        stdout.contains(&format!(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR={} CLAUDE_CONFIG_DIR={}",
+            common::export_spelling(&fixture.ns_dir(ACCT, ORG)),
+            fixture.session_dir(ACCT, ORG).display()
+        )),
+        "both exports, in one row, by value:\n{stdout}"
+    );
+    assert!(stdout.contains("migrated=false"), "no keychain item exists for it:\n{stdout}");
+
+    // Tier 3, and only tier 3.
+    let unexposed = stdout
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("unexposed"))
+        .map(|rest| rest.trim().to_owned())
+        .unwrap_or_else(|| panic!("the report has an `unexposed` row:\n{stdout}"));
+    assert_eq!(
+        unexposed, "statsig, todos.json",
+        "exactly the entries on neither allowlist, sorted; `settings.json` and `projects` are \
+         exposed and `history.jsonl` is never linked by design, so none of the three belongs \
+         here:\n{stdout}"
+    );
+
+    assert!(
+        stdout.contains("credential_entries=2"),
+        "two of the three servers carry an `env` or `headers` the linked file hands over; the \
+         empty one does not:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("secret-one") && !stdout.contains("secret-two"),
+        "and the count is all that is printed — never a key name or a value:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("changed_since_seed=true"),
+        "the live file was rewritten after the seed was taken:\n{stdout}"
+    );
+}
+
+#[test]
 fn ac58_the_isolation_section_says_the_root_is_empty_with_no_sessions() {
     let fixture = Fixture::new();
 
