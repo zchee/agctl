@@ -31,6 +31,35 @@ fn isolated_store() -> Fixture {
     fixture
 }
 
+/// Every regular file under `root`, with its bytes, symlinks skipped.
+///
+/// For the claims of the form "this pass created or rewrote nothing holding
+/// token material": a path-set comparison alone is blind to a file that was
+/// already there and got overwritten, so the contents come along. Symlinks
+/// are skipped rather than followed — the session directory is mostly
+/// symlinks into the live store, and following them would read the same live
+/// files twice and call a link's target a file this pass wrote.
+fn file_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut found = BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(path);
+            } else if let Ok(bytes) = fs::read(&path) {
+                found.insert(path, bytes);
+            }
+        }
+    }
+    found
+}
+
 /// Writes a script recording its own argv, one entry per line, to
 /// `out_file`, truncating it on each invocation.
 fn write_argv_capture_script(dir: &Path, name: &str, out_file: &Path) -> PathBuf {
@@ -91,6 +120,97 @@ fn ac52_exec_delivers_exactly_the_expected_environment_delta() {
         vars.get("AGCTL_E2E_MARKER"),
         Some(&"marker-value".to_owned()),
         "an unrelated inherited variable must pass through unchanged"
+    );
+}
+
+/// Arguments a shell would not leave alone, for the no-shell claim below.
+///
+/// One per mechanism `sh` would apply to them: word splitting, parameter
+/// expansion, pathname expansion, the command separator, and command
+/// substitution. The last two are the ones with a visible side effect, which
+/// is what makes the claim checkable from outside rather than only by
+/// comparing strings.
+const SHELL_METACHARACTER_ARGS: [&str; 5] =
+    ["a b", "$HOME", "*", "; touch semicolon-ran", "`touch backtick-ran`"];
+
+#[test]
+fn ac52_exec_runs_the_child_without_a_shell_and_writes_no_credential() {
+    // The two AC52 clauses `ac52_exec_delivers_exactly_the_expected_environment_delta`
+    // does not reach: that the child is started **directly** rather than
+    // through `sh -c`, and that `exec` writes no credential of its own.
+    //
+    // "Without a shell" is asserted by consequence, not by inspection. Every
+    // argument below is something `sh` would rewrite, and two of them would
+    // leave a file behind if one had ever seen them — so a build that spawned
+    // `sh -c "<command> <args>"` fails here twice over: the recorded argv
+    // would differ, and the child's working directory would hold files
+    // nothing asked for.
+    let fixture = isolated_store();
+    // A credential at rest before the pass, so "no new credential" is a claim
+    // about a tree that had one to begin with rather than about an empty one.
+    let at_rest = common::blob("access", "refresh", common::fresh_at());
+    fixture.write_credentials(ACCT, ORG, &at_rest);
+
+    let bin_dir = fixture.scratch("fake-path-bin");
+    fs::create_dir_all(&bin_dir).expect("the fake PATH directory should be creatable");
+    let argv_log = fixture.scratch("argv.log");
+    let capture = write_argv_capture_script(&bin_dir, "capture", &argv_log);
+
+    // The child inherits agctl's working directory, and agctl's is this
+    // test process's — the crate root. A shell's side effects have to land
+    // somewhere this test owns and can then assert is empty.
+    let cwd = fixture.scratch("child-cwd");
+    fs::create_dir_all(&cwd).expect("the child's working directory should be creatable");
+
+    let before = [file_tree(&fixture.config_dir()), file_tree(&fixture.home())];
+
+    let mut command = fixture.cmd();
+    command.current_dir(&cwd);
+    command.args(["claude", "exec", ACCT, "--"]);
+    command.arg(&capture);
+    command.args(SHELL_METACHARACTER_ARGS);
+    let output = command.output().expect("`claude exec` should run");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+
+    let expected: String = SHELL_METACHARACTER_ARGS.iter().map(|arg| format!("{arg}\n")).collect();
+    assert_eq!(
+        fs::read_to_string(&argv_log).expect("the argv log should exist"),
+        expected,
+        "every argument reached the child byte for byte; a shell would have split `a b`, \
+         expanded `$HOME`, globbed `*`, and cut the list at the `;`"
+    );
+
+    let littered: Vec<String> = fs::read_dir(&cwd)
+        .expect("the child's working directory should be readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        littered.is_empty(),
+        "a shell ran the `;` or the backticks and left {littered:?} in `{}`",
+        cwd.display()
+    );
+
+    // AC52's last clause: `exec` itself writes no credential. Asserted over
+    // both trees rather than over the namespace alone, because a leak worth
+    // catching is one that lands under a name the test did not think of.
+    let after = [file_tree(&fixture.config_dir()), file_tree(&fixture.home())];
+    for (was, now) in before.iter().zip(&after) {
+        for (path, bytes) in now {
+            if was.get(path) == Some(bytes) {
+                continue;
+            }
+            assert!(
+                !String::from_utf8_lossy(bytes).contains("sk-ant-"),
+                "`{}` was created or rewritten by `exec` and holds token material",
+                path.display()
+            );
+        }
+    }
+    assert_eq!(
+        fs::read(fixture.credentials_path(ACCT, ORG)).expect("the credential at rest is readable"),
+        at_rest.into_bytes(),
+        "and the credential that was already there is byte-identical"
     );
 }
 
@@ -551,6 +671,71 @@ fn ac57_never_rewrites_the_seed_once_claude_code_has_extended_it() {
     assert!(after_keys.contains("lastOnboardingVersion"), "the simulated addition must survive");
 }
 
+#[test]
+fn ac57_the_audit_log_records_no_write_to_the_seeded_config() {
+    // AC57's third clause. The first two — the seeded key set survives, and a
+    // re-run does not move the mtime — are asserted by the test above; this is
+    // the one that says the *other* durable record agrees with them.
+    //
+    // Seeding is the one thing `env` does that reads the live `.claude.json`
+    // under the peer's configuration lock (rulings G12/Q5), and S24b taught
+    // the audit log to carry a `config_write` line for every pass that writes
+    // that file. So "the seed was taken, and nothing was written" has a
+    // checkable second half: the log is byte-identical across both runs.
+    //
+    // Planted with a line already in it rather than left absent, because
+    // "the file does not exist" is satisfied just as well by a build whose
+    // audit writer is broken. A log that already holds a line and still holds
+    // exactly that line is a claim about appending, not about existence.
+    let (fixture, live_bytes) = linked_config_store();
+    let planted = fixture.plant_audit_lines(&[json!({
+        "ts": "2026-09-11T00:00:01Z",
+        "monotonic_ms": 1,
+        "agctl_pid": 1,
+        "event": "write",
+        "target": "live",
+        "from_digest8": "0a0b0c0d",
+        "to_digest8": "1a1b1c1d",
+        "outcome": "applied",
+        "direction": "forward",
+        "incoming_identity": { "account_uuid": ACCT, "organization_uuid": ORG },
+    })]);
+    let before = fs::read(&planted).expect("the planted audit log is readable");
+
+    fixture.cmd().args(["claude", "env", ACCT]).assert().success();
+
+    // The seeding really happened, so the assertion below is about a run that
+    // had something to record rather than about one that did nothing at all.
+    let seed_path = fixture.session_dir(ACCT, ORG).join(".claude.json");
+    assert!(seed_path.is_file(), "the first run should have seeded `{}`", seed_path.display());
+    assert!(seed_keys(&fixture).contains("theme"), "and taken the live file's seed keys");
+
+    // A second run, over a seed Claude Code has since extended: the path that
+    // would have to decide whether to rewrite, and therefore the one that
+    // would have something to audit if it ever did.
+    let mut extended: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&seed_path).expect("readable")).expect("JSON");
+    extended["lastOnboardingVersion"] = json!("9.9.9");
+    fs::write(&seed_path, serde_json::to_string_pretty(&extended).expect("serializable"))
+        .expect("writable");
+    fixture.cmd().args(["claude", "env", ACCT]).assert().success();
+
+    let after = fs::read(&planted).expect("the audit log is still readable");
+    assert_eq!(
+        String::from_utf8_lossy(&after),
+        String::from_utf8_lossy(&before),
+        "seeding appended nothing to `{}`: no write of the seed is an audited event, because \
+         no write of the seed happens",
+        planted.display()
+    );
+    assert_eq!(
+        fs::read(fixture.home().join(".claude.json")).expect("readable"),
+        live_bytes,
+        "and the live file the seed was taken from is byte-identical"
+    );
+    assert!(!fixture.backups_dir().exists(), "nothing backed it up, because nothing rewrote it");
+}
+
 // ---------------------------------------------------------------------------
 // AC79 — `use --forget`
 // ---------------------------------------------------------------------------
@@ -602,6 +787,63 @@ fn ac79_forget_an_account_with_no_session_is_a_no_op() {
         .assert()
         .success()
         .stdout(predicates::str::contains("nothing to forget"));
+}
+
+#[test]
+fn ac79_forget_removes_a_symlinked_session_directory_without_removing_what_it_points_at() {
+    // AC79's containment clause — "removes nothing outside
+    // `claude-sessions/`" — at the only shape that can actually reach the
+    // filesystem. `isolate::forget_session`'s own
+    // `Paths::is_under_session_root` guard is unreachable through the CLI by
+    // construction: `Paths::session_dir` always composes the path from
+    // validated segments, so no argument makes it point elsewhere. What a
+    // user *can* arrange is a session directory that is a symbolic link out
+    // of the session root — planted by hand, or inherited from a tree somebody
+    // moved — and then the containment question is about `remove_dir_all`
+    // rather than about the guard.
+    //
+    // The answer this pins: the link is under the session root and is
+    // removed; its target is not, and is left whole, contents and all.
+    // `remove_dir_all` identifies the top-level entry's own type before
+    // acting, so it unlinks the link rather than descending through it —
+    // which is exactly what `forget_session`'s doc comment claims, and what a
+    // switch to a "resolve then remove" implementation would silently break,
+    // taking the user's real configuration with it.
+    let fixture = isolated_store();
+
+    let outside = fixture.scratch("outside-the-session-root");
+    fs::create_dir_all(outside.join("nested")).expect("the decoy tree should be creatable");
+    fs::write(outside.join("keepme"), "the user's own file").expect("writable");
+    fs::write(outside.join("nested").join("keepme-too"), "and this one").expect("writable");
+
+    let session_dir = fixture.session_dir(ACCT, ORG);
+    assert!(
+        !outside.starts_with(fixture.config_dir().join("claude-sessions")),
+        "the decoy has to be outside the session root for this test to mean anything"
+    );
+    fs::create_dir_all(session_dir.parent().expect("the session dir has a parent"))
+        .expect("the session directory's parent should be creatable");
+    std::os::unix::fs::symlink(&outside, &session_dir)
+        .expect("the decoy symlink should be creatable");
+
+    fixture.cmd().args(["claude", "use", "--forget", ACCT, "--yes"]).assert().success();
+
+    assert!(
+        fs::symlink_metadata(&session_dir).is_err(),
+        "the link itself is under the session root, so removing it is right"
+    );
+    assert!(outside.is_dir(), "but its target is not, and must still be there");
+    assert_eq!(
+        fs::read_to_string(outside.join("keepme")).expect("the user's file should still be there"),
+        "the user's own file",
+        "nothing was deleted through the link"
+    );
+    assert_eq!(
+        fs::read_to_string(outside.join("nested").join("keepme-too"))
+            .expect("the nested file should still be there"),
+        "and this one",
+        "and nothing was deleted through it recursively either"
+    );
 }
 
 // ---------------------------------------------------------------------------
