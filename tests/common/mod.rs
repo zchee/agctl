@@ -866,10 +866,16 @@ impl Default for Fixture {
 /// scripting variables. Removed *before* the fixture's own settings are
 /// applied, so an inherited value loses to the fixture rather than to the
 /// list.
-const REMOVED_ENV: [&str; 18] = [
+const REMOVED_ENV: [&str; 19] = [
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    // Phase 3 ledger #171. Nothing here reads it yet, but the second provider
+    // will, and an inherited value would point those tests at the developer's
+    // live Codex home — the same mistake `CLAUDE_CONFIG_DIR` above is here to
+    // prevent, one provider later. Removed now, from the file phase 3 adds its
+    // own fixtures beside rather than edits.
+    "CODEX_HOME",
     "AGCTL_CONFIG_DIR",
     "AGCTL_FAULT",
     "AGCTL_FAULT_RESUME",
