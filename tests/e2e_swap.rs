@@ -1693,6 +1693,251 @@ fn ac70_an_eexist_at_the_third_lock_restarts_without_waiting_inside_the_hold() {
     audit_carries_no_token(&fixture);
 }
 
+/// The held-lock records agctl has left behind, sorted; none when the
+/// directory was never created.
+fn held_lock_records(fixture: &Fixture) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = fs::read_dir(fixture.held_locks_dir()) else { return Vec::new() };
+    let mut found: Vec<std::path::PathBuf> =
+        entries.filter_map(Result::ok).map(|entry| entry.path()).collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn ac70_the_hold_stays_within_budget_with_the_machine_busy() {
+    // Plan AC70's budget clause, measured under load. Every other caller of
+    // `hold_within_budget` runs on an idle machine, where a hold of a few
+    // milliseconds clears a 3 000 ms budget by two orders of magnitude and
+    // the assertion says almost nothing. The budget exists for the case that
+    // is not idle: fact F53's give-up floor is what a *Claude Code session*
+    // will wait before deciding agctl's lock is abandoned, and a hold that
+    // overran it on a loaded machine would get its locks broken underneath it
+    // — which is the failure the number was derived to prevent.
+    //
+    // So this one oversubscribes every core for the length of the pass and
+    // asserts the same budget. It is not a benchmark and does not measure
+    // anything: it asserts the one inequality the invariant is, under the
+    // conditions that make the inequality capable of failing.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (fixture, _service) = two_accounts(&server, common::fresh_at());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let spun = Arc::new(AtomicUsize::new(0));
+    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2;
+    let load: Vec<std::thread::JoinHandle<()>> = (0..threads)
+        .map(|_| {
+            let (stop, spun) = (Arc::clone(&stop), Arc::clone(&spun));
+            std::thread::spawn(move || {
+                let mut acc: u64 = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    for step in 0..50_000_u64 {
+                        acc = acc.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(step);
+                    }
+                    std::hint::black_box(acc);
+                    spun.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+
+    no_plaintext_store(&fixture, "before the pass");
+    let (code, stdout, stderr) = swap(&fixture, &[]);
+
+    stop.store(true, Ordering::Relaxed);
+    for handle in load {
+        let _ = handle.join();
+    }
+
+    assert_eq!(code, 0, "the swap still completes under load: {stdout}{stderr}");
+    assert!(
+        spun.load(Ordering::Relaxed) >= threads,
+        "every load thread should have run at least one round, or the machine was never busy \
+         and this test proved nothing: {} rounds across {threads} threads",
+        spun.load(Ordering::Relaxed)
+    );
+    let held = hold_ms(&stderr)
+        .unwrap_or_else(|| panic!("the release should have been logged:\n{stderr}"));
+    assert!(
+        held < 3_000,
+        "the hold was {held} ms with {threads} threads oversubscribing the machine, at or past \
+         its 3 000 ms budget — a Claude Code session would be entitled to break it"
+    );
+
+    assert_eq!(writes(&fixture).len(), 1, "exactly one write: {:?}", writes(&fixture));
+    artefacts_released(&fixture);
+    assert!(held_lock_records(&fixture).is_empty(), "and the record was cleared with them");
+    no_plaintext_store(&fixture, "after the swap");
+    assert_security(
+        &fixture,
+        &[("find-generic-password", 3), ("-i", 1), ("add-generic-password", 1)],
+    );
+    audit_carries_no_token(&fixture);
+    let _ = token;
+}
+
+// ---------------------------------------------------------------------------
+// AC64 — what a hold owes when it does not get to finish
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ac64_a_sigterm_inside_the_hold_releases_all_three_and_clears_the_record() {
+    // Plan AC64's `SIGTERM` clause. The suite already kills a swap inside its
+    // **namespace** acquire (`the_namespace_locks_are_taken_in_ascending_key_order`),
+    // which is an `flock` the kernel drops on death — so it proves nothing
+    // about the part that needs proving. Claude Code's locks are
+    // *directories*, and nothing in the kernel removes a directory when a
+    // process dies: the only thing that releases them is the emergency
+    // restore `register_emergency_release` files with the cleanup registry,
+    // and until now no test signalled a process while it held one.
+    //
+    // `swap_pause_in_locks` parks the pass inside the hold with all three
+    // taken, which is the only window in which the question can be asked at
+    // all. The resume file is never written: the pass is not meant to finish.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (mut fixture, _service) = two_accounts(&server, common::fresh_at());
+    let resume = fixture.scratch("resume-never-written");
+    fixture.fault("swap_pause_in_locks");
+    fixture.set("AGCTL_FAULT_RESUME", &resume.to_string_lossy());
+
+    let artefacts = fixture.hold_artefacts(ACCT, ORG);
+    let [primary, legacy, storage] = artefacts.clone();
+
+    no_plaintext_store(&fixture, "before the pass");
+    let child = fixture
+        .raw()
+        .args(["claude", "use", "--live", EMAIL_T, "--yes"])
+        .spawn()
+        .expect("the binary should start");
+
+    assert!(
+        common::wait_until(Duration::from_secs(20), || primary.exists()),
+        "the hold should have opened and then paused inside itself"
+    );
+    // The same wait refusal A takes: the first artefact appearing says the
+    // hold opened, and the pause is a few microseconds later. Signalling
+    // before it lands would test a different moment every run.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // The precondition, asserted rather than assumed: there is something to
+    // release, and a record bracketing it. Without this the test would pass
+    // just as well against a build that never took the locks at all.
+    for artefact in &artefacts {
+        assert!(artefact.exists(), "`{}` should be held right now", artefact.display());
+    }
+    let records = held_lock_records(&fixture);
+    assert_eq!(records.len(), 1, "one open hold, one record: {records:?}");
+
+    common::send_sigterm(child.id());
+    let finished = common::finish(child);
+
+    assert_eq!(
+        finished.code(),
+        143,
+        "128 + SIGTERM: the handler ran and exited rather than the default disposition killing \
+         it outright\nstderr:\n{}",
+        finished.stderr
+    );
+    assert!(!primary.exists(), "the primary lock was released by the signal handler");
+    assert!(!legacy.exists(), "and the legacy lock beneath it");
+    assert!(!storage.exists(), "and the storage-write lock");
+    assert!(
+        held_lock_records(&fixture).is_empty(),
+        "and the record went with them — a record outliving its directories would send \
+         `doctor --remove-stale` after paths that are already gone: {:?}",
+        held_lock_records(&fixture)
+    );
+
+    assert!(
+        writes(&fixture).is_empty(),
+        "a swap killed inside its hold writes nothing: {:?}",
+        writes(&fixture)
+    );
+    live_item_never_written(&fixture);
+    no_plaintext_store(&fixture, "after a swap killed inside its hold");
+    audit_carries_no_token(&fixture);
+    let _ = token;
+}
+
+#[test]
+fn ac64_doctor_names_the_three_directories_a_leaked_swap_hold_left() {
+    // AC64's other half: `swap_lock_leak` leaves them, and `doctor` names
+    // them. The leak is what a crashed hold looks like — a `SIGKILL`, a
+    // panic the hook did not reach, a machine that lost power — and the
+    // directories it strands are invisible to the kernel and to every other
+    // agctl command. The held-lock record is the only evidence, which is
+    // exactly why the report has to turn it back into three paths and a
+    // command the user can run.
+    //
+    // `tests/e2e_lock.rs` asserts the negative half of the same rule (a path
+    // outside the namespace root with no record is refused) and
+    // `tests/e2e_refresh.rs` asserts the leak's own shape on the refresh
+    // path. What neither does is run `doctor` over one.
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (mut fixture, _service) = two_accounts(&server, common::fresh_at());
+    fixture.fault("swap_lock_leak");
+
+    no_plaintext_store(&fixture, "before the pass");
+    let (code, stdout, stderr) = swap(&fixture, &[]);
+    assert_eq!(code, 0, "the swap itself applies; only the release leaks: {stdout}{stderr}");
+
+    let artefacts = fixture.hold_artefacts(ACCT, ORG);
+    for artefact in &artefacts {
+        let meta = fs::symlink_metadata(artefact)
+            .unwrap_or_else(|err| panic!("`{}` should have leaked: {err}", artefact.display()));
+        assert!(meta.is_dir(), "`{}` is a directory, as the peer makes them", artefact.display());
+    }
+    assert_eq!(held_lock_records(&fixture).len(), 1, "and the record that brackets them");
+
+    let report =
+        fixture.cmd().args(["claude", "doctor"]).output().expect("`claude doctor` should run");
+    assert!(report.status.success(), "stderr: {}", String::from_utf8_lossy(&report.stderr));
+    let report = String::from_utf8_lossy(&report.stdout);
+
+    assert!(report.contains("held locks"), "the section exists:\n{report}");
+    for artefact in &artefacts {
+        let path = artefact.display().to_string();
+        assert!(
+            report.contains(&format!("{path}  leaked — `doctor --remove-stale {path} --yes`")),
+            "`{path}` is named as leaked, with the command that removes it:\n{report}"
+        );
+    }
+    assert!(!report.contains("sk-ant-"), "and no token material reaches the report:\n{report}");
+
+    // What the record buys, checked at the command the report offers. A
+    // directory this young is refused on its **age** — `--remove-stale` keeps
+    // AC73's 60 s two-sample threshold, because a session that is starting up
+    // looks exactly like a leak — and that refusal is the one this test wants
+    // to see. The refusal that must **not** appear is the authorisation one:
+    // "outside the namespace root, with no record naming it" is what a leak
+    // with no record gets (`tests/e2e_lock.rs`), and getting it here would
+    // mean the record `doctor` just read its three paths out of did not
+    // authorise removing them.
+    let removal = fixture
+        .cmd()
+        .args(["claude", "doctor", "--remove-stale"])
+        .arg(&artefacts[0])
+        .arg("--yes")
+        .output()
+        .expect("`claude doctor --remove-stale` should run");
+    let refusal = String::from_utf8_lossy(&removal.stderr);
+    assert!(
+        refusal.contains("staleness threshold"),
+        "a leak this young is held back by its age, not by its authorisation: {refusal}"
+    );
+    assert!(
+        !refusal.contains("no record"),
+        "and never for want of a record — the one the report just read is what makes these \
+         three paths removable at all: {refusal}"
+    );
+    assert!(artefacts[0].exists(), "so nothing was removed yet");
+
+    audit_carries_no_token(&fixture);
+    let _ = token;
+}
+
 // ---------------------------------------------------------------------------
 // AC72 — the first write, into an item that is not there yet
 // ---------------------------------------------------------------------------

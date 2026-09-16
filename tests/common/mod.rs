@@ -1391,7 +1391,7 @@ pub fn finish(child: Child) -> Output {
 /// write lines in it is a failure, not a pass, because "the write path did
 /// nothing" is exactly the way this criterion could otherwise be satisfied
 /// (critic M8).
-pub const KEYCHAIN_WRITE_TESTS: [&str; 69] = [
+pub const KEYCHAIN_WRITE_TESTS: [&str; 71] = [
     "ac59_the_write_transport_reads_one_line_from_stdin_and_redacts_the_hex",
     "ac60_a_service_no_test_registered_is_refused_and_stores_nothing",
     "ac61_what_the_write_path_stores_is_what_the_binary_reads",
@@ -1503,6 +1503,13 @@ pub const KEYCHAIN_WRITE_TESTS: [&str; 69] = [
     // S24c (the plan column). Refreshes a migrated namespace's item in place,
     // which writes that item once, with the plan in the line.
     "a_migrated_items_plan_is_asked_before_the_hold_and_written_with_the_refresh",
+    // S26 (W5, the e2e half of phase 2 §5). Two of the three new lock tests
+    // complete one forward swap each and so write the namespaced item once.
+    // The third — `ac64_a_sigterm_inside_the_hold_releases_all_three_and_clears_the_record`
+    // — is killed inside its hold, writes nothing, and is deliberately not
+    // here: a name in this list is a write the count expects to exist.
+    "ac70_the_hold_stays_within_budget_with_the_machine_busy",
+    "ac64_doctor_names_the_three_directories_a_leaked_swap_hold_left",
 ];
 
 /// Fact F42's keychain update line, for a test that means to write one.
