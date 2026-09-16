@@ -33,6 +33,18 @@
 #                 `remove_dir_under` and `remove_dir_under_root` only in file_store.rs
 #                 and commands/doctor.rs (their base-tree caller)
 #
+# S29b appends two more:
+#
+#   codex_bin     the `AGCTL_CODEX_BIN` name (the test-only `codex` override) →
+#                 only in provider/codex/login_child.rs, the one module that
+#                 spawns the vendor's binary
+#   codex_env     `std::env` inside provider/codex/home.rs                 → none.
+#                 The Codex home is resolved from an injected `CodexEnv`, never
+#                 from the process, which is what lets every home-resolution test
+#                 run in-process without touching the developer's own (I25).
+#                 Vacuous until S30 creates that file; the planted violation
+#                 creates it, so the check itself is proven now.
+#
 # With `--log <file>...` the leak needles (the four sentinels, `eyJ`, `Bearer `
 # and `sk-ant-`) are also counted in each named file — a nextest trace log, a
 # `--json` document (plan §9.4) — and every count must be zero. The needles
@@ -88,6 +100,17 @@ REMOVE_DIR_UNDER_ROOT_ALLOWED=(
     src/secret/file_store.rs
     src/commands/doctor.rs
 )
+
+# The test-only `codex` binary override (plan §3.2, ledger #145). Production
+# resolves `codex` on PATH and refuses with `codex not on PATH`; the override is
+# compiled only under the `testing` feature and is on the release gate's seam
+# list, so a second reader of it would be a second way into a release artifact.
+CODEX_BIN_ALLOWED=(
+    src/provider/codex/login_child.rs
+)
+
+# The file that must not read the process environment (invariant I25).
+CODEX_HOME_MODULE=src/provider/codex/home.rs
 
 LEAK_NEEDLES=(
     agctl-test-codex-at-
@@ -234,6 +257,26 @@ check_helper_callers() {
     return "$bad"
 }
 
+check_codex_bin() {
+    check_helper_callers "$1" '\bAGCTL_CODEX_BIN\b' 'AGCTL_CODEX_BIN' "${CODEX_BIN_ALLOWED[@]}"
+}
+
+check_codex_env() {
+    local file="$1/$CODEX_HOME_MODULE" hits status=0
+    # Vacuous until S30 writes it. Stated rather than silent: the plant below
+    # creates the file, so the check is proven on every run regardless.
+    [[ -f $file ]] || return 0
+    hits=$(rg --line-number --no-heading --color never \
+        -e '^\s*(?:[^/\s].*)?std::env' "$file") || status=$?
+    if [[ $status -gt 1 ]]; then
+        phase3_die "check_codex_env: rg could not read $CODEX_HOME_MODULE"
+    fi
+    [[ -z $hits ]] && return 0
+    printf '  %s reads the process environment; the Codex home comes from an injected CodexEnv:\n%s\n' \
+        "$CODEX_HOME_MODULE" "$hits"
+    return 1
+}
+
 check_removal_helpers() {
     local bad=0
     check_helper_callers "$1" '\bunlink_at\b' 'unlink_at' "${UNLINK_HELPER_ALLOWED[@]}" || bad=1
@@ -259,6 +302,14 @@ plant_unlink_helper() { plant_line "$1" 'fn _phase3_plant(d: BorrowedFd<'"'"'_>)
 plant_unlink_alias() { plant_line "$1" 'use crate::secret::file_store::unlink_at as _phase3_plant;'; }
 plant_remove_dir_under_root() { plant_line "$1" 'fn _phase3_plant(p: &Paths, d: &Path) { let _ = file_store::remove_dir_under_root(p, d); }'; }
 plant_remove_dir_under() { plant_line "$1" 'fn _phase3_plant(a: &Path, p: &Path) { let _ = file_store::remove_dir_under(a, p); }'; }
+plant_codex_bin() { plant_line "$1" 'const _PHASE3_PLANT: &str = "AGCTL_CODEX_BIN";'; }
+# Creates the module as well as the violation: until S30 writes it, this is
+# also what proves the check can fail at all.
+plant_codex_env() {
+    mkdir -p "$1/$(dirname "$CODEX_HOME_MODULE")"
+    printf 'fn _phase3_plant() -> Option<std::ffi::OsString> { std::env::var_os("X") }\n' \
+        >>"$1/$CODEX_HOME_MODULE"
+}
 
 # rustfmt-shaped plants: the match begins the line's code text (review F1).
 plant_unwrap_fmt() { plant_line "$1" $'fn _phase3_plant() {\n    let _ = Some(1)\n        .unwrap();\n}'; }
@@ -267,7 +318,7 @@ plant_codex_home_fmt() { plant_line "$1" $'const _PHASE3_PLANT: [&str; 1] = [\n 
 plant_unlink_helper_fmt() { plant_line "$1" $'fn _phase3_plant(d: BorrowedFd<\'_>) {\n    unlink_at(d, "x");\n}'; }
 plant_remove_dir_under_fmt() { plant_line "$1" $'fn _phase3_plant(a: &Path, p: &Path) {\n    remove_dir_under(\n        a, p,\n    );\n}'; }
 
-CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers)
+CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers codex_bin codex_env)
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
@@ -286,6 +337,8 @@ PLANTS=(
     "removal_helpers plant_remove_dir_under_fmt"
     "removal_helpers plant_unlink_alias"
     "removal_helpers plant_remove_dir_under_root"
+    "codex_bin plant_codex_bin"
+    "codex_env plant_codex_env"
 )
 
 main() {
