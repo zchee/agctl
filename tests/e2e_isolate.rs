@@ -15,6 +15,11 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
+use std::process::ExitStatus;
+use std::process::Stdio;
+use std::time::Duration;
+use std::time::Instant;
 
 use common::ACCT;
 use common::Fixture;
@@ -212,6 +217,130 @@ fn ac52_exec_runs_the_child_without_a_shell_and_writes_no_credential() {
         at_rest.into_bytes(),
         "and the credential that was already there is byte-identical"
     );
+}
+
+/// How long a child of a signalled `exec` may outlive agctl: the drain budget
+/// the signal path waits on children before it escalates
+/// (`WORKER_JOIN_BUDGET`, duplicated here because the binary exposes nothing).
+const DRAIN_BUDGET: Duration = Duration::from_millis(500);
+
+/// Whether `pid` names a process that has not exited.
+///
+/// Through `ps` rather than `kill -0`, because a zombie answers `kill -0` too:
+/// the child of an agctl that has just exited is briefly one, until `launchd`
+/// reaps it, and a zombie is a process that has already died.
+fn pid_is_running(pid: u32) -> bool {
+    let output = Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("`ps` should be runnable");
+    let stat = String::from_utf8_lossy(&output.stdout);
+    let stat = stat.trim();
+    !stat.is_empty() && !stat.starts_with('Z')
+}
+
+/// Kills `pid` if it is still running, so a failing assertion does not leave a
+/// five-minute `sleep` behind.
+struct KillOnDrop(u32);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if pid_is_running(self.0) {
+            let _ = Command::new("/bin/kill").args(["-KILL", &self.0.to_string()]).status();
+        }
+    }
+}
+
+#[test]
+fn ac52_a_sigterm_to_exec_kills_the_child_it_registered() {
+    // AC52's third clause: the child is "registered with the cleanup
+    // registry", which means it dies with agctl. A Ctrl-C at the terminal
+    // reaches it through the process group anyway; a `kill -TERM` aimed at
+    // agctl alone does not, and before the fix the signal thread exited
+    // without touching it — the S26 probe found the child alive and
+    // reparented 4 times out of 4. So this runs the same probe 4 times.
+    let fixture = isolated_store();
+    let bin_dir = fixture.scratch("sigterm-bin");
+    fs::create_dir_all(&bin_dir).expect("the script directory should be creatable");
+    let script = bin_dir.join("record-pid-then-sleep");
+    // `exec` so the recorded pid *is* the long-lived process, with every
+    // stream let go of so it cannot hold agctl's pipes open after agctl dies.
+    fs::write(
+        &script,
+        "#!/bin/sh\necho $$ > \"$1\"\nexec /bin/sleep 300 </dev/null >/dev/null 2>&1\n",
+    )
+    .expect("the script should be writable");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+        .expect("the script should be made executable");
+
+    for round in 1..=4 {
+        let pid_file = fixture.scratch(&format!("child-{round}.pid"));
+        let stderr_path = fixture.scratch(&format!("agctl-{round}.stderr"));
+        let stderr =
+            fs::File::create(&stderr_path).expect("the stderr capture should be creatable");
+
+        let mut command = fixture.raw();
+        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(stderr);
+        command.args(["claude", "exec", ACCT, "--"]).arg(&script).arg(&pid_file);
+        let mut agctl = command.spawn().expect("`claude exec` should start");
+        let agctl_guard = KillOnDrop(agctl.id());
+
+        let mut child_pid = None;
+        let recorded = common::wait_until(Duration::from_secs(20), || {
+            child_pid = fs::read_to_string(&pid_file)
+                .ok()
+                .filter(|text| text.ends_with('\n'))
+                .and_then(|text| text.trim().parse::<u32>().ok());
+            child_pid.is_some()
+        });
+        let stderr_text = || fs::read_to_string(&stderr_path).unwrap_or_default();
+        assert!(
+            recorded,
+            "round {round}: the child never recorded its pid; stderr:\n{}",
+            stderr_text()
+        );
+        let child_pid = child_pid.expect("checked above");
+        let _child_guard = KillOnDrop(child_pid);
+        assert!(
+            pid_is_running(child_pid),
+            "round {round}: the child should be running before the signal"
+        );
+
+        common::send_sigterm(agctl.id());
+        let status = wait_bounded(&mut agctl, Duration::from_secs(10)).unwrap_or_else(|| {
+            panic!("round {round}: agctl did not exit; stderr:\n{}", stderr_text())
+        });
+        drop(agctl_guard);
+        let exited = Instant::now();
+
+        assert_eq!(
+            status.code(),
+            Some(143),
+            "round {round}: 128 + SIGTERM from the handler thread, not the child's status or a \
+             refusal racing it; stderr:\n{}",
+            stderr_text()
+        );
+        assert!(
+            common::wait_until(DRAIN_BUDGET, || !pid_is_running(child_pid)),
+            "round {round}: pid {child_pid} outlived agctl by more than {DRAIN_BUDGET:?} \
+             ({:?} so far) — the registered child was orphaned",
+            exited.elapsed()
+        );
+    }
+}
+
+/// Waits for `child` to exit, giving up after `budget`.
+fn wait_bounded(child: &mut std::process::Child, budget: Duration) -> Option<ExitStatus> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("agctl should be waitable") {
+            return Some(status);
+        }
+        if started.elapsed() >= budget {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 // ---------------------------------------------------------------------------

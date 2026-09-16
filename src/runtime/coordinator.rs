@@ -61,6 +61,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::runtime::cleanup;
+use crate::runtime::cleanup::CleanupToken;
+use crate::runtime::proc;
 
 /// The most workers a single pass will run concurrently (plan section 2, S1').
 pub const DEFAULT_MAX_WORKERS: usize = 4;
@@ -162,18 +164,44 @@ fn lock_recovering<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChildToken(u64);
 
+/// A child in a [`ChildTable`], and its entry in the process-wide
+/// [`cleanup`] registry.
+///
+/// The cleanup entry is what lets the signal thread kill the child on its way
+/// to `process::exit`, where no pass is left to do it. It is withdrawn when
+/// this value is dropped. Every wait and kill path drops it only after
+/// reaping the child, so while the entry exists the process id is still this
+/// child's — an unreaped child keeps it — except in the instant between the
+/// reap and the drop, which the recorded start time covers. The one drop
+/// without a reap is a [`PassCtx::standalone`] table dropped with a child
+/// still in it, which already leaks that child; withdrawing the entry there
+/// only means a later signal does not reach it either.
+#[derive(Debug)]
+struct Registered {
+    child: Child,
+    cleanup: Option<CleanupToken>,
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        if let Some(token) = self.cleanup.take() {
+            cleanup::unregister(token);
+        }
+    }
+}
+
 /// Every child process the pass has spawned and not yet reaped.
 #[derive(Debug, Default)]
 struct ChildTable {
     next_id: u64,
-    live: BTreeMap<ChildToken, Child>,
+    live: BTreeMap<ChildToken, Registered>,
 }
 
 impl ChildTable {
-    fn insert(&mut self, child: Child) -> ChildToken {
+    fn insert(&mut self, entry: Registered) -> ChildToken {
         let token = ChildToken(self.next_id);
         self.next_id = self.next_id.wrapping_add(1);
-        self.live.insert(token, child);
+        self.live.insert(token, entry);
         token
     }
 
@@ -183,9 +211,9 @@ impl ChildTable {
     /// the deadline firing and this call is already gone, which is the state
     /// we were trying to reach.
     fn kill_all(&mut self) {
-        for (_, mut child) in std::mem::take(&mut self.live) {
-            let _ = child.kill();
-            let _ = child.wait();
+        for (_, mut entry) in std::mem::take(&mut self.live) {
+            let _ = entry.child.kill();
+            let _ = entry.child.wait();
         }
     }
 }
@@ -247,8 +275,27 @@ impl PassCtx {
     /// calling this: from here on the coordinator owns the handle and may kill
     /// the process at any moment, and the job's only sanctioned interaction is
     /// [`PassCtx::wait_child`].
+    ///
+    /// The child is also recorded in the process-wide [`cleanup`] registry by
+    /// process id and start time, so a terminating signal kills it before the
+    /// process exits (plan AC52). A child whose start time cannot be read is
+    /// **not** recorded: without it a recycled process id could not be told
+    /// apart from the child, and killing an unrelated process is worse than
+    /// leaving this one to the waits above. Reading it before taking the table
+    /// lock keeps the lock order one-way — table, then registry, on drop only.
     pub fn register_child(&self, child: Child) -> ChildToken {
-        lock_recovering(&self.children).insert(child)
+        let pid = child.id();
+        let cleanup = match proc::start_time(pid, &self.cancel) {
+            Some(start_time) => Some(cleanup::register_child(pid, start_time)),
+            None => {
+                tracing::debug!(
+                    pid,
+                    "a child's start time is unreadable; a signal will not kill it"
+                );
+                None
+            }
+        };
+        lock_recovering(&self.children).insert(Registered { child, cleanup })
     }
 
     /// Waits for a registered child to exit, polling so the coordinator can
@@ -271,8 +318,8 @@ impl PassCtx {
             {
                 let mut table = lock_recovering(&self.children);
                 match table.live.get_mut(&token) {
-                    Some(child) => {
-                        if let Some(status) = child.try_wait()? {
+                    Some(entry) => {
+                        if let Some(status) = entry.child.try_wait()? {
                             table.live.remove(&token);
                             return Ok(status);
                         }
@@ -291,9 +338,9 @@ impl PassCtx {
                 if self.cancel.is_cancelled() {
                     // Still holding the table, so nothing can register a child
                     // under this token between the check and the kill.
-                    if let Some(mut child) = table.live.remove(&token) {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                    if let Some(mut entry) = table.live.remove(&token) {
+                        let _ = entry.child.kill();
+                        let _ = entry.child.wait();
                     }
                     return Err(io::Error::new(
                         io::ErrorKind::Interrupted,
@@ -346,8 +393,8 @@ impl PassCtx {
             {
                 let mut table = lock_recovering(&self.children);
                 match table.live.get_mut(&token) {
-                    Some(child) => {
-                        if let Some(status) = child.try_wait()? {
+                    Some(entry) => {
+                        if let Some(status) = entry.child.try_wait()? {
                             table.live.remove(&token);
                             return Ok(Some(status));
                         }
@@ -366,9 +413,9 @@ impl PassCtx {
                 if self.cancel.is_cancelled() || Instant::now() >= deadline {
                     // Still holding the table, so nothing can register a child
                     // under this token between the check and the kill.
-                    if let Some(mut child) = table.live.remove(&token) {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                    if let Some(mut entry) = table.live.remove(&token) {
+                        let _ = entry.child.kill();
+                        let _ = entry.child.wait();
                     }
                     return Ok(None);
                 }

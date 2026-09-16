@@ -31,8 +31,10 @@ use crate::config::paths::Paths;
 use crate::error::AppError;
 use crate::provider::claude::namespace;
 use crate::provider::claude::namespace::EnvView;
+use crate::runtime::cleanup;
 use crate::runtime::coordinator::Cancel;
 use crate::runtime::coordinator::PassCtx;
+use crate::runtime::signals;
 
 /// Environment variables an isolated session's child must never inherit.
 ///
@@ -238,8 +240,14 @@ fn quote_fish(value: &str) -> String {
 /// <path>` is appended to `argv` only when `argv[0]`'s basename is exactly
 /// `claude` and [`ExportSpec::mcp_config`] is `Some` — an arbitrary command
 /// must not be handed a flag it does not understand. The child is
-/// registered with `ctx` so the pass coordinator's cancellation reaches it;
-/// this function writes no credential of its own.
+/// registered with `ctx`, which also records it in the cleanup registry, so a
+/// terminating signal kills it before agctl exits; this function writes no
+/// credential of its own.
+///
+/// When that signal is what ended the wait, this does not return until the
+/// signal thread has exited the process ([`signals::defer_to_exit`]), so the
+/// exit status is agctl's `128 + signo` rather than whatever the killed
+/// child's status or a refusal would have raced it to.
 ///
 /// # Errors
 ///
@@ -256,11 +264,14 @@ pub fn exec_command(
         return Err(AppError::Config("no command was given to run".to_owned()));
     };
 
-    if cancel.is_cancelled() {
+    // Held until the child is registered, so a signal landing between
+    // `spawn` and `register_child` still finds this child to kill.
+    let Some(spawning) = cleanup::begin_spawn_unless_cancelled(cancel) else {
+        signals::defer_to_exit();
         return Err(AppError::Refused {
             reason: "cancelled before the command could start".to_owned(),
         });
-    }
+    };
 
     let mut command = Command::new(program);
     command.args(rest);
@@ -283,7 +294,10 @@ pub fn exec_command(
     })?;
 
     let token = ctx.register_child(child);
-    match ctx.wait_child(token) {
+    drop(spawning);
+    let waited = ctx.wait_child(token);
+    signals::defer_to_exit();
+    match waited {
         Ok(status) => Ok(status),
         Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
             Err(AppError::Refused { reason: "cancelled while the command was running".to_owned() })

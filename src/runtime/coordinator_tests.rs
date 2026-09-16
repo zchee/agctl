@@ -574,3 +574,56 @@ fn a_cloned_context_shares_the_child_table() {
     ctx.cancel().cancel();
     assert!(clone.cancel().is_cancelled(), "cancellation is shared too");
 }
+
+// Needs nextest's process-per-test isolation: the cleanup registry is
+// process-wide, so under a shared-process `cargo test` this would drain, and
+// signal, other tests' registered children.
+#[test]
+fn register_child_records_the_child_for_the_signal_path_until_it_is_reaped() {
+    // Plan AC52's "registered with the cleanup registry": the signal thread
+    // cannot reach a pass's child table, so registration must also leave the
+    // child's process id and start time where it can — and reaping must take
+    // them away again, or a later signal could aim at a recycled id.
+    let ctx = PassCtx::standalone(Cancel::new(), Instant::now() + Duration::from_secs(30));
+    let child = Command::new("/bin/sleep")
+        .arg("0.2")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("sleep should be spawnable");
+    let pid = child.id();
+    let token = ctx.register_child(child);
+
+    let registered = cleanup::take_children();
+    let entry = registered
+        .iter()
+        .find(|entry| entry.pid == pid)
+        .unwrap_or_else(|| panic!("pid {pid} should be in the cleanup registry: {registered:?}"));
+    assert_eq!(
+        Some(entry.start_time.clone()),
+        proc::start_time(pid, &Cancel::new()),
+        "the recorded start time is the child's own"
+    );
+
+    // The take above drained that entry, so the withdrawal-on-reap half is
+    // proved on a second child whose entry is still in the registry.
+    let second = Command::new("/bin/sleep")
+        .arg("0.2")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("sleep should be spawnable");
+    let second_pid = second.id();
+    let second_token = ctx.register_child(second);
+
+    assert!(ctx.wait_child(token).expect("the first child exits on its own").success());
+    let status = ctx
+        .wait_child_timeout(second_token, Duration::from_secs(10))
+        .expect("waiting should succeed")
+        .expect("the second child exits well inside its budget");
+    assert!(status.success());
+    assert!(
+        cleanup::take_children().iter().all(|entry| entry.pid != second_pid),
+        "a reaped child must have been withdrawn from the cleanup registry"
+    );
+}
