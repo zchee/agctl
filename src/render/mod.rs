@@ -14,6 +14,7 @@
 
 pub mod json;
 pub mod reset;
+pub mod row;
 pub mod table;
 
 use jiff::Timestamp;

@@ -221,7 +221,7 @@ struct HeldPass {
     left: Arc<AtomicBool>,
 }
 
-impl Pass for HeldPass {
+impl Pass<RowOutcome> for HeldPass {
     fn run(&self, _forced: bool, cancel: &Cancel, _deadline: Instant) -> Option<Vec<RowOutcome>> {
         let paths = Arc::clone(&self.paths);
         let entered = Arc::clone(&self.entered);
@@ -269,7 +269,7 @@ struct ChildPass {
     report: Arc<Mutex<ChildReport>>,
 }
 
-impl Pass for ChildPass {
+impl Pass<RowOutcome> for ChildPass {
     fn run(&self, _forced: bool, cancel: &Cancel, deadline: Instant) -> Option<Vec<RowOutcome>> {
         let report = Arc::clone(&self.report);
         let job: Job<()> = Box::new(move |ctx| {
@@ -306,7 +306,7 @@ struct StandaloneChildPass {
     budget: Duration,
 }
 
-impl Pass for StandaloneChildPass {
+impl Pass<RowOutcome> for StandaloneChildPass {
     fn run(&self, _forced: bool, cancel: &Cancel, deadline: Instant) -> Option<Vec<RowOutcome>> {
         let ctx = PassCtx::standalone(cancel.clone(), deadline);
         let Ok(child) = Command::new("/bin/sleep").arg("30").spawn() else {
@@ -329,7 +329,7 @@ struct PanickingPass {
     calls: Arc<AtomicUsize>,
 }
 
-impl Pass for PanickingPass {
+impl Pass<RowOutcome> for PanickingPass {
     fn run(&self, _forced: bool, _cancel: &Cancel, _deadline: Instant) -> Option<Vec<RowOutcome>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         panic!("the pass fell over")
@@ -342,7 +342,7 @@ struct RecordingPass {
     calls: Arc<Mutex<Vec<bool>>>,
 }
 
-impl Pass for RecordingPass {
+impl Pass<RowOutcome> for RecordingPass {
     fn run(&self, forced: bool, _cancel: &Cancel, _deadline: Instant) -> Option<Vec<RowOutcome>> {
         lock(&self.calls).push(forced);
         Some(vec![fixtures::row_with_usage(0, "owner@example.com")])
@@ -355,7 +355,7 @@ struct FailsAfterFirstPass {
     calls: Arc<AtomicUsize>,
 }
 
-impl Pass for FailsAfterFirstPass {
+impl Pass<RowOutcome> for FailsAfterFirstPass {
     fn run(&self, _forced: bool, _cancel: &Cancel, _deadline: Instant) -> Option<Vec<RowOutcome>> {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             Some(vec![fixtures::row_with_usage(0, "owner@example.com")])
@@ -379,7 +379,7 @@ struct StagingPass {
 }
 
 #[cfg(feature = "testing")]
-impl Pass for StagingPass {
+impl Pass<RowOutcome> for StagingPass {
     fn run(&self, _forced: bool, cancel: &Cancel, deadline: Instant) -> Option<Vec<RowOutcome>> {
         let ns_dir = self.paths.namespace_dir(ACCT, ORG);
         let request = WriteRequest {
@@ -545,7 +545,7 @@ fn frames_keep_coming_and_quit_is_answered_while_a_worker_is_held() {
     let store = store();
     let entered = Arc::new(AtomicBool::new(false));
     let left = Arc::new(AtomicBool::new(false));
-    let pass: Arc<dyn Pass> = Arc::new(HeldPass {
+    let pass: Arc<dyn Pass<RowOutcome>> = Arc::new(HeldPass {
         paths: Arc::clone(&store.paths),
         // Far longer than this test runs: the point is that the loop leaves
         // while the worker is still in there.
@@ -599,7 +599,7 @@ fn frames_keep_coming_and_quit_is_answered_while_a_worker_is_held() {
 #[test]
 fn a_registered_child_is_dead_by_the_time_quit_returns() {
     let report = Arc::new(Mutex::new(ChildReport::default()));
-    let pass: Arc<dyn Pass> = Arc::new(ChildPass { report: Arc::clone(&report) });
+    let pass: Arc<dyn Pass<RowOutcome>> = Arc::new(ChildPass { report: Arc::clone(&report) });
 
     let mut events = ScriptedEvents::quiet_then_quit(3);
     let cancel = Cancel::new();
@@ -638,7 +638,7 @@ fn a_child_registered_with_no_watchdog_is_dead_by_the_time_quit_returns() {
     // cancellation clause in `wait_child_timeout` the wait would still be
     // running when `run_loop` returned and `reaped_at` would be unset.
     let report = Arc::new(Mutex::new(ChildReport::default()));
-    let pass: Arc<dyn Pass> = Arc::new(StandaloneChildPass {
+    let pass: Arc<dyn Pass<RowOutcome>> = Arc::new(StandaloneChildPass {
         report: Arc::clone(&report),
         budget: Duration::from_secs(30),
     });
@@ -684,7 +684,7 @@ fn quitting_while_a_pass_holds_a_staged_credential_file_leaves_none_behind() {
     let ns_dir = store.paths.namespace_dir(ACCT, ORG);
     fs::create_dir_all(&ns_dir).expect("the namespace directory should be creatable");
 
-    let pass: Arc<dyn Pass> = Arc::new(StagingPass {
+    let pass: Arc<dyn Pass<RowOutcome>> = Arc::new(StagingPass {
         paths: Arc::clone(&store.paths),
         blob: blob(ACCT, "staged-access", "owner@example.com"),
     });
@@ -745,7 +745,7 @@ fn quitting_while_a_pass_holds_a_staged_credential_file_leaves_none_behind() {
 #[test]
 fn the_refresh_key_starts_a_pass_that_bypasses_the_cache() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let pass: Arc<dyn Pass> = Arc::new(RecordingPass { calls: Arc::clone(&calls) });
+    let pass: Arc<dyn Pass<RowOutcome>> = Arc::new(RecordingPass { calls: Arc::clone(&calls) });
 
     // The interval is a minute away, so nothing but `r` can start a second
     // pass inside this test.
@@ -769,7 +769,7 @@ fn the_refresh_key_starts_a_pass_that_bypasses_the_cache() {
 #[test]
 fn a_pass_that_falls_over_does_not_wedge_the_display() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let pass: Arc<dyn Pass> = Arc::new(PanickingPass { calls: Arc::clone(&calls) });
+    let pass: Arc<dyn Pass<RowOutcome>> = Arc::new(PanickingPass { calls: Arc::clone(&calls) });
 
     // The pass thread's own panic message is not this test's output. Restored
     // below so a later assertion still reports normally.
@@ -798,7 +798,7 @@ fn a_pass_that_falls_over_does_not_wedge_the_display() {
 #[test]
 fn a_cancelled_run_leaves_without_drawing_again() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let pass: Arc<dyn Pass> = Arc::new(RecordingPass { calls: Arc::clone(&calls) });
+    let pass: Arc<dyn Pass<RowOutcome>> = Arc::new(RecordingPass { calls: Arc::clone(&calls) });
     let cancel = Cancel::new();
     // What the signal thread does on TERM, HUP or INT before this loop even
     // starts (plan AC27's `watch` clause: the terminal is restored by the
@@ -856,7 +856,8 @@ fn a_pass_whose_registry_cannot_be_read_reports_nothing_rather_than_no_accounts(
 #[test]
 fn a_pass_that_reports_nothing_leaves_the_previous_rows_on_screen() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let pass: Arc<dyn Pass> = Arc::new(FailsAfterFirstPass { calls: Arc::clone(&calls) });
+    let pass: Arc<dyn Pass<RowOutcome>> =
+        Arc::new(FailsAfterFirstPass { calls: Arc::clone(&calls) });
 
     // `r` is what makes the second pass happen inside this test rather than a
     // minute later.

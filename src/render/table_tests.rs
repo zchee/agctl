@@ -526,3 +526,19 @@ fn a_continuation_row_leaves_the_kind_cell_blank() {
         "and it still has one cell per column: {continuation}"
     );
 }
+
+#[test]
+fn the_two_layouts_keep_their_own_column_lists() {
+    // Plan AC103's count, and the wrapper's promise: `headings(by_identity)`
+    // is exactly the Claude arm, so every existing caller renders what it
+    // rendered before the split.
+    assert_eq!(headings_for(Layout::Claude { by_identity: false }), headings(false));
+    assert_eq!(headings_for(Layout::Claude { by_identity: true }), headings(true));
+    assert_eq!(headings(false).len(), 10);
+    assert_eq!(headings(true).len(), 11);
+
+    let codex = headings_for(Layout::Codex);
+    assert_eq!(codex.len(), 9, "{codex:?}");
+    assert!(!codex.contains(&"Org"), "a Codex account has no organization: {codex:?}");
+    assert!(!codex.contains(&HEADLINE_SCOPE), "and no headline scoped window: {codex:?}");
+}

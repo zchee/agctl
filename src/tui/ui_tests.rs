@@ -11,13 +11,14 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 use super::*;
+use crate::commands::status::RowOutcome;
+use crate::provider::claude::account::AccountState;
 use crate::tui::app::App;
 use crate::tui::app::Event;
 use crate::tui::fixtures;
-use crate::usage::model::CreditsState;
 
 /// Renders one frame at a fixed size and returns the terminal to read back.
-fn render(app: &App, width: u16, height: u16) -> Terminal<TestBackend> {
+fn render(app: &App<RowOutcome>, width: u16, height: u16) -> Terminal<TestBackend> {
     let mut terminal = Terminal::new(TestBackend::new(width, height))
         .expect("a test backend always reports its size");
     terminal.draw(|frame| draw(frame, app)).expect("a test backend never fails to draw");
@@ -25,7 +26,7 @@ fn render(app: &App, width: u16, height: u16) -> Terminal<TestBackend> {
 }
 
 /// A display mid-run: two accounts fetched half a minute ago, one hidden.
-fn two_accounts() -> App {
+fn two_accounts() -> App<RowOutcome> {
     let mut app = App::new(fixtures::at("2026-09-08T12:00:30Z"));
     let mut hidden = fixtures::row(2, "sibling@example.com", AccountState::StaleSiblingOfLive);
     hidden.visible_by_default = false;
@@ -109,7 +110,7 @@ fn a_pass_in_flight_is_announced_and_marks_the_numbers_stale() {
 
 #[test]
 fn a_display_with_no_fetch_yet_shows_em_dashes_rather_than_zeroes() {
-    let app = App::new(fixtures::at(fixtures::NOW));
+    let app: App<RowOutcome> = App::new(fixtures::at(fixtures::NOW));
 
     let header = header_line(&app);
 
@@ -137,91 +138,4 @@ fn a_display_with_nothing_hidden_shows_only_the_help_line() {
     app.reduce(Event::Rows(vec![fixtures::row_with_usage(0, "owner@example.com")]));
 
     assert_eq!(footer_text(&app), HELP_LINE);
-}
-
-#[test]
-fn every_badge_state_has_a_badge_and_the_healthy_ones_do_not() {
-    assert_eq!(badge(&AccountState::Stale), Some("stale"));
-    assert_eq!(badge(&AccountState::RateLimited { retry_after_s: Some(30) }), Some("rate-limited"));
-    assert_eq!(
-        badge(&AccountState::ClaudeSessionDetected { lock: "l".to_owned(), age_ms: 1 }),
-        Some("claude-detected")
-    );
-    assert_eq!(
-        badge(&AccountState::KeychainLocked { detail: String::new() }),
-        Some("keychain-locked")
-    );
-    assert_eq!(badge(&AccountState::KeychainTimeout), Some("keychain-locked"));
-    assert_eq!(badge(&AccountState::Busy), Some("busy"));
-    assert_eq!(badge(&AccountState::NeedsLogin), Some("needs login"));
-
-    assert_eq!(badge(&AccountState::Ok), None);
-    assert_eq!(badge(&AccountState::PendingReplayed), None);
-}
-
-#[test]
-fn a_row_earns_one_gauge_per_window_the_response_described() {
-    let plain = fixtures::row_with_usage(0, "owner@example.com");
-    assert_eq!(gauges(&plain), vec![("5h", 21), ("weekly", 35), ("Fable", 56)]);
-
-    let with_credits = fixtures::row_with_credits(1, "second@example.com");
-    assert_eq!(
-        gauges(&with_credits),
-        vec![("5h", 4), ("weekly", 11), ("Fable", 7), ("credits", 25)],
-        "credits earn a gauge only when they are on and carry a utilisation figure"
-    );
-}
-
-#[test]
-fn credits_that_are_off_or_unreported_earn_no_gauge() {
-    let mut row = fixtures::row(0, "owner@example.com", AccountState::Ok);
-    row.usage = Some(fixtures::usage(1.0, 2.0, 3.0, CreditsState::Off { reason: None }));
-    assert_eq!(gauges(&row).len(), 3, "`off` is not a percentage");
-
-    row.usage = Some(fixtures::usage(1.0, 2.0, 3.0, CreditsState::Unavailable));
-    assert_eq!(gauges(&row).len(), 3, "neither is `n/a`");
-}
-
-#[test]
-fn a_row_without_numbers_earns_no_gauges_and_the_shortest_block() {
-    let row = fixtures::row(0, "owner@example.com", AccountState::NeedsLogin);
-
-    assert!(gauges(&row).is_empty(), "a bar at zero would claim nothing had been used");
-    assert_eq!(block_height(&row), 3, "two borders and the detail line");
-    assert_eq!(block_height(&fixtures::row_with_credits(1, "second@example.com")), 7);
-}
-
-#[test]
-fn the_detail_line_carries_the_badge_the_state_and_the_next_reset() {
-    let mut row = fixtures::row_with_usage(0, "owner@example.com");
-    row.state = AccountState::RateLimited { retry_after_s: Some(42) };
-    row.note = Some("showing the cached value".to_owned());
-
-    let line = detail_line(&row, fixtures::at("2026-09-08T12:00:00Z"));
-
-    assert_eq!(
-        line,
-        "[rate-limited] · rate-limited (retry in 42s) · (showing the cached value) · \
-         next reset in 2h13m"
-    );
-}
-
-#[test]
-fn only_the_selected_account_carries_the_marker() {
-    let row = fixtures::row_with_usage(0, "owner@example.com");
-
-    assert!(account_title(&row, true).starts_with(SELECTED_MARKER));
-    assert!(!account_title(&row, false).starts_with(SELECTED_MARKER));
-    assert!(account_title(&row, false).contains("owner@example.com · Acme · max"));
-}
-
-#[test]
-fn an_account_with_no_org_or_plan_shows_em_dashes() {
-    let mut row = fixtures::row(0, "owner@example.com", AccountState::IdentityUnknown);
-    row.org = String::new();
-    row.plan = String::new();
-
-    let title = account_title(&row, false);
-
-    assert!(title.contains("owner@example.com · — · —"), "{title}");
 }

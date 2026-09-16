@@ -26,7 +26,10 @@
 //! row — `stale`, `rate-limited`, `claude-detected`, `keychain-locked`,
 //! `busy`, `needs login` — and the full state label sits next to it on the
 //! same line. The badge is for scanning six accounts at a glance; the label
-//! is what says which lock, how long ago, and how many seconds to wait.
+//! is what says which lock, how long ago, and how many seconds to wait. What
+//! a row's badge, gauges, title and height *are* is
+//! [`TuiRow`](crate::render::row::TuiRow)'s business, not this module's:
+//! nothing here knows which provider it is drawing.
 
 use jiff::Timestamp;
 use ratatui::Frame;
@@ -37,20 +40,12 @@ use ratatui::widgets::Block;
 use ratatui::widgets::Gauge;
 use ratatui::widgets::Paragraph;
 
-use crate::commands::status::RowOutcome;
-use crate::provider::claude::account::AccountState;
-use crate::provider::claude::usage::HEADLINE_SCOPE;
+use crate::render::row::TuiRow;
 use crate::tui::app::App;
-use crate::usage::model::CreditsState;
-use crate::usage::model::UsageSnapshot;
-use crate::usage::model::WindowKind;
 use crate::usage::model::render_countdown;
 
 /// The keys the footer advertises.
 pub const HELP_LINE: &str = "q quit · r refresh · ↑↓ select";
-
-/// The marker in front of the selected account.
-pub const SELECTED_MARKER: &str = "▸";
 
 /// What an unavailable figure looks like, matching the `status` table.
 pub const EMPTY_CELL: &str = "—";
@@ -58,12 +53,8 @@ pub const EMPTY_CELL: &str = "—";
 /// How wide the name in front of each gauge is.
 const GAUGE_LABEL_WIDTH: u16 = 10;
 
-/// Lines an account block spends on something other than a gauge: the two
-/// borders and the detail line.
-const BLOCK_CHROME: u16 = 3;
-
 /// Draws the whole frame.
-pub fn draw(frame: &mut Frame<'_>, app: &App) {
+pub fn draw<R: TuiRow>(frame: &mut Frame<'_>, app: &App<R>) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -77,8 +68,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 }
 
 /// The status line above the accounts.
-pub fn header_line(app: &App) -> String {
-    let mut parts = vec![format!("agctl claude watch · {}", account_count(app.rows.len()))];
+pub fn header_line<R: TuiRow>(app: &App<R>) -> String {
+    let mut parts = vec![format!("{} · {}", R::WATCH_TITLE, account_count(app.rows.len()))];
 
     parts.push(match app.last_fetch {
         // `render_countdown` measures forwards, so the arguments are the
@@ -107,108 +98,33 @@ pub fn header_line(app: &App) -> String {
 }
 
 /// The help line, and the hidden-row count when there is one.
-pub fn footer_text(app: &App) -> String {
+pub fn footer_text<R: TuiRow>(app: &App<R>) -> String {
     if app.hidden == 0 {
         return HELP_LINE.to_owned();
     }
-    format!("{HELP_LINE}\n{}", hidden_footer(app.hidden))
+    format!("{HELP_LINE}\n{}", hidden_footer::<R>(app.hidden))
 }
 
 /// How many rows this display is not showing, and where to see them.
 ///
 /// `watch` has no `--all` of its own (plan section 3.2), so the footer points
-/// at the command that does rather than at a flag this one does not accept.
-pub fn hidden_footer(hidden: usize) -> String {
+/// at the command that does rather than at a flag this one does not accept —
+/// and at *that provider's* command, which is what
+/// [`TuiRow::HIDDEN_HINT`] carries.
+pub fn hidden_footer<R: TuiRow>(hidden: usize) -> String {
     let noun = if hidden == 1 { "entry" } else { "entries" };
-    format!("{hidden} {noun} hidden (agctl claude status --all)")
-}
-
-/// The badge for a row, when its state has one.
-///
-/// `None` is the ordinary case: a healthy row, or one whose state the label
-/// alone says better than any two-word summary could.
-pub fn badge(state: &AccountState) -> Option<&'static str> {
-    match state {
-        AccountState::Stale => Some("stale"),
-        AccountState::RateLimited { .. } => Some("rate-limited"),
-        AccountState::ClaudeSessionDetected { .. } => Some("claude-detected"),
-        AccountState::KeychainLocked { .. } | AccountState::KeychainTimeout => {
-            Some("keychain-locked")
-        }
-        AccountState::Busy => Some("busy"),
-        AccountState::NeedsLogin => Some("needs login"),
-        _ => None,
-    }
-}
-
-/// The gauges one row earns, in display order.
-pub fn gauges(row: &RowOutcome) -> Vec<(&'static str, u8)> {
-    let Some(usage) = row.usage.as_ref() else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::new();
-    if let Some(percent) = window_percent(usage, &WindowKind::Session) {
-        out.push(("5h", percent));
-    }
-    if let Some(percent) = window_percent(usage, &WindowKind::WeeklyAll) {
-        out.push(("weekly", percent));
-    }
-    if let Some(percent) =
-        usage.scoped_window(HEADLINE_SCOPE).and_then(|window| window.percent_floor)
-    {
-        out.push((HEADLINE_SCOPE, percent));
-    }
-    if let CreditsState::On(credits) = &usage.credits
-        && let Some(percent) = credits.percent
-    {
-        out.push(("credits", percent));
-    }
-    out
-}
-
-/// The line under an account's gauges: badge, state, note, next reset.
-pub fn detail_line(row: &RowOutcome, now: Timestamp) -> String {
-    let mut parts = Vec::new();
-    if let Some(badge) = badge(&row.state) {
-        parts.push(format!("[{badge}]"));
-    }
-    parts.push(row.state.label());
-    if let Some(note) = row.note.as_ref().filter(|note| !note.is_empty()) {
-        parts.push(format!("({note})"));
-    }
-    if let Some(resets_at) = row.usage.as_ref().and_then(UsageSnapshot::next_reset) {
-        parts.push(format!("next reset in {}", render_countdown(now, resets_at)));
-    }
-    parts.join(" · ")
-}
-
-/// An account block's title: who it is, and whether it is selected.
-pub fn account_title(row: &RowOutcome, selected: bool) -> String {
-    let marker = if selected { SELECTED_MARKER } else { " " };
-    let plan = if row.plan.is_empty() { EMPTY_CELL } else { row.plan.as_str() };
-    let org = if row.org.is_empty() { EMPTY_CELL } else { row.org.as_str() };
-    format!("{marker} {} · {org} · {plan} ", row.account)
-}
-
-/// How tall an account's block is.
-///
-/// Bounded by construction — [`gauges`] returns at most four entries — so the
-/// addition cannot overflow the `u16` even with overflow checks compiled out.
-pub fn block_height(row: &RowOutcome) -> u16 {
-    let count = u16::try_from(gauges(row).len()).unwrap_or(0);
-    BLOCK_CHROME.saturating_add(count)
+    format!("{hidden} {noun} hidden ({})", R::HIDDEN_HINT)
 }
 
 /// Renders one bordered block per shown account, top-aligned.
-fn draw_accounts(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_accounts<R: TuiRow>(frame: &mut Frame<'_>, app: &App<R>, area: Rect) {
     if app.rows.is_empty() {
         frame.render_widget(Paragraph::new("no accounts to show"), area);
         return;
     }
 
     let mut constraints: Vec<Constraint> =
-        app.rows.iter().map(|row| Constraint::Length(block_height(row))).collect();
+        app.rows.iter().map(|row| Constraint::Length(row.block_height())).collect();
     // Soaks up whatever is left so the blocks stay at their natural heights
     // instead of stretching to fill the terminal.
     constraints.push(Constraint::Min(0));
@@ -225,18 +141,18 @@ fn draw_accounts(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 /// Renders one account.
-fn draw_account(
+fn draw_account<R: TuiRow>(
     frame: &mut Frame<'_>,
-    row: &RowOutcome,
+    row: &R,
     selected: bool,
     now: Timestamp,
     area: Rect,
 ) {
-    let block = Block::bordered().title(account_title(row, selected));
+    let block = Block::bordered().title(row.account_title(selected));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let bars = gauges(row);
+    let bars = row.gauges();
     let mut constraints: Vec<Constraint> = vec![Constraint::Length(1); bars.len()];
     constraints.push(Constraint::Length(1));
     let lines = Layout::vertical(constraints).split(inner);
@@ -258,13 +174,8 @@ fn draw_account(
     }
 
     if let Some(line) = lines.last() {
-        frame.render_widget(Paragraph::new(detail_line(row, now)), *line);
+        frame.render_widget(Paragraph::new(row.detail_line(now)), *line);
     }
-}
-
-/// A window's floored percentage, when the response carried one.
-fn window_percent(usage: &UsageSnapshot, kind: &WindowKind) -> Option<u8> {
-    usage.window(kind).and_then(|window| window.percent_floor)
 }
 
 /// `N accounts`, pluralised.
@@ -274,7 +185,7 @@ fn account_count(shown: usize) -> String {
 }
 
 /// How many lines the footer needs.
-fn footer_height(app: &App) -> u16 {
+fn footer_height<R: TuiRow>(app: &App<R>) -> u16 {
     if app.hidden == 0 { 1 } else { 2 }
 }
 

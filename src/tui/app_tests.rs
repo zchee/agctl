@@ -5,11 +5,12 @@
 //! between a channel, a terminal and this function.
 
 use super::*;
+use crate::commands::status::RowOutcome;
 use crate::provider::claude::account::AccountState;
 use crate::tui::fixtures;
 
 /// A fresh display, dated at the fixtures' clock.
-fn app() -> App {
+fn app() -> App<RowOutcome> {
     App::new(fixtures::at(fixtures::NOW))
 }
 

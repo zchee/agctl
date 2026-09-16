@@ -96,16 +96,63 @@ const SESSION_RESET_INDEX: usize = 7;
 /// Where `Weekly reset` sits, before `--by-identity` splices `Kind` in.
 const WEEKLY_RESET_INDEX: usize = 8;
 
+/// The Codex column headings, in order (plan AC103).
+///
+/// Nine rather than Claude's ten, and not a subset: a Codex account has no
+/// organization and no headline scoped window, and what it does have — which
+/// of the three homes the credential came from — Claude only shows under
+/// `--by-identity`. Two providers rendered through one column list would have
+/// meant an `Org` column that is always an em dash for half the rows, which is
+/// a column that says nothing.
+pub const CODEX_HEADINGS: [&str; 9] =
+    ["Account", "Plan", "Kind", "5h", "Weekly", "Credits", "5h reset", "Weekly reset", "State"];
+
+/// Which provider's columns a table has.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "`Codex` is selected by the Codex table renderer (S33); `headings` passes \
+                  `Claude` for every table this build prints"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// Claude's ten columns, plus `Kind` under `--by-identity`.
+    Claude {
+        /// Whether `--by-identity` was given.
+        by_identity: bool,
+    },
+    /// Codex's nine.
+    Codex,
+}
+
+/// The headings one layout prints, in order.
+///
+/// The Codex arm has no production caller until S33 builds that table; the
+/// Claude arm is what every table this build prints goes through, via
+/// [`headings`].
+pub fn headings_for(layout: Layout) -> Vec<&'static str> {
+    match layout {
+        Layout::Claude { by_identity } => {
+            let mut headings = HEADINGS.to_vec();
+            if by_identity {
+                headings.insert(KIND_INDEX, KIND_HEADING);
+            }
+            headings
+        }
+        Layout::Codex => CODEX_HEADINGS.to_vec(),
+    }
+}
+
 /// [`HEADINGS`], plus [`KIND_HEADING`] when `by_identity`.
 ///
 /// A function rather than a second constant so the ten headings stay written
 /// down exactly once: a column added to `HEADINGS` cannot be forgotten here.
+/// Its signature is unchanged by the layout split above, because every caller
+/// of it is rendering a Claude table and should not have to say so.
 pub fn headings(by_identity: bool) -> Vec<&'static str> {
-    let mut headings = HEADINGS.to_vec();
-    if by_identity {
-        headings.insert(KIND_INDEX, KIND_HEADING);
-    }
-    headings
+    headings_for(Layout::Claude { by_identity })
 }
 
 /// Renders a whole report: the table, then the hidden-row footer.

@@ -9,7 +9,7 @@
 //! reads the clock: `now` arrives on [`Event::Tick`] so that a frame drawn
 //! from this state is a frame the test can reproduce exactly.
 //!
-//! # Why the rows are [`RowOutcome`]s
+//! # Why the rows are the pass's own
 //!
 //! `watch` runs the same pass `status` runs, through
 //! [`collect`](crate::commands::status::collect), and shows what it produced.
@@ -18,10 +18,16 @@
 //! what the badges are — rather than on a rendered string, and it means there
 //! is exactly one definition of what a row is. A second view type would be a
 //! second place for the two renderings of one pass to drift apart.
+//!
+//! The state is therefore generic over the row rather than over the provider:
+//! `App<RowOutcome>` is the Claude display and `App<CodexRowOutcome>` will be
+//! the Codex one, and everything in this file — what `q` does, when the
+//! numbers count as stale, where the selection goes when rows disappear —
+//! is written once, against [`TuiRow`] alone.
 
 use jiff::Timestamp;
 
-use crate::commands::status::RowOutcome;
+use crate::render::row::TuiRow;
 
 /// A key the watch loop binds.
 ///
@@ -43,9 +49,9 @@ pub enum Key {
 
 /// Everything that can change the watch state.
 #[derive(Debug)]
-pub enum Event {
+pub enum Event<R> {
     /// A pass finished and produced these rows, in discovery order.
-    Rows(Vec<RowOutcome>),
+    Rows(Vec<R>),
     /// The clock advanced; every countdown in the next frame is relative to
     /// this moment.
     Tick(Timestamp),
@@ -77,12 +83,12 @@ pub enum Effect {
 
 /// The watch loop's whole state.
 #[derive(Debug)]
-pub struct App {
+pub struct App<R> {
     /// The rows the frame shows, in discovery order. Rows that `status`
     /// hides without `--all` — a stale sibling of the live credential, a
     /// foreign keychain item, a forgotten service — are not here; they are
     /// counted in [`App::hidden`].
-    pub rows: Vec<RowOutcome>,
+    pub rows: Vec<R>,
     /// When the last pass finished, if one has.
     pub last_fetch: Option<Timestamp>,
     /// When the next pass is due, if one is scheduled.
@@ -100,7 +106,7 @@ pub struct App {
     pub now: Timestamp,
 }
 
-impl App {
+impl<R: TuiRow> App<R> {
     /// An empty display, before the first pass has produced anything.
     pub fn new(now: Timestamp) -> Self {
         Self {
@@ -117,7 +123,7 @@ impl App {
 
     /// Folds one event into the state and says what the loop must do about
     /// it.
-    pub fn reduce(&mut self, event: Event) -> Effect {
+    pub fn reduce(&mut self, event: Event<R>) -> Effect {
         match event {
             Event::Rows(rows) => {
                 self.take_rows(rows);
@@ -153,9 +159,9 @@ impl App {
     /// removed in another terminal, a keychain that went away — and a
     /// selection left pointing past the end would blank the highlight until
     /// the user pressed a key.
-    fn take_rows(&mut self, rows: Vec<RowOutcome>) {
-        let (shown, hidden): (Vec<RowOutcome>, Vec<RowOutcome>) =
-            rows.into_iter().partition(|row| row.visible_by_default);
+    fn take_rows(&mut self, rows: Vec<R>) {
+        let (shown, hidden): (Vec<R>, Vec<R>) =
+            rows.into_iter().partition(TuiRow::visible_by_default);
         self.rows = shown;
         self.hidden = hidden.len();
         self.selected = self.selected.min(self.last_index());

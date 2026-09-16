@@ -82,6 +82,7 @@ use crate::provider::claude::namespace::EnvView;
 use crate::provider::claude::usage::ProfileSource;
 use crate::provider::claude::usage::TokenRefresher;
 use crate::provider::claude::usage::UsageClient;
+use crate::render::row::TuiRow;
 use crate::runtime::cleanup;
 use crate::runtime::coordinator::Cancel;
 use crate::runtime::coordinator::PassCtx;
@@ -147,7 +148,7 @@ pub fn run(cli: &Cli, args: &WatchArgs, cancel: &Cancel) -> Result<(), AppError>
 
     let paths = Arc::new(Paths::resolve(cli.config_dir.as_deref())?);
     paths.ensure_dirs()?;
-    let session: Arc<dyn Pass> = Arc::new(Session::production(paths)?);
+    let session: Arc<dyn Pass<RowOutcome>> = Arc::new(Session::production(paths)?);
 
     let mut terminal = tui::enter()?;
     let mut events = CrosstermEvents;
@@ -164,7 +165,7 @@ pub fn run(cli: &Cli, args: &WatchArgs, cancel: &Cancel) -> Result<(), AppError>
 /// tested against a pass that blocks, that registers a child process, or that
 /// answers instantly — none of which the production pass can be made to do on
 /// demand without a machine to break.
-pub trait Pass: Send + Sync {
+pub trait Pass<R>: Send + Sync {
     /// Produces one pass's rows, in discovery order, or `None` when this pass
     /// has nothing to say about the accounts.
     ///
@@ -175,7 +176,7 @@ pub trait Pass: Send + Sync {
     ///
     /// Must respect `cancel` and `deadline`: the loop does not join the
     /// thread this runs on.
-    fn run(&self, forced: bool, cancel: &Cancel, deadline: Instant) -> Option<Vec<RowOutcome>>;
+    fn run(&self, forced: bool, cancel: &Cancel, deadline: Instant) -> Option<Vec<R>>;
 }
 
 /// Builds a [`UsageClient`] for one pass.
@@ -226,7 +227,7 @@ impl Session {
     }
 }
 
-impl Pass for Session {
+impl Pass<RowOutcome> for Session {
     fn run(&self, forced: bool, cancel: &Cancel, deadline: Instant) -> Option<Vec<RowOutcome>> {
         // The registry is re-read every pass: `login`, `accounts remove` or
         // `import` may have run in another terminal since the last one.
@@ -339,10 +340,10 @@ pub fn bind(key: KeyEvent) -> Option<Key> {
 /// # Errors
 ///
 /// Returns [`AppError::Io`] when a draw or a key read fails.
-pub fn run_loop<B, S>(
+pub fn run_loop<B, S, R>(
     terminal: &mut Terminal<B>,
     events: &mut S,
-    pass: &Arc<dyn Pass>,
+    pass: &Arc<dyn Pass<R>>,
     cancel: &Cancel,
     interval: Duration,
 ) -> Result<(), AppError>
@@ -350,13 +351,14 @@ where
     B: Backend,
     B::Error: fmt::Display,
     S: EventSource,
+    R: TuiRow + Send + 'static,
 {
     let mut app = App::new(Timestamp::now());
 
     // The channel the running pass will answer on, or `None` when none is
     // running. Holding the receiver *is* how the loop knows a pass is in
     // flight, so the two cannot get out of step.
-    let mut in_flight: Option<Receiver<Option<Vec<RowOutcome>>>> = None;
+    let mut in_flight: Option<Receiver<Option<Vec<R>>>> = None;
 
     // `Some(instant)` is when the next pass is due; `None` means no pass is
     // scheduled, which happens only for an interval too large to add to the
@@ -397,12 +399,11 @@ where
         // panicked — and reads as the same "nothing to show" a pass that could
         // not read the registry reports, so that neither can wedge the display
         // into `fetching` for the rest of the run.
-        let finished: Option<Option<Vec<RowOutcome>>> =
-            match in_flight.as_ref().map(Receiver::try_recv) {
-                Some(Ok(rows)) => Some(rows),
-                Some(Err(mpsc::TryRecvError::Disconnected)) => Some(None),
-                Some(Err(mpsc::TryRecvError::Empty)) | None => None,
-            };
+        let finished: Option<Option<Vec<R>>> = match in_flight.as_ref().map(Receiver::try_recv) {
+            Some(Ok(rows)) => Some(rows),
+            Some(Err(mpsc::TryRecvError::Disconnected)) => Some(None),
+            Some(Err(mpsc::TryRecvError::Empty)) | None => None,
+        };
         if let Some(rows) = finished {
             in_flight = None;
             let at = Timestamp::now();
@@ -462,7 +463,7 @@ where
 ///
 /// The whole route is bounded by [`QUIT_DRAIN_BUDGET`], which is what keeps
 /// `q` inside the 500 ms plan AC35 asks for.
-fn quit(cancel: &Cancel, in_flight: Option<Receiver<Option<Vec<RowOutcome>>>>) {
+fn quit<R>(cancel: &Cancel, in_flight: Option<Receiver<Option<Vec<R>>>>) {
     cancel.cancel();
 
     if let Some(receiver) = in_flight {
@@ -484,14 +485,14 @@ fn quit(cancel: &Cancel, in_flight: Option<Receiver<Option<Vec<RowOutcome>>>>) {
 /// One channel per pass rather than one for the whole run, so that the loop
 /// can tell a pass that finished from a pass whose thread ended without
 /// answering: the second disconnects the receiver.
-fn start_pass(
-    pass: &Arc<dyn Pass>,
+fn start_pass<R: Send + 'static>(
+    pass: &Arc<dyn Pass<R>>,
     forced: bool,
     cancel: &Cancel,
     deadline: Instant,
-) -> Option<Receiver<Option<Vec<RowOutcome>>>> {
-    type Rows = Option<Vec<RowOutcome>>;
-    let (tx, rx): (Sender<Rows>, Receiver<Rows>) = mpsc::channel();
+) -> Option<Receiver<Option<Vec<R>>>> {
+    type Rows<R> = Option<Vec<R>>;
+    let (tx, rx): (Sender<Rows<R>>, Receiver<Rows<R>>) = mpsc::channel();
     let pass = Arc::clone(pass);
     let cancel = cancel.clone();
 
@@ -510,10 +511,11 @@ fn start_pass(
 }
 
 /// Draws one frame.
-fn draw<B>(terminal: &mut Terminal<B>, app: &App) -> Result<(), AppError>
+fn draw<B, R>(terminal: &mut Terminal<B>, app: &App<R>) -> Result<(), AppError>
 where
     B: Backend,
     B::Error: fmt::Display,
+    R: TuiRow,
 {
     terminal.draw(|frame| ui::draw(frame, app)).map(|_frame| ()).map_err(|err| AppError::Io {
         context: "the watch display could not be drawn".to_owned(),
