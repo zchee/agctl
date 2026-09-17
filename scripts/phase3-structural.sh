@@ -263,6 +263,12 @@ main() {
         "fn _phase3_plant(gained_codex_auth: Vec<String>, survivors: Vec<std::path::PathBuf>, daemon_dir: bool, lock_files: Vec<std::path::PathBuf>, exit: std::process::ExitStatus) -> crate::provider::codex::proof::PostExitReport { crate::provider::codex::proof::PostExitReport { gained_codex_auth, survivors, daemon_dir, lock_files, exit } }" \
         "PostExitReport literal outside provider::codex"
 
+    # Clause 8 (S32): the refresh POST is `pub(super)`, so a command cannot send
+    # one. Planted in commands/codex/mod.rs until S33 creates status.rs.
+    clause 8 "$cmd" E0603 \
+        "fn _phase3_plant(c: &crate::provider::codex::credentials::LockedCredentials<'static>, t: crate::provider::codex::auth_store::InflightToken<'static>, r: &crate::provider::codex::oauth::RefreshClient, x: &crate::runtime::coordinator::Cancel) { let _ = crate::provider::codex::oauth::refresh(c, t, r, x); }" \
+        "oauth::refresh from commands/"
+
     # Clause 9: the token a POST consumes cannot be built by a sibling.
     clause 9 "$codex/lock.rs" E0451 \
         "fn _phase3_plant(digest8: String) -> super::auth_store::InflightToken<'static> { super::auth_store::InflightToken { digest8, _guard: std::marker::PhantomData } }" \

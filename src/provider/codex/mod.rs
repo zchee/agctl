@@ -35,11 +35,13 @@
 )]
 
 pub mod account;
+pub mod audit;
 pub mod auth_store;
 pub mod claims;
 pub mod credentials;
 pub mod home;
 pub mod lock;
+pub mod oauth;
 pub mod proof;
 pub mod usage;
 

@@ -105,6 +105,31 @@
 #   account_header  unchanged (ledger #277): usage.rs requires the header through
 #                 `credentials::ACCOUNT_ID_HEADER`, so the literal keeps one site
 #
+# S32 appends seven more and widens two:
+#
+#   auth_host     `auth.openai.com` on a code line                         → only
+#                 provider/codex/oauth.rs, the one client of the token endpoint
+#   codex_token_url  the `AGCTL_CODEX_TOKEN_URL` name (the test-only token
+#                 endpoint override)                                       → only
+#                 provider/codex/oauth.rs; it is also on the release gate's seam list
+#   oauth_cancelled  `Cancelled` on a code line in provider/codex/oauth.rs → none
+#                 (plan ledger #198: a cancel is observable only before the send)
+#   oauth_refresh_callers  `oauth::refresh(`                               → only
+#                 provider/codex/refresh.rs, the one POST path (invariant I26)
+#   consent_callers  `ResendConsent::after_confirmation(` and
+#                 `ResetConsent::after_confirmation(`                      → only
+#                 commands/codex/accounts.rs (the constructors are `pub`)
+#   refresh_usage_cache  `usage::cache` in provider/codex/refresh.rs      → none
+#                 (the refresh marker is a fail-closed file, never the cache)
+#   receipt_type  `WriteReceipt` on a code line                            → only
+#                 provider/codex/auth_store.rs (which builds receipts) and
+#                 provider/codex/audit.rs (which consumes them, invariant I30)
+#   codex_redirects, codex_decoded_cap  now per client: exactly one
+#                 `.max_redirects(0)` in each of usage.rs and oauth.rs, no other
+#                 `max_redirects(` in src/provider/codex, and each client's own
+#                 decoded-byte cap (`MAX_BODY_BYTES`, `MAX_RESPONSE_BYTES`). The
+#                 `codex_timeouts` scope already covers every file in the tree.
+#
 # With `--log`, the `LOG_ONLY_NEEDLES` are counted too: the sentinel email a
 # usage fixture carries (ledger #274). They are deliberately not code needles
 # — the fixture that carries the sentinel is how a leak test proves anything —
@@ -219,6 +244,28 @@ WHAM_USAGE_ALLOWED=(
 
 CODEX_USAGE_URL_ALLOWED=(
     src/provider/codex/usage.rs
+)
+
+# S32: the one client of the token endpoint, and of its test-only override.
+AUTH_HOST_ALLOWED=(
+    src/provider/codex/oauth.rs
+)
+
+CODEX_TOKEN_URL_ALLOWED=(
+    src/provider/codex/oauth.rs
+)
+
+OAUTH_REFRESH_ALLOWED=(
+    src/provider/codex/refresh.rs
+)
+
+CONSENT_ALLOWED=(
+    src/commands/codex/accounts.rs
+)
+
+RECEIPT_TYPE_ALLOWED=(
+    src/provider/codex/auth_store.rs
+    src/provider/codex/audit.rs
 )
 
 # Where `CreditsState` (Claude's credits) must not appear (plan §9.3 m2).
@@ -564,30 +611,109 @@ check_codex_timeouts() {
 }
 
 CODEX_USAGE_MODULE=src/provider/codex/usage.rs
+CODEX_OAUTH_MODULE=src/provider/codex/oauth.rs
+
+# The Codex HTTP clients, each with the decoded-byte cap it must read through.
+CODEX_CLIENTS=(
+    "$CODEX_USAGE_MODULE MAX_BODY_BYTES"
+    "$CODEX_OAUTH_MODULE MAX_RESPONSE_BYTES"
+)
 
 check_codex_redirects() {
-    local root=$1 hits zero others count
-    # Vacuous before S31 writes the client; the plant below needs it to exist.
-    [[ -f $root/$CODEX_USAGE_MODULE ]] || return 0
+    local root=$1 hits pair module cap zero count others bad=0 pattern=""
+    for pair in "${CODEX_CLIENTS[@]}"; do
+        read -r module cap <<<"$pair"
+        # Vacuous before the step that writes the client; its plant needs it.
+        [[ -f $root/$module ]] || continue
+        hits=$(scoped_code_hits "$root" '\bmax_redirects\(' "$module") || scan_failed check_codex_redirects
+        zero=$(printf '%s' "$hits" | rg -e '\.max_redirects\(0\)' || true)
+        count=$(printf '%s' "$zero" | grep -c . || true)
+        if [[ $count -ne 1 ]]; then
+            printf '  the Codex client %s must follow no redirect: %s `.max_redirects(0)` line(s) (expected 1)\n' \
+                "$module" "$count"
+            bad=1
+        fi
+        pattern+="${pattern:+|}^${module}:[0-9]+:.*\\.max_redirects\\(0\\)"
+    done
     hits=$(scoped_code_hits "$root" '\bmax_redirects\(' src/provider/codex) || scan_failed check_codex_redirects
-    zero=$(printf '%s' "$hits" | rg -e "^${CODEX_USAGE_MODULE}:[0-9]+:.*\.max_redirects\(0\)" || true)
-    others=$(printf '%s' "$hits" | rg -v -e "^${CODEX_USAGE_MODULE}:[0-9]+:.*\.max_redirects\(0\)" || true)
-    count=$(printf '%s' "$zero" | grep -c . || true)
-    [[ $count -eq 1 && -z $others ]] && return 0
-    printf '  the Codex usage client must follow no redirect: %s `.max_redirects(0)` line(s) in %s (expected 1)%s\n' \
-        "$count" "$CODEX_USAGE_MODULE" "${others:+, and other max_redirects settings:}"
-    [[ -n $others ]] && printf '%s\n' "$others"
-    return 1
+    others=$(printf '%s' "$hits" | rg -v -e "${pattern:-^$}" || true)
+    if [[ -n $others ]]; then
+        printf '  other max_redirects settings in Codex code:\n%s\n' "$others"
+        bad=1
+    fi
+    return "$bad"
 }
 
 check_codex_decoded_cap() {
-    local root=$1 hits
-    [[ -f $root/$CODEX_USAGE_MODULE ]] || return 0
-    hits=$(scoped_code_hits "$root" '\.take\(MAX_BODY_BYTES' "$CODEX_USAGE_MODULE") || scan_failed check_codex_decoded_cap
-    [[ -n $hits ]] && return 0
-    printf '  %s reads the body with no decoded-byte cap (`.take(MAX_BODY_BYTES…)`); gzip can expand past the wire limit\n' \
-        "$CODEX_USAGE_MODULE"
+    local root=$1 hits pair module cap bad=0
+    for pair in "${CODEX_CLIENTS[@]}"; do
+        read -r module cap <<<"$pair"
+        [[ -f $root/$module ]] || continue
+        hits=$(scoped_code_hits "$root" "\\.take\\(${cap}" "$module") || scan_failed check_codex_decoded_cap
+        [[ -n $hits ]] && continue
+        printf '  %s reads the body with no decoded-byte cap (`.take(%s…)`); gzip can expand past the wire limit\n' \
+            "$module" "$cap"
+        bad=1
+    done
+    return "$bad"
+}
+
+check_auth_host() {
+    check_helper_callers "$1" 'auth\.openai\.com' '`auth.openai.com`' "${AUTH_HOST_ALLOWED[@]}"
+}
+
+check_codex_token_url() {
+    check_helper_callers "$1" '\bAGCTL_CODEX_TOKEN_URL\b' 'AGCTL_CODEX_TOKEN_URL' "${CODEX_TOKEN_URL_ALLOWED[@]}"
+}
+
+check_oauth_cancelled() {
+    local hits
+    hits=$(scoped_code_hits "$1" '\bCancelled\b' "$CODEX_OAUTH_MODULE") || scan_failed check_oauth_cancelled
+    [[ -z $hits ]] && return 0
+    printf '  `Cancelled` in the refresh client; a cancel after the send is unobservable (ledger #198):\n%s' "$hits"
     return 1
+}
+
+# Claude's own `oauth::refresh(` shares the spelling, so a caller counts when
+# it is in a Codex tree or its file names `codex::oauth` at all (an import or a
+# path) — the two ways Codex's function can be in scope.
+check_oauth_refresh_callers() {
+    local root=$1 hits file bad=0 status=0
+    hits=$(code_hits "$root" '\boauth::refresh\(') || scan_failed check_oauth_refresh_callers
+    while IFS= read -r file; do
+        [[ -z $file ]] && continue
+        case $file in
+            src/provider/codex/* | src/commands/codex/*) ;;
+            *)
+                status=0
+                rg -q -e 'codex::oauth\b' "$root/$file" || status=$?
+                [[ $status -gt 1 ]] && phase3_die "check_oauth_refresh_callers: rg could not read $file"
+                [[ $status -eq 0 ]] || continue
+                ;;
+        esac
+        if ! contains "$file" "${OAUTH_REFRESH_ALLOWED[@]}"; then
+            printf '  %s calls `oauth::refresh` and is not in its allow-list\n' "$file"
+            bad=1
+        fi
+    done < <(printf '%s\n' "$hits" | rg -v -e '\bfn\s+refresh\b' | cut -d: -f1 | LC_ALL=C sort -u)
+    return "$bad"
+}
+
+check_consent_callers() {
+    check_helper_callers "$1" '\b(?:ResendConsent|ResetConsent)::after_confirmation\(' 'a consent constructor' \
+        "${CONSENT_ALLOWED[@]}"
+}
+
+check_refresh_usage_cache() {
+    local hits
+    hits=$(scoped_code_hits "$1" '\busage::cache\b' src/provider/codex/refresh.rs) || scan_failed check_refresh_usage_cache
+    [[ -z $hits ]] && return 0
+    printf '  the refresh path reaches the usage cache; its marker must fail closed:\n%s' "$hits"
+    return 1
+}
+
+check_receipt_type() {
+    check_helper_callers "$1" '\bWriteReceipt\b' 'WriteReceipt' "${RECEIPT_TYPE_ALLOWED[@]}"
 }
 
 check_credits_state() {
@@ -706,6 +832,44 @@ plant_codex_decoded_cap_removed() {
     [[ -f $1/$CODEX_USAGE_MODULE ]] || phase3_die "plant_codex_decoded_cap_removed: $CODEX_USAGE_MODULE is missing from the snapshot"
     perl -ni -e 'print unless /\.take\(MAX_BODY_BYTES/' "$1/$CODEX_USAGE_MODULE"
 }
+plant_oauth_redirects_removed() {
+    [[ -f $1/$CODEX_OAUTH_MODULE ]] || phase3_die "plant_oauth_redirects_removed: $CODEX_OAUTH_MODULE is missing from the snapshot"
+    perl -ni -e 'print unless /\.max_redirects\(0\)/' "$1/$CODEX_OAUTH_MODULE"
+}
+plant_oauth_decoded_cap_removed() {
+    [[ -f $1/$CODEX_OAUTH_MODULE ]] || phase3_die "plant_oauth_decoded_cap_removed: $CODEX_OAUTH_MODULE is missing from the snapshot"
+    perl -ni -e 'print unless /\.take\(MAX_RESPONSE_BYTES/' "$1/$CODEX_OAUTH_MODULE"
+}
+plant_oauth_timeouts() {
+    plant_line "$1" $'fn _phase3_plant(b: ConfigBuilder) -> ConfigBuilder {\n    b\n        .timeout_per_call(None)\n}' "$CODEX_OAUTH_MODULE"
+}
+plant_auth_host() { plant_line "$1" 'const _PHASE3_PLANT: &str = "https://auth.openai.com/oauth/token";'; }
+plant_codex_token_url() { plant_line "$1" 'const _PHASE3_PLANT: &str = "AGCTL_CODEX_TOKEN_URL";'; }
+plant_oauth_cancelled() {
+    plant_line "$1" 'fn _phase3_plant() -> RefreshOutcome { RefreshOutcome::Cancelled }' "$CODEX_OAUTH_MODULE"
+}
+plant_oauth_refresh_caller() {
+    plant_line "$1" 'fn _phase3_plant(c: &LockedCredentials<'"'"'_>, t: InflightToken<'"'"'_>, r: &RefreshClient, x: &Cancel) { let _ = oauth::refresh(c, t, r, x); }' src/provider/codex/usage.rs
+}
+plant_oauth_refresh_caller_fmt() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" $'fn _phase3_plant(c: &C, t: T, r: &R, x: &Cancel) {\n    crate::provider::codex::oauth::refresh(\n        c, t, r, x,\n    );\n}' src/commands/codex/mod.rs
+}
+plant_oauth_refresh_caller_import() {
+    plant_line "$1" $'use crate::provider::codex::oauth;\nfn _phase3_plant(c: &C, t: T, r: &R, x: &Cancel) { let _ = oauth::refresh(c, t, r, x); }' src/commands/status.rs
+}
+plant_consent_caller() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" '    let c = ResendConsent::after_confirmation("yes", true, false);' src/commands/codex/mod.rs
+}
+plant_reset_consent_caller() {
+    plant_line "$1" $'fn _phase3_plant() {\n    let _ = ResetConsent::after_confirmation(\n        "yes", true, false,\n    );\n}' src/provider/codex/usage.rs
+}
+plant_refresh_usage_cache() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'use crate::usage::cache;' src/provider/codex/refresh.rs
+}
+plant_receipt_type() { plant_line "$1" 'fn _phase3_plant(r: WriteReceipt) {}' src/provider/codex/usage.rs; }
 plant_credits_state() {
     mkdir -p "$1/src/provider/codex"
     plant_line "$1" 'fn _phase3_plant(c: &crate::usage::model::CreditsState) {}' src/provider/codex/account.rs
@@ -722,7 +886,8 @@ plant_remove_dir_under_fmt() { plant_line "$1" $'fn _phase3_plant(a: &Path, p: &
 
 CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers exposed codex_bin codex_env
     exposure_count auth_json account_header toml locked_read marker_mutators stop_policy
-    codex_debug_assert state_path codex_flock wham_usage codex_usage_url codex_timeouts codex_redirects codex_decoded_cap credits_state)
+    codex_debug_assert state_path codex_flock wham_usage codex_usage_url codex_timeouts codex_redirects codex_decoded_cap credits_state
+    auth_host codex_token_url oauth_cancelled oauth_refresh_callers consent_callers refresh_usage_cache receipt_type)
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
@@ -769,6 +934,19 @@ PLANTS=(
     "codex_decoded_cap plant_codex_decoded_cap_removed"
     "credits_state plant_credits_state"
     "credits_state plant_credits_state_json_v2"
+    "codex_redirects plant_oauth_redirects_removed"
+    "codex_decoded_cap plant_oauth_decoded_cap_removed"
+    "codex_timeouts plant_oauth_timeouts"
+    "auth_host plant_auth_host"
+    "codex_token_url plant_codex_token_url"
+    "oauth_cancelled plant_oauth_cancelled"
+    "oauth_refresh_callers plant_oauth_refresh_caller"
+    "oauth_refresh_callers plant_oauth_refresh_caller_fmt"
+    "oauth_refresh_callers plant_oauth_refresh_caller_import"
+    "consent_callers plant_consent_caller"
+    "consent_callers plant_reset_consent_caller"
+    "refresh_usage_cache plant_refresh_usage_cache"
+    "receipt_type plant_receipt_type"
 )
 
 main() {

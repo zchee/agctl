@@ -56,6 +56,11 @@
 # Codex client, so the name is folded out of a release artifact (ledger #268);
 # the step whose command first reads it adds the presence check.
 #
+# S32 adds AGCTL_CODEX_TOKEN_URL: the Codex token endpoint, read only by
+# src/provider/codex/oauth.rs under `testing`. A release binary that honoured
+# it would POST a Codex refresh token wherever an environment variable pointed
+# it — the same exfiltration AGCTL_CLAUDE_TOKEN_URL is gated against.
+#
 # Phase 2 added no other seam: AGCTL_SECURITY_BIN (the write transport) and
 # AGCTL_CLAUDE_PROFILE_URL (the live swap's profile GET) are both listed, and
 # `rg -o 'AGCTL_[A-Z0-9_]+' src --glob '!*_tests.rs'` enumerates nothing else
@@ -138,6 +143,7 @@ seams=(
 	AGCTL_NO_BROWSER
 	AGCTL_CODEX_BIN
 	AGCTL_CODEX_USAGE_URL
+	AGCTL_CODEX_TOKEN_URL
 )
 
 # The production surface. Every one of these must be PRESENT.

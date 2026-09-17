@@ -81,6 +81,7 @@ of which must be absent:**
 | `AGCTL_NO_BROWSER` | `src/commands/login.rs` |
 | `AGCTL_CODEX_BIN` | `src/provider/codex/login_child.rs` (phase 3; listed from S29b, which introduces the name — the module that reads it lands at S34, and `scripts/phase3-greps.sh` pins it to that one file) |
 | `AGCTL_CODEX_USAGE_URL` | `src/provider/codex/usage.rs` (phase 3, S31; `scripts/phase3-greps.sh` pins it to that one file) |
+| `AGCTL_CODEX_TOKEN_URL` | `src/provider/codex/oauth.rs` (phase 3, S32; `scripts/phase3-greps.sh` pins it to that one file) |
 
 **Three production names, every one of which must be present:** `AGCTL_CONFIG_DIR`,
 `AGCTL_CLAUDE_USER_AGENT`, `AGCTL_CLAUDE_OAUTH_SCOPES`. (The presence half is there so

@@ -504,6 +504,7 @@ pub struct RefreshResponse {
     id_token: Option<SecretString>,
     access_token: Option<SecretString>,
     refresh_token: Option<SecretString>,
+    earliest_refresh_at: Option<Timestamp>,
 }
 
 impl RefreshResponse {
@@ -528,11 +529,31 @@ impl RefreshResponse {
             Some(Value::String(token)) => Ok(Some(SecretString::from(token))),
             Some(_) => Err(CredentialsError::WrongType(name)),
         };
-        Ok(Self {
-            id_token: take("id_token")?,
-            access_token: take("access_token")?,
-            refresh_token: take("refresh_token")?,
-        })
+        let id_token = take("id_token")?;
+        let access_token = take("access_token")?;
+        let refresh_token = take("refresh_token")?;
+        // Fact F80 / ledger 282a: a server hint, read only when it is a whole
+        // number of seconds that names a representable time. Anything else is
+        // ignored rather than refused — the grant in the rest of the body is
+        // what matters. Every other member (`oai_is`, `scope`, …) is dropped
+        // here, unread and never persisted.
+        let earliest_refresh_at = body
+            .get("earliest_refresh_at")
+            .and_then(Value::as_i64)
+            .and_then(|seconds| Timestamp::from_second(seconds).ok());
+        Ok(Self { id_token, access_token, refresh_token, earliest_refresh_at })
+    }
+
+    /// Whether the response carries an access token: a 2xx without one is not
+    /// a usable grant (decision D-035's class table).
+    pub fn has_access_token(&self) -> bool {
+        self.access_token.is_some()
+    }
+
+    /// The server's `earliest_refresh_at`, when it sent a usable one (fact
+    /// F80, ledger 282a).
+    pub fn earliest_refresh_at(&self) -> Option<Timestamp> {
+        self.earliest_refresh_at
     }
 }
 
@@ -543,6 +564,7 @@ impl fmt::Debug for RefreshResponse {
             .field("id_token", &self.id_token.is_some())
             .field("access_token", &self.access_token.is_some())
             .field("refresh_token", &self.refresh_token.is_some())
+            .field("earliest_refresh_at", &self.earliest_refresh_at)
             .finish()
     }
 }
@@ -673,7 +695,7 @@ impl<'g> LockedCredentials<'g> {
         }
         let before_refresh = inner.refresh_digest8();
         let before_user = inner.view.claims.as_ref().and_then(|c| c.chatgpt_user_id.clone());
-        let RefreshResponse { id_token, access_token, refresh_token } = response;
+        let RefreshResponse { id_token, access_token, refresh_token, .. } = response;
         // Review S30 F3: an id token whose claims do not decode is not merged,
         // so the view below cannot fail on it and the rest of the grant lands.
         let mut id_token_unreadable = false;

@@ -26,6 +26,9 @@ open = "5.4.3"
 rand = "0.10.2"
 ratatui = "0.30"
 rustix = { version = "1", features = ["fs", "process"] }
+# Named only so a TLS failure inside an `io::Error` can be recognised by type
+# (provider/codex/oauth.rs); the same crate `ureq` already links, no new code.
+rustls = { version = "0.23.45", default-features = false }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
@@ -37,7 +40,11 @@ toml = { version = "1.1.6", default-features = false, features = ["parse", "std"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-normalization = "0.1"
-ureq = { version = "3", features = ["json"] }
+# Pinned exactly: provider/codex/oauth.rs classifies every `ureq::Error` a
+# refresh POST can end in (decision D-035's class table), and whether a token
+# may be re-sent depends on those variants and on where the TLS handshake runs.
+# A bump re-verifies that table against the new source before it lands.
+ureq = { version = "=3.4.1", features = ["json"] }
 url = "2"
 
 [dev-dependencies]
@@ -47,6 +54,9 @@ httpmock = "0.8"
 insta = "1"
 jsonschema = "0.56"
 predicates = "3.1.4"
+# The Codex refresh client's self-signed TLS test generates its certificate at
+# test time, so no key material is committed.
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
 tempfile = "3.27.0"
 
 [profile.release]
