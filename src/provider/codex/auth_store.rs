@@ -67,6 +67,7 @@ use std::time::Duration;
 use jiff::Timestamp;
 use rustix::fs::AtFlags;
 use rustix::io::Errno;
+use secrecy::zeroize::Zeroizing;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -123,6 +124,9 @@ pub const DEFAULT_FLOOR_MIN: u32 = 60;
 
 /// The write faults the refresh writer honours.
 const REFRESH_FAULTS: (&str, &str) = ("codex_before_rename", "codex_rename_fail");
+
+/// Writer 1 reports an error after its rename landed.
+const ERROR_AFTER_RENAME_FAULT: &str = "codex_error_after_rename";
 
 /// The write faults the install honours (plan AC126 (d)).
 const INSTALL_FAULTS: (&str, &str) = ("codex_before_rename", "codex_install_rename_fail");
@@ -296,8 +300,10 @@ pub enum WriteKind {
 
 /// The record of one namespace write. Consumed by the Codex audit log and
 /// nothing else (invariant I30, plan AC117).
+///
+/// Neither `Clone` nor `Copy`, so one write is audited once (review S30 LOW-2).
 #[must_use = "every Codex namespace write is audited: hand the receipt to the audit log"]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct WriteReceipt {
     kind: WriteKind,
     digest8_before: Option<String>,
@@ -650,8 +656,12 @@ impl<'g> OwnedNamespace<'g> {
         };
         let base = credentials.base_digests();
         let after = credentials.credentials().digests();
-        if before.as_ref().and_then(|d| d.refresh_sha256.as_ref())
-            != base.and_then(|d| d.refresh_sha256.as_ref())
+        // A file that is gone is not a newer grant: nothing would be written
+        // over, and the merged response is the only copy of a grant whose old
+        // refresh token is already spent, so it is written (review S30
+        // INFO-2; fact F94: a Codex keychain save can delete `auth.json`).
+        if let Some(current) = &before
+            && current.refresh_sha256.as_ref() != base.and_then(|d| d.refresh_sha256.as_ref())
         {
             return Ok(CodexWrite::ChangedSinceRead {
                 receipt: WriteReceipt {
@@ -663,24 +673,22 @@ impl<'g> OwnedNamespace<'g> {
             });
         }
 
-        let mut bytes = Vec::new();
-        credentials.credentials().write_json_to(&mut bytes).map_err(|err| {
-            FileStoreError::io(format!("could not serialize `{}`", self.ns.shown.display()), err)
-        })?;
-        let spec = PendingSpec {
-            target_name: AUTH_FILE,
-            pending_name: PENDING_FILE,
-            meta_name: PENDING_META,
-            prior: base,
-            expires_at_ms: credentials
-                .credentials()
-                .access_expires_at()
-                .and_then(|exp| exp.checked_mul(1000)),
-        };
+        let bytes = self.serialize(credentials)?;
+        let spec = refresh_spec(credentials);
         let faults =
             WriteFaults { fault, before_rename: REFRESH_FAULTS.0, rename_fail: REFRESH_FAULTS.1 };
         let outcome =
             self.ns.auth_file().write(&bytes, Some(spec), StopPolicy::Complete, &faults)?;
+        if matches!(outcome, WriteOutcome::Written { .. }) && fault.is(ERROR_AFTER_RENAME_FAULT) {
+            // The shape of a post-rename failure `SecretFile::write` can return
+            // (its snapshot of the renamed file fails): the grant is on disk and
+            // no receipt comes back. The refresh driver must re-read rather than
+            // write the same merge again (review S30 INFO-4).
+            return Err(FileStoreError::io(
+                format!("`{}` could not be examined after the rename", self.ns.shown.display()),
+                io::Error::other("error after rename injected by the test fault switch"),
+            ));
+        }
         let kind = match outcome {
             WriteOutcome::Written { .. } => WriteKind::RefreshApplied,
             WriteOutcome::SavedToPending { .. } => WriteKind::RefreshSavedToPending,
@@ -694,6 +702,92 @@ impl<'g> OwnedNamespace<'g> {
                 ids: self.ns.ids(),
             },
         })
+    }
+
+    /// Writer 1's last resort: parks a merged refresh as pending without trying
+    /// `auth.json` (review S30 LOW-1).
+    ///
+    /// For a refresh driver whose writes kept failing after the response was
+    /// applied — `auth.json` unreadable, torn, or the staging failing — and
+    /// which must not drop the only copy of the rotated grant. The pending
+    /// file records the read the merge was built on, so the next pass replays
+    /// it only onto that grant.
+    ///
+    /// # Errors
+    ///
+    /// [`FileStoreError`] for credentials from another namespace and when the
+    /// pending pair cannot be saved; a temporary that could not be parked is
+    /// kept and named in the error.
+    pub fn park(
+        &self,
+        credentials: &LockedCredentials<'g>,
+        fault: &Fault,
+    ) -> Result<CodexWrite, FileStoreError> {
+        check_ids(credentials, &self.ns.user, &self.ns.acct, &self.ns.shown)?;
+        let before = match self.ns.current() {
+            Ok(Current::Present { credentials, .. }) => credentials.digests(),
+            _ => None,
+        };
+        let bytes = self.serialize(credentials)?;
+        let faults =
+            WriteFaults { fault, before_rename: REFRESH_FAULTS.0, rename_fail: REFRESH_FAULTS.1 };
+        let outcome = self.ns.auth_file().park(&bytes, refresh_spec(credentials), &faults)?;
+        Ok(CodexWrite::Landed {
+            outcome,
+            receipt: WriteReceipt {
+                kind: WriteKind::RefreshSavedToPending,
+                digest8_before: digest8_of(before.as_ref()),
+                digest8_after: digest8_of(credentials.credentials().digests().as_ref()),
+                ids: self.ns.ids(),
+            },
+        })
+    }
+
+    /// The document in Codex's format, in a buffer zeroed on drop (review
+    /// S30 F9).
+    fn serialize(
+        &self,
+        credentials: &LockedCredentials<'g>,
+    ) -> Result<Zeroizing<Vec<u8>>, FileStoreError> {
+        let mut bytes = Zeroizing::new(Vec::new());
+        credentials.credentials().write_json_to(&mut *bytes).map_err(|err| {
+            FileStoreError::io(format!("could not serialize `{}`", self.ns.shown.display()), err)
+        })?;
+        Ok(bytes)
+    }
+
+    /// Whether a staged `auth.json.tmp.<8hex>` is in the namespace: a
+    /// [`StopPolicy::Complete`] write a process exit interrupted, which may
+    /// hold a rotated grant (risk R70). `--resend` is refused while one exists.
+    ///
+    /// # Errors
+    ///
+    /// [`FileStoreError`] when the directory cannot be listed.
+    pub fn has_stray_tmp(&self) -> Result<bool, FileStoreError> {
+        let dir = rustix::fs::Dir::read_from(&self.ns.fd).map_err(|errno| {
+            FileStoreError::errno(
+                format!("could not list `{}`", self.ns.dir_shown.display()),
+                errno,
+            )
+        })?;
+        for entry in dir {
+            let entry = entry.map_err(|errno| {
+                FileStoreError::errno(
+                    format!("could not list `{}`", self.ns.dir_shown.display()),
+                    errno,
+                )
+            })?;
+            let name = entry.file_name().to_string_lossy();
+            if name.starts_with(TMP_PREFIX) && is_named_file(&name) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The Codex daemon evidence in this namespace right now (decision D-032).
+    pub fn daemon_evidence(&self, cancel: &Cancel) -> DaemonEvidence {
+        home::daemon_evidence(&self.ns.dir_shown, cancel)
     }
 
     /// Removes `auth.json`, the pending pair, staged temporaries and the
@@ -782,6 +876,20 @@ impl<'g> OwnedNamespace<'g> {
             digest8_after: None,
             ids: self.ns.ids(),
         })
+    }
+}
+
+/// Writer 1's pending spec: what the merge was built on, and its new expiry.
+fn refresh_spec<'a>(credentials: &'a LockedCredentials<'_>) -> PendingSpec<'a> {
+    PendingSpec {
+        target_name: AUTH_FILE,
+        pending_name: PENDING_FILE,
+        meta_name: PENDING_META,
+        prior: credentials.base_digests(),
+        expires_at_ms: credentials
+            .credentials()
+            .access_expires_at()
+            .and_then(|exp| exp.checked_mul(1000)),
     }
 }
 
@@ -889,6 +997,23 @@ pub enum UnknownClass {
     Interrupted,
     /// A TLS failure during or before the send.
     Tls,
+    /// The response was applied and could be neither written nor parked
+    /// (plan section 3.3, `ambiguous (write_failed)`; ledger #272 ruling 2).
+    WriteFailed,
+}
+
+impl UnknownClass {
+    /// The word a row, an audit line and `doctor` carry.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ambiguous => "ambiguous",
+            Self::ServerError => "server_error",
+            Self::RateLimited => "rate_limited",
+            Self::Interrupted => "interrupted",
+            Self::Tls => "tls",
+            Self::WriteFailed => "write_failed",
+        }
+    }
 }
 
 /// How a sent refresh definitely ended, for clearing its marker.
@@ -945,6 +1070,35 @@ pub struct RefreshState {
     /// When a refresh was last sent, for the floor.
     #[serde(default, with = "ts_opt")]
     pub last_sent_at: Option<Timestamp>,
+    /// The token host's `earliest_refresh_at` for the grant it came with (fact
+    /// F80, ledger 282a): no automatic refresh of that grant before `at`.
+    #[serde(default)]
+    pub earliest_refresh: Option<EarliestRefresh>,
+    /// The refresh digest prefix of a grant the token host called dead. While
+    /// the file still holds it the row is `needs login` and nothing is sent
+    /// again (invariant I26: a dead token is not re-sent pass after pass).
+    #[serde(default)]
+    pub dead_digest8: Option<String>,
+}
+
+/// A server floor on refreshing one grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EarliestRefresh {
+    /// The refresh digest prefix of the grant the floor belongs to.
+    pub grant_digest8: String,
+    /// No automatic refresh before this.
+    #[serde(with = "ts")]
+    pub at: Timestamp,
+}
+
+/// What a definite outcome leaves behind in the marker besides the cleared
+/// send.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Settled {
+    /// The new grant's server floor, when the response carried one.
+    pub earliest_refresh: Option<EarliestRefresh>,
+    /// The grant the server called dead, when it did.
+    pub dead_digest8: Option<String>,
 }
 
 fn default_floor() -> u32 {
@@ -963,6 +1117,8 @@ impl Default for RefreshState {
             resent: false,
             retry_after: None,
             last_sent_at: None,
+            earliest_refresh: None,
+            dead_digest8: None,
         }
     }
 }
@@ -1249,6 +1405,54 @@ impl RefreshStateFile {
         state.class = None;
         state.resent = false;
         state.retry_after = None;
+        self.store(&state)
+    }
+
+    /// Clears the in-flight marker after a definite outcome and records what it
+    /// leaves behind, in one durable write: the new grant's server floor, or
+    /// the grant the server called dead.
+    pub(super) fn settle_inflight(
+        &self,
+        _outcome: DefiniteOutcome,
+        settled: Settled,
+    ) -> Result<(), FileStoreError> {
+        let mut state = self.load_for_update()?;
+        state.inflight = None;
+        state.ambiguous_since = None;
+        state.class = None;
+        state.resent = false;
+        state.retry_after = None;
+        state.earliest_refresh = settled.earliest_refresh;
+        state.dead_digest8 = settled.dead_digest8;
+        self.store(&state)
+    }
+
+    /// Restores the unknown marker after a `--resend` that ended without a
+    /// definite answer about the grant (review S32-C2 F1): the in-flight entry
+    /// and its class stay, and `resent` says whether the re-send counts as
+    /// spent. Refuses when there is no classified in-flight send to restore.
+    pub(super) fn restore_unknown(&self, resent: bool) -> Result<(), FileStoreError> {
+        let mut state = self.load_for_update()?;
+        if state.inflight.is_none() || state.class.is_none() {
+            return Err(FileStoreError::Json(format!(
+                "`{}` records no unknown refresh to restore",
+                self.shown.display()
+            )));
+        }
+        state.resent = resent;
+        self.store(&state)
+    }
+
+    /// Counts a sent refresh that a 401 followed: the floor doubles, 60 → 120
+    /// → 240 minutes, and the count saturates (decision D-035).
+    pub(super) fn record_did_not_help(&self) -> Result<(), FileStoreError> {
+        let mut state = self.load_for_update()?;
+        state.did_not_help = state.did_not_help.saturating_add(1);
+        state.floor_min = match state.did_not_help {
+            0 => DEFAULT_FLOOR_MIN,
+            1 => DEFAULT_FLOOR_MIN.saturating_mul(2),
+            _ => DEFAULT_FLOOR_MIN.saturating_mul(4),
+        };
         self.store(&state)
     }
 

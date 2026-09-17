@@ -39,10 +39,12 @@ pub mod audit;
 pub mod auth_store;
 pub mod claims;
 pub mod credentials;
+pub mod discovery;
 pub mod home;
 pub mod lock;
 pub mod oauth;
 pub mod proof;
+pub mod refresh;
 pub mod usage;
 
 #[cfg(test)]

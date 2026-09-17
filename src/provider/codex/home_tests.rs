@@ -296,8 +296,14 @@ fn daemon_evidence_classifies_the_pid_record() {
     fs::write(home.path().join("app-server-daemon/app-server.pid"), b"12").expect("write");
     assert_eq!(
         daemon_evidence(home.path(), &cancel),
-        DaemonEvidence::ArtefactOnly,
-        "not the F83 JSON shape"
+        DaemonEvidence::RecordUnreadable,
+        "not the F83 JSON shape: a record being published blocks a refresh (review S30 F8)"
+    );
+    fs::write(home.path().join("app-server-daemon/app-server.pid"), b"").expect("write");
+    assert_eq!(
+        daemon_evidence(home.path(), &cancel),
+        DaemonEvidence::RecordUnreadable,
+        "an empty, torn record"
     );
 
     // A link at the record is refused by the open, never followed.
@@ -309,7 +315,11 @@ fn daemon_evidence_classifies_the_pid_record() {
         home.path().join("app-server-daemon/app-server.pid"),
     )
     .expect("symlink");
-    assert_eq!(daemon_evidence(home.path(), &cancel), DaemonEvidence::ArtefactOnly);
+    assert_eq!(
+        daemon_evidence(home.path(), &cancel),
+        DaemonEvidence::RecordUnreadable,
+        "a link at the record is refused, and refusing it blocks a refresh"
+    );
 }
 
 #[test]

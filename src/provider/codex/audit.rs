@@ -31,8 +31,10 @@ use serde::Serialize;
 use crate::config::paths::Paths;
 use crate::config::paths::validate_codex_segment;
 use crate::error::AppError;
+use crate::provider::codex::auth_store::UnknownClass;
 use crate::provider::codex::auth_store::WriteKind;
 use crate::provider::codex::auth_store::WriteReceipt;
+use crate::provider::codex::oauth::PermanentClass;
 use crate::secret::audit;
 use crate::secret::file_store;
 
@@ -119,17 +121,24 @@ pub enum CodexEvent<'a> {
     /// The server called the grant dead and it was still the file's.
     NeedsLogin {
         /// Which answer.
-        class: &'static str,
+        class: PermanentClass,
         /// The grant sent.
         sent_digest8: &'a str,
     },
     /// The outcome of a send is unknown.
     Ambiguous {
-        /// `ambiguous`, `server_error`, `rate_limited`, `interrupted`, `tls`
-        /// or `write_failed`.
-        class: &'static str,
+        /// Why.
+        class: UnknownClass,
         /// The grant sent.
         sent_digest8: &'a str,
+    },
+    /// A refreshed grant is on disk though its write reported an error after
+    /// the rename, so no receipt came back; the file was re-read and holds it.
+    AppliedAfterError {
+        /// The grant sent.
+        sent_digest8: &'a str,
+        /// The grant now in the file.
+        written_digest8: Option<&'a str>,
     },
     /// The user re-sent an unknown refresh.
     Resend {
@@ -195,10 +204,13 @@ pub fn append_event(
             entry(ids, CodexOutcome::AdoptedExternal, None, Some(sent_digest8), kept_digest8)
         }
         CodexEvent::NeedsLogin { class, sent_digest8 } => {
-            entry(ids, CodexOutcome::NeedsLogin, Some(class), Some(sent_digest8), None)
+            entry(ids, CodexOutcome::NeedsLogin, Some(class.label()), Some(sent_digest8), None)
         }
         CodexEvent::Ambiguous { class, sent_digest8 } => {
-            entry(ids, CodexOutcome::Ambiguous, Some(class), Some(sent_digest8), None)
+            entry(ids, CodexOutcome::Ambiguous, Some(class.label()), Some(sent_digest8), None)
+        }
+        CodexEvent::AppliedAfterError { sent_digest8, written_digest8 } => {
+            entry(ids, CodexOutcome::Applied, None, Some(sent_digest8), written_digest8)
         }
         CodexEvent::Resend { sent_digest8 } => {
             entry(ids, CodexOutcome::Resend, None, Some(sent_digest8), None)

@@ -410,6 +410,11 @@ pub enum DaemonEvidence {
     Recycled(u32),
     /// A daemon directory, lock or record, with no live process behind it.
     ArtefactOnly,
+    /// A pid record exists in the daemon directory and cannot be read, is not
+    /// a regular file, or does not parse. Codex publishes the record under its
+    /// own reservation lock (fact F83), so this is "a daemon may be starting",
+    /// not "no daemon": a refresh sends nothing this pass (review S30 F8).
+    RecordUnreadable,
 }
 
 /// Codex's `app-server.pid` (fact F83).
@@ -452,9 +457,10 @@ struct ExecutableIdentity {
 /// alive and started more than a second after the record was last modified is
 /// [`DaemonEvidence::Recycled`]; alive otherwise is
 /// [`DaemonEvidence::PidAlive`]. A process whose start time cannot be read
-/// counts as alive — the conservative answer, since it stops a refresh.
-/// Everything else inside the daemon directory, including an unreadable
-/// record, is [`DaemonEvidence::ArtefactOnly`].
+/// counts as alive — the conservative answer, since it stops a refresh. A
+/// record that is there and cannot be used is
+/// [`DaemonEvidence::RecordUnreadable`]; a dead process, or a daemon directory
+/// with no record at all, is [`DaemonEvidence::ArtefactOnly`].
 pub fn daemon_evidence(dir: &Path, cancel: &Cancel) -> DaemonEvidence {
     let daemon = dir.join(DAEMON_DIR);
     match std::fs::symlink_metadata(&daemon) {
@@ -462,10 +468,15 @@ pub fn daemon_evidence(dir: &Path, cancel: &Cancel) -> DaemonEvidence {
         Ok(_) => return DaemonEvidence::ArtefactOnly,
         Err(_) => return DaemonEvidence::None,
     }
-    let Some((pid, written)) = read_pid_record(&daemon.join(DAEMON_PID_FILE)) else {
-        // `daemon.lock` alone, or an unreadable record: only an artefact. The
-        // lock itself is never opened, so it is never named here either.
-        return DaemonEvidence::ArtefactOnly;
+    let record = daemon.join(DAEMON_PID_FILE);
+    let Some((pid, written)) = read_pid_record(&record) else {
+        // `daemon.lock` alone is only an artefact; the lock itself is never
+        // opened, so it is never named here either. A record that is there
+        // and cannot be used may be one being published (review S30 F8).
+        return match std::fs::symlink_metadata(&record) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => DaemonEvidence::ArtefactOnly,
+            _ => DaemonEvidence::RecordUnreadable,
+        };
     };
     if pid == 0 || !proc::exists(pid) {
         return DaemonEvidence::ArtefactOnly;

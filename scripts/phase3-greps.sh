@@ -124,6 +124,12 @@
 #   receipt_type  `WriteReceipt` on a code line                            → only
 #                 provider/codex/auth_store.rs (which builds receipts) and
 #                 provider/codex/audit.rs (which consumes them, invariant I30)
+#   receipt_destructure  (C2, review S30 LOW-2) across lines, any receiver: a
+#                 `Landed { .. }`/`ChangedSinceRead { .. }` pattern that does not
+#                 bind `receipt` (or binds `receipt: _`), and a `let (a, _b, c)`
+#                 tuple bound from `resolve_pending(`, outside auth_store.rs → none;
+#                 and a file that takes receipts must call `audit::append(`.
+#                 `marker_mutators` also pins `settle_inflight`/`record_did_not_help`.
 #   codex_redirects, codex_decoded_cap  now per client: exactly one
 #                 `.max_redirects(0)` in each of usage.rs and oauth.rs, no other
 #                 `max_redirects(` in src/provider/codex, and each client's own
@@ -511,7 +517,7 @@ check_locked_read() {
     check_callers_not_fn "$1" '\b' 'from_locked_read' 'from_locked_read' "${LOCKED_READ_ALLOWED[@]}"
 }
 
-MARKER_MUTATORS='write_inflight|write_resend|clear_inflight|mark_interrupted|mark_unknown|reset_floor'
+MARKER_MUTATORS='write_inflight|write_resend|clear_inflight|mark_interrupted|mark_unknown|reset_floor|settle_inflight|record_did_not_help|restore_unknown'
 
 check_marker_mutators() {
     local bad=0
@@ -712,6 +718,39 @@ check_refresh_usage_cache() {
     return 1
 }
 
+# check_receipt_destructure: multi-line (`rg -U -P`), whole non-test files under
+# the Codex trees; comment lines are stripped first so a doc example is not a
+# pattern.
+check_receipt_destructure() {
+    local root=$1 file code bad=0 dir
+    for dir in src/provider/codex src/commands/codex; do
+        [[ -d $root/$dir ]] || continue
+        while IFS= read -r file; do
+            [[ $file == src/provider/codex/auth_store.rs ]] && continue
+            code=$(grep -v -E '^\s*//' "$root/$file" || true)
+            if printf '%s' "$code" | rg -U -P -q -e '(?:Landed|ChangedSinceRead)\s*\{(?![^}]*\breceipt\b\s*[,}])[^}]*\}'; then
+                printf '  %s: a Landed/ChangedSinceRead pattern that does not bind `receipt`\n' "$file"
+                bad=1
+            fi
+            if printf '%s' "$code" | rg -U -P -q -e 'receipt\s*:\s*_'; then
+                printf '  %s: a receipt bound to `_`\n' "$file"
+                bad=1
+            fi
+            if printf '%s' "$code" | rg -U -P -q -e 'let\s*\(\s*\w+\s*,\s*_\w*\s*,[^)]*\)\s*=[^;]*?\.resolve_pending\('; then
+                printf '  %s: a resolve_pending receipt bound to `_`\n' "$file"
+                bad=1
+            fi
+            if [[ $file != src/provider/codex/audit.rs ]] \
+                && printf '%s' "$code" | rg -U -P -q -e '(?:Landed|ChangedSinceRead)\s*\{|\.resolve_pending\(' \
+                && ! printf '%s' "$code" | rg -q -F 'audit::append('; then
+                printf '  %s: takes write receipts and never calls audit::append\n' "$file"
+                bad=1
+            fi
+        done < <(cd "$root" && rg --files --glob '*.rs' --glob '!*_tests.rs' "$dir" | LC_ALL=C sort)
+    done
+    return "$bad"
+}
+
 check_receipt_type() {
     check_helper_callers "$1" '\bWriteReceipt\b' 'WriteReceipt' "${RECEIPT_TYPE_ALLOWED[@]}"
 }
@@ -869,6 +908,22 @@ plant_refresh_usage_cache() {
     mkdir -p "$1/src/provider/codex"
     plant_line "$1" 'use crate::usage::cache;' src/provider/codex/refresh.rs
 }
+plant_receipt_dotdot() {
+    plant_line "$1" $'fn _phase3_plant(w: CodexWrite) {\n    if let CodexWrite::Landed {\n        outcome, ..\n    } = w {}\n}' src/provider/codex/refresh.rs
+}
+plant_receipt_underscore() {
+    plant_line "$1" 'fn _phase3_plant(w: CodexWrite) { if let CodexWrite::ChangedSinceRead { receipt: _ } = w {} }' src/provider/codex/refresh.rs
+}
+plant_receipt_tuple() {
+    plant_line "$1" $'fn _phase3_plant(owned: &OwnedNamespace<\'_>, c: &Cancel) {\n    let (decision,\n        _receipt, evidence) = owned.resolve_pending(c).unwrap_or_else(|_| todo!());\n}' src/provider/codex/refresh.rs
+}
+plant_receipt_unaudited() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'fn _phase3_plant(w: CodexWrite) { if let CodexWrite::Landed { outcome, receipt } = w { drop(receipt) } }' src/commands/codex/login.rs
+}
+plant_marker_mutator_settle() {
+    plant_line "$1" 'fn _phase3_plant(s: &RefreshStateFile) { let _ = s.settle_inflight(DefiniteOutcome::Applied, Settled::default()); }' src/provider/codex/discovery.rs
+}
 plant_receipt_type() { plant_line "$1" 'fn _phase3_plant(r: WriteReceipt) {}' src/provider/codex/usage.rs; }
 plant_credits_state() {
     mkdir -p "$1/src/provider/codex"
@@ -887,7 +942,8 @@ plant_remove_dir_under_fmt() { plant_line "$1" $'fn _phase3_plant(a: &Path, p: &
 CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers exposed codex_bin codex_env
     exposure_count auth_json account_header toml locked_read marker_mutators stop_policy
     codex_debug_assert state_path codex_flock wham_usage codex_usage_url codex_timeouts codex_redirects codex_decoded_cap credits_state
-    auth_host codex_token_url oauth_cancelled oauth_refresh_callers consent_callers refresh_usage_cache receipt_type)
+    auth_host codex_token_url oauth_cancelled oauth_refresh_callers consent_callers refresh_usage_cache receipt_type
+    receipt_destructure)
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
@@ -947,6 +1003,11 @@ PLANTS=(
     "consent_callers plant_reset_consent_caller"
     "refresh_usage_cache plant_refresh_usage_cache"
     "receipt_type plant_receipt_type"
+    "receipt_destructure plant_receipt_dotdot"
+    "receipt_destructure plant_receipt_underscore"
+    "receipt_destructure plant_receipt_tuple"
+    "receipt_destructure plant_receipt_unaudited"
+    "marker_mutators plant_marker_mutator_settle"
 )
 
 main() {

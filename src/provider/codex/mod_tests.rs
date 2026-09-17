@@ -133,7 +133,7 @@ fn violations(sources: &[Source]) -> Vec<String> {
     }
 
     // (2) Pinned call sites. A definition line (`fn name`) is not a call.
-    let pins: [(&str, &[&str]); 21] = [
+    let pins: [(&str, &[&str]); 27] = [
         ("from_locked_read(", &["src/provider/codex/auth_store.rs"]),
         ("LockedCredentials::new(", &["src/provider/codex/credentials.rs"]),
         ("write_refresh_body_to(", &["src/provider/codex/oauth.rs"]),
@@ -149,6 +149,9 @@ fn violations(sources: &[Source]) -> Vec<String> {
         (".mark_interrupted(", &["src/provider/codex/refresh.rs"]),
         (".mark_unknown(", &["src/provider/codex/refresh.rs"]),
         (".reset_floor(", &["src/provider/codex/refresh.rs"]),
+        (".settle_inflight(", &["src/provider/codex/refresh.rs"]),
+        (".record_did_not_help(", &["src/provider/codex/refresh.rs"]),
+        (".restore_unknown(", &["src/provider/codex/refresh.rs"]),
         // The same mutators spelled as associated functions (review S30 F5).
         ("RefreshStateFile::write_inflight(", &["src/provider/codex/refresh.rs"]),
         ("RefreshStateFile::write_resend(", &["src/provider/codex/refresh.rs"]),
@@ -156,6 +159,9 @@ fn violations(sources: &[Source]) -> Vec<String> {
         ("RefreshStateFile::mark_interrupted(", &["src/provider/codex/refresh.rs"]),
         ("RefreshStateFile::mark_unknown(", &["src/provider/codex/refresh.rs"]),
         ("RefreshStateFile::reset_floor(", &["src/provider/codex/refresh.rs"]),
+        ("RefreshStateFile::settle_inflight(", &["src/provider/codex/refresh.rs"]),
+        ("RefreshStateFile::record_did_not_help(", &["src/provider/codex/refresh.rs"]),
+        ("RefreshStateFile::restore_unknown(", &["src/provider/codex/refresh.rs"]),
     ];
     for (file, number, line) in code_lines(sources) {
         for (pattern, allowed) in pins {
@@ -169,6 +175,27 @@ fn violations(sources: &[Source]) -> Vec<String> {
             let in_home = pattern == "resolve_pending_with" && file == "src/secret/pending.rs";
             if line.contains(pattern) && !definition && !in_home && !allowed.contains(&file) {
                 found.push(format!("{file}:{number}: `{pattern}` called outside {allowed:?}"));
+            }
+        }
+    }
+
+    // (2b) The refresh POST's one caller (invariant I26). Claude's client has a
+    // function of the same name, so the pin reads Codex trees and any file
+    // that names `codex::oauth`.
+    let codex_scope = |path: &str| {
+        path.starts_with("src/provider/codex/") || path.starts_with("src/commands/codex/")
+    };
+    for (file, text) in sources.iter().filter(|(path, _)| !is_test_file(path)) {
+        if !(codex_scope(file) || text.contains("codex::oauth")) {
+            continue;
+        }
+        for (index, line) in text.lines().enumerate() {
+            let code = !line.trim_start().starts_with("//");
+            if code && line.contains("oauth::refresh(") && file != "src/provider/codex/refresh.rs" {
+                found.push(format!(
+                    "{file}:{}: `oauth::refresh` called outside refresh.rs",
+                    index + 1
+                ));
             }
         }
     }
@@ -216,10 +243,75 @@ fn violations(sources: &[Source]) -> Vec<String> {
 
     // (6) A receipt is never discarded with `let _ =` or `let _name =`
     // (invariant I30; review S30 F5): both silence `#[must_use]`.
-    let receipt_calls = [".install(", ".remove_named_files(", ".resolve_pending(", "ns.write("];
+    // Review S30 LOW-2: any receiver, and the park writer too.
+    let receipt_calls =
+        [".install(", ".remove_named_files(", ".resolve_pending(", ".write(", ".park("];
     for (file, number, line) in code_lines(sources) {
-        if is_underscore_binding(line) && receipt_calls.iter().any(|call| line.contains(call)) {
+        let in_codex =
+            file.starts_with("src/provider/codex/") || file.starts_with("src/commands/codex/");
+        if in_codex
+            && is_underscore_binding(line)
+            && receipt_calls.iter().any(|call| line.contains(call))
+        {
             found.push(format!("{file}:{number}: a write receipt discarded with `let _… =`"));
+        }
+    }
+
+    // (6b) A receipt is never dropped by a pattern (review S30 LOW-2): a
+    // `Landed { .. }`/`ChangedSinceRead { .. }` that does not bind `receipt`,
+    // or binds it to `_`, and a `resolve_pending` tuple whose middle element is
+    // `_`-prefixed — across lines, for any receiver. And whoever takes a
+    // receipt out of one hands it to `codex::audit::append`, the only consumer.
+    for (file, text) in sources.iter().filter(|(path, _)| !is_test_file(path)) {
+        if file == "src/provider/codex/auth_store.rs" {
+            continue;
+        }
+        let code: String = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut takes_receipts = false;
+        for variant in ["Landed", "ChangedSinceRead"] {
+            let mut rest = code.as_str();
+            while let Some(at) = rest.find(variant) {
+                let after = rest[at + variant.len()..].trim_start();
+                if let Some(body) = after.strip_prefix('{')
+                    && let Some(close) = body.find('}')
+                {
+                    let fields = &body[..close];
+                    takes_receipts = true;
+                    let binds = fields.split(',').any(|field| field.trim() == "receipt");
+                    if !binds {
+                        found.push(format!(
+                            "{file}: a `{variant} {{ .. }}` pattern drops its receipt"
+                        ));
+                    }
+                }
+                rest = &rest[at + variant.len()..];
+            }
+        }
+        let mut rest = code.as_str();
+        while let Some(at) = rest.find(".resolve_pending(") {
+            takes_receipts = true;
+            let head = &rest[..at];
+            if let Some(open) = head.rfind("let (") {
+                let pattern = &head[open + 5..];
+                let elements: Vec<&str> =
+                    pattern.split(')').next().unwrap_or("").split(',').map(str::trim).collect();
+                if elements.get(1).is_some_and(|middle| middle.starts_with('_')) {
+                    found.push(format!("{file}: a `resolve_pending` receipt bound to `_`"));
+                }
+            }
+            rest = &rest[at + 1..];
+        }
+        if takes_receipts
+            && file != "src/provider/codex/audit.rs"
+            && !code.contains("audit::append(")
+        {
+            found.push(format!(
+                "{file}: takes write receipts and never calls `codex::audit::append`"
+            ));
         }
     }
 
@@ -239,8 +331,19 @@ fn violations(sources: &[Source]) -> Vec<String> {
 
 #[test]
 fn the_tree_satisfies_every_ac119_rule() {
-    let found = violations(&tree());
+    let tree = tree();
+    let found = violations(&tree);
     assert!(found.is_empty(), "AC119 violations:\n{}", found.join("\n"));
+    // The consumer rule is not vacuous: the refresh driver takes receipts.
+    let refresh = tree
+        .iter()
+        .find(|(path, _)| path == "src/provider/codex/refresh.rs")
+        .map(|(_, text)| text.as_str())
+        .unwrap_or_default();
+    assert!(
+        refresh.contains("audit::append(") && refresh.contains("Landed {"),
+        "refresh.rs audits its receipts"
+    );
 }
 
 /// Adds `line` to `file` in a copy of the tree (creating the file if needed).
@@ -261,7 +364,7 @@ fn every_rule_reports_its_plant() {
     // Includes the plan's named plant: a `from_locked_read` call in
     // `provider/codex/discovery.rs`, which compiles and must fail this test.
     let base = tree();
-    let plants: [(&str, &str, &str); 20] = [
+    let plants: [(&str, &str, &str); 28] = [
         (
             "discovery from_locked_read",
             "src/provider/codex/discovery.rs",
@@ -348,6 +451,46 @@ fn every_rule_reports_its_plant() {
             "UFCS marker arm",
             "src/provider/codex/usage.rs",
             "    let t = RefreshStateFile::write_inflight(state, &c)?;",
+        ),
+        (
+            "settle from discovery",
+            "src/provider/codex/discovery.rs",
+            "    state.settle_inflight(DefiniteOutcome::Applied, Settled::default())?;",
+        ),
+        (
+            "oauth::refresh from discovery",
+            "src/provider/codex/discovery.rs",
+            "    let o = oauth::refresh(&c, token, &client, &cancel);",
+        ),
+        (
+            "oauth::refresh via an import outside codex",
+            "src/commands/status.rs",
+            "use crate::provider::codex::oauth;\nfn p() { let _ = oauth::refresh(c, t, r, x); }",
+        ),
+        (
+            "Landed with ..",
+            "src/provider/codex/refresh.rs",
+            "fn p(w: CodexWrite) { if let CodexWrite::Landed {\n    outcome, ..\n} = w {} }",
+        ),
+        (
+            "ChangedSinceRead receipt: _",
+            "src/provider/codex/refresh.rs",
+            "fn p(w: CodexWrite) { if let CodexWrite::ChangedSinceRead { receipt: _ } = w {} }",
+        ),
+        (
+            "resolve_pending tuple",
+            "src/provider/codex/refresh.rs",
+            "    let (decision,\n        _receipt, evidence) = owned.resolve_pending(&cancel)?;",
+        ),
+        (
+            "receipts taken, never audited",
+            "src/commands/codex/login.rs",
+            "fn p(w: CodexWrite) { if let CodexWrite::Landed { outcome, receipt } = w { drop(receipt) } }",
+        ),
+        (
+            "park receipt discarded",
+            "src/provider/codex/refresh.rs",
+            "    let _ = self.ns.park(&merged, fault);",
         ),
         (
             "from_process in a test",

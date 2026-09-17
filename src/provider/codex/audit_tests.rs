@@ -5,8 +5,10 @@ use std::time::Duration;
 use super::*;
 use crate::provider::codex::auth_store;
 use crate::provider::codex::auth_store::InstallNamespace;
+use crate::provider::codex::auth_store::UnknownClass;
 use crate::provider::codex::lock;
 use crate::provider::codex::lock::LockBudget;
+use crate::provider::codex::oauth::PermanentClass;
 use crate::provider::codex::proof::PostExitReport;
 use crate::provider::codex::testkit;
 use crate::runtime::coordinator::Cancel;
@@ -76,7 +78,7 @@ fn every_event_is_one_parseable_line() {
     let ids = (testkit::USER, testkit::ACCT);
     let events = [
         (
-            CodexEvent::Ambiguous { class: "interrupted", sent_digest8: "0123abcd" },
+            CodexEvent::Ambiguous { class: UnknownClass::Interrupted, sent_digest8: "0123abcd" },
             CodexOutcome::Ambiguous,
         ),
         (CodexEvent::Resend { sent_digest8: "0123abcd" }, CodexOutcome::Resend),
@@ -88,7 +90,7 @@ fn every_event_is_one_parseable_line() {
             CodexOutcome::AdoptedExternal,
         ),
         (
-            CodexEvent::NeedsLogin { class: "refresh_token_reused", sent_digest8: "0123abcd" },
+            CodexEvent::NeedsLogin { class: PermanentClass::Reused, sent_digest8: "0123abcd" },
             CodexOutcome::NeedsLogin,
         ),
         (CodexEvent::FloorReset, CodexOutcome::FloorReset),
@@ -124,9 +126,12 @@ fn the_field_guard_refuses_before_any_io() {
             CodexEvent::Resend { sent_digest8: "0123ABCD" },
         ),
         (
-            "a free-form class",
+            "a whole digest as the written grant",
             (testkit::USER, testkit::ACCT),
-            CodexEvent::Ambiguous { class: "agctl-test-codex-rt-0001", sent_digest8: "0123abcd" },
+            CodexEvent::AppliedAfterError {
+                sent_digest8: "0123abcd",
+                written_digest8: Some("agctl-test-codex-rt-0001"),
+            },
         ),
     ];
     for (name, ids, event) in tests {

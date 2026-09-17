@@ -232,11 +232,11 @@ main() {
         "fn _phase3_plant(doc: crate::provider::codex::credentials::Credentials, user: String, acct: String) -> crate::provider::codex::proof::VerifiedLogin { crate::provider::codex::proof::VerifiedLogin { doc, user, acct } }" \
         "VerifiedLogin literal outside provider::codex"
 
-    # Clause 2: `LockedCredentials::new` is private to credentials.rs, even
-    # from a sibling (refresh.rs from S32; auth_store.rs now).
-    clause 2 "$codex/auth_store.rs" E0624 \
+    # Clause 2 (moved into refresh.rs at S32): `LockedCredentials::new` is
+    # private to credentials.rs, even from the refresh driver.
+    clause 2 "$codex/refresh.rs" E0624 \
         "fn _phase3_plant(inner: super::credentials::Credentials) -> super::credentials::LockedCredentials<'static> { super::credentials::LockedCredentials::new(inner, (String::new(), String::new()), None) }" \
-        "LockedCredentials::new from a sibling module"
+        "LockedCredentials::new from the refresh driver"
 
     # Clause 3: the credential file's name is private to auth_store.rs.
     clause 3 "$cmd" E0603 \
@@ -269,10 +269,18 @@ main() {
         "fn _phase3_plant(c: &crate::provider::codex::credentials::LockedCredentials<'static>, t: crate::provider::codex::auth_store::InflightToken<'static>, r: &crate::provider::codex::oauth::RefreshClient, x: &crate::runtime::coordinator::Cancel) { let _ = crate::provider::codex::oauth::refresh(c, t, r, x); }" \
         "oauth::refresh from commands/"
 
-    # Clause 9: the token a POST consumes cannot be built by a sibling.
-    clause 9 "$codex/lock.rs" E0451 \
+    # Clause 9 (moved into refresh.rs at S32): the token a POST consumes
+    # cannot be built by the driver that sends the POST.
+    clause 9 "$codex/refresh.rs" E0451 \
         "fn _phase3_plant(digest8: String) -> super::auth_store::InflightToken<'static> { super::auth_store::InflightToken { digest8, _guard: std::marker::PhantomData } }" \
-        "InflightToken literal in a sibling of auth_store.rs"
+        "InflightToken literal in provider/codex/refresh.rs"
+
+    # Clause 10 (S32, ledger #272 ruling 1): a re-send consent cannot be built
+    # outside refresh.rs except through its confirming constructor. Planted in
+    # commands/codex/mod.rs until S34 creates accounts.rs.
+    clause 10 "$cmd" E0603 \
+        "fn _phase3_plant() -> crate::provider::codex::refresh::ResendConsent { crate::provider::codex::refresh::ResendConsent(()) }" \
+        "ResendConsent tuple literal from commands/"
 
     # Clause 11: a command cannot clear a refresh marker.
     clause 11 "$cmd" E0624 \
