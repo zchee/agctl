@@ -1137,3 +1137,164 @@ fn ac113_a_pending_grant_with_no_metadata_is_discarded_and_the_row_stays_due() {
         "the refresh that followed the discard did not install its grant:\n{installed}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A process that dies mid-write (AC123, AC124 (h))
+// ---------------------------------------------------------------------------
+
+/// Spawns the binary with the fixture's own environment, so a test that needs
+/// the child's pid keeps every isolation the fixture set up.
+///
+/// `assert_cmd::Command` does not expose `spawn`, and rebuilding the
+/// environment by hand would be the one place a test could quietly reach a
+/// real Codex home (AC109). Copying `get_program`/`get_args`/`get_envs` keeps
+/// the removals too: `get_envs` yields `None` for a variable the fixture
+/// deliberately unset.
+fn spawn_with(fixture: &CodexFixture, args: &[&str], env: &[(&str, &str)]) -> std::process::Child {
+    let template = fixture.cmd();
+    let mut command = std::process::Command::new(template.get_program());
+    command.args(template.get_args());
+    for (key, value) in template.get_envs() {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
+    }
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the binary runs")
+}
+
+/// Waits for `ready`, signals the child, and reaps it. Never leaves a child
+/// behind: a signal that does not land is followed by a kill.
+fn signal_when(
+    child: &mut std::process::Child,
+    signal: rustix::process::Signal,
+    what: &str,
+    ready: impl Fn() -> bool,
+) -> std::process::ExitStatus {
+    let start = std::time::Instant::now();
+    while !ready() && start.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(ready(), "{what}: the pass never reached the point this test signals at");
+    let pid =
+        rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("a pid fits in an i32"))
+            .expect("a live pid");
+    rustix::process::kill_process(pid, signal).expect("the signal is delivered");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match child.try_wait().expect("the child is waitable") {
+            Some(status) => return status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{what}: the child ignored the signal");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    }
+}
+
+/// The staged `<name>.tmp.<8hex>` files in the owned namespace.
+fn staged_tmps(fixture: &CodexFixture) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(namespace(fixture)) else { return Vec::new() };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp."))
+        .collect();
+    names.sort();
+    names
+}
+
+/// The fixture both signal tests share: an owned row that is due, a token
+/// endpoint that answers, and a pass paused between the fsync and the rename.
+fn interrupted_before_rename(
+    fixture: &CodexFixture,
+    signal: rustix::process::Signal,
+    what: &str,
+) -> std::process::ExitStatus {
+    owned(fixture, &auth_doc(USER, ACCT, 1_000, false, "agctl-test-codex-rt-0001"), "auto");
+    let mut child = spawn_with(
+        fixture,
+        &["codex", "status", "--account", USER],
+        &[("AGCTL_FAULT", "pause_codex_before_rename")],
+    );
+    // The staged file exists only between the fsync and the rename, which is
+    // exactly the window this test needs; no sleep decides anything.
+    let staged = || !staged_tmps(fixture).is_empty();
+    signal_when(&mut child, signal, what, staged)
+}
+
+#[test]
+fn ac124_h_sigterm_before_the_rename_keeps_the_grant_and_the_marker() {
+    let server = MockServer::start();
+    let token = server.mock(|when, then| {
+        when.method(POST).path(TOKEN_PATH);
+        then.status(200).json_body(grant("agctl-test-codex-rt-0002"));
+    });
+    let _usage = usage_mock(&server, 200);
+    let mut fixture = fixture(&server);
+
+    let status =
+        interrupted_before_rename(&fixture, rustix::process::Signal::TERM, "ac124-h-sigterm");
+
+    assert!(!status.success(), "the signal did not end the run: {status:?}");
+    assert_eq!(token.calls(), 1, "the refresh had not been sent when the signal arrived");
+    // The rotated grant is recoverable: the staged file is NOT registered with
+    // the emergency cleanup, so the signal handler leaves it alone (AC124 (h)).
+    let staged = staged_tmps(&fixture);
+    assert_eq!(staged.len(), 1, "the staged grant was unlinked on the way out: {staged:?}");
+    let recovered = fs::read_to_string(namespace(&fixture).join(&staged[0])).expect("the tmp");
+    assert!(recovered.contains("agctl-test-codex-rt-0002"), "the staged file lost the new grant");
+    // …and the credential itself still holds the grant that was sent, so
+    // nothing was half-installed.
+    let installed = fs::read_to_string(namespace(&fixture).join("auth.json")).expect("auth.json");
+    assert!(installed.contains("agctl-test-codex-rt-0001"), "the credential was rewritten anyway");
+    assert!(
+        marker(&fixture).expect("a marker")["inflight"].is_object(),
+        "the marker was cleared by a process that never learned the outcome"
+    );
+
+    // The next pass classifies the interruption and sends nothing (AC123, R70).
+    fixture.set("AGCTL_FAULT", "");
+    let next = run(&fixture, "ac124-h-next", &["codex", "status", "--account", USER]);
+    let stdout = String::from_utf8_lossy(&next.stdout);
+
+    assert!(stdout.contains("refresh outcome unknown"), "{stdout}");
+    assert_eq!(token.calls(), 1, "the next pass re-sent a grant whose fate is unknown");
+}
+
+#[test]
+fn ac123_sigint_before_the_rename_leaves_an_interrupted_outcome() {
+    let server = MockServer::start();
+    let token = server.mock(|when, then| {
+        when.method(POST).path(TOKEN_PATH);
+        then.status(200).json_body(grant("agctl-test-codex-rt-0002"));
+    });
+    let _usage = usage_mock(&server, 200);
+    let mut fixture = fixture(&server);
+
+    let status = interrupted_before_rename(&fixture, rustix::process::Signal::INT, "ac123-sigint");
+
+    assert!(!status.success(), "the signal did not end the run: {status:?}");
+    assert_eq!(staged_tmps(&fixture).len(), 1, "Ctrl-C unlinked the only copy of the new grant");
+    assert!(marker(&fixture).expect("a marker")["inflight"].is_object());
+
+    fixture.set("AGCTL_FAULT", "");
+    let next = run(&fixture, "ac123-sigint-next", &["codex", "status", "--account", USER]);
+    let stdout = String::from_utf8_lossy(&next.stdout);
+
+    // Nothing in-process classifies a send after a signal, so the *next* pass
+    // is what calls it interrupted — and it must not send again.
+    assert!(stdout.contains("refresh outcome unknown"), "{stdout}");
+    assert_eq!(token.calls(), 1, "a grant whose fate is unknown was sent again");
+}

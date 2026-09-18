@@ -434,38 +434,24 @@ pub enum DaemonEvidence {
 
 /// Codex's daemon pid record (fact F83), under either spelling.
 ///
-/// Only `pid` decides anything, and members this type does not name are
-/// ignored: `serde` tolerates them by default, so upstream's `processIdentity`
-/// (added at 0.155.0-alpha.12, and spelled `linuxProcessIdentity` on Linux)
-/// needs no field here to keep the record parsing. Modelling a member nothing
-/// compares would be dead code pretending to be a pin — review S33-C3b F1
-/// showed the field survived being deleted with the suite still green. The start time Codex recorded is compared by
-/// `mtime` instead, because its spelling is not settled (fact F83, open row);
-/// the executable digest is not needed once a recycled id is caught by time.
+/// **Only `pid` is read.** Every other member is ignored, `serde` tolerates
+/// unknown members by default, and no field is declared for one this crate
+/// does not compare: a field that exists only to be parsed is dead code
+/// pretending to be a pin, which review S33-C3b F1 demonstrated by deleting
+/// one with the suite still green. What is pinned instead is the property that
+/// has to hold as the vendor adds members —
+/// `d32_the_record_tolerates_members_this_crate_does_not_name`.
+///
+/// So `processStartTime` and `executableIdentity` are gone too. The recycled-id
+/// rule the plan states (D-032, AC93) compares agctl's **own**
+/// `proc::start_timestamp(pid)` against the **record's mtime**, not anything
+/// inside the record, and `processStartTime` is a raw `ps -o lstart=` string
+/// rather than a machine timestamp (fact F83), so parsing it would buy a second
+/// ground the plan never asked for at the cost of a locale-dependent parse.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PidRecord {
     pid: u32,
-    #[cfg_attr(
-        test,
-        expect(dead_code, reason = "parsed to pin the record's shape (F83); never compared")
-    )]
-    process_start_time: Option<serde_json::Value>,
-    #[cfg_attr(
-        test,
-        expect(dead_code, reason = "parsed to pin the record's shape (F83); never compared")
-    )]
-    executable_identity: Option<ExecutableIdentity>,
-}
-
-/// The executable fingerprint inside a [`PidRecord`].
-#[derive(Debug, Deserialize)]
-struct ExecutableIdentity {
-    #[cfg_attr(
-        test,
-        expect(dead_code, reason = "parsed to pin the record's shape (F83); never compared")
-    )]
-    digest: String,
 }
 
 /// Looks for Codex's daemon in the home at `dir`, without contending for any
