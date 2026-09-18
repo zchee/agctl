@@ -34,6 +34,7 @@
 //! No credential outlives the row it was read for: a [`CodexRowOutcome`]
 //! holds ids, figures and states, never a token (invariant I24).
 
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -279,8 +280,16 @@ pub fn plan_rows(
         plans.push(PlanSource::LiveUnreadable { reason: err.to_string() });
     }
     for source in sources {
-        plans.push(match source {
-            CodexSource::Live { home } => PlanSource::Live { home },
+        let planned = match source {
+            CodexSource::Live { home } => {
+                if !live_home_exists(&home) {
+                    // A machine that has never run Codex has no live row at
+                    // all, rather than a `needs login` one that forces exit 2
+                    // beside healthy owned rows (review S33-C2 B3).
+                    continue;
+                }
+                PlanSource::Live { home }
+            }
             CodexSource::HomeReadOnly { record, dir } => {
                 PlanSource::HomeReadOnly { record: record.clone(), dir: dir.to_path_buf() }
             }
@@ -290,13 +299,31 @@ pub fn plan_rows(
             CodexSource::InvalidOwned { record } => {
                 PlanSource::InvalidOwned { record: record.clone() }
             }
-        });
+        };
+        plans.push(planned);
     }
     plans
         .into_iter()
         .enumerate()
         .map(|(index, source)| RowPlan { index, source, pre_pass: None, retry: None })
         .collect()
+}
+
+/// Whether the resolved live Codex home is on disk at all.
+///
+/// Only the `CODEX_HOME`-unset path can reach here with a missing directory:
+/// `home::codex_home` stats and canonicalizes an explicit `CODEX_HOME` and
+/// turns a missing one into `HomeError::Missing`, which is already its own
+/// row. So "not there" here means "this machine has never run Codex", and the
+/// honest report is no live row rather than one that says `needs login`
+/// (review S33-C2 B3).
+///
+/// A dangling `~/.codex` symlink is **not** missing: `symlink_metadata` reads
+/// the link itself, so something is there, it is broken, and the row says so
+/// instead of vanishing. A home that cannot be stat'ed for any other reason
+/// (a permission on its parent) also keeps its row.
+fn live_home_exists(home: &Path) -> bool {
+    !std::fs::symlink_metadata(home).is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
 }
 
 /// Narrows the plans to `--account`: a user id, `<user>/<account>`, an email

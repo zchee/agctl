@@ -198,6 +198,68 @@ fn d18_a_codex_home_with_no_credential_says_so_and_needs_login() {
     assert_eq!(usage.calls(), 0, "a home with no credential was fetched");
 }
 
+#[test]
+fn b3_a_machine_that_has_never_run_codex_has_no_live_row() {
+    let store = Store::new();
+    let home = store.root().join("no-such-user");
+    fs::create_dir_all(&home).expect("a home directory");
+    let env = CodexEnv::new(None, Some(home.clone()));
+
+    let plans = plan_rows(&store.paths, &[], &env, &Cancel::new());
+
+    assert!(plans.is_empty(), "a home with no `.codex` still planned a row: {plans:?}");
+    assert!(!home.join(".codex").exists(), "the test created the directory it is asserting about");
+}
+
+#[test]
+fn b3_an_existing_codex_home_without_a_credential_keeps_its_row() {
+    let store = Store::new();
+    let home = store.root().join("has-codex");
+    fs::create_dir_all(home.join(".codex")).expect("a Codex home");
+    let env = CodexEnv::new(None, Some(home));
+
+    let plans = plan_rows(&store.paths, &[], &env, &Cancel::new());
+
+    assert_eq!(plans.len(), 1, "{plans:?}");
+    assert!(matches!(plans[0].source, PlanSource::Live { .. }), "{plans:?}");
+    // D18 still holds for a home that exists: the row says so and exits 2.
+    let row = only(store.watch(plans));
+    assert_eq!(row.state, CodexState::NeedsLogin);
+    assert_eq!(row.note.as_deref(), Some("no credential in this Codex home"));
+}
+
+#[test]
+fn b3_a_home_that_cannot_be_stated_keeps_its_row() {
+    let store = Store::new();
+    // A regular file where a directory belongs: `symlink_metadata` on
+    // `<file>/.codex` fails with ENOTDIR, not NotFound. Only NotFound means
+    // "this machine has never run Codex"; everything else is a home that is
+    // there and unreadable, and its row says so (review S33-C3a F2).
+    let home = store.root().join("a-file-not-a-directory");
+    fs::write(&home, b"not a directory").expect("a regular file");
+    let err = fs::symlink_metadata(home.join(".codex")).expect_err("a path under a file");
+    assert_ne!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+    let env = CodexEnv::new(None, Some(home));
+
+    let plans = plan_rows(&store.paths, &[], &env, &Cancel::new());
+
+    assert_eq!(plans.len(), 1, "a home that cannot be stat'ed vanished instead of reporting");
+    assert!(matches!(plans[0].source, PlanSource::Live { .. }), "{plans:?}");
+}
+
+#[test]
+fn b3_a_dangling_codex_symlink_is_not_a_missing_home() {
+    let store = Store::new();
+    let home = store.root().join("dangling");
+    fs::create_dir_all(&home).expect("a home directory");
+    std::os::unix::fs::symlink(home.join("nowhere"), home.join(".codex")).expect("a symlink");
+    let env = CodexEnv::new(None, Some(home));
+
+    let plans = plan_rows(&store.paths, &[], &env, &Cancel::new());
+
+    assert_eq!(plans.len(), 1, "a broken Codex home vanished instead of reporting: {plans:?}");
+}
+
 // --- selection and the display id ------------------------------------------
 
 #[test]

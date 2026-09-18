@@ -134,8 +134,6 @@ pub enum CodexState {
         /// Why, as a path and an errno.
         reason: String,
     },
-    /// A refresh lost a race with another writer.
-    RefreshRacedExternal,
     /// The account's refresh policy is `never`.
     RefreshDisabled,
     /// A 401 inside the refresh floor.
@@ -176,7 +174,6 @@ impl CodexState {
             Self::IdentityDrift => "identity_drift",
             Self::RefreshOutcomeUnknown { .. } => "refresh_outcome_unknown",
             Self::RefreshStateUnavailable { .. } => "refresh_state_unavailable",
-            Self::RefreshRacedExternal => "refresh_raced_external",
             Self::RefreshDisabled => "refresh_disabled",
             Self::UnauthorizedFloor => "unauthorized_floor",
             Self::UnauthorizedTerminal => "unauthorized_terminal",
@@ -234,7 +231,6 @@ impl CodexState {
             Self::RefreshStateUnavailable { reason } => {
                 format!("refresh state unavailable: {reason}")
             }
-            Self::RefreshRacedExternal => "refresh raced an external writer".to_owned(),
             Self::RefreshDisabled => "refresh disabled".to_owned(),
             Self::UnauthorizedFloor => "unauthorized (refresh floor)".to_owned(),
             Self::UnauthorizedTerminal => "unauthorized (refresh did not help)".to_owned(),

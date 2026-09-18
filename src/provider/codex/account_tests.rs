@@ -32,7 +32,6 @@ fn every_state() -> Vec<CodexState> {
             resend_eligible: false,
         },
         CodexState::RefreshStateUnavailable { reason: "x".to_owned() },
-        CodexState::RefreshRacedExternal,
         CodexState::RefreshDisabled,
         CodexState::UnauthorizedFloor,
         CodexState::UnauthorizedTerminal,
