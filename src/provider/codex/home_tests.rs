@@ -237,9 +237,14 @@ fn open_readonly_nofollow_flags_cannot_create_or_write() {
 }
 
 fn write_pid_record(home: &Path, pid: u32, mtime: Option<Timestamp>) {
+    write_named_pid_record(home, "app-server.pid", pid, mtime);
+}
+
+/// The same record under either of F83's two names.
+fn write_named_pid_record(home: &Path, name: &str, pid: u32, mtime: Option<Timestamp>) {
     let daemon = home.join("app-server-daemon");
     fs::create_dir_all(&daemon).expect("mkdir");
-    let path = daemon.join("app-server.pid");
+    let path = daemon.join(name);
     let body = format!(
         r#"{{"pid":{pid},"processStartTime":"Wed Sep 16 21:40:50 2026","executableIdentity":{{"digest":"abc"}}}}"#
     );
@@ -353,4 +358,160 @@ fn this_file_names_no_process_environment() {
     let code = source.lines().filter(|line| !line.trim_start().starts_with("//"));
     assert!(code.clone().all(|line| !line.contains(&needle)), "home.rs reads the environment");
     assert_eq!(source.matches(&format!("\"{}\"", CODEX_HOME_ENV)).count(), 1);
+}
+
+// --- F83's second pid-record name (deviation D32) ---------------------------
+
+#[test]
+fn d32_a_live_daemon_is_seen_under_either_pid_record_name() {
+    // At 0.155.0-alpha.12 the name is `app-server.pid` only while the managed
+    // codex binary is under `<CODEX_HOME>/packages/standalone`, and `daemon.pid`
+    // otherwise. Reading one name let a live daemon read as `ArtefactOnly`,
+    // which the refresh gate passes with a note — fail-open.
+    let cancel = Cancel::new();
+    let me = std::process::id();
+    for name in ["app-server.pid", "daemon.pid"] {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_named_pid_record(home.path(), name, me, None);
+        assert_eq!(
+            daemon_evidence(home.path(), &cancel),
+            DaemonEvidence::PidAlive(me),
+            "a live daemon under `{name}` was not seen"
+        );
+    }
+}
+
+#[test]
+fn d32_a_torn_record_under_the_second_name_still_blocks() {
+    let cancel = Cancel::new();
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = home.path().join("app-server-daemon");
+    fs::create_dir_all(&daemon).expect("mkdir");
+    fs::write(daemon.join("daemon.pid"), b"{\"pid\":").expect("a torn record");
+
+    assert_eq!(
+        daemon_evidence(home.path(), &cancel),
+        DaemonEvidence::RecordUnreadable,
+        "a record being published under the new name must still stop a send (review S30 F8)"
+    );
+}
+
+#[test]
+fn d32_when_both_names_exist_the_stronger_evidence_wins() {
+    // A migrated host can hold both: nothing cleans the legacy record up.
+    let cancel = Cancel::new();
+    let me = std::process::id();
+
+    // Live under the new name, dead under the old one.
+    let home = tempfile::tempdir().expect("tempdir");
+    write_named_pid_record(home.path(), "app-server.pid", u32::MAX - 1, None);
+    write_named_pid_record(home.path(), "daemon.pid", me, None);
+    assert_eq!(daemon_evidence(home.path(), &cancel), DaemonEvidence::PidAlive(me));
+
+    // Live under the old name, dead under the new one: the same answer.
+    let home = tempfile::tempdir().expect("tempdir");
+    write_named_pid_record(home.path(), "app-server.pid", me, None);
+    write_named_pid_record(home.path(), "daemon.pid", u32::MAX - 1, None);
+    assert_eq!(daemon_evidence(home.path(), &cancel), DaemonEvidence::PidAlive(me));
+
+    // A torn record outranks a dead one: a daemon may be starting.
+    let home = tempfile::tempdir().expect("tempdir");
+    write_named_pid_record(home.path(), "app-server.pid", u32::MAX - 1, None);
+    fs::write(home.path().join("app-server-daemon/daemon.pid"), b"{").expect("a torn record");
+    assert_eq!(daemon_evidence(home.path(), &cancel), DaemonEvidence::RecordUnreadable);
+
+    // …and a live pid outranks a torn record.
+    write_named_pid_record(home.path(), "app-server.pid", me, None);
+    assert_eq!(daemon_evidence(home.path(), &cancel), DaemonEvidence::PidAlive(me));
+}
+
+#[test]
+fn d32_the_record_tolerates_members_this_crate_does_not_name() {
+    // Upstream added `processIdentity` at alpha.12 (spelled
+    // `linuxProcessIdentity` on Linux) and may add more. `PidRecord` models
+    // none of them and must not have to: `serde` ignores unknown members
+    // unless `deny_unknown_fields` is set, and the unknown-member case below is
+    // what proves this type does not set it. Modelling a member nothing
+    // compares would be dead code pretending to be a pin (review S33-C3b F1).
+    let cancel = Cancel::new();
+    let me = std::process::id();
+    let three =
+        format!(r#"{{"pid":{me},"processStartTime":"x","executableIdentity":{{"digest":"d"}}}}"#);
+    let bodies = [
+        // The shape on disk today, and the shape before `executableIdentity`.
+        format!(r#"{{"pid":{me}}}"#),
+        three.clone(),
+        // The fourth member, under both spellings.
+        format!(
+            r#"{{"pid":{me},"processStartTime":"x","executableIdentity":{{"digest":"d"}},"processIdentity":{{"pidfdInode":7}}}}"#
+        ),
+        format!(
+            r#"{{"pid":{me},"processStartTime":"x","executableIdentity":{{"digest":"d"}},"linuxProcessIdentity":{{"pidfdInode":7}}}}"#
+        ),
+        // A member no version of Codex has ever written: the general case.
+        format!(
+            r#"{{"pid":{me},"processStartTime":"x","executableIdentity":{{"digest":"d"}},"somethingCodexAddsLater":[1,2,3]}}"#
+        ),
+    ];
+
+    let mut home = tempfile::tempdir().expect("tempdir");
+    let daemon = home.path().join("app-server-daemon");
+    fs::create_dir_all(&daemon).expect("mkdir");
+    fs::write(daemon.join("daemon.pid"), &three).expect("write");
+    let baseline = daemon_evidence(home.path(), &cancel);
+    assert_eq!(baseline, DaemonEvidence::PidAlive(me), "the three-member record must parse");
+
+    for body in bodies {
+        home = tempfile::tempdir().expect("tempdir");
+        let daemon = home.path().join("app-server-daemon");
+        fs::create_dir_all(&daemon).expect("mkdir");
+        fs::write(daemon.join("daemon.pid"), &body).expect("write");
+        assert_eq!(
+            daemon_evidence(home.path(), &cancel),
+            baseline,
+            "this record shape did not read the same as the three-member one: {body}"
+        );
+    }
+}
+
+#[test]
+fn f3_two_live_records_report_the_one_written_last() {
+    // A migrated host can hold both names with both processes alive; the
+    // leftover record must not be the one the row names (review S33-C3b F3).
+    // Two *different* live pids are needed for the assertion to distinguish
+    // which record was read, so this test uses its own and its parent's, and
+    // sets both mtimes after this process started so neither is `Recycled`.
+    let cancel = Cancel::new();
+    let me = std::process::id();
+    let parent = std::os::unix::process::parent_id();
+    assert_ne!(me, parent, "this test needs two live pids");
+    let now = Timestamp::now();
+    let later = now + SignedDuration::from_secs(5);
+
+    let home = tempfile::tempdir().expect("tempdir");
+    write_named_pid_record(home.path(), "app-server.pid", me, Some(now));
+    write_named_pid_record(home.path(), "daemon.pid", parent, Some(later));
+    assert_eq!(
+        daemon_evidence(home.path(), &cancel),
+        DaemonEvidence::PidAlive(parent),
+        "the stale legacy record was reported over the current one"
+    );
+
+    // The same the other way round, so the answer is the mtime and not the
+    // order of `DAEMON_PID_FILES`.
+    let home = tempfile::tempdir().expect("tempdir");
+    write_named_pid_record(home.path(), "app-server.pid", me, Some(later));
+    write_named_pid_record(home.path(), "daemon.pid", parent, Some(now));
+    assert_eq!(
+        daemon_evidence(home.path(), &cancel),
+        DaemonEvidence::PidAlive(me),
+        "the tiebreak followed the file name rather than the write time"
+    );
+
+    // The tiebreak never weakens the verdict: a live record still beats a
+    // newer artefact.
+    let home = tempfile::tempdir().expect("tempdir");
+    write_named_pid_record(home.path(), "app-server.pid", me, Some(now));
+    write_named_pid_record(home.path(), "daemon.pid", u32::MAX - 1, Some(later));
+    assert_eq!(daemon_evidence(home.path(), &cancel), DaemonEvidence::PidAlive(me));
 }

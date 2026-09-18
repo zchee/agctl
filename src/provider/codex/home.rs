@@ -24,7 +24,7 @@
 //!
 //! [`daemon_evidence`] looks for Codex's shared app-server daemon in a home
 //! (facts F72, F83) without taking part in any of its locks: it never opens
-//! `daemon.lock`, and reads `app-server.pid` through
+//! `daemon.lock`, and reads both spellings of the pid record through
 //! [`open_readonly_nofollow`], whose flags cannot create or write.
 
 use std::ffi::OsString;
@@ -58,8 +58,19 @@ const CONFIG_FILE: &str = "config.toml";
 /// The daemon directory inside a Codex home (fact F83).
 const DAEMON_DIR: &str = "app-server-daemon";
 
-/// The daemon's pid record (fact F83).
-const DAEMON_PID_FILE: &str = "app-server.pid";
+/// The daemon's pid record, under either of the two names Codex gives it
+/// (fact F83, re-checked at 0.155.0-alpha.12).
+///
+/// The name is conditional upstream: `app-server.pid` while the managed codex
+/// binary lives under `<CODEX_HOME>/packages/standalone`, and `daemon.pid`
+/// otherwise (`app-server-daemon/src/lib.rs:43-49`, selected at `:316-330` and
+/// `:354-356`). agctl cannot see which branch a host is on without reading the
+/// daemon's own state, and it does not need to: it reads both and takes the
+/// strongest evidence, so a live daemon stops a refresh under either name.
+/// Reading one name only was a **fail-open** gap — a live daemon writing the
+/// other name read as `ArtefactOnly`, which the refresh gate passes with a note
+/// (deviation D32).
+const DAEMON_PID_FILES: [&str; 2] = ["app-server.pid", "daemon.pid"];
 
 /// The largest `config.toml` this module will parse.
 const MAX_CONFIG_BYTES: u64 = 1 << 20;
@@ -421,9 +432,14 @@ pub enum DaemonEvidence {
     RecordUnreadable,
 }
 
-/// Codex's `app-server.pid` (fact F83).
+/// Codex's daemon pid record (fact F83), under either spelling.
 ///
-/// Only `pid` decides anything. The start time Codex recorded is compared by
+/// Only `pid` decides anything, and members this type does not name are
+/// ignored: `serde` tolerates them by default, so upstream's `processIdentity`
+/// (added at 0.155.0-alpha.12, and spelled `linuxProcessIdentity` on Linux)
+/// needs no field here to keep the record parsing. Modelling a member nothing
+/// compares would be dead code pretending to be a pin — review S33-C3b F1
+/// showed the field survived being deleted with the suite still green. The start time Codex recorded is compared by
 /// `mtime` instead, because its spelling is not settled (fact F83, open row);
 /// the executable digest is not needed once a recycled id is caught by time.
 #[derive(Debug, Deserialize)]
@@ -472,20 +488,60 @@ pub fn daemon_evidence(dir: &Path, cancel: &Cancel) -> DaemonEvidence {
         Ok(_) => return DaemonEvidence::ArtefactOnly,
         Err(_) => return DaemonEvidence::None,
     }
-    let record = daemon.join(DAEMON_PID_FILE);
-    let Some((pid, written)) = read_pid_record(&record) else {
+    DAEMON_PID_FILES
+        .iter()
+        .map(|name| one_record(&daemon.join(name), cancel))
+        .reduce(stronger)
+        .map_or(DaemonEvidence::ArtefactOnly, |(evidence, _)| evidence)
+}
+
+/// What one pid record says, whichever name it is under, and when that record
+/// was last written — the tiebreak when both names name a live process.
+fn one_record(record: &Path, cancel: &Cancel) -> (DaemonEvidence, Option<Timestamp>) {
+    let Some((pid, written)) = read_pid_record(record) else {
         // `daemon.lock` alone is only an artefact; the lock itself is never
         // opened, so it is never named here either. A record that is there
         // and cannot be used may be one being published (review S30 F8).
-        return match std::fs::symlink_metadata(&record) {
+        let evidence = match std::fs::symlink_metadata(record) {
             Err(err) if err.kind() == io::ErrorKind::NotFound => DaemonEvidence::ArtefactOnly,
             _ => DaemonEvidence::RecordUnreadable,
         };
+        return (evidence, None);
     };
     if pid == 0 || !proc::exists(pid) {
-        return DaemonEvidence::ArtefactOnly;
+        return (DaemonEvidence::ArtefactOnly, Some(written));
     }
-    classify_live(pid, proc::start_timestamp(pid, cancel), written)
+    (classify_live(pid, proc::start_timestamp(pid, cancel), written), Some(written))
+}
+
+/// The evidence that stops more: a live daemon outranks a record that cannot
+/// be read, which outranks a recycled id, which outranks a bare artefact.
+///
+/// Both names can exist at once — an upgrade migrates a host from one to the
+/// other (`migration.rs:35,85,140`), and nothing cleans the old record up — so
+/// two answers have to become one, and the safe direction is the one that
+/// sends less. **Equal verdicts are broken toward the record written last**,
+/// so a migrated host naming two live pids reports the daemon whose record is
+/// current rather than the leftover one (review S33-C3b F3). The array order
+/// is not a tiebreak: which name is current depends on the host, and the mtime
+/// does not.
+fn stronger(
+    left: (DaemonEvidence, Option<Timestamp>),
+    right: (DaemonEvidence, Option<Timestamp>),
+) -> (DaemonEvidence, Option<Timestamp>) {
+    let rank = |evidence: &DaemonEvidence| match evidence {
+        DaemonEvidence::PidAlive(_) => 4,
+        DaemonEvidence::RecordUnreadable => 3,
+        DaemonEvidence::Recycled(_) => 2,
+        DaemonEvidence::ArtefactOnly => 1,
+        DaemonEvidence::None => 0,
+    };
+    match rank(&right.0).cmp(&rank(&left.0)) {
+        std::cmp::Ordering::Greater => right,
+        std::cmp::Ordering::Less => left,
+        std::cmp::Ordering::Equal if right.1 > left.1 => right,
+        std::cmp::Ordering::Equal => left,
+    }
 }
 
 /// Alive or recycled, from the process's start and the record's `mtime`.

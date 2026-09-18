@@ -101,11 +101,19 @@ fn auth_doc(user: &str, acct: &str, exp: i64, fedramp: bool, rt: &str) -> Value 
 }
 
 fn usage_body() -> Value {
+    body_for(ACCT)
+}
+
+/// The usage body an account's own GET answers. The endpoint echoes the
+/// account it was asked about, so a mock that answers one id for every row
+/// misreports whichever row is not that one — visible in `--raw` and in v2's
+/// `raw` member (review S33-C3a carry).
+fn body_for(account: &str) -> Value {
     json!({
         "plan_type": "pro",
         "email": "agctl-test-codex-email-0001",
         "user_id": USER,
-        "account_id": ACCT,
+        "account_id": account,
         "rate_limit": {
             "allowed": true,
             "limit_reached": false,
@@ -182,9 +190,15 @@ fn checked(name: &str, output: Output) -> Output {
 #[test]
 fn ac102_status_json_validates_against_v2_and_carries_no_needle() {
     let server = MockServer::start();
+    // One mock per account, matched on the header the GET carries, so each row
+    // is answered with its own `account_id` (review S33-C3a carry).
     let usage = server.mock(|when, then| {
-        when.method(GET).path(USAGE_PATH);
-        then.status(200).json_body(usage_body());
+        when.method(GET).path(USAGE_PATH).header("chatgpt-account-id", ACCT);
+        then.status(200).json_body(body_for(ACCT));
+    });
+    let usage_live = server.mock(|when, then| {
+        when.method(GET).path(USAGE_PATH).header("chatgpt-account-id", LIVE_ACCT);
+        then.status(200).json_body(body_for(LIVE_ACCT));
     });
     let fixture = fixture(&server);
     // One user id across both rows, so D-039's qualification is still what is
@@ -228,8 +242,9 @@ fn ac102_status_json_validates_against_v2_and_carries_no_needle() {
     }
     accounts.sort();
     assert_eq!(accounts, [ACCT, LIVE_ACCT].map(str::to_owned), "{document:#}");
-    // Exact, and deterministic now that the two rows key different cache files.
-    assert_eq!(usage.calls(), 2);
+    // Exact, and deterministic now that the two rows key different cache files:
+    // one GET each, each answered with its own account.
+    assert_eq!((usage.calls(), usage_live.calls()), (1, 1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("codex_account"), "tracing is on, so the span is printed:\n{stderr}");
     assert!(stderr.contains(USER), "the display id is traced (review S31 F6):\n{stderr}");
@@ -929,4 +944,196 @@ fn ac124_a_prime_an_adopted_grant_that_is_rejected_needs_login() {
     assert_eq!(doc["rows"][0]["state"], "adopted_grant_dead", "{}", doc["rows"][0]);
     assert_eq!(token.calls(), 1, "a dead adopted grant was refreshed again");
     assert_eq!(usage.calls(), 1, "the verify GET ran more than once");
+}
+
+#[test]
+fn f7_account_live_on_a_machine_without_codex_is_an_unmatched_selector() {
+    // Deviation D30 drops the live row when the home is absent, so `--account
+    // live` then matches nothing. Ruled acceptable for phase 3 (an unmatched
+    // selector is the honest answer when there is no live row); this pins the
+    // exact wording and exit code so it stays a decision rather than drifting
+    // into an accident (review S33-C3a F7).
+    let server = MockServer::start();
+    let usage = usage_mock(&server, 200);
+    let fixture = fixture(&server);
+    owned(
+        &fixture,
+        &auth_doc(USER, ACCT, now_s() + 9 * 86_400, false, "agctl-test-codex-rt-0001"),
+        "auto",
+    );
+    assert!(!fixture.inner().home().join(".codex").exists(), "this machine has no Codex home");
+
+    let output = run(&fixture, "f7-live-absent", &["codex", "status", "--account", "live"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(1), "a selector that matches nothing is fatal: {stderr}");
+    assert!(
+        stderr.contains("no Codex account matches `live`"),
+        "the message does not name the selector:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("{USER}/{ACCT}")),
+        "the message does not list what it could have matched:\n{stderr}"
+    );
+    assert_eq!(usage.calls(), 0, "a failed selector still fetched");
+
+    // The same selector against a home that exists resolves to the live row.
+    fs::create_dir_all(fixture.inner().home().join(".codex")).expect("a Codex home");
+    let output = run(&fixture, "f7-live-present", &["codex", "status", "--account", "live"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(2), "{stdout}");
+    assert!(stdout.contains("no credential in this Codex home"), "{stdout}");
+}
+
+#[test]
+fn ac94_a_torn_credential_file_says_so_and_is_never_refreshed() {
+    let server = MockServer::start();
+    let usage = usage_mock(&server, 200);
+    let token = server.mock(|when, then| {
+        when.method(POST).path(TOKEN_PATH);
+        then.status(200).json_body(grant("agctl-test-codex-rt-0002"));
+    });
+    let fixture = fixture(&server);
+    // A file caught mid-rewrite: valid UTF-8, not valid JSON.
+    write_0600(&live_auth(&fixture), b"{\"tokens\":{\"access_to");
+    owned(&fixture, &auth_doc(USER, ACCT, 1_000, false, "agctl-test-codex-rt-0001"), "auto");
+    write_0600(&namespace(&fixture).join("auth.json"), b"{\"tokens\":{\"access_to");
+
+    let output = run(&fixture, "ac94-torn", &["codex", "status"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(2), "{stdout}");
+    assert!(
+        stdout.contains("auth.json was being rewritten"),
+        "a torn file must say so, and name the file:\n{stdout}"
+    );
+    assert!(!stdout.contains("needs login"), "a torn file is never a missing one:\n{stdout}");
+    assert_eq!(token.calls(), 0, "a torn file was refreshed");
+    assert_eq!(usage.calls(), 0, "a torn file was fetched");
+}
+
+#[test]
+fn ac95_the_live_home_is_read_from_the_environment_and_only_when_it_is_there() {
+    // The `CODEX_HOME`-unset rule through the binary: the live home is
+    // `$HOME/.codex`, read when it holds a credential and dropped when the
+    // directory is absent (deviation D30). The two `CODEX_HOME`-*set* cases
+    // cannot be driven through `codex status`: `--codex-home` exists only on
+    // `codex import` (`cli.rs:842`), which is a stub until S34, and the
+    // harness refuses to put the variable in a child's environment (AC109,
+    // `tests/common/codex.rs:143-151`). Stated in the request.
+    let server = MockServer::start();
+    let usage = usage_mock(&server, 200);
+    let fixture = fixture(&server);
+
+    let absent = run(&fixture, "ac95-unset-absent", &["codex", "status"]);
+    assert_eq!(absent.status.code(), Some(0), "no home, no row");
+    assert_eq!(usage.calls(), 0);
+
+    let doc = auth_doc(USER, ACCT, now_s() + 86_400, false, "agctl-test-codex-rt-0001");
+    write_0600(&live_auth(&fixture), &serde_json::to_vec_pretty(&doc).expect("serializes"));
+    assert_eq!(
+        live_auth(&fixture).parent().expect("a home"),
+        fixture.inner().home().join(".codex"),
+        "the live home is `$HOME/.codex`, taken from the environment"
+    );
+
+    let present = run(&fixture, "ac95-unset-present", &["codex", "status"]);
+    let stdout = String::from_utf8_lossy(&present.stdout);
+
+    assert_eq!(present.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("live"), "the live row is named `live` when it has no registry id");
+    assert_eq!(usage.calls(), 1, "the live home's credential was read and used");
+}
+
+#[test]
+fn ac113_a_parked_grant_is_replayed_on_the_next_pass_without_a_second_post() {
+    let server = MockServer::start();
+    let usage = usage_mock(&server, 200);
+    let token = server.mock(|when, then| {
+        when.method(POST).path(TOKEN_PATH);
+        then.status(200).json_body(grant("agctl-test-codex-rt-0002"));
+    });
+    let mut fixture = fixture(&server);
+    owned(&fixture, &auth_doc(USER, ACCT, 1_000, false, "agctl-test-codex-rt-0001"), "auto");
+
+    // The rename that installs the refreshed grant fails, so it is parked.
+    fixture.set("AGCTL_FAULT", "codex_rename_fail");
+    let parked = run(&fixture, "ac113-park", &["codex", "status", "--account", USER]);
+    assert_eq!(token.calls(), 1, "{}", String::from_utf8_lossy(&parked.stdout));
+    let ns = namespace(&fixture);
+    assert!(ns.join("auth.json.pending").is_file(), "the grant was not parked");
+    assert!(ns.join("auth.pending.meta").is_file(), "the pending metadata is missing");
+
+    fixture.set("AGCTL_FAULT", "");
+    let replayed = run(&fixture, "ac113-replay", &["codex", "status", "--account", USER]);
+    let stdout = String::from_utf8_lossy(&replayed.stdout);
+
+    assert!(
+        stdout.contains("pending replayed"),
+        "the row does not say the parked grant was replayed:\n{stdout}"
+    );
+    // Discriminating: the credential under the pending file is expired, so a
+    // replay that failed to install would leave the row due and this pass
+    // would POST a second time.
+    assert_eq!(token.calls(), 1, "the replay sent a second refresh:\n{stdout}");
+    assert!(usage.calls() >= 1, "the replayed grant was never used");
+    let installed = fs::read_to_string(ns.join("auth.json")).expect("the credential");
+    assert!(installed.contains("agctl-test-codex-rt-0002"), "the parked grant was not replayed");
+    assert!(!ns.join("auth.json.pending").exists(), "the pending file outlived its replay");
+    assert!(!ns.join("auth.pending.meta").exists(), "the pending metadata outlived its replay");
+}
+
+#[test]
+fn ac113_a_pending_grant_with_no_metadata_is_discarded_and_the_row_stays_due() {
+    let server = MockServer::start();
+    let _usage = usage_mock(&server, 200);
+    let token = server.mock(|when, then| {
+        when.method(POST).path(TOKEN_PATH);
+        then.status(200).json_body(grant("agctl-test-codex-rt-0003"));
+    });
+    let fixture = fixture(&server);
+    // The credential on disk is **expired**, and the pending grant beside it is
+    // not. That is what makes the POST count discriminating rather than free:
+    // discarding the pending file leaves the row due, so exactly one refresh
+    // goes out; applying it would leave the row fresh and send nothing. The
+    // AC113 table's "0 POSTs" belongs to the replay case, which the test above
+    // pins; here the honest discriminating claim is the opposite one
+    // (review S33-C3b, second test assertion).
+    owned(&fixture, &auth_doc(USER, ACCT, 1_000, false, "agctl-test-codex-rt-0001"), "auto");
+    let ns = namespace(&fixture);
+    write_0600(
+        &ns.join("auth.json.pending"),
+        &serde_json::to_vec_pretty(&auth_doc(
+            USER,
+            ACCT,
+            now_s() + 9 * 86_400,
+            false,
+            "agctl-test-codex-rt-0009",
+        ))
+        .expect("serializes"),
+    );
+
+    let output = run(&fixture, "ac113-discard", &["codex", "status", "--account", USER]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("pending discarded"),
+        "the row does not say the pending grant was discarded:\n{stdout}"
+    );
+    assert!(!ns.join("auth.json.pending").exists(), "an invalid pending file was kept:\n{stdout}");
+    let installed = fs::read_to_string(ns.join("auth.json")).expect("the credential");
+    assert!(
+        !installed.contains("agctl-test-codex-rt-0009"),
+        "a pending grant with no metadata was applied anyway:\n{installed}"
+    );
+    assert_eq!(
+        token.calls(),
+        1,
+        "the row was due after the discard, so exactly one refresh should have gone out:\n{stdout}"
+    );
+    assert!(
+        installed.contains("agctl-test-codex-rt-0003"),
+        "the refresh that followed the discard did not install its grant:\n{installed}"
+    );
 }

@@ -1427,3 +1427,64 @@ fn a_resend_is_stopped_by_daemon_evidence() {
 
     post.assert_calls(0);
 }
+
+// ---------------------------------------------------------------------------
+// F83's second pid-record name (deviation D32)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn d32_a_live_daemon_under_the_second_name_stops_a_proactive_refresh() {
+    let server = MockServer::start();
+    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let permit = permit(&server.url(TOKEN_PATH));
+    let me = std::process::id();
+
+    for name in ["app-server.pid", "daemon.pid"] {
+        let live = Fixture::expired();
+        let daemon = live.ns_dir().join("app-server-daemon");
+        fs::create_dir(&daemon).expect("mkdir");
+        fs::write(
+            daemon.join(name),
+            json!({"pid": me, "processStartTime": "x", "executableIdentity": {"digest": "x"}})
+                .to_string(),
+        )
+        .expect("write");
+
+        assert_eq!(
+            live.run(SendMode::Proactive, &permit).step,
+            RefreshStep::SessionDetected(me),
+            "a live daemon under `{name}` did not stop a proactive refresh"
+        );
+    }
+    post.assert_calls(0);
+}
+
+#[test]
+fn d32_a_live_daemon_under_the_second_name_stops_a_resend() {
+    let server = MockServer::start();
+    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let permit = permit(&server.url(TOKEN_PATH));
+    let me = std::process::id();
+
+    for name in ["app-server.pid", "daemon.pid"] {
+        let live = Fixture::expired();
+        let marker = unknown_marker(&live, 7200, UnknownClass::Ambiguous);
+        live.write_marker(&marker);
+        let daemon = live.ns_dir().join("app-server-daemon");
+        fs::create_dir(&daemon).expect("mkdir");
+        fs::write(
+            daemon.join(name),
+            json!({"pid": me, "processStartTime": "x", "executableIdentity": {"digest": "x"}})
+                .to_string(),
+        )
+        .expect("write");
+
+        assert_eq!(
+            live.run(consent(), &permit).step,
+            RefreshStep::SessionDetected(me),
+            "a live daemon under `{name}` did not stop a re-send"
+        );
+        assert_eq!(live.marker(), Some(marker), "a stopped re-send wrote to the marker");
+    }
+    post.assert_calls(0);
+}

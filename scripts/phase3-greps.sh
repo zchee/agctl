@@ -155,6 +155,9 @@
 #                 `codex::status`/`super::status`                          → none;
 #                 and, in watch.rs alone, `proof::owned` (the pass needs an
 #                 `OwnedRecord` to take the namespace lock; `watch.rs` does not)
+#   daemon_pid_names  `"app-server.pid"` / `"daemon.pid"`                  → only
+#                 provider/codex/home.rs. F83's name is conditional upstream, so
+#                 a second reader knowing one name would be fail-open (D32).
 #   usage_client_new  `UsageClient::new(` in src/commands/codex            → none
 #                 (review S31 N2: commands build the client through `from_env`)
 #   permit_mint   who may MINT a permit, which is narrower than who may name one:
@@ -365,6 +368,18 @@ PERMIT_IMPL='\bimpl\s+(?:<[^>]*>\s*)?PostPermit\b|\bimpl\b.*\bfor\s+PostPermit\b
 
 # A rename, which would make PERMIT_MINT unable to see the mint.
 PERMIT_RENAME='\bPostPermit\s+as\b|\btype\s+\w+\s*=\s*[^;]*\bPostPermit\b'
+
+# The daemon pid record is read in exactly one place, so both of F83's names
+# stay together. Upstream renamed it conditionally at 0.155.0-alpha.12
+# (`app-server.pid` under `packages/standalone`, `daemon.pid` otherwise), and a
+# second reader that learned only one name would be fail-open: a live daemon
+# would read as `ArtefactOnly`, which the refresh gate passes with a note.
+# That the two names are read *together* is pinned by
+# `d32_a_live_daemon_is_seen_under_either_pid_record_name`, which fails if
+# either is dropped; this pins that nowhere else names one at all.
+DAEMON_PID_ALLOWED=(
+    src/provider/codex/home.rs
+)
 
 # What no Codex command file other than `status.rs` may name.
 WATCH_FORBIDDEN='\brefresh::(?:run|record_retry_get)\b|\bRefreshClient\b|\bPostPermit\b|\brefresh_pre_pass\b|\bafter_unauthorized\b|\bcodex::status\b|\bsuper::status\b'
@@ -896,6 +911,11 @@ check_permit_mint_count() {
     return "$bad"
 }
 
+check_daemon_pid_names() {
+    check_helper_callers "$1" '"app-server\.pid"|"daemon\.pid"' 'a daemon pid-record name' \
+        "${DAEMON_PID_ALLOWED[@]}"
+}
+
 # Every Codex command file but `status.rs` — the pass in `pass.rs` included,
 # because that is the file `watch` calls into (review S33-C2, probe B).
 check_watch_no_post() {
@@ -1229,6 +1249,14 @@ plant_permit_wrapped_self_ctor() {
     mkdir -p "$1/src/provider/codex"
     plant_line "$1" 'pub(crate) fn _phase3_plant() -> Box<Self> { Box::new(Self::from_env()) }' src/provider/codex/permit.rs
 }
+plant_daemon_pid_name_elsewhere() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'const _PHASE3_PLANT: &str = "daemon.pid";' src/provider/codex/discovery.rs
+}
+plant_daemon_pid_legacy_name_elsewhere() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'const _PHASE3_PLANT: &str = "app-server.pid";' src/commands/codex/pass.rs
+}
 plant_usage_client_new() {
     mkdir -p "$1/src/commands/codex"
     plant_line "$1" 'fn _phase3_plant() -> UsageClient { UsageClient::new("http://x", "ua", Duration::ZERO) }' src/commands/codex/status.rs
@@ -1272,7 +1300,7 @@ CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers expose
     exposure_count auth_json account_header toml locked_read marker_mutators stop_policy
     codex_debug_assert state_path codex_flock wham_usage codex_usage_url codex_timeouts codex_redirects codex_decoded_cap credits_state
     auth_host codex_token_url oauth_cancelled oauth_refresh_callers consent_callers refresh_usage_cache receipt_type
-    receipt_destructure refresh_drivers refresh_client post_permit permit_mint permit_mint_count watch_no_post usage_client_new)
+    receipt_destructure refresh_drivers refresh_client post_permit permit_mint permit_mint_count daemon_pid_names watch_no_post usage_client_new)
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
@@ -1365,6 +1393,8 @@ PLANTS=(
     "permit_mint_count plant_permit_wrapped_factory"
     "permit_mint_count plant_permit_wrapped_self_ctor"
     "permit_mint_count plant_permit_mint_in_refresh"
+    "daemon_pid_names plant_daemon_pid_name_elsewhere"
+    "daemon_pid_names plant_daemon_pid_legacy_name_elsewhere"
     "usage_client_new plant_usage_client_new"
 )
 
