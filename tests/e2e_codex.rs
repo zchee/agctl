@@ -230,10 +230,9 @@ fn codex_tree(config_dir: &Path) -> bool {
 #[test]
 fn every_codex_subcommand_refuses_without_touching_the_store() {
     let fixture = CodexFixture::new();
-    let lines: [(&[&str], &str); 8] = [
-        (&["codex", "status"], "agctl codex status"),
-        (&["codex", "status", "--json"], "agctl codex status"),
-        (&["codex", "watch"], "agctl codex watch"),
+    // `status` and `watch` landed at S33 (`tests/e2e_codex_status.rs`); the
+    // rest are still stubs.
+    let lines: [(&[&str], &str); 5] = [
         (&["codex", "login"], "agctl codex login"),
         (&["codex", "import", "--from", "codex-home"], "agctl codex import"),
         (&["codex", "doctor"], "agctl codex doctor"),
@@ -265,27 +264,9 @@ fn every_codex_subcommand_refuses_without_touching_the_store() {
 fn the_codex_flags_parse_before_the_commands_exist() {
     // A refusal from the command, not from the parser: every flag plan §3.2
     // names is accepted today, so completions and `--help` describe the real
-    // surface rather than half of it.
+    // surface rather than half of it. (`status`'s flags are exercised by the
+    // command itself in `tests/e2e_codex_status.rs`.)
     let fixture = CodexFixture::new();
-
-    fixture
-        .cmd()
-        .args([
-            "codex",
-            "status",
-            "--all",
-            "--json",
-            "--raw",
-            "--refresh",
-            "--no-cache",
-            "--account",
-            "one",
-            "--timeout",
-            "5m",
-        ])
-        .assert()
-        .failure()
-        .stderr(contains("not implemented"));
 
     fixture
         .cmd()

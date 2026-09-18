@@ -24,6 +24,8 @@ use crate::provider::codex::audit::CodexAuditEntry;
 use crate::provider::codex::audit::CodexOutcome;
 use crate::provider::codex::auth_store::Inflight;
 use crate::provider::codex::credentials::Credentials;
+use crate::provider::codex::oauth::RefreshClient;
+use crate::provider::codex::permit::PostPermit;
 use crate::provider::codex::proof;
 use crate::provider::codex::testkit;
 
@@ -133,21 +135,20 @@ impl Fixture {
         proof::owned(&self.record).expect("an owned record")
     }
 
-    fn run_with(&self, mode: SendMode, client: &RefreshClient, fault: &Fault) -> RefreshReport {
+    fn run_with(&self, mode: SendMode, permit: &PostPermit, fault: &Fault) -> RefreshReport {
         let cancel = Cancel::new();
         let ctx = RefreshCtx {
             paths: &self.paths,
-            client,
             deadline: Instant::now() + Duration::from_secs(60),
             lock_budget: LockBudget::Pass(PASS_LOCK_BUDGET),
             cancel: &cancel,
             fault,
         };
-        run(self.owned(), mode, &ctx)
+        run(permit, self.owned(), mode, &ctx)
     }
 
-    fn run(&self, mode: SendMode, client: &RefreshClient) -> RefreshReport {
-        self.run_with(mode, client, &Fault::none())
+    fn run(&self, mode: SendMode, permit: &PostPermit) -> RefreshReport {
+        self.run_with(mode, permit, &Fault::none())
     }
 
     fn audit(&self) -> Vec<CodexAuditEntry> {
@@ -174,8 +175,8 @@ impl Fixture {
     }
 }
 
-fn client(url: &str) -> RefreshClient {
-    RefreshClient::new(url, "agctl/test")
+fn permit(url: &str) -> PostPermit {
+    PostPermit::with_client(RefreshClient::new(url, "agctl/test"))
 }
 
 fn mock<'a>(server: &'a MockServer, status: u16, body: &Value) -> Mock<'a> {
@@ -351,7 +352,7 @@ fn an_expired_owned_grant_is_refreshed_with_one_post() {
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
 
-    let report = fixture.run(SendMode::Proactive, &client(&server.url(TOKEN_PATH)));
+    let report = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH)));
 
     assert_eq!(report.step, RefreshStep::Refreshed { parked: false }, "{report:?}");
     post.assert_calls(1);
@@ -402,7 +403,7 @@ fn a_response_without_a_refresh_token_keeps_the_old_one() {
     let sent = digest8(&fixture.auth());
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(None));
-    let report = fixture.run(SendMode::Proactive, &client(&server.url(TOKEN_PATH)));
+    let report = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH)));
     assert_eq!(report.step, RefreshStep::Refreshed { parked: false }, "{report:?}");
     post.assert_calls(1);
     assert_eq!(digest8(&fixture.auth()), sent, "no refresh_token means keep the old one (F92)");
@@ -417,7 +418,7 @@ fn an_artefact_appearing_after_the_post_is_noted_and_the_grant_written() {
         fs::write(daemon.join("daemon.lock"), b"").expect("write");
         (200, grant_body(Some(NEW_RT)).to_string())
     });
-    let report = fixture.run(SendMode::Proactive, &client(&url));
+    let report = fixture.run(SendMode::Proactive, &permit(&url));
     server.join().expect("responder");
     assert_eq!(report.step, RefreshStep::Refreshed { parked: false }, "{report:?}");
     assert!(report.notes.contains(&RefreshNote::CodexSession(DaemonEvidence::ArtefactOnly)));
@@ -433,7 +434,7 @@ fn an_audit_log_that_refuses_after_a_landed_write_leaves_the_write() {
     fs::create_dir_all(audit::log_path(&fixture.paths)).expect("a directory at the log's name");
     let server = MockServer::start();
     mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let report = fixture.run(SendMode::Proactive, &client(&server.url(TOKEN_PATH)));
+    let report = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH)));
     assert_eq!(report.step, RefreshStep::Refreshed { parked: false }, "{report:?}");
     assert!(report.notes.contains(&RefreshNote::AuditLogRefused), "{report:?}");
     assert_ne!(
@@ -453,16 +454,15 @@ fn nothing_is_sent_without_the_time_the_send_needs() {
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
     let cancel = Cancel::new();
-    let client = client(&server.url(TOKEN_PATH));
+    let permit = permit(&server.url(TOKEN_PATH));
     let ctx = RefreshCtx {
         paths: &fixture.paths,
-        client: &client,
         deadline: Instant::now() + Duration::from_secs(20),
         lock_budget: LockBudget::Pass(PASS_LOCK_BUDGET),
         cancel: &cancel,
         fault: &Fault::none(),
     };
-    let report = run(fixture.owned(), SendMode::Proactive, &ctx);
+    let report = run(&permit, fixture.owned(), SendMode::Proactive, &ctx);
     assert_eq!(report.step, RefreshStep::Stale(StaleReason::NotEnoughTime));
     post.assert_calls(0);
     assert_eq!(fixture.marker(), None, "not even the marker");
@@ -472,11 +472,11 @@ fn nothing_is_sent_without_the_time_the_send_needs() {
 fn fresh_disabled_cancelled_and_busy_send_nothing() {
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let client = client(&server.url(TOKEN_PATH));
+    let permit = permit(&server.url(TOKEN_PATH));
 
     let fresh = Fixture::new(&doc(now_s() + 9 * 86_400, testkit::RT_SENTINEL));
     assert_eq!(
-        fresh.run(SendMode::Proactive, &client).step,
+        fresh.run(SendMode::Proactive, &permit).step,
         RefreshStep::Adopted(AdoptReason::Fresh)
     );
 
@@ -485,27 +485,26 @@ fn fresh_disabled_cancelled_and_busy_send_nothing() {
         export_spelling: "/x".to_owned(),
         refresh: RefreshPolicy::Never,
     };
-    assert_eq!(disabled.run(SendMode::Proactive, &client).step, RefreshStep::Disabled);
+    assert_eq!(disabled.run(SendMode::Proactive, &permit).step, RefreshStep::Disabled);
 
     let cancelled = Fixture::expired();
     let cancel = Cancel::new();
     cancel.cancel();
     let ctx = RefreshCtx {
         paths: &cancelled.paths,
-        client: &client,
         deadline: Instant::now() + Duration::from_secs(60),
         lock_budget: LockBudget::Pass(PASS_LOCK_BUDGET),
         cancel: &cancel,
         fault: &Fault::none(),
     };
     assert_eq!(
-        run(cancelled.owned(), SendMode::Proactive, &ctx).step,
+        run(&permit, cancelled.owned(), SendMode::Proactive, &ctx).step,
         RefreshStep::Stale(StaleReason::Cancelled)
     );
 
     let busy = Fixture::expired();
     let _held = testkit::lock_for(&busy.paths, &busy.record);
-    assert_eq!(busy.run(SendMode::Proactive, &client).step, RefreshStep::Busy);
+    assert_eq!(busy.run(SendMode::Proactive, &permit).step, RefreshStep::Busy);
 
     post.assert_calls(0);
 }
@@ -514,7 +513,7 @@ fn fresh_disabled_cancelled_and_busy_send_nothing() {
 fn daemon_evidence_under_the_lock() {
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let client = client(&server.url(TOKEN_PATH));
+    let permit = permit(&server.url(TOKEN_PATH));
 
     let live = Fixture::expired();
     let daemon = live.ns_dir().join("app-server-daemon");
@@ -526,14 +525,14 @@ fn daemon_evidence_under_the_lock() {
             .to_string(),
     )
     .expect("write");
-    assert_eq!(live.run(SendMode::Proactive, &client).step, RefreshStep::SessionDetected(me));
+    assert_eq!(live.run(SendMode::Proactive, &permit).step, RefreshStep::SessionDetected(me));
 
     let unreadable = Fixture::expired();
     let daemon = unreadable.ns_dir().join("app-server-daemon");
     fs::create_dir(&daemon).expect("mkdir");
     fs::write(daemon.join("app-server.pid"), b"{\"pid\":").expect("a torn record");
     assert_eq!(
-        unreadable.run(SendMode::Proactive, &client).step,
+        unreadable.run(SendMode::Proactive, &permit).step,
         RefreshStep::Stale(StaleReason::DaemonRecordUnreadable),
         "review S30 F8"
     );
@@ -544,18 +543,18 @@ fn daemon_evidence_under_the_lock() {
 fn a_torn_file_is_stale_or_unknown_never_needs_login() {
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let client = client(&server.url(TOKEN_PATH));
+    let permit = permit(&server.url(TOKEN_PATH));
 
     let fixture = Fixture::expired();
     let sent = digest8(&fixture.auth());
     testkit::write_0600(&fixture.auth_path(), b"{\"auth_mode\": \"chatgpt\", \"tok");
     assert_eq!(
-        fixture.run(SendMode::Proactive, &client).step,
+        fixture.run(SendMode::Proactive, &permit).step,
         RefreshStep::Stale(StaleReason::Torn)
     );
 
     fixture.write_marker(&state_with_inflight(&sent, ago(60)));
-    let step = fixture.run(SendMode::Proactive, &client).step;
+    let step = fixture.run(SendMode::Proactive, &permit).step;
     assert!(is_unknown(&step, UnknownClass::Interrupted), "{step:?}");
     post.assert_calls(0);
 }
@@ -571,8 +570,8 @@ fn the_server_floor_blocks_an_automatic_refresh_of_its_grant() {
     });
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let client = client(&server.url(TOKEN_PATH));
-    assert_eq!(fixture.run(SendMode::Proactive, &client).step, RefreshStep::NotBefore(at));
+    let permit = permit(&server.url(TOKEN_PATH));
+    assert_eq!(fixture.run(SendMode::Proactive, &permit).step, RefreshStep::NotBefore(at));
     post.assert_calls(0);
 
     // A floor recorded for another grant does not apply.
@@ -581,7 +580,7 @@ fn the_server_floor_blocks_an_automatic_refresh_of_its_grant() {
         ..RefreshState::default()
     });
     assert_eq!(
-        fixture.run(SendMode::Proactive, &client).step,
+        fixture.run(SendMode::Proactive, &permit).step,
         RefreshStep::Refreshed { parked: false }
     );
     post.assert_calls(1);
@@ -599,10 +598,10 @@ fn a_marker_left_by_a_dead_process_is_interrupted_and_blocks_the_send() {
     fixture.write_marker(&state_with_inflight(&sent, sent_at));
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let client = client(&server.url(TOKEN_PATH));
+    let permit = permit(&server.url(TOKEN_PATH));
 
     for _ in 0..3 {
-        let report = fixture.run(SendMode::Proactive, &client);
+        let report = fixture.run(SendMode::Proactive, &permit);
         let RefreshStep::OutcomeUnknown { since, class, resend_eligible_at } = report.step else {
             panic!("expected unknown, got {report:?}");
         };
@@ -615,7 +614,7 @@ fn a_marker_left_by_a_dead_process_is_interrupted_and_blocks_the_send() {
     // `rm -rf cache/codex` changes nothing: the marker is not in the cache.
     let _ = fs::remove_dir_all(fixture.paths.cache_dir_for(crate::provider::Provider::Codex));
     assert!(matches!(
-        fixture.run(SendMode::Proactive, &client).step,
+        fixture.run(SendMode::Proactive, &permit).step,
         RefreshStep::OutcomeUnknown { .. }
     ));
     post.assert_calls(0);
@@ -627,7 +626,7 @@ fn a_marker_for_another_grant_is_cleared_and_the_pass_proceeds() {
     fixture.write_marker(&state_with_inflight("0badc0de", ago(60)));
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let report = fixture.run(SendMode::Proactive, &client(&server.url(TOKEN_PATH)));
+    let report = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH)));
     assert_eq!(report.step, RefreshStep::Refreshed { parked: false }, "{report:?}");
     assert!(report.notes.contains(&RefreshNote::StaleMarkerCleared));
     post.assert_calls(1);
@@ -637,13 +636,13 @@ fn a_marker_for_another_grant_is_cleared_and_the_pass_proceeds() {
 fn an_unreadable_or_unwritable_marker_sends_nothing() {
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let client = client(&server.url(TOKEN_PATH));
+    let permit = permit(&server.url(TOKEN_PATH));
 
     let unreadable = Fixture::expired();
     unreadable.write_marker(&RefreshState::default());
     fs::set_permissions(unreadable.marker_path(), fs::Permissions::from_mode(0o000))
         .expect("chmod");
-    let step = unreadable.run(SendMode::Proactive, &client).step;
+    let step = unreadable.run(SendMode::Proactive, &permit).step;
     fs::set_permissions(unreadable.marker_path(), fs::Permissions::from_mode(0o600))
         .expect("chmod");
     assert!(matches!(step, RefreshStep::StateUnavailable(_)), "{step:?}");
@@ -651,7 +650,7 @@ fn an_unreadable_or_unwritable_marker_sends_nothing() {
     let unwritable = Fixture::expired();
     let state_dir = unwritable.paths.codex_state_dir();
     fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o500)).expect("chmod");
-    let step = unwritable.run(SendMode::Proactive, &client).step;
+    let step = unwritable.run(SendMode::Proactive, &permit).step;
     fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).expect("chmod");
     assert!(matches!(step, RefreshStep::StateUnavailable(_)), "{step:?}");
 
@@ -667,7 +666,7 @@ fn deleting_the_state_directory_re_arms_one_send() {
     fs::remove_dir_all(fixture.paths.codex_state_dir()).expect("rm -rf .state");
     let server = MockServer::start();
     let post = mock(&server, 503, &json!({}));
-    let step = fixture.run(SendMode::Proactive, &client(&server.url(TOKEN_PATH))).step;
+    let step = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH))).step;
     assert!(is_unknown(&step, UnknownClass::ServerError), "{step:?}");
     post.assert_calls(1);
 }
@@ -685,23 +684,22 @@ fn a_concurrent_pass_waits_then_sends_nothing() {
     let a = {
         let fixture = Arc::clone(&fixture);
         let url = url.clone();
-        thread::spawn(move || fixture.run(SendMode::Proactive, &client(&url)).step)
+        thread::spawn(move || fixture.run(SendMode::Proactive, &permit(&url)).step)
     };
     thread::sleep(Duration::from_millis(300));
     let cancel = Cancel::new();
-    let b_client = client(&url);
+    let b_permit = permit(&url);
     let ctx = RefreshCtx {
         paths: &fixture.paths,
-        client: &b_client,
         deadline: Instant::now() + Duration::from_secs(60),
         lock_budget: LockBudget::Pass(Duration::from_millis(100)),
         cancel: &cancel,
         fault: &Fault::none(),
     };
-    assert_eq!(run(fixture.owned(), SendMode::Proactive, &ctx).step, RefreshStep::Busy);
+    assert_eq!(run(&b_permit, fixture.owned(), SendMode::Proactive, &ctx).step, RefreshStep::Busy);
     let a = a.join().expect("pass A");
     assert!(is_unknown(&a, UnknownClass::ServerError), "{a:?}");
-    let b = run(fixture.owned(), SendMode::Proactive, &ctx).step;
+    let b = run(&b_permit, fixture.owned(), SendMode::Proactive, &ctx).step;
     assert!(is_unknown(&b, UnknownClass::ServerError), "{b:?}");
     post.assert_calls(1);
 }
@@ -735,8 +733,8 @@ fn unknown_outcomes_keep_the_marker_and_never_resend() {
                 then = then.header(*header, *value);
             }
         });
-        let client = client(&server.url(TOKEN_PATH));
-        let step = fixture.run(SendMode::Proactive, &client).step;
+        let permit = permit(&server.url(TOKEN_PATH));
+        let step = fixture.run(SendMode::Proactive, &permit).step;
         assert!(is_unknown(&step, class), "{name}: {step:?}");
         assert_eq!(fixture.auth(), before, "{name}: file unchanged");
         let marker = fixture.marker().expect("marker");
@@ -748,7 +746,7 @@ fn unknown_outcomes_keep_the_marker_and_never_resend() {
             assert_eq!(marker.retry_after, Some(MAX_RETRY_AFTER), "{name}: retry-after clamped");
         }
         for _ in 0..3 {
-            let later = fixture.run(SendMode::Proactive, &client).step;
+            let later = fixture.run(SendMode::Proactive, &permit).step;
             assert!(is_unknown(&later, class), "{name}: {later:?}");
         }
         post.assert_calls(1);
@@ -763,14 +761,14 @@ fn a_proven_pre_send_failure_clears_the_marker_and_the_next_pass_sends_once() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         listener.local_addr().expect("addr").port()
     };
-    let closed = client(&format!("http://127.0.0.1:{port}{TOKEN_PATH}"));
+    let closed = permit(&format!("http://127.0.0.1:{port}{TOKEN_PATH}"));
     let step = fixture.run(SendMode::Proactive, &closed).step;
     assert!(matches!(step, RefreshStep::Stale(StaleReason::PreSend(_))), "{step:?}");
     assert_eq!(fixture.marker().and_then(|marker| marker.inflight), None);
 
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let step = fixture.run(SendMode::Proactive, &client(&server.url(TOKEN_PATH))).step;
+    let step = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH))).step;
     assert_eq!(step, RefreshStep::Refreshed { parked: false });
     post.assert_calls(1);
 }
@@ -780,7 +778,7 @@ fn a_rejected_answer_clears_the_marker() {
     let fixture = Fixture::expired();
     let server = MockServer::start();
     let post = mock(&server, 403, &json!({"error": "forbidden"}));
-    let step = fixture.run(SendMode::Proactive, &client(&server.url(TOKEN_PATH))).step;
+    let step = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH))).step;
     assert_eq!(step, RefreshStep::Stale(StaleReason::Rejected(403)));
     assert_eq!(fixture.marker().and_then(|marker| marker.inflight), None);
     post.assert_calls(1);
@@ -792,14 +790,14 @@ fn a_dead_grant_needs_login_and_is_never_sent_again() {
     let before = fixture.auth();
     let server = MockServer::start();
     let post = mock(&server, 400, &json!({"error": "invalid_grant"}));
-    let client = client(&server.url(TOKEN_PATH));
+    let permit = permit(&server.url(TOKEN_PATH));
     assert_eq!(
-        fixture.run(SendMode::Proactive, &client).step,
+        fixture.run(SendMode::Proactive, &permit).step,
         RefreshStep::NeedsLogin(NeedsLoginReason::Dead)
     );
     for _ in 0..2 {
         assert_eq!(
-            fixture.run(SendMode::Proactive, &client).step,
+            fixture.run(SendMode::Proactive, &permit).step,
             RefreshStep::NeedsLogin(NeedsLoginReason::Dead)
         );
     }
@@ -827,7 +825,7 @@ fn a_permanent_answer_while_another_writer_rotated_adopts_its_grant() {
         fs::write(&auth, &written).expect("in-place rewrite");
         (400, json!({"error": {"code": "refresh_token_reused"}}).to_string())
     });
-    let step = fixture.run(SendMode::Proactive, &client(&url)).step;
+    let step = fixture.run(SendMode::Proactive, &permit(&url)).step;
     server.join().expect("responder");
     assert_eq!(step, RefreshStep::RacedExternal);
     assert_eq!(fixture.auth(), external, "the other writer's grant is kept");
@@ -846,7 +844,7 @@ fn an_applied_answer_after_another_writer_rotated_is_discarded() {
         fs::write(&auth, &written).expect("in-place rewrite");
         (200, grant_body(Some(NEW_RT)).to_string())
     });
-    let step = fixture.run(SendMode::Proactive, &client(&url)).step;
+    let step = fixture.run(SendMode::Proactive, &permit(&url)).step;
     server.join().expect("responder");
     assert_eq!(step, RefreshStep::DiscardedExternal);
     assert_eq!(fixture.auth(), external);
@@ -865,7 +863,7 @@ fn an_applied_answer_merges_onto_a_file_whose_grant_is_unchanged() {
         testkit::write_0600(&auth, &testkit::pretty(&doc));
         (200, grant_body(Some(NEW_RT)).to_string())
     });
-    let step = fixture.run(SendMode::Proactive, &client(&url)).step;
+    let step = fixture.run(SendMode::Proactive, &permit(&url)).step;
     server.join().expect("responder");
     assert_eq!(step, RefreshStep::Refreshed { parked: false });
     let after: Value = serde_json::from_slice(&fixture.auth()).expect("json");
@@ -883,7 +881,7 @@ fn a_file_removed_during_the_post_gets_the_rotated_grant_back() {
         fs::remove_file(&auth).expect("rm");
         (200, grant_body(Some(NEW_RT)).to_string())
     });
-    let step = fixture.run(SendMode::Proactive, &client(&url)).step;
+    let step = fixture.run(SendMode::Proactive, &permit(&url)).step;
     server.join().expect("responder");
     assert_eq!(step, RefreshStep::Refreshed { parked: false });
     let after: Value = serde_json::from_slice(&fixture.auth()).expect("json");
@@ -904,7 +902,7 @@ fn a_file_changed_before_the_post_is_adopted_when_fresh() {
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
     let fault = Fault::from_list("pause_codex_before_post_snapshot");
-    let step = fixture.run_with(SendMode::Proactive, &client(&server.url(TOKEN_PATH)), &fault).step;
+    let step = fixture.run_with(SendMode::Proactive, &permit(&server.url(TOKEN_PATH)), &fault).step;
     writer.join().expect("writer");
     assert_eq!(step, RefreshStep::Adopted(AdoptReason::ChangedBeforePost));
     post.assert_calls(0);
@@ -920,13 +918,13 @@ fn a_failed_rename_parks_the_grant_and_the_next_pass_replays_it() {
     let fixture = Fixture::expired();
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let client = client(&server.url(TOKEN_PATH));
+    let permit = permit(&server.url(TOKEN_PATH));
     let step =
-        fixture.run_with(SendMode::Proactive, &client, &Fault::from_list("codex_rename_fail")).step;
+        fixture.run_with(SendMode::Proactive, &permit, &Fault::from_list("codex_rename_fail")).step;
     assert_eq!(step, RefreshStep::Refreshed { parked: true });
     assert_eq!(fixture.marker().and_then(|marker| marker.inflight), None);
 
-    let report = fixture.run(SendMode::Proactive, &client);
+    let report = fixture.run(SendMode::Proactive, &permit);
     assert_eq!(report.step, RefreshStep::Adopted(AdoptReason::Fresh), "{report:?}");
     assert!(report.notes.contains(&RefreshNote::PendingReplayed));
     post.assert_calls(1);
@@ -945,7 +943,7 @@ fn a_write_that_lands_and_reports_an_error_is_not_written_twice() {
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
     let fault = Fault::from_list("codex_error_after_rename");
-    let report = fixture.run_with(SendMode::Proactive, &client(&server.url(TOKEN_PATH)), &fault);
+    let report = fixture.run_with(SendMode::Proactive, &permit(&server.url(TOKEN_PATH)), &fault);
     assert_eq!(report.step, RefreshStep::Refreshed { parked: false }, "{report:?}");
     post.assert_calls(1);
     assert_eq!(
@@ -965,7 +963,7 @@ fn an_unreadable_file_after_the_post_parks_the_grant_and_blocks_the_next_send() 
         fs::set_permissions(&auth, fs::Permissions::from_mode(0o000)).expect("chmod");
         (200, grant_body(Some(NEW_RT)).to_string())
     });
-    let step = fixture.run(SendMode::Proactive, &client(&url)).step;
+    let step = fixture.run(SendMode::Proactive, &permit(&url)).step;
     server.join().expect("responder");
     assert_eq!(step, RefreshStep::Refreshed { parked: true });
     assert!(
@@ -977,14 +975,14 @@ fn an_unreadable_file_after_the_post_parks_the_grant_and_blocks_the_next_send() 
     // While the pending grant cannot be resolved nothing is sent (INFO-1).
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let client = client(&server.url(TOKEN_PATH));
-    let step = fixture.run(SendMode::Proactive, &client).step;
+    let permit = permit(&server.url(TOKEN_PATH));
+    let step = fixture.run(SendMode::Proactive, &permit).step;
     assert!(matches!(step, RefreshStep::Failed(_)), "{step:?}");
     post.assert_calls(0);
 
     fs::set_permissions(fixture.auth_path(), fs::Permissions::from_mode(0o600)).expect("chmod");
     assert_eq!(
-        fixture.run(SendMode::Proactive, &client).step,
+        fixture.run(SendMode::Proactive, &permit).step,
         RefreshStep::Adopted(AdoptReason::Fresh)
     );
     post.assert_calls(0);
@@ -998,7 +996,7 @@ fn a_file_that_stays_torn_after_the_post_parks_the_grant() {
         testkit::write_0600(&auth, b"{\"auth_mode\": \"chat");
         (200, grant_body(Some(NEW_RT)).to_string())
     });
-    let step = fixture.run(SendMode::Proactive, &client(&url)).step;
+    let step = fixture.run(SendMode::Proactive, &permit(&url)).step;
     server.join().expect("responder");
     assert_eq!(step, RefreshStep::Refreshed { parked: true });
     assert_eq!(fixture.outcomes(), [CodexOutcome::SavedToPending]);
@@ -1012,7 +1010,7 @@ fn when_nothing_can_be_written_the_outcome_is_unknown_and_the_marker_stays() {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).expect("chmod");
         (200, grant_body(Some(NEW_RT)).to_string())
     });
-    let step = fixture.run(SendMode::Proactive, &client(&url)).step;
+    let step = fixture.run(SendMode::Proactive, &permit(&url)).step;
     server.join().expect("responder");
     fs::set_permissions(fixture.ns_dir(), fs::Permissions::from_mode(0o700)).expect("chmod");
     assert!(is_unknown(&step, UnknownClass::WriteFailed), "{step:?}");
@@ -1021,7 +1019,7 @@ fn when_nothing_can_be_written_the_outcome_is_unknown_and_the_marker_stays() {
 
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let later = fixture.run(SendMode::Proactive, &client(&server.url(TOKEN_PATH))).step;
+    let later = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH))).step;
     assert!(is_unknown(&later, UnknownClass::WriteFailed), "{later:?}");
     post.assert_calls(0);
     let audit = fixture.audit();
@@ -1047,25 +1045,25 @@ fn after_401(rejected: &str) -> SendMode {
 fn the_401_floor_counts_sent_refreshes_that_did_not_help() {
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let client = client(&server.url(TOKEN_PATH));
+    let permit = permit(&server.url(TOKEN_PATH));
     let cancel = Cancel::new();
 
     // Another writer refreshed: adopt, 0 POSTs.
     let (fixture, _) = valid_fixture();
     assert_eq!(
-        fixture.run(after_401("0badc0de"), &client).step,
+        fixture.run(after_401("0badc0de"), &permit).step,
         RefreshStep::Adopted(AdoptReason::ExternalAccess)
     );
     // A still-valid row is never refreshed proactively.
     assert_eq!(
-        fixture.run(SendMode::Proactive, &client).step,
+        fixture.run(SendMode::Proactive, &permit).step,
         RefreshStep::Adopted(AdoptReason::Fresh)
     );
 
     // A send five minutes ago: the floor.
     let (fixture, rejected) = valid_fixture();
     fixture.write_marker(&RefreshState { last_sent_at: Some(ago(300)), ..RefreshState::default() });
-    let step = fixture.run(after_401(&rejected), &client).step;
+    let step = fixture.run(after_401(&rejected), &permit).step;
     assert!(matches!(step, RefreshStep::UnauthorizedFloor { .. }), "{step:?}");
     assert_eq!(
         fixture.marker().expect("marker").did_not_help,
@@ -1080,41 +1078,40 @@ fn the_401_floor_counts_sent_refreshes_that_did_not_help() {
         ..RefreshState::default()
     });
     assert_eq!(
-        fixture.run(after_401(&rejected), &client).step,
+        fixture.run(after_401(&rejected), &permit).step,
         RefreshStep::Refreshed { parked: false }
     );
     post.assert_calls(1);
     let ctx = RefreshCtx {
         paths: &fixture.paths,
-        client: &client,
         deadline: Instant::now() + Duration::from_secs(60),
         lock_budget: LockBudget::Pass(PASS_LOCK_BUDGET),
         cancel: &cancel,
         fault: &Fault::none(),
     };
-    record_retry_get(fixture.owned(), RetryGet::Unauthorized, &ctx).expect("recorded");
+    record_retry_get(&permit, fixture.owned(), RetryGet::Unauthorized, &ctx).expect("recorded");
     let marker = fixture.marker().expect("marker");
     assert_eq!((marker.did_not_help, marker.floor_min), (1, 120));
     // The immediate second 401 of the same pass: the floor, not a POST.
     let rejected = access_digest8(&fixture.auth());
     assert!(matches!(
-        fixture.run(after_401(&rejected), &client).step,
+        fixture.run(after_401(&rejected), &permit).step,
         RefreshStep::UnauthorizedFloor { .. }
     ));
     post.assert_calls(1);
 
-    record_retry_get(fixture.owned(), RetryGet::Unauthorized, &ctx).expect("recorded");
+    record_retry_get(&permit, fixture.owned(), RetryGet::Unauthorized, &ctx).expect("recorded");
     assert_eq!(fixture.marker().expect("marker").floor_min, 240);
-    record_retry_get(fixture.owned(), RetryGet::Unauthorized, &ctx).expect("recorded");
+    record_retry_get(&permit, fixture.owned(), RetryGet::Unauthorized, &ctx).expect("recorded");
     let mut marker = fixture.marker().expect("marker");
     assert_eq!(marker.did_not_help, 3);
     marker.last_sent_at = Some(ago(86_400));
     fixture.write_marker(&marker);
-    assert_eq!(fixture.run(after_401(&rejected), &client).step, RefreshStep::UnauthorizedTerminal);
+    assert_eq!(fixture.run(after_401(&rejected), &permit).step, RefreshStep::UnauthorizedTerminal);
     post.assert_calls(1);
 
     // A 2xx after a sent refresh resets the count and the floor.
-    record_retry_get(fixture.owned(), RetryGet::Succeeded, &ctx).expect("recorded");
+    record_retry_get(&permit, fixture.owned(), RetryGet::Succeeded, &ctx).expect("recorded");
     let marker = fixture.marker().expect("marker");
     assert_eq!((marker.did_not_help, marker.floor_min), (0, 60));
 }
@@ -1156,18 +1153,18 @@ fn consent() -> SendMode {
 fn resend_sends_once_per_marker_and_only_when_eligible() {
     let server = MockServer::start();
     let post = mock(&server, 503, &json!({}));
-    let client = client(&server.url(TOKEN_PATH));
+    let permit = permit(&server.url(TOKEN_PATH));
 
     let none = Fixture::expired();
     assert_eq!(
-        none.run(consent(), &client).step,
+        none.run(consent(), &permit).step,
         RefreshStep::ResendRefused(ResendBlock::NotUnknown)
     );
 
     let early = Fixture::expired();
     early.write_marker(&unknown_marker(&early, 600, UnknownClass::Ambiguous));
     assert!(matches!(
-        early.run(consent(), &client).step,
+        early.run(consent(), &permit).step,
         RefreshStep::ResendRefused(ResendBlock::TooEarly(_))
     ));
 
@@ -1177,7 +1174,7 @@ fn resend_sends_once_per_marker_and_only_when_eligible() {
     limited.write_marker(&state);
     assert!(
         matches!(
-            limited.run(consent(), &client).step,
+            limited.run(consent(), &permit).step,
             RefreshStep::ResendRefused(ResendBlock::TooEarly(_))
         ),
         "max(retry-after, 1 h)"
@@ -1187,26 +1184,26 @@ fn resend_sends_once_per_marker_and_only_when_eligible() {
     stray.write_marker(&unknown_marker(&stray, 7200, UnknownClass::Ambiguous));
     testkit::write_0600(&stray.ns_dir().join("auth.json.tmp.0123abcd"), b"{}");
     assert_eq!(
-        stray.run(consent(), &client).step,
+        stray.run(consent(), &permit).step,
         RefreshStep::ResendRefused(ResendBlock::StrayTmp)
     );
     post.assert_calls(0);
 
     let eligible = Fixture::expired();
     eligible.write_marker(&unknown_marker(&eligible, 7200, UnknownClass::Ambiguous));
-    let step = eligible.run(consent(), &client).step;
+    let step = eligible.run(consent(), &permit).step;
     assert!(is_unknown(&step, UnknownClass::ServerError), "{step:?}");
     post.assert_calls(1);
     let marker = eligible.marker().expect("marker");
     assert!(marker.resent, "resent recorded in the same write as the send");
     assert!(matches!(step, RefreshStep::OutcomeUnknown { resend_eligible_at: None, .. }));
     assert_eq!(
-        eligible.run(consent(), &client).step,
+        eligible.run(consent(), &permit).step,
         RefreshStep::ResendRefused(ResendBlock::AlreadyResent)
     );
     // And no automatic send either.
     assert!(matches!(
-        eligible.run(SendMode::Proactive, &client).step,
+        eligible.run(SendMode::Proactive, &permit).step,
         RefreshStep::OutcomeUnknown { .. }
     ));
     post.assert_calls(1);
@@ -1231,17 +1228,16 @@ fn child_pass() {
     let record = testkit::owned_record(testkit::USER, testkit::ACCT);
     let fault = Fault::from_list(&std::env::var(CHILD_FAULT_ENV).unwrap_or_default());
     let cancel = Cancel::new();
-    let client = client(&url);
+    let permit = permit(&url);
     let ctx = RefreshCtx {
         paths: &paths,
-        client: &client,
         deadline: Instant::now() + Duration::from_secs(60),
         lock_budget: LockBudget::Pass(PASS_LOCK_BUDGET),
         cancel: &cancel,
         fault: &fault,
     };
     let owned = proof::owned(&record).expect("owned");
-    let _ = run(owned, SendMode::Proactive, &ctx);
+    let _ = run(&permit, owned, SendMode::Proactive, &ctx);
 }
 
 fn spawn_child(fixture: &Fixture, url: &str, fault: &str) -> std::process::Child {
@@ -1272,7 +1268,7 @@ fn an_abort_after_the_marker_leaves_a_send_the_next_pass_will_not_repeat() {
     post.assert_calls(0);
     assert!(fixture.marker().and_then(|marker| marker.inflight).is_some(), "the marker is durable");
 
-    let step = fixture.run(SendMode::Proactive, &client(&url)).step;
+    let step = fixture.run(SendMode::Proactive, &permit(&url)).step;
     assert!(is_unknown(&step, UnknownClass::Interrupted), "{step:?}");
     post.assert_calls(0);
 }
@@ -1302,7 +1298,7 @@ fn a_sigkill_during_the_post_leaves_a_send_the_next_pass_will_not_repeat() {
 
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let step = fixture.run(SendMode::Proactive, &client(&server.url(TOKEN_PATH))).step;
+    let step = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH))).step;
     assert!(is_unknown(&step, UnknownClass::Interrupted), "{step:?}");
     post.assert_calls(0);
 }
@@ -1320,7 +1316,7 @@ fn an_abort_between_the_parked_grant_and_the_marker_clear_is_recovered_pending_f
     post.assert_calls(1);
     assert!(fixture.marker().and_then(|marker| marker.inflight).is_some());
 
-    let report = fixture.run(SendMode::Proactive, &client(&url));
+    let report = fixture.run(SendMode::Proactive, &permit(&url));
     assert_eq!(report.step, RefreshStep::Adopted(AdoptReason::Fresh), "{report:?}");
     assert!(report.notes.contains(&RefreshNote::PendingReplayed));
     assert!(report.notes.contains(&RefreshNote::StaleMarkerCleared));
@@ -1332,12 +1328,12 @@ fn an_abort_between_the_parked_grant_and_the_marker_clear_is_recovered_pending_f
 // A --resend that gets no answer about the grant (review S32-C2 F1, D26)
 // ---------------------------------------------------------------------------
 
-fn closed_port_client() -> RefreshClient {
+fn closed_port_permit() -> PostPermit {
     let port = {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         listener.local_addr().expect("addr").port()
     };
-    client(&format!("http://127.0.0.1:{port}{TOKEN_PATH}"))
+    permit(&format!("http://127.0.0.1:{port}{TOKEN_PATH}"))
 }
 
 #[test]
@@ -1346,7 +1342,7 @@ fn a_resend_that_never_left_restores_the_unknown_marker_and_arms_nothing() {
     let before = unknown_marker(&fixture, 7200, UnknownClass::Ambiguous);
     fixture.write_marker(&before);
 
-    let step = fixture.run(consent(), &closed_port_client()).step;
+    let step = fixture.run(consent(), &closed_port_permit()).step;
     assert!(is_unknown(&step, UnknownClass::Ambiguous), "{step:?}");
     assert!(
         matches!(step, RefreshStep::OutcomeUnknown { resend_eligible_at: Some(_), .. }),
@@ -1360,9 +1356,9 @@ fn a_resend_that_never_left_restores_the_unknown_marker_and_arms_nothing() {
     // The next automatic pass sends nothing.
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let client = client(&server.url(TOKEN_PATH));
+    let permit = permit(&server.url(TOKEN_PATH));
     for _ in 0..2 {
-        let later = fixture.run(SendMode::Proactive, &client).step;
+        let later = fixture.run(SendMode::Proactive, &permit).step;
         assert!(is_unknown(&later, UnknownClass::Ambiguous), "{later:?}");
     }
     post.assert_calls(0);
@@ -1374,22 +1370,22 @@ fn a_rejected_resend_spends_the_resend_and_arms_nothing() {
     fixture.write_marker(&unknown_marker(&fixture, 7200, UnknownClass::ServerError));
     let server = MockServer::start();
     let post = mock(&server, 403, &json!({"error": "forbidden"}));
-    let client = client(&server.url(TOKEN_PATH));
+    let permit = permit(&server.url(TOKEN_PATH));
 
-    let step = fixture.run(consent(), &client).step;
+    let step = fixture.run(consent(), &permit).step;
     assert_eq!(step, RefreshStep::NeedsLogin(NeedsLoginReason::ResendRejected(403)));
     post.assert_calls(1);
     let marker = fixture.marker().expect("marker");
     assert!(marker.inflight.is_some(), "the unknown marker stays");
     assert_eq!((marker.class, marker.resent), (Some(UnknownClass::ServerError), true));
 
-    let later = fixture.run(SendMode::Proactive, &client).step;
+    let later = fixture.run(SendMode::Proactive, &permit).step;
     assert!(
         matches!(later, RefreshStep::OutcomeUnknown { resend_eligible_at: None, .. }),
         "{later:?}"
     );
     assert_eq!(
-        fixture.run(consent(), &client).step,
+        fixture.run(consent(), &permit).step,
         RefreshStep::ResendRefused(ResendBlock::AlreadyResent)
     );
     post.assert_calls(1);
@@ -1400,7 +1396,7 @@ fn a_resend_is_stopped_by_daemon_evidence() {
     // Review S32-C2 F2: deviation D25 pinned.
     let server = MockServer::start();
     let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
-    let client = client(&server.url(TOKEN_PATH));
+    let permit = permit(&server.url(TOKEN_PATH));
 
     let live = Fixture::expired();
     let marker = unknown_marker(&live, 7200, UnknownClass::Ambiguous);
@@ -1414,7 +1410,7 @@ fn a_resend_is_stopped_by_daemon_evidence() {
             .to_string(),
     )
     .expect("write");
-    assert_eq!(live.run(consent(), &client).step, RefreshStep::SessionDetected(me));
+    assert_eq!(live.run(consent(), &permit).step, RefreshStep::SessionDetected(me));
     assert_eq!(live.marker(), Some(marker.clone()), "nothing written");
 
     let torn = Fixture::expired();
@@ -1424,7 +1420,7 @@ fn a_resend_is_stopped_by_daemon_evidence() {
     fs::create_dir(&daemon).expect("mkdir");
     fs::write(daemon.join("app-server.pid"), b"{\"pid\":").expect("a torn record");
     assert_eq!(
-        torn.run(consent(), &client).step,
+        torn.run(consent(), &permit).step,
         RefreshStep::Stale(StaleReason::DaemonRecordUnreadable)
     );
     assert_eq!(torn.marker(), Some(marker), "nothing written");

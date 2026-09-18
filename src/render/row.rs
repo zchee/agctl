@@ -96,14 +96,6 @@ pub trait TuiRow {
 /// produces rows. Its associated type must be renderable both ways —
 /// [`TuiRow`] for the display, [`IntoJsonRowV2`] for the document — so a
 /// provider cannot ship a row that only one presentation can show.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Codex pass implements it at S33, and the combined command is 3.2's \
-                  (U42 = no); S29b ships the seam so the row types are built against it"
-    )
-)]
 pub trait RowSource {
     /// This source's row type.
     type Row: TuiRow + IntoJsonRowV2 + Send;

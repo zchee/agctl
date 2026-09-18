@@ -26,7 +26,9 @@
 # A clause runs only when its plant file exists in the snapshot: each clause
 # belongs to the step that creates its file (plan §4), so an earlier step skips
 # it and says so. S29a lands the harness and clause 6; S30 clauses 1-5, 7, 9,
-# 11 and the re-run of 6 in auth_store.rs.
+# 11 and the re-run of 6 in auth_store.rs; S32 clauses 8 and 10; S33 moves 3, 4,
+# 5, 8 and 11 into commands/codex/status.rs and adds 12 in watch.rs and 13 and
+# 14 in pass.rs, the file the shared read-only pass moved to.
 #
 # Usage: scripts/phase3-structural.sh
 #
@@ -225,7 +227,20 @@ main() {
     # status.rs will be, and lock.rs is a sibling of refresh.rs inside it — and
     # the owning step moves it to the plan's file. Every plant is path-qualified,
     # so the only error it can raise is the privacy one it is there to prove.
-    local cmd=src/commands/codex/mod.rs codex=src/provider/codex
+    # S33 moved clauses 3, 4, 5, 8 and 11 to commands/codex/status.rs, the file
+    # the plan names, and added 12 in watch.rs and 13/14 in pass.rs; clauses 1,
+    # 7 and 10 stay in mod.rs until S34 creates login.rs and accounts.rs.
+    #
+    # What 12, 13 and 14 do and do not prove: 12 and 13 prove that neither the
+    # loop nor the shared pass can *build* a permit, and 14 that the driver
+    # refuses to run without one. That a file may not *name* a permit it was
+    # handed is not a compiler property in a single binary crate — no visibility
+    # can be narrower than `pub(crate)` across the provider/commands boundary —
+    # so `scripts/phase3-greps.sh` holds that half, matching the path so an
+    # aliased import is a hit on its own `use` line.
+    local cmd=src/commands/codex/mod.rs status=src/commands/codex/status.rs
+    local watch=src/commands/codex/watch.rs pass=src/commands/codex/pass.rs
+    local codex=src/provider/codex
 
     # Clause 1: a `VerifiedLogin` cannot be built outside `proof.rs`.
     clause 1 "$cmd" E0451 \
@@ -239,17 +254,17 @@ main() {
         "LockedCredentials::new from the refresh driver"
 
     # Clause 3: the credential file's name is private to auth_store.rs.
-    clause 3 "$cmd" E0603 \
+    clause 3 "$status" E0603 \
         "const _PHASE3_PLANT: &str = crate::provider::codex::auth_store::AUTH_FILE;" \
         "AUTH_FILE outside auth_store.rs"
 
     # Clause 4: a registry record is not an owned-record proof.
-    clause 4 "$cmd" E0308 \
+    clause 4 "$status" E0308 \
         "fn _phase3_plant(paths: &crate::config::paths::Paths, record: &crate::config::codex::CodexAccountRecord, guard: &crate::provider::codex::proof::CodexNamespaceGuard) { let _ = crate::provider::codex::auth_store::OwnedNamespace::open(paths, record, guard); }" \
         "OwnedNamespace::open with a CodexAccountRecord"
 
     # Clause 5: a namespace lock proof cannot be wrapped outside provider::codex.
-    clause 5 "$cmd" E0603 \
+    clause 5 "$status" E0603 \
         "fn _phase3_plant(g: crate::secret::namespace_lock::NamespaceLockGuard) -> crate::provider::codex::proof::CodexNamespaceGuard { crate::provider::codex::proof::CodexNamespaceGuard(g) }" \
         "CodexNamespaceGuard tuple constructor outside provider::codex"
 
@@ -263,9 +278,9 @@ main() {
         "fn _phase3_plant(gained_codex_auth: Vec<String>, survivors: Vec<std::path::PathBuf>, daemon_dir: bool, lock_files: Vec<std::path::PathBuf>, exit: std::process::ExitStatus) -> crate::provider::codex::proof::PostExitReport { crate::provider::codex::proof::PostExitReport { gained_codex_auth, survivors, daemon_dir, lock_files, exit } }" \
         "PostExitReport literal outside provider::codex"
 
-    # Clause 8 (S32): the refresh POST is `pub(super)`, so a command cannot send
-    # one. Planted in commands/codex/mod.rs until S33 creates status.rs.
-    clause 8 "$cmd" E0603 \
+    # Clause 8 (S32, moved to status.rs at S33): the refresh POST is
+    # `pub(super)`, so even the command that refreshes cannot send one itself.
+    clause 8 "$status" E0603 \
         "fn _phase3_plant(c: &crate::provider::codex::credentials::LockedCredentials<'static>, t: crate::provider::codex::auth_store::InflightToken<'static>, r: &crate::provider::codex::oauth::RefreshClient, x: &crate::runtime::coordinator::Cancel) { let _ = crate::provider::codex::oauth::refresh(c, t, r, x); }" \
         "oauth::refresh from commands/"
 
@@ -283,9 +298,28 @@ main() {
         "ResendConsent tuple literal from commands/"
 
     # Clause 11: a command cannot clear a refresh marker.
-    clause 11 "$cmd" E0624 \
+    clause 11 "$status" E0624 \
         "fn _phase3_plant(ns: &crate::provider::codex::auth_store::OwnedNamespace<'_>) { let _ = ns.refresh_state().clear_inflight(crate::provider::codex::auth_store::DefiniteOutcome::Applied); }" \
         "RefreshStateFile::clear_inflight from commands/"
+
+    # Clause 12 (S33, U44 = option 5): `watch` cannot build the capability to
+    # POST — the permit's field is private to provider/codex/permit.rs.
+    clause 12 "$watch" E0451 \
+        "fn _phase3_plant(client: crate::provider::codex::oauth::RefreshClient) -> crate::provider::codex::permit::PostPermit { crate::provider::codex::permit::PostPermit { client } }" \
+        "PostPermit literal in commands/codex/watch.rs"
+
+    # Clause 13 (S33-C2 review F1): neither can the shared pass, which is the
+    # file `watch` actually calls into. Clause 12 alone proved a narrower thing.
+    clause 13 "$pass" E0451 \
+        "fn _phase3_plant(client: crate::provider::codex::oauth::RefreshClient) -> crate::provider::codex::permit::PostPermit { crate::provider::codex::permit::PostPermit { client } }" \
+        "PostPermit literal in commands/codex/pass.rs"
+
+    # Clause 14 (S33-C2 review F1): the driver demands the capability, so the
+    # pass cannot drive a refresh even with a `RefreshCtx` in hand — which is
+    # what made the alias route of probe A compile before C2 round 2.
+    clause 14 "$pass" E0061 \
+        "fn _phase3_plant(o: crate::provider::codex::proof::OwnedRecord<'_>, c: &crate::provider::codex::refresh::RefreshCtx<'_>) { let _ = crate::provider::codex::refresh::run(o, crate::provider::codex::refresh::SendMode::Proactive, c); }" \
+        "refresh::run without a PostPermit"
 
     if [[ $FAILED -gt 0 ]]; then
         phase3_die "$FAILED clause(s) failed"

@@ -61,6 +61,11 @@
 # it would POST a Codex refresh token wherever an environment variable pointed
 # it — the same exfiltration AGCTL_CLAUDE_TOKEN_URL is gated against.
 #
+# S33 adds AGCTL_CODEX_USER_AGENT to the production list (plan AC110): from
+# S33 `agctl codex status` builds the Codex usage client, so the name is no
+# longer folded out of a release artifact — verified with `strings` on a
+# default-feature release build before this line was added (ledger #268).
+#
 # Phase 2 added no other seam: AGCTL_SECURITY_BIN (the write transport) and
 # AGCTL_CLAUDE_PROFILE_URL (the live swap's profile GET) are both listed, and
 # `rg -o 'AGCTL_[A-Z0-9_]+' src --glob '!*_tests.rs'` enumerates nothing else
@@ -151,6 +156,7 @@ production=(
 	AGCTL_CONFIG_DIR
 	AGCTL_CLAUDE_USER_AGENT
 	AGCTL_CLAUDE_OAUTH_SCOPES
+	AGCTL_CODEX_USER_AGENT
 )
 
 if [ -n "${AGCTL_RELEASE_GATE_TARGET:-}" ]; then

@@ -505,10 +505,6 @@ pub fn validate_segment(s: &str) -> Result<(), AppError> {
 /// # Errors
 ///
 /// Returns [`AppError::Config`] describing which rule the value broke.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the Codex paths are consumed from S30 (provider::codex) onward")
-)]
 pub fn validate_codex_segment(s: &str) -> Result<(), AppError> {
     validate_segment(s)?;
     if s.starts_with('.') {

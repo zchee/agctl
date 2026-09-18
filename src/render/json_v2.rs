@@ -23,12 +23,11 @@
 //!   comes from its kind, never from its position in the response (W0
 //!   correction 2).
 //!
-//! # No CLI flag reaches this yet
+//! # Who emits it
 //!
-//! `agctl codex status --json` emits it from S33. What S29b ships is the
-//! shape, the schema and the proof that the phase-1 rows fit through it
-//! (plan AC118): a report format whose first consumer arrives with its first
-//! producer is a format nobody has checked.
+//! `agctl codex status --json` (S33). `agctl claude status --json` stays on
+//! version 1; the Claude rows' version-2 form exists so that the phase-1 rows
+//! are proven to fit (plan AC118) before a combined command needs them.
 //!
 //! # No token material, ever
 //!
@@ -36,17 +35,10 @@
 //! row's identity, its state and its usage figures, and can no more reach a
 //! credential than the v1 renderer can.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the v2 document has no CLI producer until `agctl codex status --json` (S33); \
-                  S29b ships the shape, the schema and AC118's proof that phase-1 rows fit it"
-    )
-)]
-
 use jiff::Timestamp;
 use serde::Serialize;
+use serde_json::Map;
+use serde_json::Value;
 
 use crate::commands::status::RowOutcome;
 use crate::provider::Provider;
@@ -85,12 +77,22 @@ pub struct StatusReportV2 {
     pub rows: Vec<JsonRowV2>,
     /// How many rows `--all` would have added.
     pub hidden: usize,
+    /// The usage bodies, keyed by row id. Present only with `--raw`, as in
+    /// version 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<Map<String, Value>>,
 }
 
 impl StatusReportV2 {
     /// An empty report stamped with `now`.
     pub fn new(now: Timestamp, hidden: usize) -> Self {
-        Self { version: REPORT_VERSION_V2, generated_at: now.to_string(), rows: Vec::new(), hidden }
+        Self {
+            version: REPORT_VERSION_V2,
+            generated_at: now.to_string(),
+            rows: Vec::new(),
+            hidden,
+            raw: None,
+        }
     }
 
     /// The report `rows` produce, in the order they are given in.

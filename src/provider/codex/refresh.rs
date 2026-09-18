@@ -82,8 +82,8 @@ use crate::provider::codex::lock::LockBudget;
 use crate::provider::codex::oauth;
 use crate::provider::codex::oauth::AmbiguousClass;
 use crate::provider::codex::oauth::PermanentClass;
-use crate::provider::codex::oauth::RefreshClient;
 use crate::provider::codex::oauth::RefreshOutcome;
+use crate::provider::codex::permit::PostPermit;
 use crate::provider::codex::proof::OwnedRecord;
 use crate::runtime::coordinator::Cancel;
 use crate::runtime::fault::Fault;
@@ -237,8 +237,6 @@ pub enum SendMode {
 pub struct RefreshCtx<'a> {
     /// The store.
     pub paths: &'a Paths,
-    /// The token endpoint.
-    pub client: &'a RefreshClient,
     /// When the caller's own budget runs out.
     pub deadline: Instant,
     /// How long to wait for the namespace lock.
@@ -390,13 +388,19 @@ pub struct RefreshReport {
 
 /// Refreshes an owned namespace if, and only if, its mode's gates allow a
 /// send. The only POST path.
-pub fn run(owned: OwnedRecord<'_>, mode: SendMode, ctx: &RefreshCtx<'_>) -> RefreshReport {
+pub fn run(
+    permit: &PostPermit,
+    owned: OwnedRecord<'_>,
+    mode: SendMode,
+    ctx: &RefreshCtx<'_>,
+) -> RefreshReport {
     let mut notes = Vec::new();
-    let step = locked_run(owned, mode, ctx, &mut notes);
+    let step = locked_run(permit, owned, mode, ctx, &mut notes);
     RefreshReport { step, notes }
 }
 
 fn locked_run(
+    permit: &PostPermit,
     owned: OwnedRecord<'_>,
     mode: SendMode,
     ctx: &RefreshCtx<'_>,
@@ -429,7 +433,7 @@ fn locked_run(
         Ok(ns) => ns,
         Err(err) => return RefreshStep::Failed(err.to_string()),
     };
-    let driver = Driver { ns: &ns, ctx, ids: (owned.user(), owned.acct()) };
+    let driver = Driver { ns: &ns, ctx, permit, ids: (owned.user(), owned.acct()) };
     driver.drive(mode, notes)
 }
 
@@ -437,6 +441,8 @@ fn locked_run(
 struct Driver<'n, 'g, 'c> {
     ns: &'n OwnedNamespace<'g>,
     ctx: &'n RefreshCtx<'c>,
+    /// The capability its caller was given, and the client it posts with.
+    permit: &'n PostPermit,
     ids: (&'n str, &'n str),
 }
 
@@ -723,7 +729,7 @@ impl<'g> Driver<'_, 'g, '_> {
         }
         self.ctx.fault.pause_point(PAUSE_AFTER_POST_SNAPSHOT);
 
-        let outcome = oauth::refresh(&credentials, token, self.ctx.client, self.ctx.cancel);
+        let outcome = oauth::refresh(&credentials, token, self.permit.client(), self.ctx.cancel);
         self.settle(credentials, grant, kind, outcome, notes)
     }
 
@@ -1032,7 +1038,10 @@ fn unknown_step(state: &RefreshState, since: Timestamp, class: UnknownClass) -> 
 }
 
 /// `since + 1 h`, or `since + max(retry-after, 1 h)` for `rate_limited`.
-fn resend_eligible_at(
+///
+/// Public so a read-only caller renders the same eligibility the driver
+/// enforces, rather than a second copy of the rule.
+pub fn resend_eligible_at(
     since: Timestamp,
     class: UnknownClass,
     retry_after: Option<Duration>,
@@ -1083,10 +1092,15 @@ pub enum RetryGet {
 /// Records the retry GET's answer after a sent `AfterUnauthorized` refresh
 /// (plan AC114).
 ///
+/// It writes a marker and sends nothing, but it exists only after a send, so
+/// it takes the same [`PostPermit`] the send needed: a caller that may not
+/// POST may not record a POST's answer either.
+///
 /// # Errors
 ///
 /// [`AppError`] when the lock, the namespace or the marker is unavailable.
 pub fn record_retry_get(
+    _permit: &PostPermit,
     owned: OwnedRecord<'_>,
     result: RetryGet,
     ctx: &RefreshCtx<'_>,

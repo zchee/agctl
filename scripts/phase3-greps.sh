@@ -136,6 +136,50 @@
 #                 decoded-byte cap (`MAX_BODY_BYTES`, `MAX_RESPONSE_BYTES`). The
 #                 `codex_timeouts` scope already covers every file in the tree.
 #
+# S33 appends five more (U44 = option 5: `watch` never POSTs). Each matches the
+# PATH and not the call, so an aliased import is a hit on its own `use` line —
+# review S33-C2 F1 defeated the call-shaped versions with `use …::run as drive;`:
+#
+#   refresh_drivers  `refresh::run` / `refresh::record_retry_get`         → only
+#                 commands/codex/status.rs, whose pre-pass and 401 post-pass run
+#                 on the command thread (ledger #233). The pass they wrap lives
+#                 in commands/codex/pass.rs, which is deliberately not listed.
+#   refresh_client  `RefreshClient`                                       → only
+#                 provider/codex/{oauth,permit}.rs: no command names the token
+#                 client at all now that the permit carries it
+#   post_permit   `PostPermit`                                            → only
+#                 provider/codex/{permit,refresh}.rs and commands/codex/status.rs
+#   watch_no_post  every file under src/commands/codex except status.rs:
+#                 `refresh::run`, `refresh::record_retry_get`, `RefreshClient`,
+#                 `PostPermit`, `refresh_pre_pass`, `after_unauthorized`,
+#                 `codex::status`/`super::status`                          → none;
+#                 and, in watch.rs alone, `proof::owned` (the pass needs an
+#                 `OwnedRecord` to take the namespace lock; `watch.rs` does not)
+#   usage_client_new  `UsageClient::new(` in src/commands/codex            → none
+#                 (review S31 N2: commands build the client through `from_env`)
+#   permit_mint   who may MINT a permit, which is narrower than who may name one:
+#                 `PostPermit…::from_env` → only provider/codex/permit.rs and
+#                 commands/codex/status.rs. Review S33-C2-r2 F2: `refresh.rs` may
+#                 name the capability and calls its own driver as bare `run(`, so
+#                 a `pub(crate) fn settle()` there minted and spent a permit with
+#                 no textual trace any other check looks at. The same check also
+#                 refuses a second `impl PostPermit` block (which would make
+#                 `Self::from_env` a second spelling), any rename of the type
+#                 (`PostPermit as …`, `type X = …PostPermit`) — tests included,
+#                 since a rename anywhere teaches the next author the spelling —
+#                 and any `from_env` on a code line of refresh.rs, which reads
+#                 nothing from the environment today.
+#   permit_mint_count  `permit.rs` mints in exactly 2 places and has exactly 2
+#                 constructors returning `Self` in any wrapper (both counted on
+#                 code lines only, so prose cannot trip them), and
+#                 no function anywhere in `src` returns a `PostPermit` in any
+#                 wrapper — `Box`, `Option`, `Result`, `Arc`, a reference. Review S33-C2-r2 probe E moved the mint into a
+#                 third constructor inside `permit.rs` — the one file a mint may
+#                 live in — and every name-scoped check went quiet. A count is
+#                 what makes the residual reliance "review a 61-line file whose
+#                 whole purpose is this invariant" rather than "review a
+#                 1146-line refresh.rs". Modelled on `exposure_count`.
+#
 # With `--log`, the `LOG_ONLY_NEEDLES` are counted too: the sentinel email a
 # usage fixture carries (ledger #274). They are deliberately not code needles
 # — the fixture that carries the sentinel is how a leak test proves anything —
@@ -268,6 +312,62 @@ OAUTH_REFRESH_ALLOWED=(
 CONSENT_ALLOWED=(
     src/commands/codex/accounts.rs
 )
+
+# The one command that refreshes, and only on its command thread (U44 = 5).
+# S34 adds `src/commands/codex/accounts.rs` here and to POST_PERMIT_ALLOWED,
+# and nowhere else: one line per list, reviewed as one hunk.
+REFRESH_DRIVER_ALLOWED=(
+    src/commands/codex/status.rs
+)
+
+# The token client is the permit's own field; no command names it.
+REFRESH_CLIENT_ALLOWED=(
+    src/provider/codex/oauth.rs
+    src/provider/codex/permit.rs
+)
+
+# Who may name the capability: the module that defines it, the driver that
+# demands it, and the command that builds one.
+POST_PERMIT_ALLOWED=(
+    src/provider/codex/permit.rs
+    src/provider/codex/refresh.rs
+    src/commands/codex/status.rs
+)
+
+# Who may MINT a permit. Narrower than POST_PERMIT_ALLOWED on purpose:
+# `refresh.rs` must name the capability to demand it, and must not be able to
+# hand itself one (review S33-C2-r2 F2, probe C). S34 adds
+# `src/commands/codex/accounts.rs` here as well, one line.
+PERMIT_MINT_ALLOWED=(
+    src/commands/codex/status.rs
+)
+
+# Every spelling of a call to a mint: `PostPermit::from_env`,
+# `PostPermit :: from_env`, `<PostPermit>::with_client`. `permit.rs` itself needs
+# no allow-list entry, because it spells its own constructors `fn from_env` and
+# `Self { … }`. `Self::from_env` is a mint only inside an `impl PostPermit`
+# block, and PERMIT_IMPL below proves there is exactly one.
+PERMIT_MINT='\bPostPermit\s*>?\s*::\s*(?:from_env|with_client)\b'
+
+# A function that hands a permit back, in ANY return type that mentions one:
+# `-> PostPermit`, `-> Box<PostPermit>`, `-> Option<PostPermit>`,
+# `-> Result<PostPermit, _>`, `-> Arc<PostPermit>`, `-> &'static PostPermit`.
+# Review S33-C2-r3 F3: anchoring the name straight after the arrow let probe F
+# escape with `-> Box<PostPermit>` inside `permit.rs`'s own impl block. `[^;{]*`
+# stops at the body brace and at a statement end, so a parameter of type
+# `&PostPermit` before the arrow is not a hit. There are none anywhere in `src`
+# today — `permit.rs`'s two constructors return `Self` — so any hit is a mint
+# under another name, `permit.rs` included.
+PERMIT_FACTORY='->[^;{]*\bPostPermit\b'
+
+# An impl block for the capability, however it is written.
+PERMIT_IMPL='\bimpl\s+(?:<[^>]*>\s*)?PostPermit\b|\bimpl\b.*\bfor\s+PostPermit\b'
+
+# A rename, which would make PERMIT_MINT unable to see the mint.
+PERMIT_RENAME='\bPostPermit\s+as\b|\btype\s+\w+\s*=\s*[^;]*\bPostPermit\b'
+
+# What no Codex command file other than `status.rs` may name.
+WATCH_FORBIDDEN='\brefresh::(?:run|record_retry_get)\b|\bRefreshClient\b|\bPostPermit\b|\brefresh_pre_pass\b|\bafter_unauthorized\b|\bcodex::status\b|\bsuper::status\b'
 
 RECEIPT_TYPE_ALLOWED=(
     src/provider/codex/auth_store.rs
@@ -710,6 +810,122 @@ check_consent_callers() {
         "${CONSENT_ALLOWED[@]}"
 }
 
+check_refresh_drivers() {
+    check_helper_callers "$1" '\brefresh::(?:run|record_retry_get)\b' 'a refresh driver' \
+        "${REFRESH_DRIVER_ALLOWED[@]}"
+}
+
+check_refresh_client() {
+    check_helper_callers "$1" '\bRefreshClient\b' 'the refresh client' \
+        "${REFRESH_CLIENT_ALLOWED[@]}"
+}
+
+check_post_permit() {
+    check_helper_callers "$1" '\bPostPermit\b' 'the POST capability' "${POST_PERMIT_ALLOWED[@]}"
+}
+
+# Who may hand themselves the capability. `post_permit` scopes the NAME;
+# this scopes the MINT, which is the half review S33-C2-r2 F2 found missing.
+check_permit_mint() {
+    local root=$1 bad=0 hits file status=0
+    check_helper_callers "$root" "$PERMIT_MINT" 'the POST capability constructor' \
+        "${PERMIT_MINT_ALLOWED[@]}" || bad=1
+
+    hits=$(code_hits "$root" "$PERMIT_IMPL") || scan_failed check_permit_mint
+    while IFS= read -r file; do
+        [[ -z $file ]] && continue
+        if ! contains "$file" src/provider/codex/permit.rs; then
+            printf '  %s implements the POST capability; a second impl block makes `Self::from_env` a second mint\n' "$file"
+            bad=1
+        fi
+    done < <(printf '%s\n' "$hits" | cut -d: -f1 | LC_ALL=C sort -u)
+
+    # Deliberately not `code_hits`: a rename inside a test file teaches the next
+    # author a spelling the mint check cannot see, so tests are scanned too.
+    hits=$(cd "$root" && rg --line-number --no-heading --color never \
+        -e "^\\s*(?:[^/\\s].*)?(?:${PERMIT_RENAME})" src) || status=$?
+    [[ $status -gt 1 ]] && scan_failed check_permit_mint
+    if [[ -n $hits ]]; then
+        printf '  the POST capability is renamed; `PostPermit::from_env` must stay its only spelling:\n%s\n' "$hits"
+        bad=1
+    fi
+
+    # Belt over the brace: the driver's own module reads nothing from the
+    # environment today, so it cannot mint anything either.
+    hits=$(scoped_code_hits "$root" '\bfrom_env\b' src/provider/codex/refresh.rs) \
+        || scan_failed check_permit_mint
+    if [[ -n $hits ]]; then
+        printf '  the refresh driver reads the environment; it may demand a permit but must never mint one:\n%s' "$hits"
+        bad=1
+    fi
+    return "$bad"
+}
+
+# …and that `permit.rs` still mints in exactly the two places it documents.
+# Review S33-C2-r2 probe E moved the mint into a THIRD constructor inside
+# `permit.rs` — the one file allowed to hold one — and every name-scoped check
+# went quiet. Modelled on check_exposure_count.
+check_permit_mint_count() {
+    local root=$1 file=$1/src/provider/codex/permit.rs bad=0 mints ctors hits
+    [[ -f $file ]] || return 0
+    # Code lines only, per the `code_hits` convention: a doc comment that quotes
+    # `Self { client` or `-> Self` is prose, not a mint (review S33-C2-r3 N3).
+    mints=$(rg -c -e "^\\s*(?:[^/\\s].*)?Self \\{ client" "$file" || true)
+    if [[ ${mints:-0} -ne 2 ]]; then
+        printf '  src/provider/codex/permit.rs mints a permit in %s place(s), not 2; a new constructor is a new POST path\n' \
+            "${mints:-0}"
+        bad=1
+    fi
+    # `->[^;{]*\bSelf\b`, not `-> Self`: review S33-C2-r3 probe G returned
+    # `Box<Self>`, which names neither `PostPermit` nor a bare `Self` return.
+    # `\bSelf\b` is case-sensitive, so `fn client(&self) -> &RefreshClient` is
+    # not a constructor and not a hit.
+    ctors=$(rg -c -e "^\\s*(?:[^/\\s].*)?->[^;{]*\\bSelf\\b" "$file" || true)
+    if [[ ${ctors:-0} -ne 2 ]]; then
+        printf '  src/provider/codex/permit.rs has %s constructor(s) returning Self, not 2 (`from_env` and the #[cfg(test)] `with_client`)\n' \
+            "${ctors:-0}"
+        bad=1
+    fi
+    # Any return type that mentions a permit, `permit.rs` included: a wrapper is
+    # how probe F walked past the arrow-anchored version of this (F3).
+    hits=$(code_hits "$root" "$PERMIT_FACTORY") || scan_failed check_permit_mint_count
+    if [[ -n $hits ]]; then
+        printf '  a function hands a permit back; a permit leaves `permit.rs` only as the value `from_env` returns:\n%s\n' "$hits"
+        bad=1
+    fi
+    return "$bad"
+}
+
+# Every Codex command file but `status.rs` — the pass in `pass.rs` included,
+# because that is the file `watch` calls into (review S33-C2, probe B).
+check_watch_no_post() {
+    local root=$1 hits status=0 bad=0
+    [[ -d $root/src/commands/codex ]] || return 0
+    hits=$(cd "$root" && rg --line-number --no-heading --color never \
+        --glob '!*_tests.rs' --glob '!status.rs' \
+        -e "^\\s*(?:[^/\\s].*)?(?:${WATCH_FORBIDDEN})" src/commands/codex) || status=$?
+    [[ $status -gt 1 ]] && scan_failed check_watch_no_post
+    if [[ -n $hits ]]; then
+        printf '  a Codex command file that is not `status.rs` names a refresh path; only `status` may POST (U44 = 5):\n%s\n' "$hits"
+        bad=1
+    fi
+    hits=$(scoped_code_hits "$root" '\bproof::owned\b' src/commands/codex/watch.rs) \
+        || scan_failed check_watch_no_post
+    if [[ -n $hits ]]; then
+        printf '  `agctl codex watch` names an owned-namespace handle; the pass reads for it:\n%s' "$hits"
+        bad=1
+    fi
+    return "$bad"
+}
+
+check_usage_client_new() {
+    local hits
+    hits=$(scoped_code_hits "$1" '\bUsageClient::new\(' src/commands/codex) || scan_failed check_usage_client_new
+    [[ -z $hits ]] && return 0
+    printf '  a Codex command builds its usage client without `from_env` (review S31 N2):\n%s' "$hits"
+    return 1
+}
+
 check_refresh_usage_cache() {
     local hits
     hits=$(scoped_code_hits "$1" '\busage::cache\b' src/provider/codex/refresh.rs) || scan_failed check_refresh_usage_cache
@@ -904,6 +1120,119 @@ plant_consent_caller() {
 plant_reset_consent_caller() {
     plant_line "$1" $'fn _phase3_plant() {\n    let _ = ResetConsent::after_confirmation(\n        "yes", true, false,\n    );\n}' src/provider/codex/usage.rs
 }
+plant_refresh_driver_watch() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" $'fn _phase3_plant(o: OwnedRecord<\'_>, c: &RefreshCtx<\'_>) {\n    let _ = refresh::run(\n        o, SendMode::Proactive, c,\n    );\n}' src/commands/codex/watch.rs
+}
+plant_refresh_retry_elsewhere() {
+    plant_line "$1" 'fn _phase3_plant(o: OwnedRecord<'"'"'_>, c: &RefreshCtx<'"'"'_>) { let _ = crate::provider::codex::refresh::record_retry_get(o, RetryGet::Succeeded, c); }' src/commands/status.rs
+}
+plant_refresh_client_watch() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'fn _phase3_plant() -> RefreshClient { RefreshClient::from_env() }' src/commands/codex/mod.rs
+}
+plant_post_permit_elsewhere() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" $'fn _phase3_plant(client: RefreshClient) -> PostPermit {\n    PostPermit { client }\n}' src/commands/codex/mod.rs
+}
+plant_watch_names_permit() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'fn _phase3_plant(p: &crate::provider::codex::permit::PostPermit) {}' src/commands/codex/watch.rs
+}
+# The alias route review S33-C2 probe A used: an import under another name, so
+# the call site never spells the driver. Caught on the `use` line.
+plant_refresh_driver_alias() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'use crate::provider::codex::refresh::run as drive;' src/commands/codex/pass.rs
+}
+# Probe B: the POST written in full inside the shared pass.
+plant_refresh_driver_in_pass() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" $'fn _phase3_plant(p: &PostPermit, o: OwnedRecord<\'_>, c: &RefreshCtx<\'_>) {\n    let _ = refresh::run(\n        p, o, SendMode::Proactive, c,\n    );\n}' src/commands/codex/pass.rs
+}
+plant_refresh_client_alias() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'use crate::provider::codex::oauth::RefreshClient as Rc;' src/commands/codex/mod.rs
+}
+plant_post_permit_alias() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'use crate::provider::codex::permit::PostPermit as Cap;' src/commands/codex/pass.rs
+}
+plant_pass_names_status() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'use crate::commands::codex::status as st;' src/commands/codex/pass.rs
+}
+plant_pass_retry_alias() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'use crate::provider::codex::refresh::record_retry_get as rec;' src/commands/codex/pass.rs
+}
+plant_watch_reads_owned() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'fn _phase3_plant(r: &CodexAccountRecord) { let _ = proof::owned(r); }' src/commands/codex/watch.rs
+}
+plant_watch_names_post_pass() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" $'fn _phase3_plant() {\n    let _ = status::after_unauthorized;\n}' src/commands/codex/watch.rs
+}
+# Review S33-C2-r2 probe C: the wrapper inside the driver's own module.
+plant_permit_mint_in_refresh() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'fn _phase3_plant() -> PostPermit { PostPermit::from_env() }' src/provider/codex/refresh.rs
+}
+plant_permit_mint_in_pass() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'fn _phase3_plant() -> PostPermit { PostPermit::from_env() }' src/commands/codex/pass.rs
+}
+# The spaced and fully-qualified spellings of the same mint.
+plant_permit_mint_spaced() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'fn _phase3_plant() -> Cap { <PostPermit> :: from_env() }' src/commands/codex/mod.rs
+}
+plant_permit_impl_elsewhere() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" $'impl PostPermit {\n    fn _phase3_plant() -> Self { Self::from_env() }\n}' src/provider/codex/refresh.rs
+}
+plant_permit_alias() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'use crate::provider::codex::permit::PostPermit as Cap;' src/provider/codex/refresh.rs
+}
+plant_permit_type_alias() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'type Cap = crate::provider::codex::permit::PostPermit;' src/provider/codex/refresh.rs
+}
+plant_permit_alias_in_tests() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'use crate::provider::codex::permit::PostPermit as Cap;' src/provider/codex/refresh_tests.rs
+}
+plant_refresh_from_env() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'fn _phase3_plant() { let _ = Client::from_env(); }' src/provider/codex/refresh.rs
+}
+# Review S33-C2-r2 probe E: a third constructor inside permit.rs itself.
+plant_permit_third_ctor() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" $'fn _phase3_plant() -> Self {\n    Self { client: RefreshClient::from_env() }\n}' src/provider/codex/permit.rs
+}
+plant_permit_factory_in_refresh() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'fn _phase3_plant() -> PostPermit { unreachable!() }' src/provider/codex/refresh.rs
+}
+# Review S33-C2-r3 probes F and G: the same mint behind a wrapper, inside
+# `permit.rs` itself — the shape the bare plant above proves nothing about.
+# Both spellings are planted: `Box<PostPermit>` exercises PERMIT_FACTORY, and
+# `Box<Self>`, which names the type nowhere, exercises the constructor count.
+plant_permit_wrapped_factory() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'pub(crate) fn _phase3_plant() -> Box<PostPermit> { Box::new(Self::from_env()) }' src/provider/codex/permit.rs
+}
+plant_permit_wrapped_self_ctor() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'pub(crate) fn _phase3_plant() -> Box<Self> { Box::new(Self::from_env()) }' src/provider/codex/permit.rs
+}
+plant_usage_client_new() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'fn _phase3_plant() -> UsageClient { UsageClient::new("http://x", "ua", Duration::ZERO) }' src/commands/codex/status.rs
+}
 plant_refresh_usage_cache() {
     mkdir -p "$1/src/provider/codex"
     plant_line "$1" 'use crate::usage::cache;' src/provider/codex/refresh.rs
@@ -943,7 +1272,7 @@ CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers expose
     exposure_count auth_json account_header toml locked_read marker_mutators stop_policy
     codex_debug_assert state_path codex_flock wham_usage codex_usage_url codex_timeouts codex_redirects codex_decoded_cap credits_state
     auth_host codex_token_url oauth_cancelled oauth_refresh_callers consent_callers refresh_usage_cache receipt_type
-    receipt_destructure)
+    receipt_destructure refresh_drivers refresh_client post_permit permit_mint permit_mint_count watch_no_post usage_client_new)
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
@@ -1008,6 +1337,35 @@ PLANTS=(
     "receipt_destructure plant_receipt_tuple"
     "receipt_destructure plant_receipt_unaudited"
     "marker_mutators plant_marker_mutator_settle"
+    "refresh_drivers plant_refresh_driver_watch"
+    "refresh_drivers plant_refresh_retry_elsewhere"
+    "refresh_drivers plant_refresh_driver_alias"
+    "refresh_drivers plant_refresh_driver_in_pass"
+    "refresh_client plant_refresh_client_watch"
+    "refresh_client plant_refresh_client_alias"
+    "post_permit plant_post_permit_elsewhere"
+    "post_permit plant_post_permit_alias"
+    "watch_no_post plant_watch_names_permit"
+    "watch_no_post plant_watch_names_post_pass"
+    "watch_no_post plant_refresh_driver_alias"
+    "watch_no_post plant_refresh_driver_in_pass"
+    "watch_no_post plant_pass_names_status"
+    "watch_no_post plant_pass_retry_alias"
+    "watch_no_post plant_watch_reads_owned"
+    "permit_mint plant_permit_mint_in_refresh"
+    "permit_mint plant_permit_mint_in_pass"
+    "permit_mint plant_permit_mint_spaced"
+    "permit_mint plant_permit_impl_elsewhere"
+    "permit_mint plant_permit_alias"
+    "permit_mint plant_permit_type_alias"
+    "permit_mint plant_permit_alias_in_tests"
+    "permit_mint plant_refresh_from_env"
+    "permit_mint_count plant_permit_third_ctor"
+    "permit_mint_count plant_permit_factory_in_refresh"
+    "permit_mint_count plant_permit_wrapped_factory"
+    "permit_mint_count plant_permit_wrapped_self_ctor"
+    "permit_mint_count plant_permit_mint_in_refresh"
+    "usage_client_new plant_usage_client_new"
 )
 
 main() {

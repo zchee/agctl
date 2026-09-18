@@ -139,6 +139,14 @@ const EMAIL_MEMBER: &str = "email";
 #[cfg(feature = "testing")]
 pub const USAGE_URL_ENV: &str = "AGCTL_CODEX_USAGE_URL";
 
+/// Where a `testing` build sends a usage GET when [`USAGE_URL_ENV`] is unset:
+/// the loopback discard port, a refused connection before a byte leaves the
+/// host (review S31 F8, the twin of the token client's fallback, ledger D12).
+/// A test binary never falls back to the vendor, and never with a bearer
+/// token.
+#[cfg(feature = "testing")]
+pub const TESTING_FALLBACK_BASE_URL: &str = "http://127.0.0.1:9";
+
 /// One window, with the vendor names version 2 carries beside it.
 ///
 /// Codex's `additional_rate_limits[]` rows describe a limit that Claude has
@@ -294,13 +302,17 @@ impl UsageClient {
     /// Production always talks to [`DEFAULT_BASE_URL`]. Under the `testing`
     /// feature [`USAGE_URL_ENV`] redirects it at an `httpmock` server, which
     /// is how every test in this crate exercises the endpoint without
-    /// contacting the vendor.
+    /// contacting the vendor, and an unset seam fails closed to
+    /// [`TESTING_FALLBACK_BASE_URL`].
+    ///
+    /// Commands build their client here and nowhere else (review S31 N2):
+    /// [`UsageClient::new`] trusts the agent string it is given.
     pub fn from_env(timeout: Duration) -> Self {
         #[cfg(feature = "testing")]
         let base = std::env::var(USAGE_URL_ENV)
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
+            .unwrap_or_else(|| TESTING_FALLBACK_BASE_URL.to_owned());
         #[cfg(not(feature = "testing"))]
         let base = DEFAULT_BASE_URL.to_owned();
 

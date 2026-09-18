@@ -717,9 +717,11 @@ pub struct CodexStatusArgs {
 
     /// Per-request HTTP timeout, such as `10s` or `5m`.
     ///
-    /// The budget for one request, not for the pass: when an owned account is
-    /// due a refresh the pass may take up to `1s + 19s + 1s + 2 × --timeout`,
-    /// because a refresh POST has its own budget and is never cut short.
+    /// The budget for each phase of one request, not for the pass. One request
+    /// can take `4 × min(--timeout, 5s) + 2 × --timeout` (40s by default), and
+    /// when an owned account may be refreshed the pass may take up to
+    /// `1s + 19s + 1s + 2 ×` that (101s by default), because a refresh POST
+    /// has its own budget and is never cut short.
     #[arg(long, value_name = "DUR", default_value = "10s", value_parser = duration_value_parser)]
     pub timeout: Duration,
 }

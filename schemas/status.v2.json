@@ -25,6 +25,11 @@
       "description": "How many rows --all would have added. Zero when --all was given.",
       "type": "integer",
       "minimum": 0
+    },
+    "raw": {
+      "description": "The usage response bodies, keyed by row id, less any member that names the account's email. Present only with --raw.",
+      "type": "object",
+      "additionalProperties": true
     }
   },
   "$defs": {

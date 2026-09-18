@@ -421,21 +421,6 @@ fn a_non_object_body_is_an_error() {
 // --- AC101 unit half: the request, against a fake endpoint ---------------
 
 #[test]
-fn from_env_talks_to_the_vendor_endpoint_when_nothing_redirects_it() {
-    // Building a client makes no request. Nothing in this suite sets the
-    // variable, and nextest runs each test in a process of its own.
-    #[cfg(feature = "testing")]
-    assert!(
-        std::env::var_os(USAGE_URL_ENV).is_none(),
-        "{USAGE_URL_ENV} is set in the test environment"
-    );
-
-    let client = UsageClient::from_env(Duration::from_secs(5));
-    assert_eq!(client.usage_url(), "https://chatgpt.com/backend-api/wham/usage");
-    assert_eq!(client.usage_url(), format!("{DEFAULT_BASE_URL}{USAGE_PATH}"));
-}
-
-#[test]
 fn base_url_trailing_slashes_are_trimmed() {
     let client = UsageClient::new("http://127.0.0.1:9/", "agctl/test", Duration::from_secs(1));
     assert_eq!(client.usage_url(), "http://127.0.0.1:9/backend-api/wham/usage");
@@ -982,4 +967,36 @@ fn a_traced_fetch_logs_no_email_token_or_header_value() {
     assert!(!logs.to_ascii_lowercase().contains("bearer"), "the log leaked a header:\n{logs}");
     testkit::assert_no_needles(&logs, "the fetch log");
     assert!(!format!("{usage:?}").contains(EMAIL_SENTINEL));
+}
+
+#[test]
+fn from_env_never_falls_back_to_the_vendor_in_a_testing_build() {
+    // Read, never set: a process variable set here would race every other
+    // test. Whatever the seam holds, a `testing` build's URL is it or the
+    // loopback fallback — never the vendor's host (review S31 F8).
+    let client = UsageClient::from_env(Duration::from_secs(1));
+    #[cfg(feature = "testing")]
+    {
+        let base = std::env::var(USAGE_URL_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| TESTING_FALLBACK_BASE_URL.to_owned());
+        assert_eq!(client.usage_url(), format!("{}{USAGE_PATH}", base.trim_end_matches('/')));
+        assert!(!client.usage_url().starts_with(DEFAULT_BASE_URL));
+        assert!(TESTING_FALLBACK_BASE_URL.starts_with("http://127.0.0.1:"));
+    }
+    #[cfg(not(feature = "testing"))]
+    assert_eq!(client.usage_url(), format!("{DEFAULT_BASE_URL}{USAGE_PATH}"));
+}
+
+#[cfg(feature = "testing")]
+#[test]
+fn the_testing_fallback_refuses_before_a_request_is_read() {
+    let client = UsageClient::new(TESTING_FALLBACK_BASE_URL, "agctl/test", Duration::from_secs(2));
+    let credentials = credentials(|_| {});
+    let account = AccountRef { id: "user-fallback", auth: &credentials };
+
+    let outcome = client.fetch(&account, &Cancel::new());
+
+    assert!(matches!(outcome, Err(FetchError::Transport(_))), "{outcome:?}");
 }

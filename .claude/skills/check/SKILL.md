@@ -83,8 +83,9 @@ of which must be absent:**
 | `AGCTL_CODEX_USAGE_URL` | `src/provider/codex/usage.rs` (phase 3, S31; `scripts/phase3-greps.sh` pins it to that one file) |
 | `AGCTL_CODEX_TOKEN_URL` | `src/provider/codex/oauth.rs` (phase 3, S32; `scripts/phase3-greps.sh` pins it to that one file) |
 
-**Three production names, every one of which must be present:** `AGCTL_CONFIG_DIR`,
-`AGCTL_CLAUDE_USER_AGENT`, `AGCTL_CLAUDE_OAUTH_SCOPES`. (The presence half is there so
+**Four production names, every one of which must be present:** `AGCTL_CONFIG_DIR`,
+`AGCTL_CLAUDE_USER_AGENT`, `AGCTL_CLAUDE_OAUTH_SCOPES`, and — from S33, once
+`agctl codex status` builds the Codex usage client — `AGCTL_CODEX_USER_AGENT`. (The presence half is there so
 a build that somehow embedded no strings at all cannot pass by accident.)
 
 A seam in a release artifact is not a style problem. `AGCTL_CLAUDE_TOKEN_URL` in a

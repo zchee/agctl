@@ -639,6 +639,20 @@ impl<'g> LockedCredentials<'g> {
         &self.inner
     }
 
+    /// The credentials, no longer bound to the lock they were read under.
+    ///
+    /// For a usage GET, which reads a token and writes nothing: holding the
+    /// namespace lock for the length of a request would make every other
+    /// agctl process's refresh of this namespace `busy` meanwhile. What an
+    /// unbound value cannot do is the point of the type — build a refresh
+    /// body ([`LockedCredentials::write_refresh_body_to`]) or be written
+    /// (`OwnedNamespace::write` takes `&LockedCredentials`) — so unbinding
+    /// gives up exactly the capabilities a read-only caller does not need
+    /// (invariant I26).
+    pub fn into_credentials(self) -> Credentials {
+        self.inner
+    }
+
     /// The first eight hex digits of the refresh token's digest.
     pub fn refresh_digest8(&self) -> Option<String> {
         self.inner.refresh_digest8()

@@ -19,9 +19,7 @@ fn codex(args: &[&str]) -> CodexCommand {
 
 #[test]
 fn every_subcommand_refuses_and_names_itself() {
-    let lines: [(&[&str], &str); 8] = [
-        (&["agctl", "codex", "status"], "agctl codex status"),
-        (&["agctl", "codex", "watch"], "agctl codex watch"),
+    let lines: [(&[&str], &str); 6] = [
         (&["agctl", "codex", "login"], "agctl codex login"),
         (&["agctl", "codex", "import", "--from", "codex-home"], "agctl codex import"),
         (&["agctl", "codex", "doctor"], "agctl codex doctor"),

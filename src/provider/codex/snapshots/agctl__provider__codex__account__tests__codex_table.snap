@@ -1,0 +1,10 @@
+---
+source: src/provider/codex/account_tests.rs
+expression: rendered
+---
+ Account                                        | Plan | Kind  | 5h  | Weekly | Credits | 5h reset            | Weekly reset        | State                    
+------------------------------------------------+------+-------+-----+--------+---------+---------------------+---------------------+--------------------------
+ owner@example.com                              | plus | owned | 21% | 35%    | 12.34   | 5h0m (Thu 02:00 AM) | 5d2h (Mon 11:00 PM) | ok                       
+   ↳ GPT-5.3-Codex-Spark:primary (unknown kind) |      |       |     | 3%     |         |                     | 5h0m (Thu 02:00 AM) |                          
+ user-0001                                      | —    | live  | —   | —      | n/a     | —                   | —                   | no usage source (apikey) 
+1 entry hidden (--all)

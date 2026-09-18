@@ -325,6 +325,10 @@ fn read_config(path: &Path) -> Result<Option<String>, ConfigNote> {
     String::from_utf8(bytes).map(Some).map_err(|_| ConfigNote::Unparseable { line: None })
 }
 
+/// The keychain item service Codex stores a home's credentials under (fact
+/// F94). Compared against a read-only listing, never passed to a writer.
+pub const KEYRING_SERVICE: &str = "Codex Auth";
+
 /// The keychain item account Codex uses for a home (fact F94):
 /// `cli|<first 16 hex digits of sha256(canonical home)>`.
 ///
