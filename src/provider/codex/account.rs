@@ -109,13 +109,6 @@ pub enum CodexState {
         /// The `retry-after` hint, in seconds.
         retry_after: Option<u64>,
     },
-    /// A parked refresh was moved into place.
-    PendingReplayed,
-    /// A parked refresh was deleted unused.
-    PendingDiscarded {
-        /// The resolver's label.
-        reason: String,
-    },
     /// A refresh response was discarded.
     RefreshDiscarded,
     /// The refreshed id token names a different account (fact F92).
@@ -168,8 +161,6 @@ impl CodexState {
             Self::LockUnavailable => "lock_unavailable",
             Self::Stale => "stale",
             Self::RateLimited { .. } => "rate_limited",
-            Self::PendingReplayed => "pending_replayed",
-            Self::PendingDiscarded { .. } => "pending_discarded",
             Self::RefreshDiscarded => "refresh_discarded",
             Self::IdentityDrift => "identity_drift",
             Self::RefreshOutcomeUnknown { .. } => "refresh_outcome_unknown",
@@ -221,8 +212,6 @@ impl CodexState {
                 format!("rate-limited (retry in {seconds}s)")
             }
             Self::RateLimited { retry_after: None } => "rate-limited".to_owned(),
-            Self::PendingReplayed => "pending replayed".to_owned(),
-            Self::PendingDiscarded { reason } => format!("pending discarded ({reason})"),
             Self::RefreshDiscarded => "refresh discarded".to_owned(),
             Self::IdentityDrift => "identity drift".to_owned(),
             Self::RefreshOutcomeUnknown { class, .. } => {

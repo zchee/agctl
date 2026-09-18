@@ -22,8 +22,6 @@ fn every_state() -> Vec<CodexState> {
         CodexState::LockUnavailable,
         CodexState::Stale,
         CodexState::RateLimited { retry_after: Some(30) },
-        CodexState::PendingReplayed,
-        CodexState::PendingDiscarded { reason: "invalid".to_owned() },
         CodexState::RefreshDiscarded,
         CodexState::IdentityDrift,
         CodexState::RefreshOutcomeUnknown {
@@ -322,22 +320,4 @@ fn ac102_every_state_serializes_into_a_valid_v2_row_without_a_needle() {
     assert_eq!(first.credits.balance.as_deref(), Some("12.34"));
     assert!(first.session_reset.is_some() && first.weekly_reset.is_some());
     assert_eq!(first.windows.len(), 3);
-}
-
-#[test]
-fn n4b_the_pending_states_render_the_codex_wording_not_claude_s() {
-    // Review S33-C3b N4b. Codex and Claude spell the discard differently —
-    // `pending discarded (<reason>)` here, `pending discarded: <reason>` in
-    // `provider/claude/account.rs:162` — and the Codex pass renders a bare
-    // `pending discarded` note besides. Nothing produces
-    // `CodexState::PendingDiscarded` today (the pass reaches for the note),
-    // so this pins the wording the state would show rather than one a row is
-    // known to print; the request records the missing producer as a finding.
-    assert_eq!(
-        CodexState::PendingDiscarded { reason: "invalid".to_owned() }.label(),
-        "pending discarded (invalid)"
-    );
-    assert_eq!(CodexState::PendingDiscarded { reason: "x".to_owned() }.name(), "pending_discarded");
-    assert_eq!(CodexState::PendingReplayed.label(), "pending replayed");
-    assert_eq!(CodexState::PendingReplayed.name(), "pending_replayed");
 }
