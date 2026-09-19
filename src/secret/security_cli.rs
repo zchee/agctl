@@ -361,3 +361,50 @@ fn attribute(line: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 #[path = "security_cli_tests.rs"]
 mod tests;
+
+impl SecurityCli {
+    /// Re-runs `dump-keychain`, replacing this reader's memo with the result.
+    ///
+    /// [`KeychainReader::list_services`] answers from a dump taken once and
+    /// kept for the reader's lifetime, which is right for a pass that asks the
+    /// same question about several accounts. `login` asks a different
+    /// question: it compares the keychain **before** the child ran with the
+    /// keychain **after**, and a memo would answer the second question with
+    /// the first question's dump — silently voiding the check that refuses an
+    /// install when the child created a `Codex Auth` item (plan AC105).
+    ///
+    /// Inherent rather than a trait method on purpose: `fake_reader.rs` and
+    /// `DisabledReader` have no memo to bypass, and adding a method they must
+    /// implement would spread a concern that belongs to this one reader. The
+    /// cost is that a caller needs a concrete `SecurityCli`, which is exactly
+    /// the property that stops `login` from reaching the keychain through a
+    /// `Box<dyn KeychainReader>` whose memo could serve the second listing
+    /// from the first.
+    ///
+    /// # Errors
+    ///
+    /// As [`KeychainReader::list_services`].
+    pub fn list_services_uncached(&self, prefix: &str) -> Result<Vec<ServiceEntry>, KeychainError> {
+        *lock(&self.dump) = None;
+        self.list_services(prefix)
+    }
+
+    /// The production reader, or `None` when this build has no keychain to
+    /// read (the `testing` seams that disable it).
+    ///
+    /// Mirrors `secret::default_reader`, but hands back the concrete type so
+    /// [`SecurityCli::list_services_uncached`] is reachable.
+    pub fn from_env(ctx: PassCtx) -> Option<Self> {
+        #[cfg(feature = "testing")]
+        if std::env::var(crate::secret::KEYCHAIN_BACKEND_ENV).is_ok_and(|value| value == "none") {
+            return None;
+        }
+
+        #[cfg(feature = "testing")]
+        let bin = std::env::var_os(crate::secret::SECURITY_BIN_ENV).map(PathBuf::from)?;
+        #[cfg(not(feature = "testing"))]
+        let bin = PathBuf::from(crate::secret::SECURITY_BIN);
+
+        Some(Self::new(bin, crate::secret::current_account(), ctx))
+    }
+}

@@ -19,6 +19,12 @@ show-keychain-info)
     exit "${AGCTL_FAKE_SECURITY_PREFLIGHT_EXIT:-0}"
     ;;
 dump-keychain)
+    # Fail this dump only once a marker exists, so a test can let the first
+    # listing through and fail the second one (the fake `codex` creates the
+    # marker in between).
+    if [ -n "${AGCTL_FAKE_SECURITY_DUMP_EXIT_IF:-}" ] && [ -e "$AGCTL_FAKE_SECURITY_DUMP_EXIT_IF" ]; then
+        exit "${AGCTL_FAKE_SECURITY_DUMP_EXIT_IF_CODE:-36}"
+    fi
     if [ -n "${AGCTL_FAKE_SECURITY_DUMP:-}" ] && [ -f "$AGCTL_FAKE_SECURITY_DUMP" ]; then
         cat "$AGCTL_FAKE_SECURITY_DUMP"
     fi

@@ -123,6 +123,44 @@ impl CodexFixture {
         dir
     }
 
+    /// Wires the fake `security` into every spawn, the way the Claude suite
+    /// does, so a Codex login takes real keychain listings instead of the
+    /// empty ones a disabled backend returns.
+    ///
+    /// `Fixture::new` disables the keychain for every test; a login test that
+    /// does not call this runs keychain-less, and says so.
+    pub fn with_keychain(&mut self) -> &mut Self {
+        self.inner.with_keychain();
+        self
+    }
+
+    /// The fake `security`'s `dump-keychain` output, once [`Self::with_keychain`]
+    /// has run.
+    ///
+    /// `Fixture::dump_path` is private to the phase-2 harness, so the path is
+    /// derived here the same way and asserted to exist: a rename there fails
+    /// loudly here instead of pointing a test at a file nobody reads.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the keychain is not wired.
+    #[must_use]
+    pub fn keychain_dump_path(&self) -> PathBuf {
+        let path = self.root().join("keychain-dump.txt");
+        assert!(
+            path.exists(),
+            "call `with_keychain` first; there is no dump at {}",
+            path.display()
+        );
+        path
+    }
+
+    /// The fake `security`'s argv log, once [`Self::with_keychain`] has run.
+    #[must_use]
+    pub fn security_log_path(&self) -> PathBuf {
+        self.inner.security_log_path()
+    }
+
     /// Where the fake `codex` was written.
     #[must_use]
     pub fn codex_bin(&self) -> &Path {
@@ -163,7 +201,25 @@ impl CodexFixture {
     #[must_use]
     pub fn cmd(&self) -> Command {
         let command = self.inner.cmd();
-        self.assert_isolated(&command);
+        self.assert_isolated(command.get_envs());
+        command
+    }
+
+    /// A `std::process::Command` to the binary, for the few tests that must
+    /// control a stream `assert_cmd` cannot (a stdout whose reader is closed).
+    ///
+    /// Never call `self.inner().raw()` bare: that keeps phase 2's isolation but
+    /// skips this fixture's own [`Self::assert_isolated`]. This runs the same
+    /// check [`Self::cmd`] runs, over the same environment.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Codex home variable reached the child's environment,
+    /// or when `HOME` is not inside the fixture.
+    #[must_use]
+    pub fn raw(&self) -> std::process::Command {
+        let command = self.inner.raw();
+        self.assert_isolated(command.get_envs());
         command
     }
 
@@ -214,9 +270,12 @@ impl CodexFixture {
     ///
     /// Panics when the Codex home variable is set in the child's environment,
     /// or when `HOME` is not the fixture's.
-    fn assert_isolated(&self, command: &Command) {
+    fn assert_isolated<'a>(
+        &self,
+        envs: impl Iterator<Item = (&'a std::ffi::OsStr, Option<&'a std::ffi::OsStr>)>,
+    ) {
         let home = self.inner.home();
-        for (key, value) in command.get_envs() {
+        for (key, value) in envs {
             if key == CODEX_HOME_ENV {
                 assert!(
                     value.is_none(),

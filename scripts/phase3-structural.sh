@@ -238,11 +238,19 @@ main() {
     # can be narrower than `pub(crate)` across the provider/commands boundary —
     # so `scripts/phase3-greps.sh` holds that half, matching the path so an
     # aliased import is a hit on its own `use` line.
-    local cmd=src/commands/codex/mod.rs status=src/commands/codex/status.rs
+    # `cmd` is the login command: clauses 1, 7 and 7b moved here from
+    # `commands/codex/mod.rs` at S34, which is the commit that creates the
+    # file (the `p3-s30-review2` carry). Clause 10 belongs to `accounts.rs`
+    # and stays on `mod.rs` until S34 C4 creates it — the two must not share a
+    # variable, or moving one silently moves the other.
+    local cmd=src/commands/codex/login.rs status=src/commands/codex/status.rs
+    local consent=src/commands/codex/mod.rs
     local watch=src/commands/codex/watch.rs pass=src/commands/codex/pass.rs
     local codex=src/provider/codex
 
     # Clause 1: a `VerifiedLogin` cannot be built outside `proof.rs`.
+    # S34: clauses 1, 7 and 7b moved from `commands/codex/mod.rs` to the real
+    # `login.rs`, which this commit creates (the `p3-s30-review2` carry).
     clause 1 "$cmd" E0451 \
         "fn _phase3_plant(doc: crate::provider::codex::credentials::Credentials, user: String, acct: String) -> crate::provider::codex::proof::VerifiedLogin { crate::provider::codex::proof::VerifiedLogin { doc, user, acct } }" \
         "VerifiedLogin literal outside provider::codex"
@@ -275,8 +283,15 @@ main() {
 
     # Clause 7: a login child's report cannot be forged outside proof.rs.
     clause 7 "$cmd" E0451 \
-        "fn _phase3_plant(gained_codex_auth: Vec<String>, survivors: Vec<std::path::PathBuf>, daemon_dir: bool, lock_files: Vec<std::path::PathBuf>, exit: std::process::ExitStatus) -> crate::provider::codex::proof::PostExitReport { crate::provider::codex::proof::PostExitReport { gained_codex_auth, survivors, daemon_dir, lock_files, exit } }" \
+        "fn _phase3_plant(gained_codex_auth: Vec<String>, survivors: Vec<std::path::PathBuf>, survey: crate::provider::codex::proof::ScratchSurvey, exit: std::process::ExitStatus) -> crate::provider::codex::proof::PostExitReport { crate::provider::codex::proof::PostExitReport { gained_codex_auth, survivors, survey, exit } }" \
         "PostExitReport literal outside provider::codex"
+
+    # Clause 7b (S34, ledger #333): the evidence a report is built FROM cannot
+    # be forged outside `provider::codex` either. Without this, a command
+    # could hand `from_child` a survey saying the scratch home was spotless.
+    clause 7b "$cmd" E0451 \
+        "fn _phase3_plant(daemon_dir: bool, held_locks: Vec<std::path::PathBuf>, odd_locks: Vec<std::path::PathBuf>, truncated: bool) -> crate::provider::codex::proof::ScratchSurvey { crate::provider::codex::proof::ScratchSurvey { daemon_dir, held_locks, odd_locks, truncated } }" \
+        "ScratchSurvey literal outside provider::codex"
 
     # Clause 8 (S32, moved to status.rs at S33): the refresh POST is
     # `pub(super)`, so even the command that refreshes cannot send one itself.
@@ -293,7 +308,7 @@ main() {
     # Clause 10 (S32, ledger #272 ruling 1): a re-send consent cannot be built
     # outside refresh.rs except through its confirming constructor. Planted in
     # commands/codex/mod.rs until S34 creates accounts.rs.
-    clause 10 "$cmd" E0603 \
+    clause 10 "$consent" E0603 \
         "fn _phase3_plant() -> crate::provider::codex::refresh::ResendConsent { crate::provider::codex::refresh::ResendConsent(()) }" \
         "ResendConsent tuple literal from commands/"
 

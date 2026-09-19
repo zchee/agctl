@@ -170,13 +170,41 @@ impl CodexNamespaceGuard {
     }
 }
 
+/// What the scratch home looked like after the login child exited.
+///
+/// Produced by `login_child::survey` and consumed by
+/// [`PostExitReport::from_child`]. It exists so that the report is built from
+/// one named value rather than from a row of positional `Vec`s and `bool`s
+/// that a caller could silently transpose.
+/// **Deliberately no `Default`, and no `new`/`empty`/`clean` constructor.** A
+/// default survey is the claim "we looked and found nothing", which is the
+/// silent-clean failure `truncated` exists to remove; handing callers a cheap
+/// way to make that claim would put it straight back. The only production
+/// producer is `login_child::survey`, and every value is built by a named
+/// struct literal so a transposed field cannot compile quietly. A test that
+/// wants a clean value builds one in its own `*_tests.rs`.
+///
+/// The fields are `pub(super)`, so `commands/` cannot write the literal
+/// either (E0451) — the same boundary AC122 clause 7 puts around
+/// [`PostExitReport`].
+#[derive(Debug)]
+pub struct ScratchSurvey {
+    /// Whether a Codex daemon directory appeared.
+    pub(super) daemon_dir: bool,
+    /// `*.lock` files something still holds, proved by a non-blocking probe.
+    pub(super) held_locks: Vec<PathBuf>,
+    /// Entries named `*.lock` that are not regular files.
+    pub(super) odd_locks: Vec<PathBuf>,
+    /// Whether a depth or entry bound stopped the walk short.
+    pub(super) truncated: bool,
+}
+
 /// What a login child left behind (plan section 3.3, L2′).
 #[derive(Debug)]
 pub struct PostExitReport {
     gained_codex_auth: Vec<String>,
     survivors: Vec<PathBuf>,
-    daemon_dir: bool,
-    lock_files: Vec<PathBuf>,
+    survey: ScratchSurvey,
     exit: ExitStatus,
 }
 
@@ -186,23 +214,50 @@ impl PostExitReport {
     ///
     /// `gained_codex_auth` holds the `Codex Auth` item accounts present in the
     /// second listing and not the first — `cli|<hash>` names, never emails.
+    ///
+    /// `survivors` is **always empty today**. Plan section 3.3's "refuse if a
+    /// process still holds the scratch" is replaced entirely by the held-lock
+    /// evidence in `survey` (ledger #310, #323, #325): there is no process
+    /// scan in the login path, so a survivor holding an ordinary descriptor,
+    /// rather than a lock, is not detected. That is harmless only because the
+    /// install copies the bytes `verify_login` parsed — nothing a survivor
+    /// writes to the scratch afterwards can reach the namespace. The field
+    /// stays so a future process scan has somewhere to report.
+    ///
+    /// `survey` is what the scratch home looked like: see [`ScratchSurvey`].
+    /// Its `held_locks` are lock files something still **holds**, never lock
+    /// files that merely exist — a normal `codex login` leaves an unheld
+    /// `tmp/arg0/…/.lock` behind (fact F81, measured at S28), so refusing on
+    /// existence would refuse every real login. Its `odd_locks` are entries
+    /// named `*.lock` that are not regular files; S28's residue has none, so
+    /// one is an anomaly, and `flock` is never called on it. Its `truncated`
+    /// says the walk could not look everywhere — a bound, an unreadable
+    /// directory, a lock whose state could not be asked — and a home that was
+    /// not walked completely has not been shown clean.
     pub(super) fn from_child(
         gained_codex_auth: Vec<String>,
         survivors: Vec<PathBuf>,
-        daemon_dir: bool,
-        lock_files: Vec<PathBuf>,
+        survey: ScratchSurvey,
         exit: ExitStatus,
     ) -> Self {
-        Self { gained_codex_auth, survivors, daemon_dir, lock_files, exit }
+        Self { gained_codex_auth, survivors, survey, exit }
     }
 
     /// Whether the child exited successfully and left nothing behind.
     pub(super) fn clean(&self) -> bool {
-        self.exit.success()
-            && self.gained_codex_auth.is_empty()
-            && self.survivors.is_empty()
-            && !self.daemon_dir
-            && self.lock_files.is_empty()
+        // Destructured exhaustively, with no `..`: a field added to either
+        // struct is a compile error here until somebody has decided what it
+        // means for cleanliness. The mutant "add a field, forget `clean()`"
+        // is caught by the compiler rather than by a reviewer's attention.
+        let Self { gained_codex_auth, survivors, survey, exit } = self;
+        let ScratchSurvey { daemon_dir, held_locks, odd_locks, truncated } = survey;
+        exit.success()
+            && gained_codex_auth.is_empty()
+            && survivors.is_empty()
+            && !daemon_dir
+            && held_locks.is_empty()
+            && odd_locks.is_empty()
+            && !truncated
     }
 
     /// The reasons [`PostExitReport::clean`] is false, as refusal fragments.
@@ -221,12 +276,30 @@ impl PostExitReport {
         if !self.survivors.is_empty() {
             found.push(format!("{} process(es) still use the scratch home", self.survivors.len()));
         }
-        if self.daemon_dir {
+        if self.survey.daemon_dir {
             found.push("the login started a Codex daemon in the scratch home".to_owned());
         }
-        if !self.lock_files.is_empty() {
+        if !self.survey.odd_locks.is_empty() {
+            found.push(format!(
+                "{} entr(y/ies) named `*.lock` in the scratch home are not regular files: {}",
+                self.survey.odd_locks.len(),
+                self.survey
+                    .odd_locks
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if self.survey.truncated {
             found
-                .push(format!("{} lock file(s) remain in the scratch home", self.lock_files.len()));
+                .push("the scratch home was too large or too deep to survey completely".to_owned());
+        }
+        if !self.survey.held_locks.is_empty() {
+            found.push(format!(
+                "{} lock file(s) are still held in the scratch home",
+                self.survey.held_locks.len()
+            ));
         }
         found
     }

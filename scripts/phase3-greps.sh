@@ -215,8 +215,25 @@ REMOVE_ALLOWED=(
     src/secret/file_store.rs
     src/secret/secret_file.rs
     src/provider/codex/auth_store.rs
+    # S34: the scratch home's fd-relative removal — `remove_tree_at`,
+    # `sweep_stale_at` and `Scratch`'s `Drop` — all live here, and every one
+    # acts through a descriptor, never a path. `commands/codex/login.rs`
+    # removes nothing itself and is deliberately NOT listed.
     src/provider/codex/login_child.rs
 )
+
+# Files allowed to name `flock` inside the Codex trees, with the count they
+# may spell. `login_child.rs`'s two are the held-lock PROBE (S34, ledger #310):
+# it opens a `*.lock` in agctl's OWN scratch home read-only, asks for the lock
+# non-blockingly, and releases it in the same breath. It never takes a lock to
+# hold, and never touches a lock inside a Codex home, so invariant I21 is not
+# in play — but the grep cannot tell "asks and releases" from "takes", which is
+# why this is an allow-list entry with a pinned count rather than a silent
+# exemption. A third `flock` line here fails the check.
+CODEX_FLOCK_ALLOWED=(
+    src/provider/codex/login_child.rs
+)
+CODEX_FLOCK_EXPECTED=2
 
 BEARER_ALLOWED=(
     src/provider/claude/credentials.rs
@@ -658,8 +675,24 @@ check_codex_flock() {
         [[ -n $hits ]] && found+="$hits"$'\n'
     done
     [[ -z $found ]] && return 0
-    printf '  `flock` in Codex code; take locks through namespace_lock only:\n%s' "$found"
-    return 1
+
+    local bad=0 file count
+    while IFS= read -r file; do
+        [[ -z $file ]] && continue
+        if ! contains "$file" "${CODEX_FLOCK_ALLOWED[@]}"; then
+            printf '  %s names `flock`; take locks through namespace_lock only\n' "$file"
+            bad=1
+        fi
+    done < <(printf '%s\n' "$found" | cut -d: -f1 | LC_ALL=C sort -u)
+
+    # The allowed file's count is pinned, so the exemption cannot widen.
+    count=$(printf '%s\n' "$found" | grep -c 'login_child\.rs:' || true)
+    if [[ -n $found && ${count:-0} -ne 0 && ${count:-0} -ne $CODEX_FLOCK_EXPECTED ]]; then
+        printf '  src/provider/codex/login_child.rs names `flock` %s time(s), not %s (the probe acquires and releases, and does nothing else)\n' \
+            "$count" "$CODEX_FLOCK_EXPECTED"
+        bad=1
+    fi
+    return "$bad"
 }
 
 check_stop_policy() {
@@ -1003,6 +1036,36 @@ check_codex_bin() {
     check_helper_callers "$1" '\bAGCTL_CODEX_BIN\b' 'AGCTL_CODEX_BIN' "${CODEX_BIN_ALLOWED[@]}"
 }
 
+# check_fake_prefix: order B3. The `testing`-only prefix that lets the fake
+# `codex`'s knobs through the login child's environment allowlist is spelled
+# exactly ONCE in non-test source, on the line directly under
+# `#[cfg(feature = "testing")]`. The release gate cannot prove this: a
+# `starts_with` against a short constant is compiled to immediate compares, so
+# a re-spelled literal in a default-feature arm leaves no string in the
+# artifact for `strings` to find (review C1b F4, mutant R1).
+check_fake_prefix() {
+    local root=$1 hits count file line prev
+    hits=$(code_hits "$root" 'AGCTL_FAKE_CODEX_') || scan_failed check_fake_prefix
+    count=$(printf '%s\n' "$hits" | sed '/^$/d' | wc -l | tr -d ' ')
+    if [[ $count -ne 1 ]]; then
+        printf '  `AGCTL_FAKE_CODEX_` is spelled %s time(s) in non-test source, not once:\n%s\n' "$count" "$hits"
+        return 1
+    fi
+    file=${hits%%:*}
+    line=${hits#*:}
+    line=${line%%:*}
+    prev=$(sed -n "$((line - 1))p" "$root/$file")
+    # Anchored: the whole line must be the attribute. A substring test
+    # accepted `// #[cfg(feature = "testing")]` — a commented-out attribute
+    # that leaves the prefix compiled into every build (review C1b-r2 F2).
+    if ! [[ $prev =~ ^[[:space:]]*\#\[cfg\(feature\ =\ \"testing\"\)\][[:space:]]*$ ]]; then
+        printf '  %s:%s spells `AGCTL_FAKE_CODEX_` without `#[cfg(feature = "testing")]` directly above it\n' \
+            "$file" "$line"
+        return 1
+    fi
+    return 0
+}
+
 check_codex_env() {
     local file="$1/$CODEX_HOME_MODULE" hits status=0
     # Vacuous until S30 writes it. Stated rather than silent: the plant below
@@ -1046,6 +1109,14 @@ plant_unlink_helper() { plant_line "$1" 'fn _phase3_plant(d: BorrowedFd<'"'"'_>)
 plant_unlink_alias() { plant_line "$1" 'use crate::secret::file_store::unlink_at as _phase3_plant;'; }
 plant_remove_dir_under_root() { plant_line "$1" 'fn _phase3_plant(p: &Paths, d: &Path) { let _ = file_store::remove_dir_under_root(p, d); }'; }
 plant_remove_dir_under() { plant_line "$1" 'fn _phase3_plant(a: &Path, p: &Path) { let _ = file_store::remove_dir_under(a, p); }'; }
+plant_fake_prefix() { plant_line "$1" 'fn _phase3_plant(t: &str) -> bool { t.starts_with("AGCTL_FAKE_CODEX_") }'; }
+# The commented-out attribute (review C1b-r2 P-cfg): the literal is still spelled
+# once, but its `#[cfg]` is a comment, so it compiles into a default build.
+plant_fake_prefix_cfg_commented() {
+    mkdir -p "$1/src/provider/codex"
+    sed -i.bak -e 's|^\([[:space:]]*\)#\[cfg(feature = "testing")\]\([[:space:]]*\)$|\1// #[cfg(feature = "testing")]\2|' \
+        "$1/src/provider/codex/login_child.rs" && rm -f "$1/src/provider/codex/login_child.rs.bak"
+}
 plant_codex_bin() { plant_line "$1" 'const _PHASE3_PLANT: &str = "AGCTL_CODEX_BIN";'; }
 plant_expose_elsewhere() { plant_line "$1" 'fn _phase3_plant(s: &SecretString) -> String { s.expose_secret().to_owned() }'; }
 plant_expose_public() { plant_line "$1" 'pub(crate) fn exposed<R>(s: &SecretString, f: impl FnOnce(&str) -> R) -> R { f("") }'; }
@@ -1274,9 +1345,20 @@ plant_receipt_underscore() {
 plant_receipt_tuple() {
     plant_line "$1" $'fn _phase3_plant(owned: &OwnedNamespace<\'_>, c: &Cancel) {\n    let (decision,\n        _receipt, evidence) = owned.resolve_pending(c).unwrap_or_else(|_| todo!());\n}' src/provider/codex/refresh.rs
 }
+# S34: moved off `commands/codex/login.rs`, the twin of the same move in
+# `src/provider/codex/mod_tests.rs`. The last clause of check_receipt_destructure
+# is file-level — "takes receipts and never calls audit::append" — and it was
+# planted into a file that did not exist, so the harness created one holding
+# only the violation. The moment `login.rs` was written and audited its own
+# receipt, the plant stopped being caught and the check went quietly green.
+# `watch.rs` never writes at all (U44 = 5), so it cannot acquire a legitimate
+# `audit::append` and mask the plant the same way.
+#
+# Residual, recorded rather than hidden: the clause still cannot see a SECOND,
+# unaudited receipt inside a file that audits a first one, and `login.rs` is
+# now exactly such a file.
 plant_receipt_unaudited() {
-    mkdir -p "$1/src/commands/codex"
-    plant_line "$1" 'fn _phase3_plant(w: CodexWrite) { if let CodexWrite::Landed { outcome, receipt } = w { drop(receipt) } }' src/commands/codex/login.rs
+    plant_line "$1" 'fn _phase3_plant(w: CodexWrite) { if let CodexWrite::Landed { outcome, receipt } = w { drop(receipt) } }' src/commands/codex/watch.rs
 }
 plant_marker_mutator_settle() {
     plant_line "$1" 'fn _phase3_plant(s: &RefreshStateFile) { let _ = s.settle_inflight(DefiniteOutcome::Applied, Settled::default()); }' src/provider/codex/discovery.rs
@@ -1300,7 +1382,8 @@ CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers expose
     exposure_count auth_json account_header toml locked_read marker_mutators stop_policy
     codex_debug_assert state_path codex_flock wham_usage codex_usage_url codex_timeouts codex_redirects codex_decoded_cap credits_state
     auth_host codex_token_url oauth_cancelled oauth_refresh_callers consent_callers refresh_usage_cache receipt_type
-    receipt_destructure refresh_drivers refresh_client post_permit permit_mint permit_mint_count daemon_pid_names watch_no_post usage_client_new)
+    receipt_destructure refresh_drivers refresh_client post_permit permit_mint permit_mint_count daemon_pid_names watch_no_post usage_client_new
+    fake_prefix)
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
@@ -1338,6 +1421,8 @@ PLANTS=(
     "state_path plant_state_path"
     "marker_mutators plant_marker_mutator_ufcs"
     "codex_flock plant_codex_flock"
+    "fake_prefix plant_fake_prefix"
+    "fake_prefix plant_fake_prefix_cfg_commented"
     "wham_usage plant_wham_usage"
     "codex_usage_url plant_codex_usage_url"
     "codex_timeouts plant_codex_timeouts"

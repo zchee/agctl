@@ -243,3 +243,31 @@ pub(crate) fn leaves(value: &Value) -> std::collections::BTreeMap<String, Value>
     walk("", value, &mut out);
     out
 }
+
+/// A survey of a scratch home the login child left spotless.
+///
+/// `ScratchSurvey` deliberately has no `Default` in production code — a
+/// default value is the claim "we looked and found nothing", and making that
+/// claim cheap is what let a truncated walk read as clean. Tests that need
+/// one build it here, where the claim is obviously a fixture.
+pub fn clean_survey() -> crate::provider::codex::proof::ScratchSurvey {
+    crate::provider::codex::proof::ScratchSurvey {
+        daemon_dir: false,
+        held_locks: Vec::new(),
+        odd_locks: Vec::new(),
+        truncated: false,
+    }
+}
+
+/// A survey that differs from a clean one only where `edit` says, by field name.
+///
+/// Named, not positional: four arguments of two adjacent `Vec<PathBuf>` and
+/// two adjacent `bool`s is the shape `ScratchSurvey` was introduced to remove
+/// (ledger #333), and a test helper should not bring it back.
+pub fn survey_where(
+    edit: impl FnOnce(&mut crate::provider::codex::proof::ScratchSurvey),
+) -> crate::provider::codex::proof::ScratchSurvey {
+    let mut survey = clean_survey();
+    edit(&mut survey);
+    survey
+}

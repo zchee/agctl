@@ -19,8 +19,11 @@ fn codex(args: &[&str]) -> CodexCommand {
 
 #[test]
 fn every_subcommand_refuses_and_names_itself() {
-    let lines: [(&[&str], &str); 6] = [
-        (&["agctl", "codex", "login"], "agctl codex login"),
+    // `login` left this list at S34: it is implemented, and its own refusals
+    // are proved in `login_tests.rs` and `tests/e2e_codex_login.rs`. A command
+    // that lands must leave this list, or the list stops meaning "still a
+    // stub" and starts meaning nothing.
+    let lines: [(&[&str], &str); 5] = [
         (&["agctl", "codex", "import", "--from", "codex-home"], "agctl codex import"),
         (&["agctl", "codex", "doctor"], "agctl codex doctor"),
         (&["agctl", "codex", "accounts", "list"], "agctl codex accounts list"),

@@ -45,8 +45,7 @@ fn a_verified_login_proves_itself_as_an_unregistered_owned_record() {
     let report = PostExitReport::from_child(
         Vec::new(),
         Vec::new(),
-        false,
-        Vec::new(),
+        testkit::clean_survey(),
         testkit::exit_status(0),
     );
     let login = auth_store::verify_login(scratch.path(), &report).expect("verifies");
@@ -64,20 +63,21 @@ fn a_verified_login_proves_itself_as_an_unregistered_owned_record() {
 #[test]
 fn a_post_exit_report_is_clean_only_when_nothing_was_left_behind() {
     let ok = testkit::exit_status(0);
-    assert!(PostExitReport::from_child(Vec::new(), Vec::new(), false, Vec::new(), ok).clean());
     assert!(
-        PostExitReport::from_child(Vec::new(), Vec::new(), false, Vec::new(), ok)
+        PostExitReport::from_child(Vec::new(), Vec::new(), testkit::clean_survey(), ok).clean()
+    );
+    assert!(
+        PostExitReport::from_child(Vec::new(), Vec::new(), testkit::clean_survey(), ok)
             .anomalies()
             .is_empty()
     );
-    let cases: [(&str, PostExitReport); 5] = [
+    let cases: [(&str, PostExitReport); 7] = [
         (
             "exit",
             PostExitReport::from_child(
                 Vec::new(),
                 Vec::new(),
-                false,
-                Vec::new(),
+                testkit::clean_survey(),
                 testkit::exit_status(2),
             ),
         ),
@@ -86,8 +86,7 @@ fn a_post_exit_report_is_clean_only_when_nothing_was_left_behind() {
             PostExitReport::from_child(
                 vec!["cli|0000".to_owned()],
                 Vec::new(),
-                false,
-                Vec::new(),
+                testkit::clean_survey(),
                 ok,
             ),
         ),
@@ -96,19 +95,51 @@ fn a_post_exit_report_is_clean_only_when_nothing_was_left_behind() {
             PostExitReport::from_child(
                 Vec::new(),
                 vec![PathBuf::from("/x")],
-                false,
-                Vec::new(),
+                testkit::clean_survey(),
                 ok,
             ),
         ),
-        ("daemon", PostExitReport::from_child(Vec::new(), Vec::new(), true, Vec::new(), ok)),
+        (
+            "daemon",
+            PostExitReport::from_child(
+                Vec::new(),
+                Vec::new(),
+                testkit::survey_where(|s| {
+                    s.daemon_dir = true;
+                }),
+                ok,
+            ),
+        ),
         (
             "lock",
             PostExitReport::from_child(
                 Vec::new(),
                 Vec::new(),
-                false,
-                vec![PathBuf::from("a.lock")],
+                testkit::survey_where(|s| {
+                    s.held_locks = vec![PathBuf::from("a.lock")];
+                }),
+                ok,
+            ),
+        ),
+        (
+            "odd lock",
+            PostExitReport::from_child(
+                Vec::new(),
+                Vec::new(),
+                testkit::survey_where(|s| {
+                    s.odd_locks = vec![PathBuf::from("wedge.lock")];
+                }),
+                ok,
+            ),
+        ),
+        (
+            "truncated survey",
+            PostExitReport::from_child(
+                Vec::new(),
+                Vec::new(),
+                testkit::survey_where(|s| {
+                    s.truncated = true;
+                }),
                 ok,
             ),
         ),

@@ -74,6 +74,12 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(TerminalAwareWriter)
+        // A log line that cannot be delivered is dropped, never a panic. The
+        // default reports a failed write with `eprintln!` on the same broken
+        // stderr, which panics, and under `panic = "abort"` a panic skips every
+        // destructor — including the one that removes a login's scratch
+        // credential (`codex login` with a closed stderr, plan AC105).
+        .log_internal_errors(false)
         .try_init();
 }
 

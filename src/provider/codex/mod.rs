@@ -42,6 +42,7 @@ pub mod credentials;
 pub mod discovery;
 pub mod home;
 pub mod lock;
+pub mod login_child;
 pub mod oauth;
 pub mod permit;
 pub mod proof;

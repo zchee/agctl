@@ -19,7 +19,12 @@ use crate::secret::pending::PendingDiscardReason;
 const OTHER_ACCT: &str = "99999999-2222-4333-8444-555555555555";
 
 fn clean_report() -> PostExitReport {
-    PostExitReport::from_child(Vec::new(), Vec::new(), false, Vec::new(), testkit::exit_status(0))
+    PostExitReport::from_child(
+        Vec::new(),
+        Vec::new(),
+        testkit::clean_survey(),
+        testkit::exit_status(0),
+    )
 }
 
 fn record() -> CodexAccountRecord {
@@ -122,8 +127,10 @@ fn verify_login_refusals() {
     let unclean = PostExitReport::from_child(
         vec!["cli|0123456789abcdef".to_owned()],
         vec![PathBuf::from("/proc/1")],
-        true,
-        vec![PathBuf::from("x.lock")],
+        testkit::survey_where(|s| {
+            s.daemon_dir = true;
+            s.held_locks = vec![PathBuf::from("x.lock")];
+        }),
         testkit::exit_status(1),
     );
     let empty = tempfile::tempdir().expect("tempdir");

@@ -214,9 +214,10 @@ fn resolve_honours_a_cli_override_without_touching_the_environment() {
 #[test]
 fn the_codex_layout_is_derived_from_the_config_dir() {
     let paths = Paths::with_config_dir(PathBuf::from("/store"));
-    let cases: [(&str, PathBuf, &str); 7] = [
+    let cases: [(&str, PathBuf, &str); 8] = [
         ("codex_root", paths.codex_root(), "/store/codex"),
         ("codex_locks_dir", paths.codex_locks_dir(), "/store/codex/.locks"),
+        ("codex_scratch_lock", paths.codex_scratch_lock(), "/store/codex/.locks/scratch.lock"),
         ("codex_state_dir", paths.codex_state_dir(), "/store/codex/.state"),
         ("codex_scratch_root", paths.codex_scratch_root(), "/store/codex/.scratch"),
         ("cache_root", paths.cache_root(), "/store/cache"),
@@ -376,4 +377,38 @@ fn is_single_component_accepts_exactly_one_plain_name() {
     for bad in ["", ".", "..", "a/b", "../a", "a/", "/a", "./a", "a/."] {
         assert!(!is_single_component(bad), "`{bad}` should be refused");
     }
+}
+
+#[test]
+fn the_scratch_lock_can_never_collide_with_a_namespace_lock() {
+    // Plan section 3.3 puts `scratch.lock` in the same directory as every
+    // namespace lock, so the two naming schemes must be unable to meet. A
+    // namespace lock is `<user>+<acct>.lock` and therefore always contains
+    // `+`; `validate_codex_segment` refuses `+` inside either id, so no pair
+    // of ids can spell `scratch.lock`. This asserts both halves rather than
+    // trusting the shape of the format string.
+    let paths = Paths::with_config_dir(PathBuf::from("/store"));
+    let scratch = paths.codex_scratch_lock();
+    let name = scratch.file_name().and_then(|n| n.to_str()).expect("a name");
+
+    assert_eq!(name, "scratch.lock");
+    assert!(!name.contains('+'), "the scratch lock carries no separator: {name}");
+    assert_eq!(
+        scratch.parent(),
+        Some(paths.codex_locks_dir().as_path()),
+        "it lives beside the namespace locks"
+    );
+
+    // `+` is what makes the collision impossible, and it is the only thing
+    // that does: a dot mid-id is legal (`validate_segment` allows `.`), so
+    // `scratch.lock` is a perfectly valid id on its own — it is the mandatory
+    // separator that keeps every namespace lock away from this name.
+    validate_codex_segment("scratch.lock").expect("a dot mid-id is legal, so this is a valid id");
+    validate_codex_segment("scratch+lock").expect_err("but `+` is refused in an id");
+
+    // And a namespace lock that is accepted always differs from it.
+    let namespace = paths.codex_lock_path("user-1", "acct-1").expect("a valid pair");
+    assert_ne!(namespace, scratch);
+    let ns_name = namespace.file_name().and_then(|n| n.to_str()).expect("a name");
+    assert!(ns_name.contains('+'), "a namespace lock always carries the separator: {ns_name}");
 }

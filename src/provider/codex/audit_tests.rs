@@ -21,8 +21,7 @@ fn install_receipt(paths: &Paths) -> WriteReceipt {
     let report = PostExitReport::from_child(
         Vec::new(),
         Vec::new(),
-        false,
-        Vec::new(),
+        testkit::clean_survey(),
         testkit::exit_status(0),
     );
     let login = auth_store::verify_login(scratch.path(), &report).expect("a clean login verifies");

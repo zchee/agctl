@@ -149,6 +149,20 @@ seams=(
 	AGCTL_CODEX_BIN
 	AGCTL_CODEX_USAGE_URL
 	AGCTL_CODEX_TOKEN_URL
+	# S34: the login child's `testing`-only allowlist prefix and the pause
+	# point between `verify_login` and `install`.
+	#
+	# What the PREFIX entry proves, and what it does not: it proves no copy of
+	# the literal survives as data in the artifact. It does NOT prove a
+	# default-feature build cannot honour the prefix — a `starts_with` against
+	# a short constant compiles to immediate compares and leaves no string
+	# behind. That half is `scripts/phase3-greps.sh`'s `fake_prefix` rule (the
+	# literal spelled once, under `#[cfg(feature = "testing")]`) plus the
+	# default-feature clippy gate. The fake's individual knob names are read by
+	# the fixture script only — agctl's code names none of them — so they are
+	# not listed here.
+	AGCTL_FAKE_CODEX_
+	codex_login_before_install
 )
 
 # The production surface. Every one of these must be PRESENT.

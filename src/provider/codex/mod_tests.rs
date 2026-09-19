@@ -483,8 +483,20 @@ fn every_rule_reports_its_plant() {
             "    let (decision,\n        _receipt, evidence) = owned.resolve_pending(&cancel)?;",
         ),
         (
+            // S34: moved off `commands/codex/login.rs`, which was chosen when
+            // that file did not exist yet. The rule it proves is file-level by
+            // design — "this file takes receipts and never calls
+            // `audit::append`" — so the moment `login.rs` was written, and
+            // audited its own receipt, the plant stopped being reported and
+            // the pin went quietly green. `watch.rs` never writes at all
+            // (U44 = 5), so it cannot acquire a legitimate `audit::append` and
+            // mask the plant the same way.
+            //
+            // Residual, stated rather than hidden: the rule still cannot see a
+            // SECOND, unaudited receipt inside a file that audits a first one
+            // — `login.rs` is now exactly such a file. Carried as a bead.
             "receipts taken, never audited",
-            "src/commands/codex/login.rs",
+            "src/commands/codex/watch.rs",
             "fn p(w: CodexWrite) { if let CodexWrite::Landed { outcome, receipt } = w { drop(receipt) } }",
         ),
         (
