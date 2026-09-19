@@ -127,8 +127,9 @@
 #   receipt_destructure  (C2, review S30 LOW-2) across lines, any receiver: a
 #                 `Landed { .. }`/`ChangedSinceRead { .. }` pattern that does not
 #                 bind `receipt` (or binds `receipt: _`), and a `let (a, _b, c)`
-#                 tuple bound from `resolve_pending(`, outside auth_store.rs → none;
-#                 and a file that takes receipts must call `audit::append(`.
+#                 tuple bound from `resolve_pending(`, outside auth_store.rs → none.
+#                 (Its file-level clause — "a file that takes receipts calls
+#                 `audit::append(`" — is retired: see check_receipt_destructure.)
 #                 `marker_mutators` also pins `settle_inflight`/`record_did_not_help`.
 #   codex_redirects, codex_decoded_cap  now per client: exactly one
 #                 `.max_redirects(0)` in each of usage.rs and oauth.rs, no other
@@ -1009,12 +1010,15 @@ check_receipt_destructure() {
                 printf '  %s: a resolve_pending receipt bound to `_`\n' "$file"
                 bad=1
             fi
-            if [[ $file != src/provider/codex/audit.rs ]] \
-                && printf '%s' "$code" | rg -U -P -q -e '(?:Landed|ChangedSinceRead)\s*\{|\.resolve_pending\(' \
-                && ! printf '%s' "$code" | rg -q -F 'audit::append('; then
-                printf '  %s: takes write receipts and never calls audit::append\n' "$file"
-                bad=1
-            fi
+            # RETIRED (S34 C1b-1, bead agctl-meqv): the file-level clause "a
+            # file that takes receipts calls audit::append( somewhere". A
+            # second, unaudited receipt in a file that audits a first one
+            # passed it, and no line-oriented grep can follow a receipt from
+            # its binding to its audit. The per-binding rule R6c in
+            # src/provider/codex/ac119_receipts_tests.rs (a `syn` walk over a
+            # vocabulary derived from signatures) replaces it; one strong pin
+            # rather than a strong one and a weak twin. The three clauses
+            # above stay: each is a per-pattern check a grep does hold.
         done < <(cd "$root" && rg --files --glob '*.rs' --glob '!*_tests.rs' "$dir" | LC_ALL=C sort)
     done
     return "$bad"
@@ -1345,21 +1349,10 @@ plant_receipt_underscore() {
 plant_receipt_tuple() {
     plant_line "$1" $'fn _phase3_plant(owned: &OwnedNamespace<\'_>, c: &Cancel) {\n    let (decision,\n        _receipt, evidence) = owned.resolve_pending(c).unwrap_or_else(|_| todo!());\n}' src/provider/codex/refresh.rs
 }
-# S34: moved off `commands/codex/login.rs`, the twin of the same move in
-# `src/provider/codex/mod_tests.rs`. The last clause of check_receipt_destructure
-# is file-level — "takes receipts and never calls audit::append" — and it was
-# planted into a file that did not exist, so the harness created one holding
-# only the violation. The moment `login.rs` was written and audited its own
-# receipt, the plant stopped being caught and the check went quietly green.
-# `watch.rs` never writes at all (U44 = 5), so it cannot acquire a legitimate
-# `audit::append` and mask the plant the same way.
-#
-# Residual, recorded rather than hidden: the clause still cannot see a SECOND,
-# unaudited receipt inside a file that audits a first one, and `login.rs` is
-# now exactly such a file.
-plant_receipt_unaudited() {
-    plant_line "$1" 'fn _phase3_plant(w: CodexWrite) { if let CodexWrite::Landed { outcome, receipt } = w { drop(receipt) } }' src/commands/codex/watch.rs
-}
+# plant_receipt_unaudited is RETIRED with the clause it proved (S34 C1b-1,
+# bead agctl-meqv): see check_receipt_destructure. Its shape — a receipt
+# dropped in `watch.rs` — is now R6c's plant in mod_tests.rs, beside the shape
+# the clause could not see: a second receipt dropped in the real `login.rs`.
 plant_marker_mutator_settle() {
     plant_line "$1" 'fn _phase3_plant(s: &RefreshStateFile) { let _ = s.settle_inflight(DefiniteOutcome::Applied, Settled::default()); }' src/provider/codex/discovery.rs
 }
@@ -1448,7 +1441,6 @@ PLANTS=(
     "receipt_destructure plant_receipt_dotdot"
     "receipt_destructure plant_receipt_underscore"
     "receipt_destructure plant_receipt_tuple"
-    "receipt_destructure plant_receipt_unaudited"
     "marker_mutators plant_marker_mutator_settle"
     "refresh_drivers plant_refresh_driver_watch"
     "refresh_drivers plant_refresh_retry_elsewhere"
