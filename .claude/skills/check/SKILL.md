@@ -59,12 +59,10 @@ scripts/release-gate.sh
 It runs `scripts/docs-gate.sh` first (no build needed, so a prose failure is reported in
 seconds), then builds `cargo build --release` (default features, no `--config`, into a scratch
 `--target-dir` that is never `./target` and never the shared `~/.cache/rust/target`) and
-greps the artifact for two lists. The thirteen seam names are one representative name per
-seam-owning module, not the whole test-only surface — `fixtures/fake-security.sh` alone
-defines ten `AGCTL_FAKE_SECURITY_*` names on its own. The fake's **write** knob is the
-one exception to "one per owner": the keychain write path is the only seam that can change
-a keychain, so it is gated by name rather than by family. **Thirteen seam names, every one
-of which must be absent:**
+greps the artifact for two lists. The seam names are the ones in `scripts/release-gate.sh`:
+one representative name per seam-owning module, and only names a `testing` build of the
+binary can carry as a string (the fake stand-ins' knob names and the fake `codex` prefix
+cannot, so they are not listed). **The seam names, every one of which must be absent:**
 
 | name | owner |
 |------|-------|
@@ -76,12 +74,12 @@ of which must be absent:**
 | `AGCTL_CLAUDE_TOKEN_URL` | `src/provider/claude/oauth.rs` |
 | `AGCTL_CLAUDE_AUTHORIZE_URL` | `src/provider/claude/oauth.rs` |
 | `AGCTL_CLAUDE_PROFILE_URL` | `src/provider/claude/oauth.rs` (the live swap's profile GET) |
-| `AGCTL_FAKE_SECURITY_LOG` | `fixtures/fake-security.sh` |
-| `AGCTL_FAKE_SECURITY_WRITE_EXIT` | `fixtures/fake-security.sh` (the `-i` write path) |
 | `AGCTL_NO_BROWSER` | `src/commands/login.rs` |
 | `AGCTL_CODEX_BIN` | `src/provider/codex/login_child.rs` (phase 3; listed from S29b, which introduces the name — the module that reads it lands at S34, and `scripts/phase3-greps.sh` pins it to that one file) |
 | `AGCTL_CODEX_USAGE_URL` | `src/provider/codex/usage.rs` (phase 3, S31; `scripts/phase3-greps.sh` pins it to that one file) |
 | `AGCTL_CODEX_TOKEN_URL` | `src/provider/codex/oauth.rs` (phase 3, S32; `scripts/phase3-greps.sh` pins it to that one file) |
+| `codex_login_before_install` | `src/commands/codex/login.rs` (phase 3, S34: the pause point between `verify_login` and `install`) |
+| `agctl lock order violated: ` | `src/runtime/lock_order.rs` (phase 3, S34: the prefix of the lock-order witness's three messages) |
 
 **Four production names, every one of which must be present:** `AGCTL_CONFIG_DIR`,
 `AGCTL_CLAUDE_USER_AGENT`, `AGCTL_CLAUDE_OAUTH_SCOPES`, and — from S33, once

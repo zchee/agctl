@@ -171,3 +171,90 @@ fn the_registry_update_runs_after_the_drop_and_ignores_other_threads() {
         updated.expect("another thread's guard does not trip this thread");
     });
 }
+
+/// Holds `.config.lock` on a second open file description of this process
+/// (an `flock` belongs to the description, so `update`'s own open contends
+/// with it), and proves the contention is real: a third description with a
+/// zero budget gets `Busy`.
+#[cfg(feature = "testing")]
+fn hold_config_lock(paths: &Paths) -> crate::secret::namespace_lock::NamespaceLockGuard {
+    paths.ensure_dirs().expect("the store directories exist");
+    let cancel = Cancel::new();
+    let later = Instant::now() + Duration::from_secs(30);
+    let held = namespace_lock::lock_file(&paths.config_lock(), later, &cancel, &Fault::none())
+        .expect("a second open file description takes .config.lock");
+    let third =
+        namespace_lock::lock_file(&paths.config_lock(), Instant::now(), &cancel, &Fault::none());
+    assert!(matches!(third, Err(LockError::Busy)), "the lock is not contended: {:?}", third.err());
+    held
+}
+
+/// Round N5 (C1b-2 review): the lock-order assertion runs BEFORE
+/// `.config.lock` is taken, so a thread holding a Codex guard panics at once
+/// instead of waiting on a contended lock and returning `Refused`. With the
+/// assertion moved after the lock (mutant M7) the call waits, gets `Refused`,
+/// returns before the assertion, and this test fails: no panic comes back.
+#[cfg(feature = "testing")]
+#[test]
+fn a_held_codex_guard_panics_before_waiting_on_a_contended_config_lock() {
+    let (_dir, paths) = testkit::store();
+    let _other = hold_config_lock(&paths);
+    let _guard = guard_for_testkit_record(&paths);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::config::AgctlConfig::update(&paths, |_| ())
+    }));
+    let payload = result.expect_err("the lock-order assertion fired; no wait on the lock");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+        .unwrap_or_default();
+    assert!(
+        message.contains(
+            "agctl lock order violated: .config.lock requested while this thread holds a Codex namespace guard"
+        ),
+        "a different panic: {message:?}"
+    );
+}
+
+/// The twin: the SAME contended update with no guard live is refused and does
+/// not panic — the panic above comes from the guard, not from the contention.
+#[cfg(feature = "testing")]
+#[test]
+fn a_contended_config_lock_without_a_guard_is_refused_not_a_panic() {
+    let (_dir, paths) = testkit::store();
+    let _other = hold_config_lock(&paths);
+    assert_eq!(crate::runtime::lock_order::held_codex_guards(), 0, "no guard is live");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::config::AgctlConfig::update(&paths, |_| ())
+    }));
+    let returned = result.expect("no panic without a guard");
+    assert!(
+        matches!(returned, Err(crate::error::AppError::Refused { .. })),
+        "a contended .config.lock is refused: {returned:?}"
+    );
+}
+
+/// Round N3: the underflow panic (a token dropped on a thread that did not
+/// make it) carries the same `agctl lock order violated: ` prefix the release
+/// gate lists, so it cannot reach a release artifact unseen. The assertion's
+/// message is pinned by the tests above; the overflow cannot be reached.
+#[cfg(feature = "testing")]
+#[test]
+fn a_token_dropped_on_another_thread_panics_with_the_gated_prefix() {
+    let token = crate::runtime::lock_order::HeldCodexGuard::take();
+    let payload = std::thread::spawn(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(token)))
+            .expect_err("dropping on another thread underflows that thread's count")
+    })
+    .join()
+    .expect("the dropping thread reports its panic");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+        .unwrap_or_default();
+    assert!(message.starts_with("agctl lock order violated: "), "{message:?}");
+    // The count of 1 this thread keeps (it made the token and never saw it
+    // dropped) belongs to this test's own thread and ends with it.
+}

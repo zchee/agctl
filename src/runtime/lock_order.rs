@@ -23,8 +23,10 @@
 //! with `overflow-checks=off` a bare `- 1` would wrap silently, so both
 //! directions use checked arithmetic and panic with a message instead.
 //!
-//! Compiled only under the `testing` feature; `scripts/release-gate.sh`
-//! proves the assertion's message is absent from a release artifact.
+//! Compiled only under the `testing` feature. All three of its messages
+//! start with the one prefix `agctl lock order violated: `, inside a single
+//! literal, and `scripts/release-gate.sh` proves that prefix absent from a
+//! release artifact — so no message escapes the gate if one of them moves.
 //!
 //! [`CodexNamespaceGuard`]: crate::provider::codex::proof::CodexNamespaceGuard
 //! [`AgctlConfig::update`]: crate::config::AgctlConfig::update
@@ -53,7 +55,7 @@ impl HeldCodexGuard {
     pub fn take() -> Self {
         HELD_CODEX_GUARDS.with(|held| {
             let Some(next) = held.get().checked_add(1) else {
-                panic!("lock order: Codex namespace guard count overflowed on this thread");
+                panic!("agctl lock order violated: Codex namespace guard count overflowed on this thread");
             };
             held.set(next);
         });
@@ -66,7 +68,7 @@ impl Drop for HeldCodexGuard {
         HELD_CODEX_GUARDS.with(|held| {
             let Some(next) = held.get().checked_sub(1) else {
                 panic!(
-                    "lock order: a Codex namespace guard was dropped on a thread that did not create it"
+                    "agctl lock order violated: a Codex namespace guard was dropped on a thread that did not create it"
                 );
             };
             held.set(next);

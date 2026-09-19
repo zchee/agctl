@@ -39,6 +39,8 @@ use std::process::Output;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex::CodexFixture;
+use codex::Needle;
+use codex::Stream;
 use serde_json::Value;
 use serde_json::json;
 
@@ -50,8 +52,14 @@ const EMAIL: &str = "codex-login@example.invalid";
 const REFRESH_TOKEN: &str = "agctl-test-codex-login-rt-0001";
 const JWT_SIGNATURE: &str = "agctl-test-codex-login-sig";
 
-/// Strings that must never appear on either stream of a login run.
-const NEEDLES: [&str; 5] = [REFRESH_TOKEN, JWT_SIGNATURE, "eyJ", "Bearer ", "bearer "];
+/// Strings that must never appear on either stream of a login run, by name.
+const NEEDLES: [Needle; 5] = [
+    ("the refresh token", REFRESH_TOKEN),
+    ("the JWT signature", JWT_SIGNATURE),
+    ("a JWT header", "eyJ"),
+    ("a Bearer header", "Bearer "),
+    ("a bearer header", "bearer "),
+];
 
 fn jwt(payload: &Value) -> String {
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
@@ -102,20 +110,45 @@ fn armed() -> (CodexFixture, PathBuf) {
 
 /// Asserts neither stream carries a needle and captures both streams.
 fn checked(name: &str, output: Output) -> Output {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for needle in NEEDLES {
-        assert!(!stdout.contains(needle), "{name}: stdout carries `{needle}`:\n{stdout}");
-        assert!(!stderr.contains(needle), "{name}: stderr carries `{needle}`:\n{stderr}");
-    }
-    if let Some(dir) = std::env::var_os("AGCTL_E2E_TRACE_DIR") {
-        let dir = PathBuf::from(dir);
-        fs::write(dir.join(format!("e2e_codex_login-{name}.stdout")), &output.stdout)
-            .expect("the trace directory is writable");
-        fs::write(dir.join(format!("e2e_codex_login-{name}.stderr")), &output.stderr)
-            .expect("the trace directory is writable");
-    }
-    output
+    codex::checked("e2e_codex_login", name, output, &NEEDLES, &[Stream::Stdout, Stream::Stderr])
+}
+
+/// The shared `checked` reports a leaked needle by NAME and byte offset, and
+/// never prints the value or the stream around it (the positive control that
+/// its report is safe to put in a failure log).
+#[test]
+fn checked_reports_a_needle_by_name_and_offset_never_by_value() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let leaky = Output {
+        status: std::process::ExitStatus::from_raw(0),
+        stdout: format!("before {REFRESH_TOKEN} after").into_bytes(),
+        stderr: Vec::new(),
+    };
+    let report = std::panic::catch_unwind(|| {
+        codex::checked("e2e_codex_login", "positive-control", leaky, &NEEDLES, &[])
+    })
+    .expect_err("a stream carrying a needle is refused");
+    let message = report
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| report.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+        .unwrap_or_default();
+    assert!(
+        message.contains("stdout carries the needle `the refresh token` at byte 7"),
+        "{message:?}"
+    );
+    assert!(!message.contains(REFRESH_TOKEN), "the report printed the needle's value");
+    assert!(!message.contains("before"), "the report printed the stream");
+
+    // The twin: a clean stream passes and comes back unchanged.
+    let clean = Output {
+        status: std::process::ExitStatus::from_raw(0),
+        stdout: b"nothing to see".to_vec(),
+        stderr: Vec::new(),
+    };
+    let back = codex::checked("e2e_codex_login", "positive-control-clean", clean, &NEEDLES, &[]);
+    assert_eq!(back.stdout, b"nothing to see");
 }
 
 /// Runs `agctl codex login` through [`checked`].
@@ -234,6 +267,9 @@ fn ac105_the_child_sees_exactly_the_allowlist_and_no_decoy() {
     let (mut fixture, _doc) = armed();
     fixture.set("AWS_SECRET_ACCESS_KEY", "decoy-value-must-not-appear");
     fixture.set("CODEX_API_KEY", "decoy-value-must-not-appear");
+    // A value that spans lines, in a variable the `testing` pass-through lets
+    // reach the child: its second line must never be recorded as a name.
+    fixture.set("AGCTL_FAKE_CODEX_MULTILINE", "first\nenv DECOY_FROM_A_VALUE");
 
     let output = login(&fixture, "allowlist");
     assert!(output.status.success(), "{}", stderr(&output));
@@ -246,17 +282,28 @@ fn ac105_the_child_sees_exactly_the_allowlist_and_no_decoy() {
     assert!(names.contains(&"CODEX_HOME"), "the child is told which home to use");
     assert!(names.contains(&"PATH"), "the child keeps PATH");
 
-    // No value but the named three, and never a decoy's.
+    assert!(
+        names.contains(&"AGCTL_FAKE_CODEX_MULTILINE"),
+        "the multi-line decoy reached the child (the positive control for the next line)"
+    );
+    assert!(
+        !log.contains("DECOY_FROM_A_VALUE"),
+        "a line of a multi-line VALUE was recorded as a name"
+    );
+
+    // Values for exactly the named three, and never a decoy's.
     assert!(!log.contains("decoy-value-must-not-appear"), "a decoy VALUE reached the log");
-    for line in log.lines() {
-        if let Some(rest) = line.strip_prefix("value ") {
-            let name = rest.split('=').next().unwrap_or_default();
-            assert!(
-                ["CODEX_HOME", "HOME", "TMPDIR"].contains(&name),
-                "a value was logged for {name}"
-            );
-        }
-    }
+    let mut valued: Vec<&str> = log
+        .lines()
+        .filter_map(|line| line.strip_prefix("value "))
+        .map(|rest| rest.split('=').next().unwrap_or_default())
+        .collect();
+    valued.sort_unstable();
+    assert_eq!(
+        valued,
+        ["CODEX_HOME", "HOME", "TMPDIR"],
+        "the values recorded are exactly the three"
+    );
     // Under direnv this also proves any real, inherited `KACHE_*` name was
     // dropped: agctl inherits the test runner's environment.
     assert_eq!(log.matches("KACHE_").count(), 0, "no KACHE_ name appears anywhere in the record");
@@ -300,8 +347,10 @@ fn ac105_the_child_gets_the_measured_argv() {
     assert!(output.status.success(), "{}", stderr(&output));
 
     let log = codex_log(&fixture);
-    let argv = log.lines().find_map(|line| line.strip_prefix("argv ")).expect("argv recorded");
-    assert_eq!(argv, "-c cli_auth_credentials_store=\"file\" login");
+    // One `arg` line per argument: the override and its `-c` are two words,
+    // never the one word `-c cli_auth…` that a `$*` record could not tell apart.
+    let argv: Vec<&str> = log.lines().filter_map(|line| line.strip_prefix("arg ")).collect();
+    assert_eq!(argv, ["-c", "cli_auth_credentials_store=\"file\"", "login"]);
 }
 
 #[test]

@@ -42,6 +42,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Output;
 
 use assert_cmd::Command;
 
@@ -298,4 +299,60 @@ impl Default for CodexFixture {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A string a test's output must not carry: the NAME a failure reports, and
+/// the value searched for. A hit reports the name and the byte offset only —
+/// never the value, and never the text around it, because a value may be a
+/// credential and the text a stream that holds one.
+pub type Needle = (&'static str, &'static str);
+
+/// A captured stream that [`checked`] copies to `AGCTL_E2E_TRACE_DIR`.
+#[derive(Clone, Copy)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
+/// The first needle `text` carries, as its name and byte offset.
+pub fn find_needle(text: &[u8], needles: &[Needle]) -> Option<(&'static str, usize)> {
+    needles.iter().find_map(|(name, value)| {
+        text.windows(value.len())
+            .position(|window| window == value.as_bytes())
+            .map(|at| (*name, at))
+    })
+}
+
+/// Panics if `text` carries a needle, naming `test`, `what` was searched, the
+/// needle's name and its byte offset.
+pub fn assert_no_needle(test: &str, what: &str, text: &[u8], needles: &[Needle]) {
+    if let Some((name, at)) = find_needle(text, needles) {
+        panic!("{test}: {what} carries the needle `{name}` at byte {at}");
+    }
+}
+
+/// Asserts neither stream of `output` carries a needle, then copies the
+/// `keep` streams to `AGCTL_E2E_TRACE_DIR/<prefix>-<test>.<stream>` when that
+/// directory is named. Every e2e crate's `checked` is this one.
+pub fn checked(
+    prefix: &str,
+    test: &str,
+    output: Output,
+    needles: &[Needle],
+    keep: &[Stream],
+) -> Output {
+    assert_no_needle(test, "stdout", &output.stdout, needles);
+    assert_no_needle(test, "stderr", &output.stderr, needles);
+    if let Some(dir) = std::env::var_os("AGCTL_E2E_TRACE_DIR") {
+        let dir = PathBuf::from(dir);
+        for stream in keep {
+            let (suffix, bytes) = match stream {
+                Stream::Stdout => ("stdout", &output.stdout),
+                Stream::Stderr => ("stderr", &output.stderr),
+            };
+            fs::write(dir.join(format!("{prefix}-{test}.{suffix}")), bytes)
+                .expect("the trace directory is writable");
+        }
+    }
+    output
 }

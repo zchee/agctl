@@ -1043,10 +1043,13 @@ check_codex_bin() {
 # check_fake_prefix: order B3. The `testing`-only prefix that lets the fake
 # `codex`'s knobs through the login child's environment allowlist is spelled
 # exactly ONCE in non-test source, on the line directly under
-# `#[cfg(feature = "testing")]`. The release gate cannot prove this: a
-# `starts_with` against a short constant is compiled to immediate compares, so
-# a re-spelled literal in a default-feature arm leaves no string in the
-# artifact for `strings` to find (review C1b F4, mutant R1).
+# `#[cfg(feature = "testing")]`. The release gate cannot prove this, and no
+# longer lists the prefix: a `starts_with` against a short constant is
+# compiled to immediate compares, so NO build — the `testing` one included —
+# carries the literal as a string for `strings` to find (review C1b F4,
+# mutant R1; S34 C1b-3a counted it: 0 in an all-features binary). This rule
+# and the default-feature clippy gate are what guard the prefix; the plants
+# `plant_fake_prefix` and `plant_fake_prefix_cfg_commented` show it fires.
 check_fake_prefix() {
     local root=$1 hits count file line prev
     hits=$(code_hits "$root" 'AGCTL_FAKE_CODEX_') || scan_failed check_fake_prefix

@@ -30,6 +30,8 @@ use std::process::Output;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex::CodexFixture;
+use codex::Needle;
+use codex::Stream;
 use httpmock::Method::GET;
 use httpmock::Method::POST;
 use httpmock::MockServer;
@@ -46,16 +48,16 @@ const ACCT: &str = "11111111-2222-4333-8444-555555555555";
 const LIVE_ACCT: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
 const EMAIL: &str = "codex-owner@example.invalid";
 
-/// The needles no output of a pass may carry (plan section 9.4).
-const NEEDLES: [&str; 8] = [
-    "agctl-test-codex-at-",
-    "agctl-test-codex-rt-",
-    "agctl-test-codex-ak-",
-    "agctl-test-codex-jwt-",
-    "agctl-test-codex-email-",
-    "eyJ",
-    "Bearer ",
-    "bearer ",
+/// The needles no output of a pass may carry (plan section 9.4), by name.
+const NEEDLES: [Needle; 8] = [
+    ("an access token", "agctl-test-codex-at-"),
+    ("a refresh token", "agctl-test-codex-rt-"),
+    ("an API key", "agctl-test-codex-ak-"),
+    ("a JWT", "agctl-test-codex-jwt-"),
+    ("an email sentinel", "agctl-test-codex-email-"),
+    ("a JWT header", "eyJ"),
+    ("a Bearer header", "Bearer "),
+    ("a bearer header", "bearer "),
 ];
 
 /// The published version-2 schema.
@@ -174,17 +176,7 @@ fn run(fixture: &CodexFixture, name: &str, args: &[&str]) -> Output {
 
 /// Asserts neither stream carries a needle and captures the standard error.
 fn checked(name: &str, output: Output) -> Output {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for needle in NEEDLES {
-        assert!(!stdout.contains(needle), "{name}: stdout carries `{needle}`:\n{stdout}");
-        assert!(!stderr.contains(needle), "{name}: stderr carries `{needle}`:\n{stderr}");
-    }
-    if let Some(dir) = std::env::var_os("AGCTL_E2E_TRACE_DIR") {
-        let path = PathBuf::from(dir).join(format!("e2e_codex_status-{name}.stderr"));
-        fs::write(&path, &output.stderr).expect("the trace directory is writable");
-    }
-    output
+    codex::checked("e2e_codex_status", name, output, &NEEDLES, &[Stream::Stderr])
 }
 
 #[test]
@@ -636,10 +628,13 @@ fn ac117_a_refresh_appends_one_audited_line_that_names_no_identity() {
     assert_eq!(lines[0]["provider"], "codex");
     let path = fixture.inner().config_dir().join("codex").join("writes.jsonl");
     let text = fs::read_to_string(&path).expect("the log");
-    for needle in NEEDLES {
-        assert!(!text.contains(needle), "the write log carries `{needle}`:\n{text}");
-    }
-    assert!(!text.contains('@'), "the write log carries an address:\n{text}");
+    codex::assert_no_needle("ac117-audit", "the write log", text.as_bytes(), &NEEDLES);
+    codex::assert_no_needle(
+        "ac117-audit",
+        "the write log",
+        text.as_bytes(),
+        &[("an address", "@")],
+    );
     use std::os::unix::fs::PermissionsExt;
     let mode = fs::metadata(&path).expect("the log").permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "the write log is not 0600");
@@ -1223,15 +1218,24 @@ fn interrupted_before_rename(
     what: &str,
 ) -> std::process::ExitStatus {
     owned(fixture, &auth_doc(USER, ACCT, 1_000, false, "agctl-test-codex-rt-0001"), "auto");
+    // The signal is sent once the pass is AT the pause point, which it
+    // announces by creating `<resume>.reached` after the staged file has been
+    // written and fsynced. Waiting for the staged file to merely EXIST would
+    // race the write: the file is created first and filled after, and a
+    // signal in between leaves it empty (bead agctl-u82l). The resume file is
+    // never written, so the pass waits at the pause point until the signal.
+    let resume = fixture.inner().config_dir().join("resume-before-rename");
+    let mut reached = resume.clone().into_os_string();
+    reached.push(".reached");
+    let reached = PathBuf::from(reached);
+    let resume_env = resume.to_string_lossy().into_owned();
     let mut child = spawn_with(
         fixture,
         &["codex", "status", "--account", USER],
-        &[("AGCTL_FAULT", "pause_codex_before_rename")],
+        &[("AGCTL_FAULT", "pause_codex_before_rename"), ("AGCTL_FAULT_RESUME", &resume_env)],
     );
-    // The staged file exists only between the fsync and the rename, which is
-    // exactly the window this test needs; no sleep decides anything.
-    let staged = || !staged_tmps(fixture).is_empty();
-    signal_when(&mut child, signal, what, staged)
+    let at_pause = || reached.exists();
+    signal_when(&mut child, signal, what, at_pause)
 }
 
 #[test]

@@ -4,8 +4,8 @@
 # Builds agctl the way a release is built (default features, release profile)
 # into a scratch target directory, then proves two things about the artifact:
 #
-#   1. none of the thirteen test-seam environment-variable names appear in it, and
-#   2. the three production-visible names do.
+#   1. none of the test-seam names in the `seams` array appear in it, and
+#   2. every production-visible name in the `production` array does.
 #
 # It also runs scripts/docs-gate.sh first (AC77 and AC83), so that one command
 # covers everything a release must satisfy that the three check-skill commands
@@ -16,11 +16,10 @@
 # and the `testing` builds get `serde_json/float_roundtrip` (the live
 # `.claude.json` guard's exact float parsing).
 #
-# The thirteen are one representative name per seam-owning module, not the whole
-# test-only surface — fixtures/fake-security.sh alone defines ten
-# AGCTL_FAKE_SECURITY_* names on its own. The fake's write knob is the one
-# exception to "one per owner": the keychain *write* path is the only seam that
-# can change a keychain, so it is gated by name rather than by family. A new
+# The seam names are one representative per seam-owning module, not the whole
+# test-only surface. A name is listed only if a `testing` build of the binary
+# CAN carry it as a string; one no build carries would be absent here whatever
+# the release did, so it would prove nothing (see the notes in the array). A new
 # seam-owning module adds its representative to the `seams` array below and to
 # the table in .claude/skills/check/SKILL.md, in the same change that
 # introduces it.
@@ -143,31 +142,34 @@ seams=(
 	AGCTL_CLAUDE_TOKEN_URL
 	AGCTL_CLAUDE_AUTHORIZE_URL
 	AGCTL_CLAUDE_PROFILE_URL
-	AGCTL_FAKE_SECURITY_LOG
-	AGCTL_FAKE_SECURITY_WRITE_EXIT
+	# No knob name of the `security(1)` stand-in is listed. It is embedded
+	# (`include_str!` in `src/secret/fake_security.rs`, `testing` only) for
+	# the UNIT tests alone: its one reader is called from unit tests only,
+	# so it is dead code in every binary, `testing` builds included, and no
+	# build can carry its knobs. A name no build carries would be absent
+	# here whatever the release did, so listing it would prove nothing.
 	AGCTL_NO_BROWSER
 	AGCTL_CODEX_BIN
 	AGCTL_CODEX_USAGE_URL
 	AGCTL_CODEX_TOKEN_URL
-	# S34: the login child's `testing`-only allowlist prefix and the pause
-	# point between `verify_login` and `install`.
+	# S34: the pause point between `verify_login` and `install`.
 	#
-	# What the PREFIX entry proves, and what it does not: it proves no copy of
-	# the literal survives as data in the artifact. It does NOT prove a
-	# default-feature build cannot honour the prefix — a `starts_with` against
-	# a short constant compiles to immediate compares and leaves no string
-	# behind. That half is `scripts/phase3-greps.sh`'s `fake_prefix` rule (the
-	# literal spelled once, under `#[cfg(feature = "testing")]`) plus the
-	# default-feature clippy gate. The fake's individual knob names are read by
-	# the fixture script only — agctl's code names none of them — so they are
-	# not listed here.
-	AGCTL_FAKE_CODEX_
+	# Not listed: the login child's `testing`-only allowlist prefix
+	# `AGCTL_FAKE_CODEX_`. It is used only in a `starts_with`, which compiles
+	# to immediate compares, so no build — `testing` included — carries it
+	# as a string. What guards it is `scripts/phase3-greps.sh`'s `fake_prefix`
+	# rule (the literal spelled once, under `#[cfg(feature = "testing")]`)
+	# plus the default-feature clippy gate. The fake `codex`'s own knob names
+	# are not listed either: `fixtures/fake-codex.sh` is never compiled into
+	# the crate, so no build carries them.
 	codex_login_before_install
 	# S34 C1b-2 (numbered deviation 13): the `testing`-only lock-order
-	# witness in src/runtime/lock_order.rs. Its assertion message is one
-	# literal with nothing interpolated, so a `testing` build carries it whole
-	# and this entry proves the witness never reaches a release artifact.
-	'agctl lock order violated: .config.lock requested while this thread holds a Codex namespace guard'
+	# witness in src/runtime/lock_order.rs. All three of its messages (the
+	# assertion, the overflow and the underflow panic) start with this one
+	# prefix inside a single literal with nothing interpolated, so a `testing`
+	# build carries it whole and this entry proves none of them — nor the
+	# witness — reaches a release artifact.
+	'agctl lock order violated: '
 )
 
 # The production surface. Every one of these must be PRESENT.

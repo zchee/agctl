@@ -17,7 +17,7 @@
 # refuse every real login (ledger #310). The happy-path test only proves what
 # it claims if the happy path leaves a real login's mess behind.
 #
-#   AGCTL_FAKE_CODEX_LOG        append `argv`, `cwd`, `env`, `residue` and `exit`
+#   AGCTL_FAKE_CODEX_LOG        append `arg`, `cwd`, `env`, `residue` and `exit`
 #                               records here
 #   AGCTL_FAKE_CODEX_SLEEP      seconds to sleep before doing anything
 #   AGCTL_FAKE_CODEX_EXIT       exit status (default 0)
@@ -54,12 +54,19 @@ umask 077
 
 if [ -n "${AGCTL_FAKE_CODEX_LOG:-}" ]; then
 	{
-		printf 'argv %s\n' "$*"
+		# One `arg <word>` line per argument, so a test sees the boundaries:
+		# `"$*"` would record `-c k=v` passed as ONE argument exactly like two.
+		for word in "$@"; do
+			printf 'arg %s\n' "$word"
+		done
 		printf 'cwd %s\n' "$(pwd)"
 		# One `env <NAME>` line per variable, sorted, so a test can assert on
 		# the whole environment rather than on the names it happened to think
-		# of — without the values ever reaching disk.
-		env | sed 's/=.*//' | LC_ALL=C sort | sed 's/^/env /'
+		# of — without the values ever reaching disk. `awk`'s ENVIRON is keyed
+		# by variable: a value that spans lines stays whole and is never
+		# printed (`env | sed` works per LINE and would print a multi-line
+		# value's continuation lines as if they were names).
+		awk 'BEGIN { for (name in ENVIRON) print "env " name }' | LC_ALL=C sort
 		# The three the assertions actually compare. None of them is a secret,
 		# and each is named here rather than swept up by a pattern.
 		for named in CODEX_HOME HOME TMPDIR; do
