@@ -298,6 +298,10 @@ impl AgctlConfig {
         let cancel = Cancel::new();
         let now = Instant::now();
         let deadline = now.checked_add(CONFIG_LOCK_TIMEOUT).unwrap_or(now);
+        // The only place `.config.lock` is taken. A thread holding a Codex
+        // namespace guard must not block here (numbered deviation 13).
+        #[cfg(feature = "testing")]
+        crate::runtime::lock_order::assert_no_codex_guard_before_config_lock();
         let guard = namespace_lock::lock_file(&lock_path, deadline, &cancel, &Fault::none())
             .map_err(|err| AppError::Refused {
                 reason: format!("could not lock `{}`: {err}", lock_path.display()),

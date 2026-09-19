@@ -163,6 +163,11 @@ seams=(
 	# not listed here.
 	AGCTL_FAKE_CODEX_
 	codex_login_before_install
+	# S34 C1b-2 (numbered deviation 13): the `testing`-only lock-order
+	# witness in src/runtime/lock_order.rs. Its assertion message is one
+	# literal with nothing interpolated, so a `testing` build carries it whole
+	# and this entry proves the witness never reaches a release artifact.
+	'agctl lock order violated: .config.lock requested while this thread holds a Codex namespace guard'
 )
 
 # The production surface. Every one of these must be PRESENT.

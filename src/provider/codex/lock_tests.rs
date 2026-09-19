@@ -106,3 +106,68 @@ fn budgets_report_their_wait() {
     assert_eq!(LockBudget::Pass(Duration::from_secs(1)).duration(), Duration::from_secs(1));
     assert_eq!(LockBudget::Command(Duration::from_secs(5)).duration(), Duration::from_secs(5));
 }
+
+/// Takes the lock for the testkit's owned record with a one-second budget.
+#[cfg(feature = "testing")]
+fn guard_for_testkit_record(paths: &Paths) -> CodexNamespaceGuard {
+    let record = testkit::owned_record(testkit::USER, testkit::ACCT);
+    let owned = proof::owned(&record).expect("owned");
+    acquire_codex(
+        paths,
+        owned,
+        LockBudget::Command(Duration::from_secs(1)),
+        &Cancel::new(),
+        &Fault::none(),
+    )
+    .expect("locks")
+}
+
+/// Numbered deviation 13, the direct pin: the registry update refuses to take
+/// `.config.lock` while this thread holds a Codex namespace guard.
+#[cfg(feature = "testing")]
+#[test]
+#[should_panic(
+    expected = "agctl lock order violated: .config.lock requested while this thread holds a Codex namespace guard"
+)]
+fn the_registry_update_panics_while_this_thread_holds_a_codex_guard() {
+    let (_dir, paths) = testkit::store();
+    let _guard = guard_for_testkit_record(&paths);
+    assert_eq!(crate::runtime::lock_order::held_codex_guards(), 1, "the guard counted itself");
+    let _ = crate::config::AgctlConfig::update(&paths, |_| ());
+}
+
+/// The positive-control twin: the same update runs once the guard is gone,
+/// and a guard held by ANOTHER thread is not this thread's ordering fault.
+#[cfg(feature = "testing")]
+#[test]
+fn the_registry_update_runs_after_the_drop_and_ignores_other_threads() {
+    use std::sync::mpsc;
+    use std::thread;
+
+    use crate::runtime::lock_order::held_codex_guards;
+
+    let (_dir, paths) = testkit::store();
+    let guard = guard_for_testkit_record(&paths);
+    assert_eq!(held_codex_guards(), 1, "the guard counted itself");
+    drop(guard);
+    assert_eq!(held_codex_guards(), 0, "the drop uncounted it");
+    crate::config::AgctlConfig::update(&paths, |_| ()).expect("updates with no guard held");
+
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    thread::scope(|scope| {
+        let paths = &paths;
+        scope.spawn(move || {
+            let guard = guard_for_testkit_record(paths);
+            held_tx.send(held_codex_guards()).expect("reports");
+            release_rx.recv().expect("released");
+            drop(guard);
+            assert_eq!(held_codex_guards(), 0, "dropped on the thread that made it");
+        });
+        assert_eq!(held_rx.recv().expect("held"), 1, "the other thread counts its own guard");
+        assert_eq!(held_codex_guards(), 0, "this thread holds none");
+        let updated = crate::config::AgctlConfig::update(paths, |_| ());
+        release_tx.send(()).expect("releases");
+        updated.expect("another thread's guard does not trip this thread");
+    });
+}

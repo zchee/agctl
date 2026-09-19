@@ -155,13 +155,27 @@ impl fmt::Debug for VerifiedLogin {
 }
 
 /// A held Codex namespace lock.
+///
+/// Under the `testing` feature it also carries a
+/// [`HeldCodexGuard`](crate::runtime::lock_order::HeldCodexGuard), so a test
+/// that takes `.config.lock` while one is alive panics (numbered deviation 13).
 #[derive(Debug)]
-pub struct CodexNamespaceGuard(NamespaceLockGuard);
+pub struct CodexNamespaceGuard(
+    NamespaceLockGuard,
+    #[cfg(feature = "testing")] crate::runtime::lock_order::HeldCodexGuard,
+);
 
 impl CodexNamespaceGuard {
     /// Wraps an acquired lock. The only caller is `lock.rs` (plan AC119).
     pub(super) fn wrap(guard: NamespaceLockGuard) -> Self {
-        Self(guard)
+        #[cfg(feature = "testing")]
+        {
+            Self(guard, crate::runtime::lock_order::HeldCodexGuard::take())
+        }
+        #[cfg(not(feature = "testing"))]
+        {
+            Self(guard)
+        }
     }
 
     /// The lock file held.
