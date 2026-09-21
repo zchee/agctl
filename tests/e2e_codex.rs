@@ -252,12 +252,12 @@ fn codex_tree(config_dir: &Path) -> bool {
 #[test]
 fn every_codex_subcommand_refuses_without_touching_the_store() {
     let fixture = CodexFixture::new();
-    // `status` and `watch` landed at S33 (`tests/e2e_codex_status.rs`) and
-    // `login` at S34 (`tests/e2e_codex_login.rs`); the rest are still stubs.
-    // A command that lands leaves this list in the commit that lands it,
-    // otherwise "no stub may touch a file" quietly stops covering anything.
-    let lines: [(&[&str], &str); 4] = [
-        (&["codex", "import", "--from", "codex-home"], "agctl codex import"),
+    // `status` and `watch` landed at S33 (`tests/e2e_codex_status.rs`),
+    // `login` at S34 C1 (`tests/e2e_codex_login.rs`) and `import` at S34 C2-b
+    // (`tests/e2e_codex_import.rs`); the rest are still stubs. A command that
+    // lands leaves this list in the commit that lands it, otherwise "no stub
+    // may touch a file" quietly stops covering anything.
+    let lines: [(&[&str], &str); 3] = [
         (&["codex", "doctor"], "agctl codex doctor"),
         (&["codex", "accounts", "list"], "agctl codex accounts list"),
         (&["codex", "accounts", "refresh", "x", "--reset-floor"], "agctl codex accounts refresh"),

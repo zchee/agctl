@@ -165,7 +165,13 @@ impl KeyringListing {
     /// Whether the listing names an item for `home` (fact F94). A listing with
     /// no account column matches by service alone (the coarse match `doctor`
     /// reports).
-    fn probe(&self, home: &Path) -> KeyringProbe {
+    ///
+    /// `pub(super)` rather than private since S34 C2-a's sibling commit:
+    /// `commands::codex::import` asks the same question of the same listing,
+    /// so that one home gets one answer from both commands (plan AC95). The
+    /// narrowest visibility that reaches it — nothing outside
+    /// `commands::codex` can call it.
+    pub(super) fn probe(&self, home: &Path) -> KeyringProbe {
         let Self::Entries(entries) = self else { return KeyringProbe::Unknown };
         let account = home::keyring_account(home);
         let listed = entries.iter().any(|entry| {

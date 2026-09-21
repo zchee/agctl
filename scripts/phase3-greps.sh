@@ -195,6 +195,15 @@
 #                 in the binary reaches `audit::append` first. Modelled on
 #                 `fake_prefix`, for the same reason.
 #
+# S34 C2-b appends one (the C2-a review's carry C-1):
+#
+#   reached_audit  callers of `reached_audit(` (not its `fn`)             → exactly
+#                 one, in provider/codex/audit.rs. It is the method that disarms
+#                 the unaudited-receipt drop check and it is `pub(super)`, so any
+#                 new code in `provider::codex` could disarm a receipt and drop
+#                 it. Pinned by count AND by file: the count alone would accept
+#                 the one call moving somewhere else.
+#
 # With `--log`, the `LOG_ONLY_NEEDLES` are counted too: the sentinel email a
 # usage fixture carries (ledger #274). They are deliberately not code needles
 # — the fixture that carries the sentinel is how a leak test proves anything —
@@ -1116,6 +1125,39 @@ check_receipt_check() {
     return 0
 }
 
+# check_reached_audit: S34 C2-b, from the C2-a review (carry C-1). The drop
+# check of C2-a is disarmed by `WriteReceipt::reached_audit`, which is
+# `pub(super)` — reachable from anywhere in `provider::codex`. Nothing in the
+# type system stops a future writer there from disarming a receipt and then
+# dropping it, which would silence the run-time guard exactly where it matters.
+# So the call is pinned by COUNT and by FILE: exactly one caller in non-test
+# source, in the audit log's own module, which is the one place a receipt is
+# legitimately consumed. The `fn` that declares it is filtered out, the way
+# `check_callers_not_fn` does, so `auth_store.rs` is not a hit for defining it.
+# The plants `plant_reached_audit_second_caller` and
+# `plant_reached_audit_elsewhere` show both halves fire.
+REACHED_AUDIT_FILE=src/provider/codex/audit.rs
+
+check_reached_audit() {
+    local root=$1 hits count file status=0
+    hits=$(code_hits "$root" '\breached_audit\(') || scan_failed check_reached_audit
+    hits=$(printf '%s\n' "$hits" | rg -v -e '\bfn\s+reached_audit\b') || status=$?
+    [[ $status -gt 1 ]] && phase3_die "check_reached_audit: rg failed filtering the definition"
+    count=$(printf '%s\n' "$hits" | sed '/^$/d' | wc -l | tr -d ' ')
+    if [[ $count -ne 1 ]]; then
+        printf '  `reached_audit(` is called %s time(s) in non-test source, not once; it disarms the unaudited-receipt drop check, so a second caller is a second way to silence it:\n%s\n' \
+            "$count" "$hits"
+        return 1
+    fi
+    file=${hits%%:*}
+    if [[ $file != "$REACHED_AUDIT_FILE" ]]; then
+        printf '  `reached_audit(` is called from %s, not %s; only the audit log may disarm a receipt\n' \
+            "$file" "$REACHED_AUDIT_FILE"
+        return 1
+    fi
+    return 0
+}
+
 check_codex_env() {
     local file="$1/$CODEX_HOME_MODULE" hits status=0
     # Vacuous until S30 writes it. Stated rather than silent: the plant below
@@ -1174,6 +1216,14 @@ plant_receipt_check_cfg_commented() {
     mkdir -p "$1/src/provider/codex"
     sed -i.bak -e 's|^\([[:space:]]*\)#\[cfg(feature = "testing")\]\([[:space:]]*\)$|\1// #[cfg(feature = "testing")]\2|' \
         "$1/src/provider/codex/auth_store.rs" && rm -f "$1/src/provider/codex/auth_store.rs.bak"
+}
+# A second caller, in the one file that is allowed to hold the first.
+plant_reached_audit_second_caller() { plant_line "$1" 'fn _phase3_plant(r: &WriteReceipt) { r.reached_audit(); }' "$REACHED_AUDIT_FILE"; }
+# The only caller, but in another file: the count alone would pass this.
+plant_reached_audit_elsewhere() {
+    sed -i.bak -e 's|^\( *\)receipt\.reached_audit();|\1|' "$1/$REACHED_AUDIT_FILE" \
+        && rm -f "$1/$REACHED_AUDIT_FILE.bak"
+    plant_line "$1" 'fn _phase3_plant(r: &WriteReceipt) { r.reached_audit(); }'
 }
 plant_codex_bin() { plant_line "$1" 'const _PHASE3_PLANT: &str = "AGCTL_CODEX_BIN";'; }
 plant_expose_elsewhere() { plant_line "$1" 'fn _phase3_plant(s: &SecretString) -> String { s.expose_secret().to_owned() }'; }
@@ -1430,7 +1480,7 @@ CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers expose
     codex_debug_assert state_path codex_flock wham_usage codex_usage_url codex_timeouts codex_redirects codex_decoded_cap credits_state
     auth_host codex_token_url oauth_cancelled oauth_refresh_callers consent_callers refresh_usage_cache receipt_type
     receipt_destructure refresh_drivers refresh_client post_permit permit_mint permit_mint_count daemon_pid_names watch_no_post usage_client_new
-    fake_prefix receipt_check)
+    fake_prefix receipt_check reached_audit)
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
@@ -1472,6 +1522,8 @@ PLANTS=(
     "fake_prefix plant_fake_prefix_cfg_commented"
     "receipt_check plant_receipt_check"
     "receipt_check plant_receipt_check_cfg_commented"
+    "reached_audit plant_reached_audit_second_caller"
+    "reached_audit plant_reached_audit_elsewhere"
     "wham_usage plant_wham_usage"
     "codex_usage_url plant_codex_usage_url"
     "codex_timeouts plant_codex_timeouts"

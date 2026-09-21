@@ -5,7 +5,8 @@
 //! (`cli::CodexCommand`), and the commands behind it land wave by wave: the
 //! usage pass ([`status`], [`watch`]) at S33, login, import and accounts at
 //! S34, doctor at S35. Until each one exists its arm is a stub, and a stub
-//! does exactly one thing — it says so and exits non-zero.
+//! does exactly one thing — it says so and exits non-zero. `accounts` and
+//! `doctor` are the two still standing.
 //!
 //! # Why the flags exist before the commands do
 //!
@@ -25,6 +26,7 @@
 //! anything would be a write nobody asked for, on a path the reviewer of the
 //! real command has not seen yet.
 
+pub mod import;
 pub mod login;
 pub mod pass;
 pub mod status;
@@ -42,7 +44,8 @@ use crate::runtime::coordinator::Cancel;
 
 /// Routes a parsed `agctl codex` subcommand.
 ///
-/// `status` and `watch` run; every other arm refuses until its wave lands.
+/// `status`, `watch`, `login` and `import` run; every other arm refuses until
+/// its wave lands.
 ///
 /// # Errors
 ///
@@ -53,6 +56,7 @@ pub fn run(cli: &Cli, command: &CodexCommand, cancel: &Cancel) -> Result<i32, Ap
         CodexCommand::Status(args) => status::run(cli, args, cancel).map(|()| 0),
         CodexCommand::Watch(args) => watch::run(cli, args, cancel).map(|()| 0),
         CodexCommand::Login(args) => login::run(cli, args, cancel).map(|()| 0),
+        CodexCommand::Import(args) => import::run(cli, args, cancel).map(|()| 0),
         other => Err(AppError::not_implemented(&name(other))),
     }
 }
