@@ -50,6 +50,7 @@ use crate::config::codex::RefreshPolicy;
 use crate::config::paths::Paths;
 use crate::error::AppError;
 use crate::provider::codex::audit;
+use crate::provider::codex::auth_store;
 use crate::provider::codex::auth_store::OwnedNamespace;
 use crate::provider::codex::lock;
 use crate::provider::codex::lock::LockBudget;
@@ -329,15 +330,23 @@ pub fn remove(
 /// namespace work** — a link, a regular file, `EACCES` or any other error
 /// goes on to `OwnedNamespace::open`, which owns that refusal and states it
 /// properly; this function does not invent a second opinion about a path it
-/// cannot read. And when it does skip, there is no write, therefore no
-/// [`WriteReceipt`] and therefore **no `delete` line in the audit log** —
+/// cannot read.
+///
+/// # What the skip still has to clean up
+///
+/// The namespace's refresh marker is not in the namespace: it is
+/// `codex/.state/<user>+<acct>.refresh`, one directory up. So a skip that did
+/// nothing at all left the marker behind with nothing referencing it the
+/// moment the registry row was dropped — a state no `remove` should be able to
+/// produce, and the one this branch now clears through
+/// `auth_store::remove_orphaned_refresh_state`, which opens `codex/.state/`
+/// and never the namespace. When there was no marker either, nothing is
+/// written, so there is no receipt and **no `delete` line in the audit log** —
 /// nothing happened to record (plan AC125).
 ///
 /// The remaining races are harmless by construction: a namespace that appears
 /// after the skip is an orphan `doctor` reports, and one that vanishes before
 /// the open is re-created and `rmdir`ed by the removal itself.
-///
-/// [`WriteReceipt`]: crate::provider::codex::auth_store::WriteReceipt
 fn delete_namespace(
     paths: &Paths,
     record: &CodexAccountRecord,
@@ -358,7 +367,18 @@ fn delete_namespace(
     // Under the guard, and an lstat: only "it is not there" skips the work.
     if matches!(std::fs::symlink_metadata(&dir), Err(ref err) if err.kind() == io::ErrorKind::NotFound)
     {
-        io.tell(&format!("{shown} has no stored credential; nothing to delete"));
+        let removed = auth_store::remove_orphaned_refresh_state(paths, owned, &guard)
+            .map_err(|err| AppError::Refused { reason: err.to_string() })?;
+        if let Some(receipt) = removed {
+            // Audited under the guard, as every removal of an agctl file is,
+            // and before the row is dropped.
+            audit::append(paths, receipt)?;
+            io.tell(&format!(
+                "{shown} has no stored credential; its leftover refresh marker is gone"
+            ));
+        } else {
+            io.tell(&format!("{shown} has no stored credential; nothing to delete"));
+        }
         return Ok(());
     }
 

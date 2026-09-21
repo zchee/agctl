@@ -134,6 +134,58 @@ fn the_proxy_and_ca_names_pass_through_when_set_and_are_absent_when_not() {
 }
 
 #[test]
+fn the_lowercase_proxy_names_pass_through_and_no_other_spelling_does() {
+    // A proxy variable has no canonical case. Rust's HTTP stacks read the
+    // lowercase names, and on a machine that exports only those the uppercase
+    // list passes nothing through, so the child cannot reach the
+    // authorization endpoint at all. Both cases are on the list; nothing
+    // between them is.
+    let scratch = Path::new("/scratch");
+    let lowercase = names_of(
+        &[
+            ("http_proxy", "http://proxy:3128"),
+            ("https_proxy", "http://proxy:3128"),
+            ("no_proxy", "localhost"),
+            ("all_proxy", "socks5://proxy:1080"),
+        ],
+        scratch,
+    );
+    assert_eq!(lowercase, ["CODEX_HOME", "all_proxy", "http_proxy", "https_proxy", "no_proxy"]);
+
+    // The match is on the exact name, so a third spelling is not smuggled in
+    // by a case-insensitive comparison the allowlist does not perform.
+    let mixed = names_of(
+        &[
+            ("Http_Proxy", "http://proxy:3128"),
+            ("HTTPS_proxy", "http://proxy:3128"),
+            ("No_Proxy", "localhost"),
+            ("ALL_proxy", "socks5://proxy:1080"),
+        ],
+        scratch,
+    );
+    assert_eq!(mixed, ["CODEX_HOME"], "a spelling on neither list is dropped");
+}
+
+#[test]
+fn both_proxy_cases_reach_the_child_when_both_are_set() {
+    // Neither case is folded onto the other: what the vendor's child reads is
+    // the vendor's business, so agctl passes what the parent set and rewrites
+    // no name.
+    let scratch = Path::new("/scratch");
+    let names = names_of(
+        &[("HTTPS_PROXY", "http://upper:3128"), ("https_proxy", "http://lower:3128")],
+        scratch,
+    );
+    assert_eq!(names, ["CODEX_HOME", "HTTPS_PROXY", "https_proxy"]);
+
+    let values = env_of(&[("https_proxy", "http://lower:3128")], scratch);
+    assert!(
+        values.iter().any(|(k, v)| k == "https_proxy" && v == "http://lower:3128"),
+        "the value reaches the child unchanged: {values:?}"
+    );
+}
+
+#[test]
 fn user_logname_and_shell_are_not_passed_through() {
     // Not in D-037's list and not in S28's measured set. Adding one needs
     // evidence and a numbered deviation, so this test is the pin that makes

@@ -463,17 +463,7 @@ impl NamespaceDir {
         acct: &str,
         guard: &CodexNamespaceGuard,
     ) -> Result<Self, FileStoreError> {
-        let expected = paths.codex_lock_path(user, acct).map_err(refused)?;
-        if guard.path() != expected {
-            return Err(FileStoreError::io(
-                format!(
-                    "the lock held is `{}`, not `{}`; refusing to open that namespace",
-                    guard.path().display(),
-                    expected.display()
-                ),
-                io::Error::from(io::ErrorKind::PermissionDenied),
-            ));
-        }
+        check_guard(paths, user, acct, guard)?;
         let root = paths.codex_root();
         let dir_shown = paths.codex_namespace_dir(user, acct).map_err(refused)?;
         let fd = file_store::create_dir_under(&root, &dir_shown)?;
@@ -984,6 +974,73 @@ impl<'g> OwnedNamespace<'g> {
             pending_audit: AuditPending::armed(WriteKind::Delete),
         })
     }
+}
+
+/// Refuses a guard that is not this namespace's lock (review F7, plan AC119).
+///
+/// Shared by every entry point that acts on a namespace, so the rule has one
+/// implementation: a second copy is a second opinion about which lock proves
+/// what.
+fn check_guard(
+    paths: &Paths,
+    user: &str,
+    acct: &str,
+    guard: &CodexNamespaceGuard,
+) -> Result<(), FileStoreError> {
+    let expected = paths.codex_lock_path(user, acct).map_err(refused)?;
+    if guard.path() == expected {
+        return Ok(());
+    }
+    Err(FileStoreError::io(
+        format!(
+            "the lock held is `{}`, not `{}`; refusing to open that namespace",
+            guard.path().display(),
+            expected.display()
+        ),
+        io::Error::from(io::ErrorKind::PermissionDenied),
+    ))
+}
+
+/// Removes the refresh marker of a namespace whose directory is already gone.
+///
+/// # Why this is not `OwnedNamespace::remove_named_files`
+///
+/// [`OwnedNamespace::open`] **creates** the directory it opens, so
+/// `accounts remove --delete-secret` cannot go through it to clean up after a
+/// credential that is no longer there: it would create the namespace in order
+/// to delete it. The marker does not live in the namespace — it is
+/// `codex/.state/<user>+<acct>.refresh` — so it outlived that skip with
+/// nothing left referencing it once the registry row was dropped. This removes
+/// the marker and only the marker: the one directory it opens is
+/// `codex/.state/`, and a missing one means there was no marker.
+///
+/// `Ok(None)` is "there was none": nothing was written, so there is nothing to
+/// audit and no `delete` line is owed (plan AC125). `Ok(Some(receipt))` is a
+/// removal that happened, and the caller audits it like any other write.
+///
+/// # Errors
+///
+/// [`FileStoreError`] when `guard` is not this namespace's lock — the same
+/// check [`OwnedNamespace::open`] makes, because this is the same authority to
+/// write — and when the unlink itself fails.
+pub fn remove_orphaned_refresh_state(
+    paths: &Paths,
+    owned: OwnedRecord<'_>,
+    guard: &CodexNamespaceGuard,
+) -> Result<Option<WriteReceipt>, FileStoreError> {
+    check_guard(paths, owned.user(), owned.acct(), guard)?;
+    let state = RefreshStateFile::new(paths, owned.user(), owned.acct())?;
+    if !state.remove()? {
+        return Ok(None);
+    }
+    Ok(Some(WriteReceipt {
+        kind: WriteKind::Delete,
+        digest8_before: None,
+        digest8_after: None,
+        ids: (owned.user().to_owned(), owned.acct().to_owned()),
+        #[cfg(feature = "testing")]
+        pending_audit: AuditPending::armed(WriteKind::Delete),
+    }))
 }
 
 /// Writer 1's pending spec: what the merge was built on, and its new expiry.

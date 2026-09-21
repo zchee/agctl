@@ -912,6 +912,47 @@ fn a_write_compares_with_the_read_it_came_from() {
 }
 
 #[test]
+fn the_orphan_marker_removal_takes_the_right_guard_and_creates_no_namespace() {
+    // The narrow path `accounts remove` uses when the namespace directory is
+    // already gone (bead `agctl-r1gu`). It writes — it unlinks a file agctl
+    // wrote — so it answers to the same authority every other writer does: the
+    // lock for THAT namespace, checked rather than assumed (plan AC119). And
+    // the whole point of it not going through `OwnedNamespace::open` is that
+    // it must create nothing, so that is asserted too.
+    let (_dir, paths) = testkit::store();
+    let a = record();
+    let b = testkit::owned_record(testkit::USER, OTHER_ACCT);
+    let guard_a = testkit::lock_for(&paths, &a);
+    let guard_b = testkit::lock_for(&paths, &b);
+    let marker = paths.codex_refresh_state_path(testkit::USER, testkit::ACCT).expect("valid ids");
+    fs::create_dir_all(marker.parent().expect("a parent")).expect("the state directory");
+    testkit::write_0600(&marker, br#"{"schema":1,"floor_min":60}"#);
+
+    let err = remove_orphaned_refresh_state(&paths, proof::owned(&a).expect("owned"), &guard_b)
+        .expect_err("another namespace's lock proves nothing about this one");
+    assert!(err.to_string().contains("refusing to open that namespace"), "{err}");
+    assert!(marker.is_file(), "the marker was removed under the wrong lock");
+
+    let receipt = remove_orphaned_refresh_state(&paths, proof::owned(&a).expect("owned"), &guard_a)
+        .expect("the namespace's own lock")
+        .expect("a marker was there, so the removal happened");
+    assert_eq!(receipt.kind(), WriteKind::Delete);
+    assert_eq!(receipt.ids(), (testkit::USER, testkit::ACCT));
+    assert_eq!(receipt.digest8_before(), None, "there was no credential to name");
+    discarded_by_this_test(receipt);
+
+    assert!(!marker.exists(), "the marker is still there");
+    assert!(
+        !paths.codex_namespace_dir(testkit::USER, testkit::ACCT).expect("dir").exists(),
+        "the removal created the namespace it exists to avoid creating"
+    );
+
+    let again = remove_orphaned_refresh_state(&paths, proof::owned(&a).expect("owned"), &guard_a)
+        .expect("a second call is not an error");
+    assert!(again.is_none(), "nothing was removed, so there is nothing to audit");
+}
+
+#[test]
 fn credentials_from_another_namespace_are_refused_by_the_writer_and_the_marker() {
     // Review S30 F7.
     let (_dir, paths) = testkit::store();

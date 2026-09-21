@@ -425,6 +425,62 @@ fn ac105_the_child_sees_exactly_the_allowlist_and_no_decoy() {
 }
 
 #[test]
+fn ac105_the_lowercase_proxy_names_reach_the_child_and_nothing_else_new() {
+    // D-037's list names the uppercase proxy variables only, and a machine
+    // that exports only the lowercase spellings — the ones Rust's HTTP stacks
+    // read — could not log in at all. The four are on the list now. What this
+    // proves through the real binary is both halves at once: the child sees
+    // them, and it sees nothing else that it did not see before, which is the
+    // half a unit test over `allowed_env` cannot state about the shipped
+    // environment-building path.
+    let names_recorded = |log: &str| -> Vec<String> {
+        let mut names: Vec<String> =
+            log.lines().filter_map(|line| line.strip_prefix("env ")).map(str::to_owned).collect();
+        names.sort();
+        names
+    };
+
+    let (baseline_fixture, _baseline_doc) = armed();
+    let baseline = login(&baseline_fixture, "proxy-lowercase-baseline");
+    assert!(baseline.status.success(), "{}", stderr(&baseline));
+    let before = names_recorded(&codex_log(&baseline_fixture));
+
+    let (mut fixture, _doc) = armed();
+    fixture.set("http_proxy", "http://proxy.invalid:3128");
+    fixture.set("https_proxy", "http://proxy.invalid:3128");
+    fixture.set("no_proxy", "localhost");
+    fixture.set("all_proxy", "socks5://proxy.invalid:1080");
+    // A spelling on neither list, set alongside them: the allowlist compares
+    // exact names, so this one must not ride in with its neighbours.
+    fixture.set("Https_Proxy", "http://proxy.invalid:3128");
+
+    let output = login(&fixture, "proxy-lowercase");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let after = names_recorded(&codex_log(&fixture));
+
+    for name in ["http_proxy", "https_proxy", "no_proxy", "all_proxy"] {
+        assert!(after.iter().any(|seen| seen == name), "the child never saw `{name}`: {after:?}");
+    }
+
+    let added: Vec<&str> = after
+        .iter()
+        .filter(|name| !before.iter().any(|seen| seen == *name))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        added,
+        ["all_proxy", "http_proxy", "https_proxy", "no_proxy"],
+        "the child sees exactly the four new names and nothing else new"
+    );
+    let dropped: Vec<&str> = before
+        .iter()
+        .filter(|name| !after.iter().any(|seen| seen == *name))
+        .map(String::as_str)
+        .collect();
+    assert!(dropped.is_empty(), "the four cost the child a name it had before: {dropped:?}");
+}
+
+#[test]
 fn ac105_the_child_runs_in_its_scratch_home_and_is_given_it() {
     // Order A4: the child's working directory is its scratch home, so no
     // `.codex/` Project config layer (fact F95) from wherever agctl was started

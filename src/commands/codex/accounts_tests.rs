@@ -326,6 +326,114 @@ fn a_namespace_holding_something_agctl_did_not_create_is_refused_with_nothing_re
     assert!(!audit_log_mentions_delete(&paths), "a refusal was audited as a delete");
 }
 
+#[test]
+fn a_leftover_refresh_marker_is_removed_when_the_namespace_is_already_gone() {
+    // Bead `agctl-r1gu` (2). The marker does not live in the namespace — it is
+    // `codex/.state/<user>+<acct>.refresh` — so the skip that protects an
+    // absent namespace from being CREATED in order to be deleted used to walk
+    // past it, and dropping the row left the marker with nothing referencing
+    // it. A successful remove may not leave that behind.
+    let (_dir, paths) = testkit::store();
+    seed(&paths, vec![owned_row()]);
+    let marker = marker_path(&paths);
+    plant_a_marker(&marker);
+    assert!(!ns_dir(&paths).exists(), "the fixture starts with no namespace");
+
+    let mut io = Scripted::saying(true);
+    let removal = Removal { id: testkit::USER, delete_secret: true, yes: true };
+    remove(&paths, &removal, &Cancel::new(), &mut io).expect("succeeds");
+
+    assert!(!marker.exists(), "the refresh marker outlived the account it belonged to");
+    assert!(rows(&paths).is_empty(), "the row is gone");
+    assert!(!ns_dir(&paths).exists(), "the cleanup CREATED the namespace it was avoiding");
+    assert!(
+        !paths.codex_root().join(testkit::USER).exists(),
+        "and it created the user directory above it"
+    );
+    assert!(
+        io.output().contains("refresh marker"),
+        "a person is told what was removed: {}",
+        io.output()
+    );
+    assert!(audit_log_mentions_delete(&paths), "a removal that happened was not audited");
+}
+
+#[test]
+fn a_successful_remove_leaves_neither_a_credential_nor_a_marker_nor_a_row() {
+    // The pin for bead `agctl-r1gu` as a whole: after a remove that reports
+    // success there is no state left for `doctor` to report — no `auth.json`,
+    // no namespace, no marker, no registry row. The two halves of the bead are
+    // the two ways that was false.
+    let (_dir, paths) = testkit::store();
+    seed(&paths, vec![owned_row()]);
+    let dir = namespace_with_a_credential(&paths);
+    let marker = marker_path(&paths);
+    plant_a_marker(&marker);
+
+    let mut io = Scripted::saying(true);
+    let removal = Removal { id: testkit::USER, delete_secret: true, yes: true };
+    remove(&paths, &removal, &Cancel::new(), &mut io).expect("succeeds");
+
+    assert!(!dir.join("auth.json").exists(), "the credential is still there");
+    assert!(!dir.exists(), "the namespace is still there");
+    assert!(!marker.exists(), "the refresh marker is still there");
+    assert!(rows(&paths).is_empty(), "the row is still recorded");
+}
+
+#[test]
+fn a_registry_update_that_fails_after_the_delete_leaves_the_state_ac125_describes() {
+    // Bead `agctl-r1gu` (5), ruled: the ordering stays as it is — delete under
+    // the namespace guard, drop the guard, then update the registry — and this
+    // test pins what that ordering costs when the last step fails. The
+    // credential is gone and the row remains: a record without an `auth.json`,
+    // which is exactly the state plan AC125 defines and `doctor` reports. The
+    // alternative ordering would drop the row first and lose the only pointer
+    // to a credential still on disk, which is worse and is why it was not
+    // chosen.
+    //
+    // The registry is written temp-then-rename into the config directory, so a
+    // directory the process may search and read but not write fails that step
+    // and only that step: the lock file already exists, and the namespace, its
+    // marker and the audit log live one level down in `codex/`.
+    let (_dir, paths) = testkit::store();
+    seed(&paths, vec![owned_row()]);
+    let dir = namespace_with_a_credential(&paths);
+    let marker = marker_path(&paths);
+    plant_a_marker(&marker);
+    let config_dir = paths.config_dir().to_path_buf();
+    let restore = fs::metadata(&config_dir).expect("metadata").permissions();
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o500)).expect("read-only");
+
+    let mut io = Scripted::saying(true);
+    let removal = Removal { id: testkit::USER, delete_secret: true, yes: true };
+    let result = remove(&paths, &removal, &Cancel::new(), &mut io);
+
+    fs::set_permissions(&config_dir, restore).expect("restores the mode");
+    let err = result.expect_err("the registry update failed, so the remove did");
+
+    assert!(!dir.exists(), "the delete did not run before the registry update: {err}");
+    assert!(!marker.exists(), "the marker survived a delete that did run");
+    assert_eq!(rows(&paths).len(), 1, "the row was dropped although its update failed");
+    assert!(audit_log_mentions_delete(&paths), "the delete that happened was not audited");
+}
+
+/// The refresh marker's path for the testkit's ids.
+fn marker_path(paths: &Paths) -> PathBuf {
+    paths.codex_refresh_state_path(testkit::USER, testkit::ACCT).expect("valid ids")
+}
+
+/// Writes a marker the way a refresh leaves one.
+fn plant_a_marker(marker: &Path) {
+    fs::create_dir_all(marker.parent().expect("a parent")).expect("the state directory");
+    let state = serde_json::json!({
+        "schema": 1,
+        "floor_min": 60,
+        "did_not_help": 1,
+        "resent": false,
+    });
+    testkit::write_0600(marker, serde_json::to_string(&state).expect("serializes").as_bytes());
+}
+
 /// Whether the Codex audit log holds a `delete` outcome.
 fn audit_log_mentions_delete(paths: &Paths) -> bool {
     let path = audit::log_path(paths);

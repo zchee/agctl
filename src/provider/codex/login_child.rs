@@ -105,7 +105,19 @@ const SURVEY_MAX_ENTRIES: u32 = 4096;
 /// `TERM` is a numbered deviation from the plan's list: it was in the
 /// environment every S28 fact was measured with, and the vendor's prompts are
 /// drawn with it.
-const PASS_THROUGH: [&str; 11] = [
+///
+/// The four lowercase proxy names are a second numbered deviation from
+/// D-037's list. The list names the uppercase spellings only, but a proxy
+/// variable has no canonical case: Rust's HTTP stacks read `http_proxy`,
+/// `https_proxy`, `no_proxy` and `all_proxy`, and on a machine where only
+/// those are exported the uppercase list passes nothing through — the child
+/// then cannot reach the authorization endpoint at all, which is the very
+/// failure L9 and m14 put the uppercase names here to prevent. Both cases are
+/// passed through rather than one being folded onto the other: what the
+/// vendor's child reads is the vendor's business, and rewriting a name is a
+/// guess about a program agctl does not own. `https_proxy` in particular is
+/// the one spelling curl honours in lowercase only.
+const PASS_THROUGH: [&str; 15] = [
     "HOME",
     "PATH",
     "TMPDIR",
@@ -115,6 +127,10 @@ const PASS_THROUGH: [&str; 11] = [
     "HTTPS_PROXY",
     "NO_PROXY",
     "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "all_proxy",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
 ];
