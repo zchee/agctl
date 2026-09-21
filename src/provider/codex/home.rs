@@ -296,13 +296,31 @@ fn mode_from(value: &str) -> StoreMode {
     }
 }
 
-/// `value` when it is an `http(s)` URL without credentials in it.
+/// `value` as scheme, host, port and path, when it is an `http(s)` URL that
+/// carries no credential.
+///
+/// # Why the query and the fragment are dropped rather than inspected
+///
+/// The value is `chatgpt_base_url` out of a `config.toml` this process only
+/// reads, and `doctor` prints it. Refusing userinfo keeps a
+/// `https://user:token@host` spelling out of the report, but an endpoint is
+/// just as often authenticated by a query parameter — `?key=…`, `?token=…`,
+/// `?sig=…` — and that spelling walked straight through the check (review
+/// S35 C4). There is no list of parameter names a credential may not use, so
+/// there is no inspection to do: what a reader needs in order to recognise
+/// their own override is the host and the path, and everything from the `?`
+/// on is dropped.
 fn plain_url(value: &str) -> Option<String> {
-    let url = url::Url::parse(value).ok()?;
-    let plain = matches!(url.scheme(), "https" | "http")
-        && url.username().is_empty()
-        && url.password().is_none();
-    plain.then(|| url.as_str().to_owned())
+    let mut url = url::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "https" | "http")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.as_str().to_owned())
 }
 
 /// The 1-based line containing byte `offset` of `text`.

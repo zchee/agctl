@@ -58,6 +58,13 @@ pub struct CodexDoctorReport {
     pub namespaces: Vec<NamespaceSection>,
     /// What agctl's own tree holds that no record explains.
     pub orphans: Vec<OrphanEntry>,
+    /// How many further entries it holds under a name agctl would not have
+    /// written.
+    ///
+    /// A **count**: an entry's name is a directory name read off disk, and
+    /// anything running as the user can create one, escape bytes and all
+    /// (review S35 C3).
+    pub unnameable_orphans: usize,
     /// The audit log's last lines, oldest first.
     pub audit: Vec<String>,
     /// Sentences that belong to the report as a whole.
@@ -471,7 +478,7 @@ fn marker_lines(out: &mut String, marker: &MarkerSection) {
 
 fn orphans_section(out: &mut String, report: &CodexDoctorReport) {
     push(out, 0, "left behind");
-    if report.orphans.is_empty() {
+    if report.orphans.is_empty() && report.unnameable_orphans == 0 {
         push(out, 1, "nothing");
         return;
     }
@@ -480,6 +487,17 @@ fn orphans_section(out: &mut String, report: &CodexDoctorReport) {
             Some(age) => push(out, 1, &format!("{} ({}, {age})", orphan.kind, orphan.subject)),
             None => push(out, 1, &format!("{} ({})", orphan.kind, orphan.subject)),
         }
+    }
+    if report.unnameable_orphans > 0 {
+        push(
+            out,
+            1,
+            &format!(
+                "{} further entr(y/ies) are named in a way agctl would not have written; list \
+                 the Codex directory yourself — agctl will not print a name it did not make",
+                report.unnameable_orphans
+            ),
+        );
     }
 }
 

@@ -110,6 +110,30 @@ fn base_url_refuses_credentials_in_the_url() {
 }
 
 #[test]
+fn base_url_keeps_the_endpoint_and_drops_everything_after_it() {
+    // Review S35 C4: userinfo was refused, but an endpoint authenticated by a
+    // query parameter walked through — and `doctor` prints this string. The
+    // host and the path are what a reader needs in order to recognise their
+    // own override; nothing after the `?` is.
+    for text in [
+        format!("chatgpt_base_url = 'https://h.invalid/v1?key={}'\n", testkit::AK_SENTINEL),
+        format!("chatgpt_base_url = 'https://h.invalid/v1#{}'\n", testkit::AK_SENTINEL),
+        format!("chatgpt_base_url = 'https://h.invalid/v1?a=1&token={}#f'\n", testkit::RT_SENTINEL),
+    ] {
+        let parsed = parse_config(&text).0.base_url;
+        assert_eq!(parsed.as_deref(), Some("https://h.invalid/v1"), "{text}");
+        testkit::assert_no_needles(&format!("{parsed:?}"), &text);
+    }
+
+    // An empty query is still a query: `?` alone does not survive either, so
+    // the rendered string cannot end in a dangling separator.
+    assert_eq!(
+        parse_config("chatgpt_base_url = 'https://h.invalid/v1?'\n").0.base_url.as_deref(),
+        Some("https://h.invalid/v1")
+    );
+}
+
+#[test]
 fn an_unparseable_config_is_a_line_number_and_nothing_else() {
     // Plan AC116 (unit half), invariant I31: the bad line carries a key
     // sentinel; the note carries a line number, and no rendering of the result

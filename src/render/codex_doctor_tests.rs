@@ -82,6 +82,7 @@ fn full() -> CodexDoctorReport {
             subject: "agctl-codex-login-abcd".to_owned(),
             age: Some("22m".to_owned()),
         }],
+        unnameable_orphans: 1,
         audit: vec!["{\"provider\":\"codex\"}".to_owned()],
         notes: vec!["a report-wide note".to_owned()],
     }
@@ -128,6 +129,7 @@ fn empty() -> CodexDoctorReport {
         },
         namespaces: Vec::new(),
         orphans: Vec::new(),
+        unnameable_orphans: 0,
         audit: Vec::new(),
         notes: Vec::new(),
     }

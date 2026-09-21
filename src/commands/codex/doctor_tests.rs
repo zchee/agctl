@@ -543,8 +543,23 @@ fn the_write_log_is_rendered_and_its_last_lines_kept() {
     let home = home_with(dir.path(), None, None);
     let log = paths.codex_root().join("writes.jsonl");
     fs::create_dir_all(paths.codex_root()).expect("the codex root");
+    // Real entries, not a shape of the test's own: `doctor` re-renders each
+    // line from its parsed fields now, so a line this build would not have
+    // written is replaced rather than echoed (review S37-b1, carry 1). The
+    // digest carries the index, which is what the tail assertion reads.
     let lines: Vec<String> = (0..AUDIT_LINES + 3)
-        .map(|index| format!("{{\"provider\":\"codex\",\"n\":{index}}}"))
+        .map(|index| {
+            json!({
+                "ts": "2026-09-22T00:00:00Z",
+                "agctl_pid": 1,
+                "provider": "codex",
+                "user_id": testkit::USER,
+                "account_id": testkit::ACCT,
+                "outcome": "applied",
+                "digest8_after": format!("{index:08x}"),
+            })
+            .to_string()
+        })
         .collect();
     testkit::write_0600(&log, lines.join("\n").as_bytes());
 
@@ -552,7 +567,11 @@ fn the_write_log_is_rendered_and_its_last_lines_kept() {
         .expect("a report");
 
     assert_eq!(report.audit.len(), AUDIT_LINES, "only the last lines are kept");
-    assert!(report.audit[AUDIT_LINES - 1].contains(&format!("\"n\":{}", AUDIT_LINES + 2)));
+    assert!(
+        report.audit[AUDIT_LINES - 1].contains(&format!("{:08x}", AUDIT_LINES + 2)),
+        "{:?}",
+        report.audit
+    );
 }
 
 #[test]

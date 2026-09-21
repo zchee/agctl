@@ -505,6 +505,177 @@ fn the_three_login_orphans_are_reported() {
     assert!(kinds.contains(&"record without auth.json"), "{kinds:?}\n{table}");
     assert!(kinds.contains(&"stale scratch"), "{kinds:?}\n{table}");
     assert!(table.contains("agctl-codex-login-deadbeef"), "{table}");
+    assert_eq!(report["unnameable_orphans"], json!(0), "every name here is one agctl writes");
+}
+
+#[test]
+fn an_orphan_named_in_a_way_agctl_would_not_have_written_is_counted_and_never_printed() {
+    // Review S35 C3, as the delta review ruled it: `discovery::orphans` lists
+    // whatever directories are under the Codex root and the scratch root, and
+    // anything running as the user can create one. An escape sequence in such
+    // a name would redraw the reader's terminal, and a needle in one would be
+    // echoed; unlike a keychain account there is nothing a reader must do
+    // with the name, so the count is the whole answer.
+    let mut fixture = CodexFixture::new();
+    fixture.with_keychain();
+    live_home(&fixture);
+    registry(&fixture, vec![owned_row()]);
+    fs::create_dir_all(namespace(&fixture)).expect("the recorded namespace");
+
+    let codex_root = fixture.inner().config_dir().join("codex");
+    // A `<user>` component carrying an escape sequence, and an `<acct>` one
+    // carrying a needle: both halves of the pair are checked, not just one.
+    //
+    // The needle is spelled with shell metacharacters around it on purpose.
+    // The rule is about the SHAPE of a name, and a needle that happens to be
+    // a valid segment — `agctl-test-codex-ak-0007` is all `[A-Za-z0-9._-]` —
+    // is indistinguishable from a real ChatGPT account id, which the report
+    // must show. What the rule guarantees is that no byte outside that set
+    // ever reaches a stream from a directory name.
+    let hostile_user = "user\u{1b}]0;pwned\u{7}";
+    let hostile_acct = "agctl-test-codex-ak-0007$(id)";
+    fs::create_dir_all(codex_root.join(hostile_user).join(ACCT)).expect("a hostile user dir");
+    fs::create_dir_all(codex_root.join("user-orphan-0003").join(hostile_acct))
+        .expect("a hostile acct dir");
+    // And a scratch directory whose suffix is not the eight hex digits
+    // `Scratch::create` draws.
+    let scratch = codex_root.join(".scratch").join("agctl-codex-login-$(id)");
+    fs::create_dir_all(&scratch).expect("a hostile scratch dir");
+    age_by(&scratch, 30 * 60);
+
+    let table = doctor(&fixture, "hostile-orphan");
+    let report = doctor_json(&fixture, "hostile-orphan-json");
+
+    assert_eq!(report["unnameable_orphans"], json!(3), "{table}");
+    let subjects: Vec<&str> = report["orphans"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|orphan| orphan["subject"].as_str().expect("a subject"))
+        .collect();
+    // The one well-spelled orphan — the recorded namespace holding no
+    // credential — is still named, so the count above is a filter and not a
+    // switch that turned the section off.
+    let owned = format!("{USER}+{ACCT}");
+    assert!(subjects.contains(&owned.as_str()), "{subjects:?}\n{table}");
+    assert_eq!(subjects.len(), 1, "{subjects:?}\n{table}");
+    assert!(table.contains("agctl will not print a name it did not make"), "{table}");
+
+    let rendered = format!("{table}\n{report}");
+    for fragment in [hostile_user, hostile_acct, "\u{1b}]0;", "$(id)"] {
+        assert!(!rendered.contains(fragment), "a name agctl did not write reached a stream");
+    }
+    // `run` goes through `checked`, which sweeps both streams for every
+    // needle: the `agctl-test-codex-ak-` account above would have failed the
+    // two launches by itself, before any assertion here ran.
+}
+
+#[test]
+fn a_write_log_line_agctl_would_not_have_written_is_not_echoed() {
+    // Review S37-b1, carry 1. `doctor` printed the log's tail verbatim, so
+    // bytes a planted line carried reached the reader's terminal. The log is
+    // agctl's own 0600 file, but "agctl wrote it" is an assumption about a
+    // file on a disk, not a property of the bytes being rendered.
+    let mut fixture = CodexFixture::new();
+    fixture.with_keychain();
+    live_home(&fixture);
+    registry(&fixture, vec![owned_row()]);
+
+    let planted = format!(
+        "{}\n{}\n{}\n",
+        // Not JSON at all.
+        "\u{1b}]0;pwned\u{7} not a log line",
+        // JSON, an entry's shape, but an id the guard refuses and an escape
+        // sequence riding in it.
+        json!({
+            "ts": "2026-09-22T00:00:00Z",
+            "agctl_pid": 1,
+            "provider": "codex",
+            "user_id": "user\u{1b}[2J",
+            "account_id": ACCT,
+            "outcome": "applied",
+        }),
+        // A line this build would write, which must still be shown.
+        json!({
+            "ts": "2026-09-22T00:00:00Z",
+            "agctl_pid": 1,
+            "provider": "codex",
+            "user_id": USER,
+            "account_id": ACCT,
+            "outcome": "login_install",
+        }),
+    );
+    write_0600(&audit_log(&fixture), planted.as_bytes());
+
+    let table = doctor(&fixture, "planted-log-line");
+    let report = doctor_json(&fixture, "planted-log-line-json");
+
+    let rendered = format!("{table}\n{report}");
+    for fragment in ["\u{1b}]0;", "\u{1b}[2J", "not a log line"] {
+        assert!(!rendered.contains(fragment), "a planted log line reached a stream");
+    }
+    let shown = report["audit"].as_array().expect("an array");
+    assert_eq!(shown.len(), 3, "the tail still has three lines: {shown:?}");
+    let refused = shown
+        .iter()
+        .filter(|line| line.as_str().is_some_and(|line| line.contains("agctl did not write")))
+        .count();
+    assert_eq!(refused, 2, "two of the three are replaced: {shown:?}");
+    assert!(rendered.contains("login_install"), "the line agctl would write is still shown");
+}
+
+#[test]
+fn a_write_log_line_whose_only_hostile_field_is_the_provider_is_not_shown() {
+    // Review S37-b1b F1, end to end. Every OTHER field of the planted line is
+    // exactly what agctl writes, so nothing but `provider` can be the reason
+    // it is refused — which is the hole: `entry_line` checked every field but
+    // that one, and `shown_line` re-serializes a line parsed from a file.
+    let mut fixture = CodexFixture::new();
+    fixture.with_keychain();
+    live_home(&fixture);
+    registry(&fixture, vec![owned_row()]);
+
+    let hostile = "codex\u{1b}]0;pwned\u{7}$(id)";
+    let planted = format!(
+        "{}\n{}\n",
+        json!({
+            "ts": "2026-09-22T00:00:00Z",
+            "agctl_pid": 1,
+            "provider": hostile,
+            "user_id": USER,
+            "account_id": ACCT,
+            "outcome": "applied",
+            "digest8_after": "0123abcd",
+        }),
+        json!({
+            "ts": "2026-09-22T00:00:00Z",
+            "agctl_pid": 1,
+            "provider": "codex",
+            "user_id": USER,
+            "account_id": ACCT,
+            "outcome": "login_install",
+        }),
+    );
+    write_0600(&audit_log(&fixture), planted.as_bytes());
+
+    let output = fixture.cmd().args(["codex", "doctor"]).output().expect("the binary runs");
+    let table = checked(&fixture, "provider-only-hostile", output);
+    let stdout = String::from_utf8(table.stdout.clone()).expect("UTF-8");
+    let stderr_text = String::from_utf8(table.stderr.clone()).expect("UTF-8");
+    let report = doctor_json(&fixture, "provider-only-hostile-json");
+
+    // All three streams: the table, standard error, and `--json`.
+    let rendered = format!("{stdout}\n{stderr_text}\n{report}");
+    for fragment in [hostile, "\u{1b}]0;", "$(id)"] {
+        assert!(!rendered.contains(fragment), "a planted `provider` reached a stream");
+    }
+    let shown = report["audit"].as_array().expect("an array");
+    assert_eq!(shown.len(), 2, "{shown:?}");
+    assert!(
+        shown[0].as_str().is_some_and(|line| line.contains("agctl did not write")),
+        "the planted line renders as the fixed sentence: {shown:?}"
+    );
+    assert!(rendered.contains("login_install"), "the well-formed line is still shown");
 }
 
 #[test]

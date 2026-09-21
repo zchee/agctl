@@ -556,6 +556,10 @@ fn ac105_keychain_a_child_that_creates_a_codex_auth_item_is_refused() {
     assert!(!output.status.success(), "a child that created a keychain item is refused");
     assert!(text.contains("Codex Auth"), "the refusal names the kind of item: {text}");
     assert!(text.contains("cli|0123456789abcdef"), "and the item itself: {text}");
+    assert!(
+        !text.contains("agctl would not have written"),
+        "a well-spelled item is named, not counted: {text}"
+    );
     assert_nothing_installed(&fixture, "keychain-gain");
 
     // agctl deletes no keychain item, so the only way this one can ever be
@@ -589,6 +593,15 @@ fn ac105_keychain_an_item_a_child_gained_is_named_only_in_agctls_spelling() {
     assert!(audit_keychain_accounts(&fixture).is_empty(), "a hostile spelling reached the log");
     let text = stderr(&output);
     assert!(text.contains("Codex Auth"), "the refusal still names the kind of item: {text}");
+    // Review S37-b1, carry 3: the refusal SENTENCE carried the raw account
+    // too, and that sentence goes to the user's terminal. The value guard
+    // runs before the message-shape assertion, so a regression cannot leak
+    // through this test's own failure output.
+    assert!(!text.contains("; id; "), "a hostile account reached standard error");
+    assert!(
+        text.contains("agctl would not have written"),
+        "the refusal counts what it will not name: {text}"
+    );
     assert_nothing_installed(&fixture, "keychain-gain-hostile");
 }
 
@@ -1040,4 +1053,37 @@ fn ac126_a_relogin_over_a_terminal_namespace_resets_its_refresh_state() {
         marker.get("inflight").is_none_or(Value::is_null),
         "no send is left in flight: {marker}"
     );
+}
+
+#[test]
+fn an_odd_lock_the_child_named_is_reported_without_its_name_reaching_stderr() {
+    // Review S37-b1b F2, from the reviewer's own probe. `is_lock_name` is
+    // only `ends_with(".lock")`, so the login child chooses these bytes, and
+    // `anomalies()` joined the full paths into the sentence agctl prints.
+    let (mut fixture, _doc) = armed();
+    fixture.set("AGCTL_FAKE_CODEX_ODD_LOCK", "PROBEODD\u{1b}]0;pwned\u{7}$(id).lock");
+
+    let text = stderr(&login(&fixture, "odd-lock-hostile"));
+
+    for shape in ["PROBEODD", "\u{1b}]0;", "$(id)"] {
+        assert!(!text.contains(shape), "an odd-lock path reached stderr: shape {shape:?}");
+    }
+    // The anomaly is still REPORTED: the guard hides the name, not the fact.
+    assert!(text.contains("not regular files"), "the anomaly is still reported: {text}");
+    assert!(text.contains("unnameable lock file"), "and it is counted: {text}");
+}
+
+#[test]
+fn an_odd_lock_named_the_way_agctl_writes_one_is_still_named() {
+    // The positive control the reviewer asked for: the GREEN direction must
+    // not be "the arm was switched off". A name agctl would accept is still
+    // shown, so the guard above is a filter and not a switch.
+    let (mut fixture, _doc) = armed();
+    fixture.set("AGCTL_FAKE_CODEX_ODD_LOCK", "codex.lock");
+
+    let text = stderr(&login(&fixture, "odd-lock-plain"));
+
+    assert!(text.contains("not regular files"), "a well-spelled odd lock is an anomaly: {text}");
+    assert!(text.contains("codex.lock"), "and it is named: {text}");
+    assert!(!text.contains("unnameable lock file"), "nothing was withheld: {text}");
 }

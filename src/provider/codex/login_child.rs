@@ -358,8 +358,10 @@ pub(crate) fn mkdir_leaf(root: &OwnedFd, name: &str) -> Result<(), Errno> {
 ///
 /// Exact, not a prefix: the sweep removes what this accepts, so it must accept
 /// only what [`Scratch::create`] could have made, and nothing a user happened
-/// to name similarly.
-fn is_scratch_name(name: &str) -> bool {
+/// to name similarly. `doctor` asks the same question for the other reason —
+/// a name it did not write is a name it will not print (review S35 C3) — and
+/// the two answers must not drift, so they are one predicate.
+pub(crate) fn is_scratch_name(name: &str) -> bool {
     name.strip_prefix(SCRATCH_PREFIX).is_some_and(|suffix| {
         suffix.len() == 8
             && suffix.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))

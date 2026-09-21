@@ -55,6 +55,7 @@ use crate::config::codex::CodexAccountRecord;
 use crate::config::codex::CodexKind;
 use crate::config::codex::RefreshPolicy;
 use crate::config::paths::Paths;
+use crate::config::paths::validate_codex_segment;
 use crate::error::AppError;
 use crate::provider::codex::audit;
 use crate::provider::codex::auth_store;
@@ -73,6 +74,7 @@ use crate::provider::codex::home::FileInEffect;
 use crate::provider::codex::home::KeyringProbe;
 use crate::provider::codex::home::StoreMode;
 use crate::provider::codex::home::is_home_account;
+use crate::provider::codex::login_child;
 use crate::provider::codex::proof;
 use crate::provider::codex::refresh;
 use crate::render::codex_doctor::CodexDoctorReport;
@@ -248,7 +250,7 @@ pub fn build(
     let store = store_section(home_dir.as_deref(), listings);
     let live = live_section(home_dir.as_deref(), &store.read, accounts, paths, cancel);
     let namespaces = namespace_sections(paths, accounts, cancel);
-    let orphans = orphan_entries(paths, accounts)?;
+    let (orphans, unnameable_orphans) = orphan_entries(paths, accounts)?;
     // A log that cannot be read explains nothing, so it explains no keychain
     // item either: the failure costs removal commands, never adds one. The
     // reader still sees the log's own error in the `audit` section.
@@ -270,6 +272,7 @@ pub fn build(
         foreign: foreign_section(home_dir.as_deref(), listings, &caused),
         namespaces,
         orphans,
+        unnameable_orphans,
         audit: audit_lines(paths),
         notes: Vec::new(),
     })
@@ -703,33 +706,69 @@ fn present_marker(state: &RefreshState) -> MarkerSection {
     }
 }
 
-/// Everything under the Codex tree that no record explains.
+/// Everything under the Codex tree that no record explains, and how many
+/// further entries were found under a name agctl would not have written.
+///
+/// # Why a name read off disk is checked before it is printed
+///
+/// An orphan's subject is a directory name, and `discovery::orphans` lists
+/// whatever directories exist under the Codex root and the scratch root.
+/// Those are typically agctl's own, but anything running as the user can
+/// create one — the same threat model review S35 C1 assumed for a keychain
+/// account, and the S35 delta review ruled ("Ruling on C3") that the rule C1
+/// established applies to this other read-from-disk surface. So a subject is
+/// rendered only when it is spelled the way agctl spells one:
+/// [`validate_codex_segment`] for each half of a `<user>+<acct>` pair,
+/// [`login_child::is_scratch_name`] for a scratch directory. Anything else is
+/// counted.
+///
+/// An escape sequence in a name would otherwise redraw the reader's terminal,
+/// and unlike a keychain account there is nothing a reader must do with the
+/// name itself: the count tells them the directory is worth listing.
 fn orphan_entries(
     paths: &Paths,
     accounts: &[CodexAccountRecord],
-) -> Result<Vec<OrphanEntry>, AppError> {
+) -> Result<(Vec<OrphanEntry>, usize), AppError> {
     let found = discovery::orphans(paths, accounts, SystemTime::now())
         .map_err(|err| AppError::Config(format!("the Codex tree could not be listed: {err}")))?;
-    Ok(found
-        .into_iter()
-        .map(|orphan| match orphan {
-            Orphan::NamespaceWithoutRecord { user, acct } => OrphanEntry {
-                kind: "namespace without record".to_owned(),
-                subject: format!("{user}+{acct}"),
-                age: None,
-            },
-            Orphan::RecordWithoutCredentials { user, acct } => OrphanEntry {
-                kind: format!("record without {}", auth_store::shown_name()),
-                subject: format!("{user}+{acct}"),
-                age: None,
-            },
-            Orphan::StaleScratch { name, age } => OrphanEntry {
-                kind: "stale scratch".to_owned(),
-                subject: name,
-                age: Some(words(age)),
-            },
-        })
-        .collect())
+    let mut entries = Vec::new();
+    let mut unnameable = 0usize;
+    for orphan in found {
+        let entry = match orphan {
+            Orphan::NamespaceWithoutRecord { user, acct } => {
+                namespace_pair(&user, &acct).map(|subject| OrphanEntry {
+                    kind: "namespace without record".to_owned(),
+                    subject,
+                    age: None,
+                })
+            }
+            Orphan::RecordWithoutCredentials { user, acct } => {
+                namespace_pair(&user, &acct).map(|subject| OrphanEntry {
+                    kind: format!("record without {}", auth_store::shown_name()),
+                    subject,
+                    age: None,
+                })
+            }
+            Orphan::StaleScratch { name, age } => {
+                login_child::is_scratch_name(&name).then(|| OrphanEntry {
+                    kind: "stale scratch".to_owned(),
+                    subject: name,
+                    age: Some(words(age)),
+                })
+            }
+        };
+        match entry {
+            Some(entry) => entries.push(entry),
+            None => unnameable = unnameable.saturating_add(1),
+        }
+    }
+    Ok((entries, unnameable))
+}
+
+/// `<user>+<acct>`, when both halves are ids agctl would have written.
+fn namespace_pair(user: &str, acct: &str) -> Option<String> {
+    let spelled = validate_codex_segment(user).is_ok() && validate_codex_segment(acct).is_ok();
+    spelled.then(|| format!("{user}+{acct}"))
 }
 
 /// The write log's last [`AUDIT_LINES`] lines, oldest first.
@@ -740,11 +779,21 @@ fn audit_lines(paths: &Paths) -> Vec<String> {
     match audit::read(paths) {
         Ok(None) => Vec::new(),
         Ok(Some(text)) => {
+            // Each line is re-checked and re-rendered from its parsed fields
+            // (`audit::shown_line`): the tail is displayed, and a line this
+            // build would not have written is replaced by a fixed sentence
+            // rather than echoed (review S37-b1, carry 1). The tail is taken
+            // first, so the count a reader sees is still the log's last
+            // `AUDIT_LINES` entries and not a filtered subset of them.
             let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
             lines
                 .iter()
                 .skip(lines.len().saturating_sub(AUDIT_LINES))
-                .map(|line| (*line).to_owned())
+                .map(|line| {
+                    audit::shown_line(line).unwrap_or_else(|| {
+                        "a line agctl did not write, or would not write; not shown".to_owned()
+                    })
+                })
                 .collect()
         }
         Err(err) => vec![format!("the Codex write log could not be read: {err}")],

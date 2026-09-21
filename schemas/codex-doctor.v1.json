@@ -14,6 +14,7 @@
     "foreign",
     "namespaces",
     "orphans",
+    "unnameable_orphans",
     "audit",
     "notes"
   ],
@@ -40,6 +41,11 @@
       "description": "Everything under the Codex tree that no record explains.",
       "type": "array",
       "items": { "$ref": "#/$defs/orphan" }
+    },
+    "unnameable_orphans": {
+      "description": "How many further entries under the Codex tree were found under a name agctl would not have written. A COUNT: an entry's name is a directory name read off disk, and anything running as the user can create one (review S35 C3).",
+      "type": "integer",
+      "minimum": 0
     },
     "audit": {
       "description": "The Codex write log's last lines, oldest first.",
@@ -346,7 +352,7 @@
           "enum": ["namespace without record", "record without auth.json", "stale scratch"]
         },
         "subject": {
-          "description": "The directory name, or the `<user>+<acct>` pair it concerns.",
+          "description": "The directory name, or the `<user>+<acct>` pair it concerns — rendered only when it is spelled the way agctl spells one, anything else being counted in `unnameable_orphans` instead (review S35 C3).",
           "type": "string"
         },
         "age": { "type": ["string", "null"] }

@@ -35,6 +35,9 @@
 #                               that record's `acct` attribute (default
 #                               `cli|0123456789abcdef`), so a test can plant a
 #                               spelling agctl would never have written
+#   AGCTL_FAKE_CODEX_ODD_LOCK   create a DIRECTORY of this name under
+#                               <CODEX_HOME>, so the survey meets an entry
+#                               named `*.lock` that is not a regular file
 #   AGCTL_FAKE_CODEX_TOUCH      create this file (a marker another fake reads)
 #   AGCTL_FAKE_CODEX_SENTINEL   a directory OUTSIDE the scratch: link it from
 #                               inside the residue, so a cleanup that followed
@@ -163,6 +166,13 @@ fi
 
 if [ -n "${AGCTL_FAKE_CODEX_TOUCH:-}" ]; then
 	: >"$AGCTL_FAKE_CODEX_TOUCH"
+fi
+
+# An entry named `*.lock` that is NOT a regular file, so the post-exit survey
+# reports an odd lock. The NAME is the test's, so a test can plant one agctl
+# would never have written (review S37-b1b, F2).
+if [ -n "${AGCTL_FAKE_CODEX_ODD_LOCK:-}" ] && [ -n "${CODEX_HOME:-}" ]; then
+	mkdir -p "$CODEX_HOME/$AGCTL_FAKE_CODEX_ODD_LOCK"
 fi
 
 status="${AGCTL_FAKE_CODEX_EXIT:-0}"

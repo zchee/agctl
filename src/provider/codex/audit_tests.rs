@@ -318,3 +318,62 @@ fn a_line_past_the_entry_bound_is_passed_over_and_the_next_one_is_not() {
         vec!["cli|00112233abcdefff".to_owned()]
     );
 }
+
+#[test]
+fn a_provider_that_is_not_this_ones_is_refused_on_write_and_never_quoted() {
+    // Review S37-b1b F1. `provider` was the one field `entry_line` did not
+    // check, and `shown_line` re-serializes a line parsed from a FILE — so
+    // whatever the file spelled reached the table and `--json`.
+    let mut entry =
+        entry((testkit::USER, testkit::ACCT), CodexOutcome::Applied, None, None, Some("0123abcd"));
+    for hostile in [
+        "$(id)",
+        "`id`",
+        "codex\u{1b}[2J",
+        "codex\u{2028}",
+        "codex\u{9b}0m",
+        "claude",
+        "",
+        testkit::AK_SENTINEL,
+    ] {
+        entry.provider = hostile.to_owned();
+        let err = entry_line(&entry).expect_err("a foreign provider is refused");
+        let shown = err.to_string();
+        // The refusal names the LENGTH, never the bytes: this message is
+        // printed, and the value is the thing that must not be.
+        assert!(shown.contains(&format!("({} characters)", hostile.len())), "{shown}");
+        assert!(!shown.contains(hostile) || hostile.is_empty(), "the refusal quoted the value");
+        testkit::assert_no_needles(&shown, "the refusal");
+    }
+}
+
+#[test]
+fn a_planted_line_is_shown_only_when_every_field_would_have_been_written() {
+    // The read side of the same rule: `shown_line` is what `doctor` renders
+    // through, so a line the guard would refuse must come back `None`.
+    let good = serde_json::json!({
+        "ts": "2026-09-22T00:00:00Z",
+        "agctl_pid": 1,
+        "provider": "codex",
+        "user_id": testkit::USER,
+        "account_id": testkit::ACCT,
+        "outcome": "applied",
+    });
+    assert!(shown_line(&good.to_string()).is_some(), "a well-formed line is shown");
+
+    for (field, value) in [
+        ("provider", serde_json::json!("$(id)")),
+        ("user_id", serde_json::json!("user\u{1b}[2J")),
+        ("account_id", serde_json::json!("acct|1")),
+        ("digest8_before", serde_json::json!("nothex!!")),
+        ("class", serde_json::json!("made up")),
+        ("keychain_account", serde_json::json!("cli|00112233abcdefff")),
+    ] {
+        let mut planted = good.clone();
+        planted[field] = value;
+        assert!(
+            shown_line(&planted.to_string()).is_none(),
+            "a line whose `{field}` the guard refuses was shown"
+        );
+    }
+}

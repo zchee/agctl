@@ -36,6 +36,7 @@ use crate::config::codex::RefreshPolicy;
 use crate::config::paths::validate_codex_segment;
 use crate::provider::codex::credentials::CodexIdentity;
 use crate::provider::codex::credentials::Credentials;
+use crate::provider::codex::home::is_home_account;
 use crate::secret::namespace_lock::NamespaceLockGuard;
 
 /// A registry record agctl owns, with ids fit to name a directory.
@@ -291,10 +292,35 @@ impl PostExitReport {
             found.push(format!("the login exited with {}", self.exit));
         }
         if !self.gained_codex_auth.is_empty() {
+            // A keychain `acct` is an attribute any application on this
+            // machine can set, and this sentence is printed to the user's
+            // terminal. So the same rule `doctor` applies before it names one
+            // applies here: a spelling agctl itself could have written is
+            // shown, and anything else is counted (review S37-b1, carry 3).
+            // Without this, a quote, a `$(…)`, a backtick or an escape byte
+            // in that attribute rode into stderr on the refusal path.
+            let (named, unnameable): (Vec<&String>, Vec<&String>) =
+                self.gained_codex_auth.iter().partition(|account| is_home_account(account));
+            let which = if named.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ": {}",
+                    named.iter().map(|account| account.as_str()).collect::<Vec<_>>().join(", ")
+                )
+            };
+            let rest = if unnameable.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({} of them under an account agctl would not have written, so it is not \
+                     printed; look in Keychain Access)",
+                    unnameable.len()
+                )
+            };
             found.push(format!(
-                "the login created {} `Codex Auth` keychain item(s): {}",
-                self.gained_codex_auth.len(),
-                self.gained_codex_auth.join(", ")
+                "the login created {} `Codex Auth` keychain item(s){which}{rest}",
+                self.gained_codex_auth.len()
             ));
         }
         if !self.survivors.is_empty() {
@@ -304,15 +330,33 @@ impl PostExitReport {
             found.push("the login started a Codex daemon in the scratch home".to_owned());
         }
         if !self.survey.odd_locks.is_empty() {
+            // The twin of the keychain join above, and the same rule. These
+            // are names the login CHILD chose inside the scratch home, and
+            // `is_lock_name` is only `ends_with(".lock")`, so a directory it
+            // creates carries whatever bytes it likes into this sentence —
+            // which is printed to the user's terminal (review S37-b1b, F2).
+            // Only the final component is ever shown, and only when it is
+            // spelled the way agctl spells a name: the leading directories
+            // are agctl's own derived path and say nothing a reader needs.
+            let mut named: Vec<&str> = Vec::new();
+            let mut unnameable = 0usize;
+            for path in &self.survey.odd_locks {
+                match path.file_name().and_then(|name| name.to_str()) {
+                    Some(name) if validate_codex_segment(name).is_ok() => named.push(name),
+                    _ => unnameable = unnameable.saturating_add(1),
+                }
+            }
+            let which =
+                if named.is_empty() { String::new() } else { format!(": {}", named.join(", ")) };
+            let rest = if unnameable == 0 {
+                String::new()
+            } else {
+                format!(" ({unnameable} unnameable lock file(s), not printed)")
+            };
             found.push(format!(
-                "{} entr(y/ies) named `*.lock` in the scratch home are not regular files: {}",
-                self.survey.odd_locks.len(),
-                self.survey
-                    .odd_locks
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "{} entr(y/ies) named `*.lock` in the scratch home are not regular \
+                 files{which}{rest}",
+                self.survey.odd_locks.len()
             ));
         }
         if self.survey.truncated {

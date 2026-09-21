@@ -42,6 +42,15 @@ use crate::secret::file_store;
 /// The log's file name under `codex_root()`.
 pub const LOG_FILE: &str = "writes.jsonl";
 
+/// The only value `provider` may hold, spelled once.
+///
+/// A field of a struct is not a validated field just because this crate is
+/// the only thing that writes it: [`shown_line`] re-serializes a line parsed
+/// from a FILE, so every field it renders needs a rule of its own. This one
+/// had none, and a planted line's `provider` reached the table and `--json`
+/// exactly as the file spelled it (review S37-b1b, F1).
+const PROVIDER: &str = "codex";
+
 /// The `user_id` and `account_id` of a line that belongs to no namespace.
 ///
 /// A valid namespace segment, so the field guard is unchanged, and a word no
@@ -281,6 +290,46 @@ pub fn append_event(
     write_entry(paths, &entry)
 }
 
+/// One log line as it may be shown, or `None` when it may not be.
+///
+/// # Why a line agctl wrote is re-checked before it is displayed
+///
+/// `doctor` prints the log's tail, and until S37 it printed whatever bytes
+/// each line held. The log is agctl's own 0600 file, so every line agctl
+/// wrote already passed [`entry_line`]'s guard — but "agctl wrote it" is an
+/// assumption about a file on a disk, not a property of the bytes being
+/// rendered, and a planted line's escape sequence would redraw the reader's
+/// terminal (review S37-b1, carry 1).
+///
+/// So a line is shown only when it parses as an entry AND that entry would be
+/// accepted by the same guard that writes one, and what is shown is this
+/// crate's own re-serialization of the parsed fields rather than the bytes
+/// from the file.
+///
+/// That claim is only worth as much as the guard's field coverage, so the
+/// coverage is written down rather than asserted. Every field of
+/// [`CodexAuditEntry`], and what constrains it:
+///
+/// | field | what makes it safe to render |
+/// |-------|------------------------------|
+/// | `ts` | a `jiff::Timestamp`; a value that is not RFC 3339 fails to parse, and what is rendered is jiff's own formatting, not the file's bytes |
+/// | `agctl_pid` | a `u32` |
+/// | `provider` | [`entry_line`]: equal to [`PROVIDER`], a word this build compiled in |
+/// | `user_id`, `account_id` | [`entry_line`]: `validate_codex_segment` |
+/// | `outcome` | a `CodexOutcome`; an unknown discriminant fails to parse |
+/// | `class` | [`entry_line`]: one of [`CLASSES`] |
+/// | `digest8_before`, `digest8_after` | [`entry_line`]: [`is_digest8`] |
+/// | `keychain_account` | [`entry_line`]: [`home::is_home_account`], and only on one outcome |
+///
+/// plus the whole-line refusal of any `@`. Adding a field to
+/// [`CodexAuditEntry`] without adding a row here and a rule to [`entry_line`]
+/// re-opens exactly the hole `provider` was (review S37-b1b, F1): a field
+/// nothing checks is a field the file controls.
+pub fn shown_line(line: &str) -> Option<String> {
+    let entry: CodexAuditEntry = serde_json::from_str(line).ok()?;
+    entry_line(&entry).ok().map(|line| line.trim_end().to_owned())
+}
+
 /// The `Codex Auth` accounts this log records a refused login child as having
 /// gained, oldest first and each named once.
 ///
@@ -362,7 +411,7 @@ fn entry(
     CodexAuditEntry {
         ts: Timestamp::now(),
         agctl_pid: std::process::id(),
-        provider: "codex".to_owned(),
+        provider: PROVIDER.to_owned(),
         user_id: ids.0.to_owned(),
         account_id: ids.1.to_owned(),
         outcome,
@@ -394,6 +443,13 @@ fn entry_line(entry: &CodexAuditEntry) -> Result<String, AppError> {
                 value.len()
             )));
         }
+    }
+    if entry.provider != PROVIDER {
+        return Err(AppError::Config(format!(
+            "a Codex audit entry's provider is not `{PROVIDER}` ({} characters); the log holds \
+             this provider's lines only",
+            entry.provider.len()
+        )));
     }
     // Two-sided, so neither half can drift: the keychain account belongs to
     // that one outcome and to no other, that outcome is meaningless without
