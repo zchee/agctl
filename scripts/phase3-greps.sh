@@ -118,7 +118,8 @@
 #                 provider/codex/refresh.rs, the one POST path (invariant I26)
 #   consent_callers  `ResendConsent::after_confirmation(` and
 #                 `ResetConsent::after_confirmation(`                      → only
-#                 commands/codex/accounts.rs (the constructors are `pub`)
+#                 commands/codex/accounts_refresh.rs (the constructors are `pub`
+#                 for that one caller; S34 C4 numbered deviation 1)
 #   refresh_usage_cache  `usage::cache` in provider/codex/refresh.rs      → none
 #                 (the refresh marker is a fail-closed file, never the cache)
 #   receipt_type  `WriteReceipt` on a code line                            → only
@@ -351,14 +352,17 @@ OAUTH_REFRESH_ALLOWED=(
 )
 
 CONSENT_ALLOWED=(
-    src/commands/codex/accounts.rs
+    src/commands/codex/accounts_refresh.rs
 )
 
-# The one command that refreshes, and only on its command thread (U44 = 5).
-# S34 adds `src/commands/codex/accounts.rs` here and to POST_PERMIT_ALLOWED,
-# and nowhere else: one line per list, reviewed as one hunk.
+# The commands that refresh, and only on their command thread (U44 = 5).
+# S34 C4 added `src/commands/codex/accounts_refresh.rs` — the `--resend` arm —
+# here and to the three lists below, and nowhere else. It is the whole of
+# `accounts`'s POST surface: `accounts.rs` itself must still fail every one of
+# these rules (numbered deviation 1; the plan's wording said `accounts.rs`).
 REFRESH_DRIVER_ALLOWED=(
     src/commands/codex/status.rs
+    src/commands/codex/accounts_refresh.rs
 )
 
 # The token client is the permit's own field; no command names it.
@@ -373,14 +377,16 @@ POST_PERMIT_ALLOWED=(
     src/provider/codex/permit.rs
     src/provider/codex/refresh.rs
     src/commands/codex/status.rs
+    src/commands/codex/accounts_refresh.rs
 )
 
 # Who may MINT a permit. Narrower than POST_PERMIT_ALLOWED on purpose:
 # `refresh.rs` must name the capability to demand it, and must not be able to
-# hand itself one (review S33-C2-r2 F2, probe C). S34 adds
-# `src/commands/codex/accounts.rs` here as well, one line.
+# hand itself one (review S33-C2-r2 F2, probe C). S34 C4 added
+# `src/commands/codex/accounts_refresh.rs` here as well, one line.
 PERMIT_MINT_ALLOWED=(
     src/commands/codex/status.rs
+    src/commands/codex/accounts_refresh.rs
 )
 
 # Every spelling of a call to a mint: `PostPermit::from_env`,
@@ -419,7 +425,8 @@ DAEMON_PID_ALLOWED=(
     src/provider/codex/home.rs
 )
 
-# What no Codex command file other than `status.rs` may name.
+# What no Codex command file other than `status.rs` and `accounts_refresh.rs`
+# may name.
 WATCH_FORBIDDEN='\brefresh::(?:run|record_retry_get)\b|\bRefreshClient\b|\bPostPermit\b|\brefresh_pre_pass\b|\bafter_unauthorized\b|\bcodex::status\b|\bsuper::status\b'
 
 RECEIPT_TYPE_ALLOWED=(
@@ -970,13 +977,16 @@ check_daemon_pid_names() {
         "${DAEMON_PID_ALLOWED[@]}"
 }
 
-# Every Codex command file but `status.rs` — the pass in `pass.rs` included,
-# because that is the file `watch` calls into (review S33-C2, probe B).
+# Every Codex command file but `status.rs` and `accounts_refresh.rs` — the pass
+# in `pass.rs` included, because that is the file `watch` calls into (review
+# S33-C2, probe B). `accounts_refresh.rs` is the user's audited one-shot
+# re-send (S34 C4): it is a command thread, never a pass, and nothing `watch`
+# calls reaches it.
 check_watch_no_post() {
     local root=$1 hits status=0 bad=0
     [[ -d $root/src/commands/codex ]] || return 0
     hits=$(cd "$root" && rg --line-number --no-heading --color never \
-        --glob '!*_tests.rs' --glob '!status.rs' \
+        --glob '!*_tests.rs' --glob '!status.rs' --glob '!accounts_refresh.rs' \
         -e "^\\s*(?:[^/\\s].*)?(?:${WATCH_FORBIDDEN})" src/commands/codex) || status=$?
     [[ $status -gt 1 ]] && scan_failed check_watch_no_post
     if [[ -n $hits ]]; then

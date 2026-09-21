@@ -56,6 +56,8 @@ use crate::provider::codex::lock::LockBudget;
 use crate::provider::codex::proof;
 use crate::runtime::coordinator::Cancel;
 
+use super::accounts_refresh;
+
 /// How long `remove --delete-secret` waits for the namespace lock.
 ///
 /// A command budget, not a pass budget: a person is waiting, and another
@@ -81,9 +83,21 @@ pub fn run(cli: &Cli, command: &CodexAccountsCommand, cancel: &Cancel) -> Result
         }
         CodexAccountsCommand::Forget { id } => forget(&paths, id, true, io),
         CodexAccountsCommand::Unforget { id } => forget(&paths, id, false, io),
-        // `set` and `refresh` are C4's: they change refresh policy and send
-        // POSTs, which is a different capability from anything here.
-        other => Err(AppError::not_implemented(&format!("agctl codex accounts {}", name(other)))),
+        // `set` and `refresh` live in `accounts_refresh`: they change refresh
+        // policy and send POSTs, a capability `scripts/phase3-greps.sh` pins
+        // to that file alone.
+        CodexAccountsCommand::Set { id, refresh } => {
+            accounts_refresh::set(&paths, id, *refresh, io)
+        }
+        CodexAccountsCommand::Refresh { id, resend, reset_floor, yes } => {
+            let request = accounts_refresh::Request {
+                id,
+                resend: *resend,
+                reset_floor: *reset_floor,
+                yes: *yes,
+            };
+            accounts_refresh::refresh(&paths, &request, cancel, io)
+        }
     }
 }
 
@@ -101,7 +115,7 @@ pub struct Removal<'a> {
 ///
 /// `<user>/<account>`, because that pair is the key (decision D-039): an
 /// email is a convenience and two rows can share one.
-fn key(record: &CodexAccountRecord) -> String {
+pub(super) fn key(record: &CodexAccountRecord) -> String {
     format!("{}/{}", record.chatgpt_user_id, record.chatgpt_account_id)
 }
 
@@ -111,7 +125,7 @@ fn key(record: &CodexAccountRecord) -> String {
 ///
 /// [`AppError::Config`] naming the unambiguous spellings when more than one
 /// row matches, and a plain "no account matches" when none does.
-fn resolve<'a>(
+pub(super) fn resolve<'a>(
     rows: &'a [CodexAccountRecord],
     id: &str,
 ) -> Result<&'a CodexAccountRecord, AppError> {
@@ -387,7 +401,7 @@ fn refresh_name(refresh: RefreshPolicy) -> &'static str {
 }
 
 /// The row for `(user, acct)`, for a registry update's closure.
-fn find_mut<'a>(
+pub(super) fn find_mut<'a>(
     config: &'a mut AgctlConfig,
     user: &str,
     acct: &str,
@@ -396,19 +410,6 @@ fn find_mut<'a>(
         .codex_accounts
         .iter_mut()
         .find(|row| row.chatgpt_user_id == user && row.chatgpt_account_id == acct)
-}
-
-/// What to call a subcommand this wave has not landed.
-fn name(command: &CodexAccountsCommand) -> &'static str {
-    match command {
-        CodexAccountsCommand::List { .. } => "list",
-        CodexAccountsCommand::Show { .. } => "show",
-        CodexAccountsCommand::Remove { .. } => "remove",
-        CodexAccountsCommand::Forget { .. } => "forget",
-        CodexAccountsCommand::Unforget { .. } => "unforget",
-        CodexAccountsCommand::Set { .. } => "set",
-        CodexAccountsCommand::Refresh { .. } => "refresh",
-    }
 }
 
 #[cfg(test)]

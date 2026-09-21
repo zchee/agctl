@@ -35,12 +35,14 @@
 //! login's sweep (see `login_child::Scratch`).
 
 use std::io;
+use std::io::IsTerminal;
 use std::io::Write;
 use std::time::Duration;
 use std::time::Instant;
 
 use crate::cli::Cli;
 use crate::cli::CodexLoginArgs;
+use crate::commands::Prompt;
 use crate::config::AgctlConfig;
 use crate::config::codex::CodexAccountRecord;
 use crate::config::codex::CodexKind;
@@ -147,10 +149,14 @@ pub fn run(cli: &Cli, args: &CodexLoginArgs, cancel: &Cancel) -> Result<(), AppE
     let report = login_child::run(&scratch, &bin, &ctx, &before, || listing(reader.as_ref()))
         .map_err(refused)?;
 
-    install_verified(&paths, &scratch, &report, args, cancel, &fault)
+    // One reading of the terminal, taken here and passed down, so the
+    // confirmation below is a value a test can choose (plan AC107).
+    let stdin_is_tty = io::stdin().is_terminal();
+    install_verified(&paths, &scratch, &report, args, cancel, &fault, stdin_is_tty, &mut Console)
 }
 
-/// Steps 7-14: verify, notice, lock, install, audit, release, record.
+/// Steps 7-14: verify, notice, confirm, lock, install, audit, release, record.
+#[expect(clippy::too_many_arguments, reason = "each is a distinct input the install needs")]
 fn install_verified(
     paths: &Paths,
     scratch: &login_child::Scratch,
@@ -158,6 +164,8 @@ fn install_verified(
     args: &CodexLoginArgs,
     cancel: &Cancel,
     fault: &crate::runtime::fault::Fault,
+    stdin_is_tty: bool,
+    io: &mut dyn Prompt,
 ) -> Result<(), AppError> {
     // Step 7. Evidence first: the report decides whether the document is even
     // read, and `verify_login` parses it exactly once.
@@ -168,6 +176,15 @@ fn install_verified(
     let identity = login.identity();
     if let Some(notice) = live_identity_notice(&identity.user_id, &identity.account_id) {
         say(&notice);
+    }
+
+    // Step 8b (plan AC107): an account agctl already owns is overwritten only
+    // after a person says so. Asked HERE — after the document has been
+    // verified, before the namespace lock and therefore before the install —
+    // so a refusal costs the new grant (`Scratch` unlinks it on the way out)
+    // and never the stored one.
+    if let Some(shown) = already_owned(paths, &identity.user_id, &identity.account_id)? {
+        confirm_overwrite(&shown, stdin_is_tty, io)?;
     }
 
     // Steps 9-13, in plan section 3.3's order: namespace lock → install (with
@@ -224,6 +241,86 @@ fn install_verified(
         describe(overwrote)
     ));
     Ok(())
+}
+
+/// The terminal this command asks its one question at.
+///
+/// Not [`Tty`](crate::commands::Tty), for the reason [`say`] exists: the
+/// question is put while a verified credential is lying in the scratch home,
+/// and `println!`/`print!` **panic** when stdout is a pipe whose reader has
+/// gone. Under `panic = "abort"` that panic would skip the `Scratch` drop and
+/// strand the credential, so a prompt that cannot be delivered is dropped
+/// instead and the answer is read from stdin as usual; a stdin that cannot be
+/// read is an error, which unwinds through the drop.
+struct Console;
+
+impl Prompt for Console {
+    fn tell(&mut self, message: &str) {
+        say(message);
+    }
+
+    fn confirm(&mut self, question: &str) -> Result<bool, AppError> {
+        let mut out = io::stdout().lock();
+        let _ = write!(out, "{question} [y/N] ");
+        let _ = out.flush();
+        drop(out);
+
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).map_err(|err| AppError::Io {
+            context: "could not read the confirmation".to_owned(),
+            source: err,
+        })?;
+        Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    }
+}
+
+/// The spelling of the row agctl already owns for `(user, acct)`, if any.
+///
+/// The registry, not the namespace: a namespace with no record is the crash
+/// AC105 describes, and the next login **adopts** it rather than asking about
+/// a credential nothing claims.
+///
+/// # Errors
+///
+/// Whatever loading the registry reports.
+fn already_owned(paths: &Paths, user: &str, acct: &str) -> Result<Option<String>, AppError> {
+    let config = AgctlConfig::load(paths)?;
+    Ok(config
+        .codex_accounts
+        .iter()
+        .find(|record| {
+            record.chatgpt_user_id == user
+                && record.chatgpt_account_id == acct
+                && matches!(record.kind, CodexKind::Owned { .. })
+        })
+        .map(|record| format!("{}/{}", record.chatgpt_user_id, record.chatgpt_account_id)))
+}
+
+/// Asks before replacing a grant agctl already holds (plan AC107).
+///
+/// There is no `--yes` on `login` (plan section 3.2 gives it `--label` and
+/// `--no-refresh` and nothing else), so the refusal without a terminal must
+/// not name one: what a non-interactive run does instead is remove the
+/// account first, which is a separate, audited command.
+///
+/// # Errors
+///
+/// [`AppError::Refused`] when there is no terminal to ask at and when the
+/// answer is not yes; whatever reading the answer reports.
+fn confirm_overwrite(shown: &str, stdin_is_tty: bool, io: &mut dyn Prompt) -> Result<(), AppError> {
+    if !stdin_is_tty {
+        return Err(AppError::Refused {
+            reason: format!(
+                "`{shown}` is already logged in and standard input is not a terminal, so there                  is nobody to confirm replacing its stored grant; the grant agctl holds was left                  alone. Run this from a terminal, or `agctl codex accounts remove {shown}` first"
+            ),
+        });
+    }
+    if io.confirm(&format!("replace the grant agctl already holds for `{shown}`?"))? {
+        return Ok(());
+    }
+    Err(AppError::Refused {
+        reason: format!("`{shown}` was left as it was; the new grant was discarded"),
+    })
 }
 
 /// Prints one line on stdout, and never panics.

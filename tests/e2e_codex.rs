@@ -250,17 +250,19 @@ fn codex_tree(config_dir: &Path) -> bool {
 }
 
 #[test]
-fn every_codex_subcommand_refuses_without_touching_the_store() {
+fn a_codex_command_that_refuses_its_argument_still_touches_no_file() {
+    // This test used to walk the subcommands that were still stubs: `status`
+    // and `watch` landed at S33, `login` at S34 C1, `import` at S34 C2-b,
+    // `accounts list/show/remove/forget/unforget` at S34 C3, `doctor` at S35,
+    // and `accounts set` / `accounts refresh` at S34 C4 — so the list is
+    // empty and every `agctl codex` subcommand is a command now.
+    //
+    // What it guarded is still worth guarding, on the commands themselves: a
+    // run that gets no further than "no such account" must not have created
+    // the store on its way there. `accounts set` and `accounts refresh` are
+    // the strictest cases — plan AC127 gives `set` the registry and nothing
+    // else, so neither may so much as make `codex/` (`ensure_codex_dirs`).
     let fixture = CodexFixture::new();
-    // `status` and `watch` landed at S33 (`tests/e2e_codex_status.rs`),
-    // `login` at S34 C1 (`tests/e2e_codex_login.rs`), `import` at S34 C2-b
-    // (`tests/e2e_codex_import.rs`), `accounts list/show/remove/forget/
-    // unforget` at S34 C3 (`tests/e2e_codex_accounts.rs`) and `doctor` at S35
-    // (`tests/e2e_codex_doctor.rs`); the rest are still stubs. A command that
-    // lands leaves this list in the commit that lands it, otherwise "no stub
-    // may touch a file" quietly stops covering anything. `accounts set` and
-    // `accounts refresh` stay: they change the refresh policy and send POSTs,
-    // which is C4's capability.
     let lines: [(&[&str], &str); 2] = [
         (&["codex", "accounts", "set", "x", "--refresh", "never"], "agctl codex accounts set"),
         (&["codex", "accounts", "refresh", "x", "--reset-floor"], "agctl codex accounts refresh"),
@@ -270,22 +272,21 @@ fn every_codex_subcommand_refuses_without_touching_the_store() {
         launched(named, fixture.cmd().args(args))
             .assert()
             .failure()
-            .stderr(contains("not implemented"))
-            .stderr(contains(named));
+            .stderr(contains("no account matches `x`"));
     }
 
     assert!(
         !codex_tree(&fixture.inner().config_dir()),
-        "a stub created a `codex/` tree; no stub may touch a file"
+        "a command that refused its argument created a `codex/` tree"
     );
     assert!(
         !fixture.codex_log_path().exists(),
-        "a stub spawned the fake `codex`; no stub may spawn a child"
+        "a command that refused its argument spawned the fake `codex`"
     );
 }
 
 #[test]
-fn the_codex_flags_parse_before_the_commands_exist() {
+fn the_codex_flags_parse_and_reach_their_commands() {
     // A refusal from the command, not from the parser: every flag plan §3.2
     // names is accepted today, so completions and `--help` describe the real
     // surface rather than half of it. (`status`'s flags are exercised by the
@@ -293,12 +294,12 @@ fn the_codex_flags_parse_before_the_commands_exist() {
     let fixture = CodexFixture::new();
 
     launched(
-        "accounts-set-stub",
+        "accounts-set-unknown-id",
         fixture.cmd().args(["codex", "accounts", "set", "x", "--refresh", "never"]),
     )
     .assert()
     .failure()
-    .stderr(contains("not implemented"));
+    .stderr(contains("no account matches `x`"));
 
     // And a flag it does not name is still a usage error.
     launched("unknown-flag", fixture.cmd().args(["codex", "status", "--by-identity"]))

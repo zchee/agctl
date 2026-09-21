@@ -238,6 +238,26 @@ fn login(fixture: &CodexFixture, name: &str) -> Output {
     checked(name, fixture.cmd().args(["codex", "login"]).output().expect("the binary runs"))
 }
 
+/// Drops the registry row for `(USER, ACCT)` — the credential and its
+/// namespace stay where they are.
+///
+/// S34 C4 gave `login` AC107's confirmation, so a second login over an
+/// account agctl **owns** now refuses without a terminal. A test that needs
+/// the install to happen a second time therefore removes the record first,
+/// which is the same state AC105's crash window leaves: a namespace with
+/// nothing claiming it, which `login` adopts.
+fn drop_the_record(fixture: &CodexFixture, name: &str) {
+    let output = checked(
+        name,
+        fixture
+            .cmd()
+            .args(["codex", "accounts", "remove", &format!("{USER}/{ACCT}")])
+            .output()
+            .expect("the binary runs"),
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
@@ -672,6 +692,7 @@ fn ac126_a_failed_install_rename_leaves_the_previous_grant_byte_identical() {
     let first = fs::read(&installed).expect("installed");
     assert_eq!(first, fs::read(&doc).expect("readable"));
 
+    drop_the_record(&fixture, "rename-fail-drop-record");
     fixture.set("AGCTL_FAULT", "codex_install_rename_fail");
     let second = login(&fixture, "rename-fail-second");
     fixture.set("AGCTL_FAULT", "");
@@ -693,6 +714,7 @@ fn ac105_a_login_audits_an_install_and_then_an_overwrite() {
     assert!(first_run.status.success(), "{}", stderr(&first_run));
     assert_eq!(audit_outcomes(&fixture), ["login_install"], "a first login is an install");
 
+    drop_the_record(&fixture, "audit-drop-record");
     let second_run = login(&fixture, "audit-overwrite");
     assert!(second_run.status.success(), "{}", stderr(&second_run));
     assert_eq!(

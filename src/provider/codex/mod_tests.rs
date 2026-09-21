@@ -247,14 +247,25 @@ fn violations(sources: &[Source], parsed: &[&Parsed]) -> Vec<String> {
         ("from_verified", &["src/provider/codex/auth_store.rs"]),
         ("CodexNamespaceGuard::wrap", &["src/provider/codex/lock.rs"]),
         ("PostExitReport::from_child", &["src/provider/codex/login_child.rs"]),
-        ("ResendConsent::after_confirmation", &["src/commands/codex/accounts.rs"]),
-        ("ResetConsent::after_confirmation", &["src/commands/codex/accounts.rs"]),
+        // S34 C4: the `set` / `refresh` arms live in `accounts_refresh.rs`, so
+        // that `accounts.rs` keeps no capability to consent or to POST.
+        ("ResendConsent::after_confirmation", &["src/commands/codex/accounts_refresh.rs"]),
+        ("ResetConsent::after_confirmation", &["src/commands/codex/accounts_refresh.rs"]),
         (".write_inflight", &["src/provider/codex/refresh.rs"]),
         (".write_resend", &["src/provider/codex/refresh.rs"]),
         (".clear_inflight", &["src/provider/codex/refresh.rs"]),
         (".mark_interrupted", &["src/provider/codex/refresh.rs"]),
         (".mark_unknown", &["src/provider/codex/refresh.rs"]),
-        (".reset_floor", &["src/provider/codex/refresh.rs"]),
+        // `refresh::reset_floor(paths, ns, consent)` — the free function plan
+        // section 3.3 gives `accounts refresh --reset-floor` — ends in the same
+        // name as the marker mutator this pin is about, and `names_path`
+        // cannot tell the two apart. The mutator itself stays pinned to
+        // `refresh.rs` by `scripts/phase3-greps.sh`'s `marker_mutators`, which
+        // matches method calls only (S34 C4, numbered deviation 4).
+        (
+            ".reset_floor",
+            &["src/provider/codex/refresh.rs", "src/commands/codex/accounts_refresh.rs"],
+        ),
         (".settle_inflight", &["src/provider/codex/refresh.rs"]),
         (".record_did_not_help", &["src/provider/codex/refresh.rs"]),
         (".restore_unknown", &["src/provider/codex/refresh.rs"]),

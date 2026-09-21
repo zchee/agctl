@@ -18,40 +18,13 @@ fn codex(args: &[&str]) -> CodexCommand {
     }
 }
 
-#[test]
-fn every_subcommand_refuses_and_names_itself() {
-    // `login` left this list at S34 C1, `import` at S34 C2-b,
-    // `accounts list/show/remove/forget/unforget` at S34 C3 and `doctor` at
-    // S35: each is implemented, and its own refusals are proved in its
-    // `*_tests.rs` and its `tests/e2e_codex_*.rs`. A command that lands must
-    // leave this list, or the list stops meaning "still a stub" and starts
-    // meaning nothing.
-    //
-    // `accounts set` and `accounts refresh` stay: they change the refresh
-    // policy and send POSTs, which is C4's capability.
-    let lines: [(&[&str], &str); 2] = [
-        (
-            &["agctl", "codex", "accounts", "set", "x", "--refresh", "never"],
-            "agctl codex accounts set",
-        ),
-        (
-            &["agctl", "codex", "accounts", "refresh", "x", "--resend"],
-            "agctl codex accounts refresh",
-        ),
-    ];
-
-    for (args, expected) in lines {
-        let cli = parse(args);
-        let crate::cli::Command::Codex { command } = &cli.command else {
-            panic!("`{}` is not a codex command", args.join(" "));
-        };
-        let err = run(&cli, command, &Cancel::new()).expect_err("no stub may report success");
-        let message = err.to_string();
-        assert!(message.contains(expected), "{message}");
-        assert!(message.contains("not implemented"), "{message}");
-        assert_eq!(err.exit_code(), crate::error::EXIT_FATAL, "a stub must not exit 0");
-    }
-}
+// `every_subcommand_refuses_and_names_itself` stood here until S34 C4. It
+// walked the subcommands that were still stubs and proved each refused,
+// named itself and exited non-zero; `accounts set` and `accounts refresh`
+// were the last two, and with them implemented the list is empty and the
+// test had no subject left. `run` above now dispatches every arm, so a stub
+// cannot be added without adding an arm — and a stub that ever comes back
+// brings this test back with it.
 
 #[test]
 fn status_takes_the_phase_one_flags_and_the_same_default_timeout() {

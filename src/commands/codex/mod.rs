@@ -27,6 +27,7 @@
 //! real command has not seen yet.
 
 pub mod accounts;
+pub mod accounts_refresh;
 pub mod doctor;
 pub mod import;
 pub mod login;
