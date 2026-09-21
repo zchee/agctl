@@ -3,6 +3,7 @@
 use clap::Parser;
 
 use super::*;
+use crate::cli::CodexAccountsCommand;
 
 /// Parses a command line, or panics naming it.
 fn parse(args: &[&str]) -> Cli {
@@ -19,16 +20,16 @@ fn codex(args: &[&str]) -> CodexCommand {
 
 #[test]
 fn every_subcommand_refuses_and_names_itself() {
-    // `login` left this list at S34 C1, `import` at S34 C2-b, and
-    // `accounts list/show/remove/forget/unforget` at S34 C3: each is
-    // implemented, and its own refusals are proved in its `*_tests.rs` and its
-    // `tests/e2e_codex_*.rs`. A command that lands must leave this list, or the
-    // list stops meaning "still a stub" and starts meaning nothing.
+    // `login` left this list at S34 C1, `import` at S34 C2-b,
+    // `accounts list/show/remove/forget/unforget` at S34 C3 and `doctor` at
+    // S35: each is implemented, and its own refusals are proved in its
+    // `*_tests.rs` and its `tests/e2e_codex_*.rs`. A command that lands must
+    // leave this list, or the list stops meaning "still a stub" and starts
+    // meaning nothing.
     //
     // `accounts set` and `accounts refresh` stay: they change the refresh
-    // policy and send POSTs, which is C4's capability, not C3's.
-    let lines: [(&[&str], &str); 3] = [
-        (&["agctl", "codex", "doctor"], "agctl codex doctor"),
+    // policy and send POSTs, which is C4's capability.
+    let lines: [(&[&str], &str); 2] = [
         (
             &["agctl", "codex", "accounts", "set", "x", "--refresh", "never"],
             "agctl codex accounts set",

@@ -1283,7 +1283,14 @@ pub struct RefreshStateFile {
 
 impl RefreshStateFile {
     /// The marker for one namespace.
-    fn new(paths: &Paths, user: &str, acct: &str) -> Result<Self, FileStoreError> {
+    ///
+    /// `pub(crate)` since S35 (deviation D1): `agctl codex doctor` renders a
+    /// namespace's marker, and every other route to one goes through
+    /// [`OwnedNamespace::open`], which **creates** the namespace directory —
+    /// a read-only command must not. Only the reader widens: every mutator
+    /// below stays `pub(super)`, so nothing outside `provider::codex` can
+    /// write a marker (invariant I26, plan AC122 clause 11).
+    pub(crate) fn new(paths: &Paths, user: &str, acct: &str) -> Result<Self, FileStoreError> {
         let shown = paths.codex_refresh_state_path(user, acct).map_err(refused)?;
         let name = shown
             .file_name()

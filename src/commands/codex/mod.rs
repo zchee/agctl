@@ -4,9 +4,9 @@
 //! The command line for the whole Codex surface is parsed from S29b
 //! (`cli::CodexCommand`), and the commands behind it land wave by wave: the
 //! usage pass ([`status`], [`watch`]) at S33, login, import and accounts at
-//! S34, doctor at S35. Until each one exists its arm is a stub, and a stub
-//! does exactly one thing — it says so and exits non-zero. `accounts` and
-//! `doctor` are the two still standing.
+//! S34, doctor at S35. Every arm of this table now runs; the two `accounts`
+//! subcommands that send a POST — `set` and `refresh` — are the last stubs,
+//! and they refuse inside [`accounts`] rather than here.
 //!
 //! # Why the flags exist before the commands do
 //!
@@ -27,6 +27,7 @@
 //! real command has not seen yet.
 
 pub mod accounts;
+pub mod doctor;
 pub mod import;
 pub mod login;
 pub mod pass;
@@ -36,7 +37,6 @@ pub mod watch;
 use std::path::PathBuf;
 
 use crate::cli::Cli;
-use crate::cli::CodexAccountsCommand;
 use crate::cli::CodexCommand;
 use crate::error::AppError;
 use crate::provider::codex::home;
@@ -45,13 +45,12 @@ use crate::runtime::coordinator::Cancel;
 
 /// Routes a parsed `agctl codex` subcommand.
 ///
-/// `status`, `watch`, `login` and `import` run; every other arm refuses until
-/// its wave lands.
+/// Every arm runs. The refusals that are left belong to `accounts set` and
+/// `accounts refresh`, and are made inside [`accounts`].
 ///
 /// # Errors
 ///
-/// Whatever the command returns, and [`AppError::Config`] naming the
-/// command for a subcommand whose wave has not landed.
+/// Whatever the command returns.
 pub fn run(cli: &Cli, command: &CodexCommand, cancel: &Cancel) -> Result<i32, AppError> {
     match command {
         CodexCommand::Status(args) => status::run(cli, args, cancel).map(|()| 0),
@@ -59,7 +58,7 @@ pub fn run(cli: &Cli, command: &CodexCommand, cancel: &Cancel) -> Result<i32, Ap
         CodexCommand::Login(args) => login::run(cli, args, cancel).map(|()| 0),
         CodexCommand::Import(args) => import::run(cli, args, cancel).map(|()| 0),
         CodexCommand::Accounts { command } => accounts::run(cli, command, cancel).map(|()| 0),
-        other => Err(AppError::not_implemented(&name(other))),
+        CodexCommand::Doctor(args) => doctor::run(cli, args, cancel).map(|()| 0),
     }
 }
 
@@ -75,35 +74,6 @@ pub fn codex_env_from_process() -> CodexEnv {
         std::env::var_os(home::CODEX_HOME_ENV),
         std::env::var_os("HOME").map(PathBuf::from),
     )
-}
-
-/// What to call one subcommand in the refusal.
-///
-/// The user's own spelling, so the message names the thing they typed rather
-/// than an internal variant.
-fn name(command: &CodexCommand) -> String {
-    let tail = match command {
-        CodexCommand::Status(_) => "status".to_owned(),
-        CodexCommand::Watch(_) => "watch".to_owned(),
-        CodexCommand::Login(_) => "login".to_owned(),
-        CodexCommand::Import(_) => "import".to_owned(),
-        CodexCommand::Doctor(_) => "doctor".to_owned(),
-        CodexCommand::Accounts { command } => format!("accounts {}", accounts_name(command)),
-    };
-    format!("agctl codex {tail}")
-}
-
-/// The `accounts` subcommand's own name.
-fn accounts_name(command: &CodexAccountsCommand) -> &'static str {
-    match command {
-        CodexAccountsCommand::List { .. } => "list",
-        CodexAccountsCommand::Show { .. } => "show",
-        CodexAccountsCommand::Remove { .. } => "remove",
-        CodexAccountsCommand::Forget { .. } => "forget",
-        CodexAccountsCommand::Unforget { .. } => "unforget",
-        CodexAccountsCommand::Set { .. } => "set",
-        CodexAccountsCommand::Refresh { .. } => "refresh",
-    }
 }
 
 #[cfg(test)]

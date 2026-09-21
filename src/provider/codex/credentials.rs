@@ -94,6 +94,22 @@ const TOP_LEVEL_SECRETS: [&str; 5] = [
 /// Members of `tokens` that hold a credential.
 const TOKEN_SECRETS: [&str; 3] = ["id_token", "access_token", "refresh_token"];
 
+/// Every top-level member fact F61 names, in the order the fact lists them.
+///
+/// The one list `doctor`'s field-set comparison (premortem PM22) reports
+/// against. It is compiled in, so the names it prints came from this crate and
+/// never from the file on disk.
+pub const KNOWN_MEMBERS: [&str; 8] = [
+    "auth_mode",
+    "OPENAI_API_KEY",
+    "tokens",
+    "last_refresh",
+    "agent_identity",
+    "personal_access_token",
+    "bedrock_api_key",
+    "bedrock_access_keys",
+];
+
 /// Where a secret sits in the document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecretPath {
@@ -392,6 +408,23 @@ impl Credentials {
     /// The access token's expiry, in seconds since the epoch.
     pub fn access_expires_at(&self) -> Option<i64> {
         self.view.access_exp
+    }
+
+    /// The members of [`KNOWN_MEMBERS`] this document does not have.
+    ///
+    /// Static strings: a name here came from this crate's list, never from the
+    /// file (premortem PM22, the S35 lead ruling of 2026-09-22).
+    pub fn missing_known_members(&self) -> Vec<&'static str> {
+        KNOWN_MEMBERS.iter().filter(|name| !self.doc.contains_key(**name)).copied().collect()
+    }
+
+    /// How many members the document has that [`KNOWN_MEMBERS`] does not name.
+    ///
+    /// A count and never the names: a member name is file content, and a
+    /// credential pasted as a key would otherwise be echoed to the terminal
+    /// and into `--json` (invariant I24).
+    pub fn unknown_member_count(&self) -> usize {
+        self.doc.keys().filter(|name| !KNOWN_MEMBERS.contains(&name.as_str())).count()
     }
 
     /// The secret at `path`, when the document has one.
