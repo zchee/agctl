@@ -80,7 +80,13 @@ cannot, so they are not listed). **The seam names, every one of which must be ab
 | `AGCTL_CODEX_TOKEN_URL` | `src/provider/codex/oauth.rs` (phase 3, S32; `scripts/phase3-greps.sh` pins it to that one file) |
 | `codex_login_before_install` | `src/commands/codex/login.rs` (phase 3, S34: the pause point between `verify_login` and `install`) |
 | `agctl lock order violated: ` | `src/runtime/lock_order.rs` (phase 3, S34: the prefix of the lock-order witness's three messages) |
-| `agctl unaudited write receipt` | `src/provider/codex/auth_store.rs` (phase 3, S34 C2-a: `UNAUDITED_RECEIPT`, the prefix of the unaudited-receipt drop check's one message) |
+
+Not in this table: `agctl unaudited write receipt` (S34 C2-a's `UNAUDITED_RECEIPT`, in
+`src/provider/codex/auth_store.rs`). Removed at S37: measured absent from an all-features
+release build, flags cleared and with this project's own build flags applied, 2026-09-22 —
+its absence here proved nothing, since nothing a release build produces was ever shown to
+carry it. The guards that remain: the drop check itself under `cargo nextest
+run --all-features`, and `scripts/phase3-greps.sh`'s `receipt_check`/`reached_audit` rules.
 
 **Four production names, every one of which must be present:** `AGCTL_CONFIG_DIR`,
 `AGCTL_CLAUDE_USER_AGENT`, `AGCTL_CLAUDE_OAUTH_SCOPES`, and — from S33, once
@@ -94,11 +100,17 @@ If the gate fails, the build enabled `testing` — never `cargo build --release
 
 One representative name per seam-owning module: a new seam-owning module adds its
 representative to the `seams` array in `scripts/release-gate.sh` **and** to the table
-above, in the same change that introduces it. Three `AGCTL_*` names in the tree are
-deliberately outside the array — `AGCTL_LOCK_CHILD_ROLE` and `AGCTL_LOCK_CHILD_DIR`, which
-live only in a `#[cfg(test)]` sibling and are covered more strongly by `tests/e2e_lock.rs`,
-and `AGCTL_E2E_MARKER`, which a test sets on a child and the crate never reads. The script
-says so in a comment; do not "tidy" them in.
+above, in the same change that introduces it. Some `AGCTL_*` names in the tree are
+deliberately outside the array, for two different reasons. `AGCTL_LOCK_CHILD_ROLE` and
+`AGCTL_LOCK_CHILD_DIR` live only in a `#[cfg(test)]` sibling and are covered more strongly by
+`tests/e2e_lock.rs`; `AGCTL_E2E_MARKER` is set on a child by a test and the crate never reads
+it — none of the three shows up in a `src`-only sweep at all, since all three live in
+`*_tests.rs` files. Eleven more are dead code in every binary this crate ships (the
+`AGCTL_FAKE_SECURITY_*` family and `AGCTL_FAKE_CODEX_`, added since `e6c00e9`; see below for
+why): `rg -o --no-filename 'AGCTL_[A-Z0-9_]+' src --glob '!*_tests.rs' | sort -u | wc -l`
+finds **27** distinct names outside `*_tests.rs`, of which 4 are the production list above
+and 12 are in the `seams` array, leaving **11** genuinely outside both by that measure. The
+script says so in its own comments; do not "tidy" any of them in.
 
 `AGCTL_FAKE_CODEX_` is outside the array for a different reason: it is only ever a
 `starts_with` argument, so no build carries it as a string at all and an artifact grep

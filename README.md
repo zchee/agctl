@@ -90,9 +90,11 @@ rather than in the order the help text lists them; everything else is the same.
 
 ## Commands
 
-Every provider command lives under `agctl claude`; the one top-level command is
-`agctl completions`, above. `--config-dir DIR` is global and names *agctl's* store; it
-is accepted before or after the subcommand.
+Every provider command lives under `agctl claude` or `agctl codex` — the Codex commands are
+documented in [Codex](#codex), below; the rest of this section is Claude's. The one
+non-provider top-level command is `agctl completions`, above. `--config-dir DIR` is global
+and names *agctl's* store; it is accepted before or after the subcommand, for either
+provider.
 
 ### `status` — the table
 
@@ -660,6 +662,15 @@ the same credentials.
   the same account into both makes two independent holders of one refresh chain, and each
   will eventually invalidate the other's token. Use one store per account.
 
+**Codex is different here, because phase 3 has no live-swap equivalent yet.** `agctl codex
+login` never touches the live `CODEX_HOME`'s own credential at all — it runs the real `codex
+login` against a scratch home agctl creates and removes, and pins that scratch child to
+file-mode storage (`cli_auth_credentials_store="file"`) regardless of what the live machine's
+own `config.toml` says, so agctl's own login never contends with a keyring-based Codex
+switcher. Running `codex login` directly, outside agctl, still replaces whatever the live
+`CODEX_HOME` holds — the same read-only relationship `agctl codex import`/`doctor` have with
+it that phase 1 originally had with Claude, before `use --live` gave phase 2 a write path.
+
 ## Environment variables
 
 | variable | meaning |
@@ -667,15 +678,22 @@ the same credentials.
 | `AGCTL_CONFIG_DIR` | the environment form of `--config-dir`. Default: the XDG configuration directory plus `agctl`, i.e. `~/.config/agctl` |
 | `AGCTL_CLAUDE_USER_AGENT` | replaces `agctl/<version>` as the `User-Agent` of every request |
 | `AGCTL_CLAUDE_OAUTH_SCOPES` | replaces the space-separated scope set requested at login. A diagnostic: the server grants the same five scopes whatever is asked for |
+| `AGCTL_CODEX_USER_AGENT` | replaces `agctl/<version>` as the `User-Agent` of every Codex usage request |
 | `RUST_LOG` | tracing filter for the diagnostics on stderr. Unset or unparseable means `warn`. `RUST_LOG=agctl=trace` is the useful setting; no token material is ever logged at any level |
 | `TZ` | selects the zone the `5h reset` and `Weekly reset` columns are printed in. Unset — or set to something unrecognised — means the system zone (`/etc/localtime`), and UTC when even that cannot be determined |
 
-The three `AGCTL_*` names above are the whole `AGCTL_*` surface agctl defines —
+The four `AGCTL_*` names above are the whole `AGCTL_*` surface agctl defines —
 `RUST_LOG` and `TZ` it only reads. Every other `AGCTL_*`
 name you may find in the source is a test seam compiled only under the `testing` feature
 and absent from a release build — see [Build](#build) and `scripts/release-gate.sh`. The
-gate checks eleven of them. `AGCTL_CLAUDE_PROFILE_URL` is one: it redirects the profile
-request, and with it the access token that request carries.
+gate's seam list checks twelve such names (four shared between both providers, five
+Claude's, three Codex's) plus two more `testing`-only message prefixes that are not
+`AGCTL_*` names at all: a Codex-only login pause-point marker, and a lock-order witness
+shared by both providers (`src/config/mod.rs` and `src/commands/use.rs` use it too, not only
+Codex's own command modules). `AGCTL_CLAUDE_PROFILE_URL` is one of Claude's: it redirects
+the profile request, and with it the access token that request carries;
+`AGCTL_CODEX_TOKEN_URL` is its Codex counterpart, redirecting the refresh request and the
+refresh token it carries.
 
 ### Read, but owned by Claude Code
 
@@ -744,6 +762,177 @@ On `18` the rewrite is not attempted, and `config` says so with the reason `swap
 The line about a secure-storage backend in agctl's own environment is a warning, not a
 refusal, and exits `0` too.
 
+## Codex
+
+`agctl codex` shows subscription usage for Codex (ChatGPT) accounts the same way `agctl
+claude` does for Claude: one table, `--json`, a `watch` UI, no keychain writes for reading.
+Which commands write agctl's own registry, and which ever touch the network in a way that
+changes a credential, is stated in each command's own section below — a one-line summary
+here would only have to be re-read against them, so this file does not restate it. There is
+no Codex equivalent of `use`, `exec`, `env` or `use --live` yet — phase 3 does not switch
+which account the `codex` CLI uses, only tracks and refreshes the accounts agctl owns.
+
+agctl does not implement Codex's OAuth flow itself. `agctl codex login` runs the real `codex
+login` against a scratch home agctl owns, verifies what that run left behind, and copies the
+verified bytes into agctl's own store — never Codex's own browser flow reimplemented, and
+never a credential trusted before it is checked.
+
+### `status` — the table
+
+```sh
+agctl codex status
+agctl codex status --json | jq '.rows[] | {id, state, windows}'
+agctl codex status --account 8ff4… --account someone@example.com
+agctl codex status --all --refresh --timeout 30s
+```
+
+| flag | effect |
+|------|--------|
+| `--json` | the report as JSON instead of a table |
+| `--raw` | include the untouched upstream response body under `raw` |
+| `--refresh` | refresh expired credentials even when a cached value would do |
+| `--no-cache` | bypass the usage cache without forcing a token refresh |
+| `--all` | also show rows hidden by default, such as stale siblings |
+| `--account <ID>` | limit the report to one account; repeat for several |
+| `--timeout <DUR>` | per-request HTTP timeout, default `10s` |
+
+`status` is also where an owned account's refresh happens: when a due row's policy is
+`auto` (the default — see `accounts set`, below), `status` runs the refresh as a sequential
+pre-pass on the command thread, one namespace at a time, before the usage requests are
+coordinated, and only then reads that account's usage. `watch` never does this — see below.
+Because a refresh POST has its own budget and is never cut short, one `status` run can take
+up to `1s + 19s + 1s + 2 ×` `--timeout` (101s at the default `--timeout`) when an owned
+account is due, against `4 × min(--timeout, 5s) + 2 × --timeout` (40s at the default) when
+none is.
+
+**The live access token this depends on lasts 10 days** from Codex's own last login or
+refresh. A row past that window shows `expired (run codex to refresh)` rather than being
+fetched — `status`/`watch` never send a request for a token they already know is dead — so
+running `codex` (or `agctl codex login`) at least that often is what keeps a Codex row alive
+without a manual refresh.
+
+### `watch` — the same table, live
+
+```sh
+agctl codex watch
+agctl codex watch --interval 10m
+```
+
+`--interval` defaults to `300s` and will not go below `60s`, the same floor `agctl claude
+watch` uses. Unlike `status`, **`watch` never sends a refresh token** — a due owned row shows
+`expired (run agctl codex status)` instead of being refreshed from an unattended loop, by
+design: an unattended background process is exactly where a refresh defect is most expensive
+to have, so refreshing is kept to the commands a person runs and reads the result of.
+
+### `login` — mint a credential agctl owns
+
+```sh
+agctl codex login
+agctl codex login --label work
+agctl codex login --no-refresh
+```
+
+Runs the real `codex login` (from `PATH`; never overridden by an environment variable in a
+release build — see [Build](#build)) against a scratch `CODEX_HOME` agctl creates and
+removes, reads what it wrote, and — only after that read is verified — copies the credential
+into `<config-dir>/codex/<user-id>/<account-id>/auth.json` under that namespace's lock.
+Nothing reaches agctl's own store before the child's output is parsed and checked; a
+mismatched or unreadable result leaves nothing behind. `--label` gives the resulting account
+a human-readable name; `--no-refresh` records it with `accounts set --refresh never` already
+applied, so agctl never sends its refresh token unless you opt back in.
+
+### `accounts` — inspect and edit what agctl knows
+
+```sh
+agctl codex accounts list [--all]
+agctl codex accounts show <id>
+agctl codex accounts remove <id> [--delete-secret] [--yes]
+agctl codex accounts forget <id>
+agctl codex accounts unforget <id>
+agctl codex accounts set <id> --refresh auto|never
+agctl codex accounts refresh <id> --resend [--yes]
+agctl codex accounts refresh <id> --reset-floor [--yes]
+```
+
+`<id>` is the account id, email or label; the canonical spelling `list` and `show` print is
+`<user-id>/<account-id>`, the registry's key (two rows can share one email).
+
+`set --refresh` changes only agctl's own registry, under its own config lock — it never opens
+the namespace, never takes its lock, never reads `auth.json`. `--refresh never` is what
+`login --no-refresh` applies at login time; the next `status` pass makes zero refresh
+requests for that account and the row goes `expired (run agctl codex login)` once its access
+token runs out. `--refresh auto` restores the default.
+
+`refresh --resend` and `refresh --reset-floor` act on a row `status`'s own refresh pre-pass
+already touched:
+
+- **`--resend`** is the one deliberate exception to "agctl never re-sends a refresh token
+  automatically." It only applies to a row whose last refresh outcome is *unknown* — an
+  ambiguous network failure, not a rejection — and only once that state is **at least an
+  hour old**, and only **once per such state**: a second `--resend` against the same
+  unresolved send is refused, and so is one while a pending write from an earlier attempt is
+  still waiting to be replayed. (A pending write that was already *discarded* — superseded by
+  a newer, successful write — does not block a `--resend`; only one still waiting to be
+  replayed does.) Without a terminal, `--resend` refuses even with `--yes`: a second send of a
+  token the server may already have consumed is a cost a person takes deliberately, never
+  something a script or a cron job can schedule on agctl's behalf.
+- **`--reset-floor`** lifts the terminal state a Codex row reaches after three refreshes in a
+  row that were sent but did not clear a 401 — `unauthorized (refresh did not help)`. Nothing
+  else does: not `--refresh` on `status`, not `watch`'s periodic pass, only `agctl codex
+  login` (which replaces the credential outright) or this flag (which keeps it and gives the
+  next due refresh another chance).
+
+`remove --delete-secret` also deletes the credential file agctl wrote for that account, not
+just the registry row; without it, the row is dropped but the file (and any parked residue
+under it) stays on disk. `forget`/`unforget` only flip whether a foreign Codex keychain item
+is hidden from `doctor`'s report — nothing is read, written or removed by either.
+
+### `import --from codex-home` — record what another Codex home already has
+
+```sh
+agctl codex import --from codex-home
+agctl codex import --from codex-home --codex-home ~/work/.codex --dry-run
+```
+
+Reads another `CODEX_HOME`'s `auth.json` **read-only** — never a byte written, moved or
+removed under it — and files what its claims say (account id, email, plan) as a read-only
+row in agctl's registry; an account already known is reported and left alone, so a second
+import is a no-op. `--codex-home` names the directory to read instead of the one this
+environment names; `--dry-run` prints the plan and writes nothing.
+
+### `doctor` — what is actually on this machine, for Codex
+
+```sh
+agctl codex doctor
+agctl codex doctor --json
+```
+
+Reports the resolved Codex home and the links walked to reach it, the store mode (`file` or
+`keyring`) and whether agctl can read it, the four `AGCTL_CODEX_*` variables this process
+carries, the live credential's shape and its refresh-floor state, daemon evidence, every
+owned namespace with its lock and its refresh marker, and the write-receipt audit log's
+health. There is no `--remove-stale` here: no Codex lock is agctl's to break, so `doctor` has
+no write path and creates nothing — running it on a machine that has never seen `agctl codex
+login` leaves that machine exactly as it was.
+
+<!-- ## depends on S37-b: the two sentences below describe doctor's foreign-item handling
+     and orphan/base_url wording the way S37-b's landed commit leaves it, not the way it
+     read at base 0304a40. -->
+`doctor` never hands you a removal command for a foreign `Codex Auth` keychain item on its
+own say-so: a pasted removal of another Codex home's legitimate credential is data loss, not
+a fix. A refused login that gained a `Codex Auth` item writes one audit line for it
+(`login_keychain_gained`, its account guarded to the `cli|` + 16 hex shape) — a removal
+command (`security delete-generic-password …`) is offered **only** for an item that audit
+line names; every other foreign `Codex Auth` item — one `import` never claimed, one
+belonging to a different `CODEX_HOME` entirely — is reported as a count, with no command and
+no account attached. agctl itself still deletes no keychain item: the command is printed for
+you to run, never run on your behalf. The same caution applies to `orphans`: a subject that
+does not have the shape agctl's own writes leave becomes a count, not a named row.
+`store.base_url` is printed without its query string, for the same reason doctor prints
+no email or account id anywhere in its report.
+
+---
+
 ## Development
 
 The gate is three commands, and `--all-features` is not optional for the last two — the
@@ -780,13 +969,14 @@ contracts read out of Claude Code's own binary, and an upgrade can change any of
 
 | phase | scope |
 |-------|-------|
-| 1 | `status`, `watch`, `login`, `accounts`, `import` (read-only), `doctor` |
-| 2 (this) | switching the account Claude Code uses: `use`, `exec`, `env`, `use --live` |
-| 3+ | other providers: Codex, Cursor, Copilot, and the rest |
+| 1 | `status`, `watch`, `login`, `accounts`, `import` (read-only), `doctor` (Claude) |
+| 2 | switching the account Claude Code uses: `use`, `exec`, `env`, `use --live` (Claude) |
+| 3 (this) | a second provider, Codex: `status`, `watch`, `login`, `accounts` (incl. `set`, `refresh --resend`/`--reset-floor`), `import`, `doctor` — see [Codex](#codex) |
+| 4+ | further providers: Cursor, Copilot, and the rest; a Codex `use`/`use --live` equivalent, if one is ever wanted |
 
-Phases 1 and 2 have landed, both Claude only and macOS only. Phase 2 adds neither Linux nor
-another provider, and it expects to be the only tool switching accounts on the machine;
-see [One switcher at a time](#one-switcher-at-a-time).
+Phases 1–3 have landed, and all three are macOS only. Phase 3 adds a second provider but not
+a second platform, and it adds no Codex equivalent of phase 2's account-switching commands —
+see [Codex](#codex) and [One switcher at a time](#one-switcher-at-a-time).
 
 ## License
 

@@ -65,10 +65,23 @@
 # longer folded out of a release artifact — verified with `strings` on a
 # default-feature release build before this line was added (ledger #268).
 #
+# S37 removed `agctl unaudited write receipt` (S34 C2-a's drop-check witness):
+# measured absent from an all-features release build, flags cleared and with
+# this project's own build flags applied, 2026-09-22. The counts and the
+# remaining guards — the testing-only drop test, and phase3-greps.sh's
+# receipt_check / reached_audit rules — are recorded in
+# .claude/skills/check/SKILL.md.
+#
 # Phase 2 added no other seam: AGCTL_SECURITY_BIN (the write transport) and
-# AGCTL_CLAUDE_PROFILE_URL (the live swap's profile GET) are both listed, and
-# `rg -o 'AGCTL_[A-Z0-9_]+' src --glob '!*_tests.rs'` enumerates nothing else
-# outside this array and the production list below.
+# AGCTL_CLAUDE_PROFILE_URL (the live swap's profile GET) are both listed.
+# `rg -o 'AGCTL_[A-Z0-9_]+' src --glob '!*_tests.rs'` is a starting point for
+# reviewing a name that is new to this array, not a closed enumeration: it
+# also finds AGCTL_FAKE_SECURITY_* (src/secret/fake_security.rs, since
+# e6c00e9) and AGCTL_FAKE_CODEX_ (src/provider/codex/login_child.rs), both
+# deliberately outside this array for the reasons given where each name is
+# declared — the first is dead code in every binary this crate ships, the
+# second is only ever a `starts_with` argument, so neither can appear in a
+# grep of a built artifact.
 #
 # The first is the one that matters. The `testing` feature compiles overrides for
 # the OAuth token endpoint, the authorize endpoint, the profile endpoint and the
@@ -170,16 +183,6 @@ seams=(
 	# build carries it whole and this entry proves none of them — nor the
 	# witness — reaches a release artifact.
 	'agctl lock order violated: '
-	# S34 C2-a: the prefix of the `testing`-only unaudited-receipt drop check
-	# in src/provider/codex/auth_store.rs. Its one panic message begins with
-	# this literal, spelled once as `UNAUDITED_RECEIPT` under
-	# `#[cfg(feature = "testing")]`, so this entry proves neither the message
-	# nor the witness reaches a release artifact.
-	#
-	# The same prefix is spelled a second time in tests/common/codex.rs, which
-	# no build compiles into the crate, and `scripts/phase3-greps.sh`'s
-	# `receipt_check` rule pins the source spelling and its attribute.
-	'agctl unaudited write receipt'
 )
 
 # The production surface. Every one of these must be PRESENT.

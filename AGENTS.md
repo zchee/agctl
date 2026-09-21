@@ -3,21 +3,41 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 `agctl` is a CLI for managing AI coding agents. Binary-only, single crate, no public
-library API. Phase 1 is a multi-account Claude subscription usage viewer, and the module
-layout follows the data as it moves: `cli.rs` parses (every flag lives there and nowhere
-else) and `main.rs` dispatches one arm per command into `commands/` (`status`, `watch`,
-`login`, `accounts`, `import`, `doctor`, `completions`); `config/` owns the account registry and
-`config/paths.rs` derives every path agctl is allowed to write; `provider/claude/`
-holds the provider-specific knowledge — namespace and keychain-service naming, credential
-blobs, discovery, OAuth, the usage request — behind the `provider` traits that phase 3
-will implement a second time; `secret/` is the only code that touches credentials on disk
-(`security_cli.rs` reads the keychain and never writes it, `file_store.rs` writes the
-0600 store, `namespace_lock.rs` and `foreign_activity.rs` decide whether writing is
-allowed at all); `usage/` parses and caches responses; `runtime/` carries the pass
-coordinator, cancellation, child-process cleanup and the fault-injection seam; and
-`render/` plus `tui/` are the two presentations, table/JSON and the `watch` UI. The
-`testing` feature compiles the test seams and must never reach a release artifact — see
-`scripts/release-gate.sh`.
+library API. Phase 1 added Claude, phase 2 added switching which account Claude Code uses,
+and phase 3 added a second provider, Codex — the module layout follows the data as it moves
+and now has one copy per provider where the two differ: `cli.rs` parses (every flag lives
+there and nowhere else) and `main.rs` dispatches one arm per command into `commands/`
+(`status`, `watch`, `login`, `accounts`, `import`, `doctor`, `completions`, `isolate`,
+`export`, `use` for Claude; `commands/codex/` holds the Codex twins of `status`, `watch`,
+`login`, `accounts`, `import`, `doctor`, plus `accounts_refresh` and the shared pass
+coordination in `pass.rs`); `config/` owns the account registry and `config/paths.rs`
+derives every path agctl is allowed to write, for both providers; `provider/claude/` and
+`provider/codex/` each hold one provider's knowledge behind the shared `provider` traits —
+namespace and keychain-service naming, credential blobs, discovery, OAuth, the usage
+request — and `provider/codex/` alone additionally carries what phase 3's login mechanism
+and refresh policy need: `login_child.rs` (the child process that spawns the real `codex
+login` and reports what it did), `auth_store.rs` plus `refresh.rs` (the D-035 owned-refresh
+state machine and its write-ahead marker in `.state/`), and `audit.rs` (the write-receipt
+audit log every keychain-affecting write must reach); `secret/` is the only code that
+touches credentials on disk (`security_cli.rs` reads the keychain and never writes it,
+`file_store.rs` writes the 0600 store, `namespace_lock.rs` and `foreign_activity.rs` decide
+whether writing is allowed at all) and is shared by both providers; `usage/` parses and
+caches responses; `runtime/` carries the pass coordinator, cancellation, child-process
+cleanup and the fault-injection seam; and `render/` plus `tui/` are the two presentations,
+table/JSON and the `watch` UI, each with a Codex row renderer alongside Claude's. The
+`testing` feature compiles every test seam — both providers' endpoint overrides, the fake
+keychain and fake `codex` stand-ins, the fault-injection switch — and must never reach a
+release artifact: `scripts/release-gate.sh` proves that. Three more gates are phase-3
+specific and run beside it: `scripts/phase3-greps.sh` (AC120 — pattern pins over `src/`,
+never the `*_tests.rs` siblings; every check runs twice, once against a snapshot with one
+violation planted, where it must fail, then against the real tree, where it must pass),
+`scripts/phase3-structural.sh` (AC122 — invariants the compiler enforces rather than a
+test, such as a private field or a `pub(super)` constructor: it plants the violating code in
+a temporary-index snapshot of the working tree and requires `cargo check` to reject it at
+the planted file and line), and `scripts/phase3-version-gate.sh` (AC99 — builds the phase-2
+`agctl` from an older commit and proves it refuses a version-2 account registry outright,
+writing nothing, while still reading a version-1 one; it builds no Codex binary and reads no
+installed `codex`).
 
 ## Run cargo through direnv
 
