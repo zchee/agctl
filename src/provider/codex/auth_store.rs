@@ -298,10 +298,87 @@ pub enum WriteKind {
     Delete,
 }
 
+/// A `testing`-only witness that one [`WriteReceipt`] reaches the audit log.
+///
+/// The run-time half of invariant I30. `#[must_use]` makes an ignored receipt
+/// a warning and the static AC119 rule reads the source for receipts that are
+/// taken and never audited, but neither sees a receipt that a live path drops
+/// — bound to a name and then let go, moved into a value nobody consumes,
+/// taken out of an `Option` and discarded. This does: every receipt is born
+/// armed, [`append`] disarms it, and a drop while it is still armed panics on
+/// whatever path the test drove.
+///
+/// Compiled only under the `testing` feature, like the lock-order witness it
+/// is modelled on ([`HeldCodexGuard`]). Its one message begins with
+/// [`UNAUDITED_RECEIPT`], spelled once and pinned to that attribute by
+/// `scripts/phase3-greps.sh`.
+///
+/// [`append`]: crate::provider::codex::audit::append
+/// [`HeldCodexGuard`]: crate::runtime::lock_order::HeldCodexGuard
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+pub struct AuditPending {
+    armed: std::cell::Cell<bool>,
+    kind: WriteKind,
+}
+
+/// The prefix of the unaudited-drop panic, spelled once.
+///
+/// `scripts/phase3-greps.sh`'s `receipt_check` rule pins that single spelling
+/// and the `#[cfg]` directly above it, and `tests/common/codex.rs::checked`
+/// fails any e2e run whose binary printed it. `scripts/release-gate.sh`
+/// deliberately does not list it — its comment carries the measurement and the
+/// reason.
+#[cfg(feature = "testing")]
+const UNAUDITED_RECEIPT: &str = "agctl unaudited write receipt";
+
+#[cfg(feature = "testing")]
+impl AuditPending {
+    /// Arms the witness for a receipt of `kind`.
+    fn armed(kind: WriteKind) -> Self {
+        Self { armed: std::cell::Cell::new(true), kind }
+    }
+
+    /// Records that the receipt reached the audit log.
+    fn disarm(&self) {
+        self.armed.set(false);
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Drop for AuditPending {
+    /// Panics when the receipt never reached the audit log.
+    ///
+    /// Silent while the thread is already unwinding: a panic inside a panic
+    /// aborts the process, which would replace the failure the test is about
+    /// to report with this one.
+    fn drop(&mut self) {
+        if self.armed.get() && !std::thread::panicking() {
+            let kind = self.kind;
+            panic!("{UNAUDITED_RECEIPT}: {kind:?} was dropped before codex::audit::append");
+        }
+    }
+}
+
+/// Every witness equals every other: whether a receipt has been audited yet is
+/// not part of what the receipt *says*, and `WriteReceipt` compares by value in
+/// the landed tests.
+#[cfg(feature = "testing")]
+impl PartialEq for AuditPending {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Eq for AuditPending {}
+
 /// The record of one namespace write. Consumed by the Codex audit log and
 /// nothing else (invariant I30, plan AC117).
 ///
 /// Neither `Clone` nor `Copy`, so one write is audited once (review S30 LOW-2).
+/// Under the `testing` feature it also carries an [`AuditPending`], so a
+/// receipt any test drives off the audited path fails that test.
 #[must_use = "every Codex namespace write is audited: hand the receipt to the audit log"]
 #[derive(Debug, PartialEq, Eq)]
 pub struct WriteReceipt {
@@ -309,12 +386,32 @@ pub struct WriteReceipt {
     digest8_before: Option<String>,
     digest8_after: Option<String>,
     ids: (String, String),
+    #[cfg(feature = "testing")]
+    pending_audit: AuditPending,
 }
 
 impl WriteReceipt {
     /// What the write did.
     pub fn kind(&self) -> WriteKind {
         self.kind
+    }
+
+    /// Records that this receipt reached the Codex audit log.
+    ///
+    /// Called by [`append`] before it builds the entry, so a receipt whose log
+    /// line is then refused still counts as audited: that write has landed and
+    /// stands, and the row says `audit log refused` (plan AC117). A no-op
+    /// without the `testing` feature.
+    ///
+    /// A shared borrow, so this is not a way to *consume* a receipt. The one
+    /// function that takes one by value and does not audit it is a helper in
+    /// `auth_store_tests.rs` — outside the source the AC119 rule reads, and
+    /// outside every binary.
+    ///
+    /// [`append`]: crate::provider::codex::audit::append
+    pub(super) fn reached_audit(&self) {
+        #[cfg(feature = "testing")]
+        self.pending_audit.disarm();
     }
 
     /// The refresh digest prefix of the credential before the write.
@@ -587,6 +684,8 @@ impl<'g> OwnedNamespace<'g> {
                 digest8_before: digest8_of(write.before.as_ref()),
                 digest8_after: digest8_of(write.pending.as_ref()),
                 ids: self.ns.ids(),
+                #[cfg(feature = "testing")]
+                pending_audit: AuditPending::armed(kind),
             }
         });
         Ok((decision, receipt, evidence))
@@ -669,6 +768,8 @@ impl<'g> OwnedNamespace<'g> {
                     digest8_before: digest8_of(before.as_ref()),
                     digest8_after: digest8_of(after.as_ref()),
                     ids: self.ns.ids(),
+                    #[cfg(feature = "testing")]
+                    pending_audit: AuditPending::armed(WriteKind::DiscardedExternal),
                 },
             });
         }
@@ -700,6 +801,8 @@ impl<'g> OwnedNamespace<'g> {
                 digest8_before: digest8_of(before.as_ref()),
                 digest8_after: digest8_of(after.as_ref()),
                 ids: self.ns.ids(),
+                #[cfg(feature = "testing")]
+                pending_audit: AuditPending::armed(kind),
             },
         })
     }
@@ -739,6 +842,8 @@ impl<'g> OwnedNamespace<'g> {
                 digest8_before: digest8_of(before.as_ref()),
                 digest8_after: digest8_of(credentials.credentials().digests().as_ref()),
                 ids: self.ns.ids(),
+                #[cfg(feature = "testing")]
+                pending_audit: AuditPending::armed(WriteKind::RefreshSavedToPending),
             },
         })
     }
@@ -875,6 +980,8 @@ impl<'g> OwnedNamespace<'g> {
             digest8_before: digest8_of(before.as_ref()),
             digest8_after: None,
             ids: self.ns.ids(),
+            #[cfg(feature = "testing")]
+            pending_audit: AuditPending::armed(WriteKind::Delete),
         })
     }
 }
@@ -973,11 +1080,14 @@ impl<'g> InstallNamespace<'g> {
         if let Err(err) = self.state.reset_for_login() {
             tracing::warn!(error = %err, "the refresh marker could not be reset after a login install");
         }
+        let kind = WriteKind::LoginInstall { overwrote: before.is_some() };
         let receipt = WriteReceipt {
-            kind: WriteKind::LoginInstall { overwrote: before.is_some() },
+            kind,
             digest8_before: before.flatten().as_ref().and_then(|d| digest8_of(Some(d))),
             digest8_after: digest8_of(self.login.doc().digests().as_ref()),
             ids: self.ns.ids(),
+            #[cfg(feature = "testing")]
+            pending_audit: AuditPending::armed(kind),
         };
         Ok((receipt, self.login.identity()))
     }

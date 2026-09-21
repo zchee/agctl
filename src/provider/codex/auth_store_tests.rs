@@ -18,6 +18,20 @@ use crate::secret::pending::PendingDiscardReason;
 
 const OTHER_ACCT: &str = "99999999-2222-4333-8444-555555555555";
 
+/// Accepts a receipt this test drives a writer to produce and then has no
+/// audit log for.
+///
+/// The `testing`-only drop check panics on a receipt that is dropped before
+/// `codex::audit::append`, which is the bug it exists to catch on a real path.
+/// A unit test that asserts on the write itself and stops there is not that
+/// bug, so it says so once, here, rather than letting each site trip the
+/// check. It lives in this file, not in `auth_store.rs`: nothing that takes a
+/// receipt by value and does not audit it belongs in a file the AC119 source
+/// rule reads, or in any binary.
+fn discarded_by_this_test(receipt: WriteReceipt) {
+    receipt.reached_audit();
+}
+
 fn clean_report() -> PostExitReport {
     PostExitReport::from_child(
         Vec::new(),
@@ -254,6 +268,7 @@ fn writer_one_replaces_atomically_after_the_snapshot_check() {
     assert_eq!(receipt.digest8_after(), merged.refresh_digest8().as_deref());
     assert_ne!(receipt.digest8_before(), receipt.digest8_after());
     assert_eq!(receipt.ids(), (testkit::USER, testkit::ACCT));
+    discarded_by_this_test(receipt);
 
     let meta = fs::metadata(auth_path(&paths)).expect("stat");
     assert_ne!(meta.ino(), inode_before, "a rename, never an in-place write");
@@ -289,6 +304,7 @@ fn writer_one_discards_when_another_writer_refreshed_first() {
         panic!("expected a discard")
     };
     assert_eq!(receipt.kind(), WriteKind::DiscardedExternal);
+    discarded_by_this_test(receipt);
     assert_eq!(fs::read(auth_path(&paths)).expect("read"), external, "the newer grant stands");
 
     fs::write(auth_path(&paths), b"{").expect("torn");
@@ -319,6 +335,7 @@ fn a_failed_rename_parks_the_grant_and_the_next_pass_replays_it() {
     };
     assert!(matches!(outcome, WriteOutcome::SavedToPending { .. }));
     assert_eq!(receipt.kind(), WriteKind::RefreshSavedToPending);
+    discarded_by_this_test(receipt);
     assert!(
         ns_dir(&paths).join(PENDING_FILE).is_file() && ns_dir(&paths).join(PENDING_META).is_file()
     );
@@ -333,6 +350,7 @@ fn a_failed_rename_parks_the_grant_and_the_next_pass_replays_it() {
     let receipt = receipt.expect("a replay is a write");
     assert_eq!(receipt.kind(), WriteKind::PendingReplayed);
     assert_eq!(receipt.digest8_after(), merged.refresh_digest8().as_deref());
+    discarded_by_this_test(receipt);
     let replayed = Credentials::parse(&fs::read(auth_path(&paths)).expect("read")).expect("parses");
     assert_eq!(
         replayed.refresh_digest8(),
@@ -354,11 +372,12 @@ fn a_torn_target_keeps_the_pending_grant() {
         OwnedNamespace::open(&paths, proof::owned(&this).expect("owned"), &guard).expect("opens");
     testkit::write_0600(&auth_path(&paths), &expired_doc_bytes());
     let credentials = locked_owned(&ns);
-    let CodexWrite::Landed { .. } =
+    let CodexWrite::Landed { receipt, .. } =
         ns.write(&credentials, &Fault::from_list("codex_rename_fail")).expect("parks")
     else {
         panic!("expected a parked write")
     };
+    discarded_by_this_test(receipt);
     fs::write(auth_path(&paths), b"{\"auth_mode\":").expect("torn by an in-place writer");
     let err = ns.resolve_pending(&Cancel::new()).expect_err("an error, not a discard");
     assert!(err.to_string().contains("does not parse"), "{err}");
@@ -366,8 +385,9 @@ fn a_torn_target_keeps_the_pending_grant() {
     assert!(ns_dir(&paths).join(PENDING_META).is_file());
 
     fs::write(auth_path(&paths), expired_doc_bytes()).expect("the writer finished");
-    let (decision, _receipt, _evidence) = ns.resolve_pending(&Cancel::new()).expect("resolves");
+    let (decision, receipt, _evidence) = ns.resolve_pending(&Cancel::new()).expect("resolves");
     assert_eq!(decision, PendingDecision::Replayed { first_write: false });
+    discarded_by_this_test(receipt.expect("a replay is a write"));
 }
 
 #[test]
@@ -379,17 +399,20 @@ fn a_pending_grant_derived_from_another_file_is_discarded_with_a_receipt() {
         OwnedNamespace::open(&paths, proof::owned(&this).expect("owned"), &guard).expect("opens");
     testkit::write_0600(&auth_path(&paths), &expired_doc_bytes());
     let credentials = locked_owned(&ns);
-    let CodexWrite::Landed { .. } =
+    let CodexWrite::Landed { receipt, .. } =
         ns.write(&credentials, &Fault::from_list("codex_rename_fail")).expect("parks")
     else {
         panic!("expected a parked write")
     };
+    discarded_by_this_test(receipt);
     let mut changed = testkit::chatgpt_doc(Some(4_102_444_800), None);
     changed["tokens"]["refresh_token"] = json!("agctl-test-codex-rt-changed");
     fs::write(auth_path(&paths), testkit::pretty(&changed)).expect("write");
     let (decision, receipt, _evidence) = ns.resolve_pending(&Cancel::new()).expect("resolves");
     assert_eq!(decision, PendingDecision::Discarded(PendingDiscardReason::FileChanged));
-    assert_eq!(receipt.map(|r| r.kind()), Some(WriteKind::PendingDiscarded));
+    let receipt = receipt.expect("a discard is a write");
+    assert_eq!(receipt.kind(), WriteKind::PendingDiscarded);
+    discarded_by_this_test(receipt);
 }
 
 #[test]
@@ -428,6 +451,7 @@ fn the_login_tail_installs_a_copy_and_resets_the_marker() {
     assert_eq!(installed, identity);
     assert_eq!(receipt.kind(), WriteKind::LoginInstall { overwrote: false });
     assert_eq!(receipt.digest8_before(), None);
+    discarded_by_this_test(receipt);
 
     let meta = fs::metadata(auth_path(&paths)).expect("stat");
     assert_eq!(meta.permissions().mode() & 0o777, 0o600);
@@ -455,6 +479,7 @@ fn the_login_tail_installs_a_copy_and_resets_the_marker() {
         .expect("installs");
     assert_eq!(receipt.kind(), WriteKind::LoginInstall { overwrote: true });
     assert!(receipt.digest8_before().is_some());
+    discarded_by_this_test(receipt);
 }
 
 #[test]
@@ -486,6 +511,7 @@ fn a_failed_install_rename_leaves_the_previous_grant_and_no_pending() {
     let install = InstallNamespace::open_for_install(&paths, login, &guard).expect("opens");
     let (receipt, _) = install.install(&Fault::from_list("codex_rename_fail")).expect("installs");
     assert_eq!(receipt.kind(), WriteKind::LoginInstall { overwrote: true });
+    discarded_by_this_test(receipt);
 }
 
 #[test]
@@ -600,6 +626,53 @@ fn an_unreadable_marker_fails_closed() {
 }
 
 #[test]
+#[cfg(feature = "testing")]
+fn a_receipt_dropped_before_the_audit_log_fails_the_test_that_drops_it() {
+    // The run-time half of invariant I30 (user decision, ledger #454). The
+    // static AC119 rule reads the source and cannot see a receipt that a live
+    // path lets go; this fires on whatever path a test actually drives, and
+    // here is the proof that it fires at all — a check never seen to fail
+    // proves nothing.
+    let (_dir, paths) = testkit::store();
+    let this = record();
+    let guard = testkit::lock_for(&paths, &this);
+    let ns =
+        OwnedNamespace::open(&paths, proof::owned(&this).expect("owned"), &guard).expect("opens");
+    testkit::write_0600(&auth_path(&paths), &expired_doc_bytes());
+    let receipt = ns.remove_named_files().expect("removes");
+
+    // nextest runs each test in its own process, so replacing the hook here
+    // cannot silence another test's panic.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let fired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(receipt)));
+    std::panic::set_hook(previous);
+
+    let payload = fired.expect_err("an unaudited receipt panics when it drops");
+    let message = payload.downcast_ref::<String>().expect("a formatted message");
+    assert!(message.starts_with(UNAUDITED_RECEIPT), "the gated prefix: {message}");
+    assert!(message.contains("Delete"), "the message names the kind: {message}");
+}
+
+#[test]
+#[cfg(feature = "testing")]
+fn a_receipt_that_reached_the_audit_log_is_quiet_when_it_drops() {
+    // The other half of the twin: the check is not a panic on every receipt.
+    let (_dir, paths) = testkit::store();
+    let this = record();
+    let guard = testkit::lock_for(&paths, &this);
+    let ns =
+        OwnedNamespace::open(&paths, proof::owned(&this).expect("owned"), &guard).expect("opens");
+    testkit::write_0600(&auth_path(&paths), &expired_doc_bytes());
+    let receipt = ns.remove_named_files().expect("removes");
+
+    let quiet = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::provider::codex::audit::append(&paths, receipt)
+    }));
+    quiet.expect("an audited receipt does not panic when it drops").expect("the entry is written");
+}
+
+#[test]
 fn remove_named_files_removes_exactly_its_own_files() {
     let (_dir, paths) = testkit::store();
     let this = record();
@@ -626,6 +699,7 @@ fn remove_named_files_removes_exactly_its_own_files() {
     let receipt = ns.remove_named_files().expect("removes");
     assert_eq!(receipt.kind(), WriteKind::Delete);
     assert_eq!(receipt.digest8_before(), credentials.refresh_digest8().as_deref());
+    discarded_by_this_test(receipt);
     assert!(!ns_dir(&paths).exists(), "the namespace directory is gone");
     assert!(!paths.codex_root().join(testkit::USER).exists(), "and its empty user directory");
     assert_eq!(ns.refresh_state().load(), RefreshStateRead::Absent, "the marker went with it");
@@ -710,11 +784,12 @@ fn an_unopenable_auth_json_is_an_error_never_needs_login_and_never_a_discard() {
     testkit::write_0600(&auth_path(&paths), &expired_doc_bytes());
     let credentials = locked_owned(&ns);
     // Park a pending grant derived from this file.
-    let CodexWrite::Landed { .. } =
+    let CodexWrite::Landed { receipt, .. } =
         ns.write(&credentials, &Fault::from_list("codex_rename_fail")).expect("parks")
     else {
         panic!("expected a parked write")
     };
+    discarded_by_this_test(receipt);
 
     chmod(&auth_path(&paths), 0o000);
     let read = ns.read();
@@ -742,11 +817,12 @@ fn an_unopenable_pending_file_keeps_both_files() {
         OwnedNamespace::open(&paths, proof::owned(&this).expect("owned"), &guard).expect("opens");
     testkit::write_0600(&auth_path(&paths), &expired_doc_bytes());
     let credentials = locked_owned(&ns);
-    let CodexWrite::Landed { .. } =
+    let CodexWrite::Landed { receipt, .. } =
         ns.write(&credentials, &Fault::from_list("codex_rename_fail")).expect("parks")
     else {
         panic!("expected a parked write")
     };
+    discarded_by_this_test(receipt);
     let pending = ns_dir(&paths).join(PENDING_FILE);
     chmod(&pending, 0o000);
     let resolve = ns.resolve_pending(&Cancel::new());
@@ -754,12 +830,13 @@ fn an_unopenable_pending_file_keeps_both_files() {
     assert!(resolve.is_err(), "an error, not an `invalid` discard");
     assert!(pending.is_file() && ns_dir(&paths).join(PENDING_META).is_file());
 
-    let (decision, _receipt, _evidence) = ns.resolve_pending(&Cancel::new()).expect("resolves");
+    let (decision, receipt, _evidence) = ns.resolve_pending(&Cancel::new()).expect("resolves");
     assert_eq!(
         decision,
         PendingDecision::Replayed { first_write: false },
         "readable again → replayed"
     );
+    discarded_by_this_test(receipt.expect("a replay is a write"));
 }
 
 #[test]
@@ -777,11 +854,12 @@ fn a_live_codex_daemon_does_not_discard_a_parked_grant() {
     )
     .expect("parses");
     let (merged, _) = credentials.merge_refresh(response, Timestamp::now()).expect("merges");
-    let CodexWrite::Landed { .. } =
+    let CodexWrite::Landed { receipt, .. } =
         ns.write(&merged, &Fault::from_list("codex_rename_fail")).expect("parks")
     else {
         panic!("expected a parked write")
     };
+    discarded_by_this_test(receipt);
 
     // This process as the daemon, its record written after it started.
     let daemon = ns_dir(&paths).join("app-server-daemon");
@@ -792,7 +870,9 @@ fn a_live_codex_daemon_does_not_discard_a_parked_grant() {
     let (decision, receipt, evidence) = ns.resolve_pending(&Cancel::new()).expect("resolves");
     assert_eq!(evidence, DaemonEvidence::PidAlive(std::process::id()), "surfaced as a note");
     assert_eq!(decision, PendingDecision::Replayed { first_write: false });
-    assert_eq!(receipt.map(|r| r.kind()), Some(WriteKind::PendingReplayed));
+    let receipt = receipt.expect("a replay is a write");
+    assert_eq!(receipt.kind(), WriteKind::PendingReplayed);
+    discarded_by_this_test(receipt);
     let now = Credentials::parse(&fs::read(auth_path(&paths)).expect("read")).expect("parses");
     assert_eq!(now.refresh_digest8(), merged.refresh_digest8(), "the rotated grant is on disk");
 }
@@ -827,6 +907,7 @@ fn a_write_compares_with_the_read_it_came_from() {
         panic!("a merge built on the older read must not overwrite the newer grant")
     };
     assert_eq!(receipt.kind(), WriteKind::DiscardedExternal);
+    discarded_by_this_test(receipt);
     assert_eq!(fs::read(auth_path(&paths)).expect("read"), external);
 }
 

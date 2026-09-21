@@ -1256,7 +1256,17 @@ fn interrupted_before_rename(
         &["codex", "status", "--account", USER],
         &[("AGCTL_FAULT", "pause_codex_before_rename"), ("AGCTL_FAULT_RESUME", &resume_env)],
     );
-    signal_when(&mut child, signal, what, &reached)
+    let status = signal_when(&mut child, signal, what, &reached);
+    // The only launch in this file that does not go through `checked`: both
+    // callers assert on the exit status alone, and a signalled run is expected
+    // to fail, so a dropped write receipt would have been invisible here
+    // (S34 C2-a). The child has exited, so its stderr pipe is at EOF.
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        std::io::Read::read_to_end(&mut pipe, &mut stderr).expect("the child's stderr is readable");
+    }
+    codex::assert_receipts_were_audited(what, &stderr);
+    status
 }
 
 #[test]

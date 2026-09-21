@@ -170,6 +170,16 @@ seams=(
 	# build carries it whole and this entry proves none of them — nor the
 	# witness — reaches a release artifact.
 	'agctl lock order violated: '
+	# S34 C2-a: the prefix of the `testing`-only unaudited-receipt drop check
+	# in src/provider/codex/auth_store.rs. Its one panic message begins with
+	# this literal, spelled once as `UNAUDITED_RECEIPT` under
+	# `#[cfg(feature = "testing")]`, so this entry proves neither the message
+	# nor the witness reaches a release artifact.
+	#
+	# The same prefix is spelled a second time in tests/common/codex.rs, which
+	# no build compiles into the crate, and `scripts/phase3-greps.sh`'s
+	# `receipt_check` rule pins the source spelling and its attribute.
+	'agctl unaudited write receipt'
 )
 
 # The production surface. Every one of these must be PRESENT.

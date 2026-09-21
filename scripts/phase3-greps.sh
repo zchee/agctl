@@ -184,6 +184,17 @@
 #                 whole purpose is this invariant" rather than "review a
 #                 1146-line refresh.rs". Modelled on `exposure_count`.
 #
+# S34 C2-a appends one:
+#
+#   receipt_check  the unaudited-receipt drop check's panic prefix, `agctl
+#                 unaudited write receipt`                                 → spelled
+#                 exactly once in non-test source, on the line directly under
+#                 `#[cfg(feature = "testing")]`. The release gate cannot prove
+#                 this one either: every build it makes is optimizing, and an
+#                 optimizing build folds the message away because every receipt
+#                 in the binary reaches `audit::append` first. Modelled on
+#                 `fake_prefix`, for the same reason.
+#
 # With `--log`, the `LOG_ONLY_NEEDLES` are counted too: the sentinel email a
 # usage fixture carries (ledger #274). They are deliberately not code needles
 # — the fixture that carries the sentinel is how a leak test proves anything —
@@ -1073,6 +1084,38 @@ check_fake_prefix() {
     return 0
 }
 
+# check_receipt_check: S34 C2-a. The `testing`-only unaudited-receipt drop
+# check's panic prefix is spelled exactly ONCE in non-test source, on the line
+# directly under `#[cfg(feature = "testing")]`. The release gate deliberately
+# does not list it (its comment carries the measurement): the check panics only
+# on a receipt dropped still armed, every receipt in the binary disarms first,
+# so an optimizing build — every build that gate makes — proves the branch dead
+# and drops the message. Only opt-level 0 carries it, so an artifact grep would
+# pass whether or not the attribute is doing anything. This rule and the
+# default-feature clippy gate are what guard it; the plants
+# `plant_receipt_check` and `plant_receipt_check_cfg_commented` show it fires.
+check_receipt_check() {
+    local root=$1 hits count file line prev
+    hits=$(code_hits "$root" 'agctl unaudited write receipt') || scan_failed check_receipt_check
+    count=$(printf '%s\n' "$hits" | sed '/^$/d' | wc -l | tr -d ' ')
+    if [[ $count -ne 1 ]]; then
+        printf '  `agctl unaudited write receipt` is spelled %s time(s) in non-test source, not once:\n%s\n' "$count" "$hits"
+        return 1
+    fi
+    file=${hits%%:*}
+    line=${hits#*:}
+    line=${line%%:*}
+    prev=$(sed -n "$((line - 1))p" "$root/$file")
+    # Anchored, as check_fake_prefix is: a commented-out attribute would leave
+    # the witness compiled into every build (review C1b-r2 F2).
+    if ! [[ $prev =~ ^[[:space:]]*\#\[cfg\(feature\ =\ \"testing\"\)\][[:space:]]*$ ]]; then
+        printf '  %s:%s spells the unaudited-receipt prefix without `#[cfg(feature = "testing")]` directly above it\n' \
+            "$file" "$line"
+        return 1
+    fi
+    return 0
+}
+
 check_codex_env() {
     local file="$1/$CODEX_HOME_MODULE" hits status=0
     # Vacuous until S30 writes it. Stated rather than silent: the plant below
@@ -1123,6 +1166,14 @@ plant_fake_prefix_cfg_commented() {
     mkdir -p "$1/src/provider/codex"
     sed -i.bak -e 's|^\([[:space:]]*\)#\[cfg(feature = "testing")\]\([[:space:]]*\)$|\1// #[cfg(feature = "testing")]\2|' \
         "$1/src/provider/codex/login_child.rs" && rm -f "$1/src/provider/codex/login_child.rs.bak"
+}
+plant_receipt_check() { plant_line "$1" 'const _PHASE3_PLANT: &str = "agctl unaudited write receipt";'; }
+# The commented-out attribute: the prefix is still spelled once, but its
+# `#[cfg]` is a comment, so the witness compiles into every build.
+plant_receipt_check_cfg_commented() {
+    mkdir -p "$1/src/provider/codex"
+    sed -i.bak -e 's|^\([[:space:]]*\)#\[cfg(feature = "testing")\]\([[:space:]]*\)$|\1// #[cfg(feature = "testing")]\2|' \
+        "$1/src/provider/codex/auth_store.rs" && rm -f "$1/src/provider/codex/auth_store.rs.bak"
 }
 plant_codex_bin() { plant_line "$1" 'const _PHASE3_PLANT: &str = "AGCTL_CODEX_BIN";'; }
 plant_expose_elsewhere() { plant_line "$1" 'fn _phase3_plant(s: &SecretString) -> String { s.expose_secret().to_owned() }'; }
@@ -1379,7 +1430,7 @@ CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers expose
     codex_debug_assert state_path codex_flock wham_usage codex_usage_url codex_timeouts codex_redirects codex_decoded_cap credits_state
     auth_host codex_token_url oauth_cancelled oauth_refresh_callers consent_callers refresh_usage_cache receipt_type
     receipt_destructure refresh_drivers refresh_client post_permit permit_mint permit_mint_count daemon_pid_names watch_no_post usage_client_new
-    fake_prefix)
+    fake_prefix receipt_check)
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
@@ -1419,6 +1470,8 @@ PLANTS=(
     "codex_flock plant_codex_flock"
     "fake_prefix plant_fake_prefix"
     "fake_prefix plant_fake_prefix_cfg_commented"
+    "receipt_check plant_receipt_check"
+    "receipt_check plant_receipt_check_cfg_commented"
     "wham_usage plant_wham_usage"
     "codex_usage_url plant_codex_usage_url"
     "codex_timeouts plant_codex_timeouts"

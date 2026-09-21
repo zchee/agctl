@@ -172,6 +172,67 @@ fn checked_reports_a_needle_by_name_and_offset_never_by_value() {
     assert_eq!(back.stderr, b"nor here");
 }
 
+/// The shared `checked` also refuses a run whose binary dropped a Codex write
+/// receipt before the audit log, by name rather than as a wrong exit code.
+///
+/// C2-a's e2e twin. The check itself lives in the binary and is proven to fire
+/// by `auth_store_tests::a_receipt_dropped_before_the_audit_log_fails_the_test_
+/// that_drops_it`; what is proven here is the other half — that its line on
+/// stderr fails the e2e test that saw it, including one that expected the run
+/// to refuse. The real binary is not driven into the state on purpose: no
+/// production path reaches it, and a fault seam that created one would be a
+/// seam whose only user is its own test.
+#[test]
+fn checked_refuses_a_run_that_dropped_a_write_receipt() {
+    use std::os::unix::process::ExitStatusExt;
+
+    // Exit 2 — a refusal — so the case is the one a status assertion misses.
+    let aborted = Output {
+        status: std::process::ExitStatus::from_raw(2 << 8),
+        stdout: Vec::new(),
+        stderr: b"agctl unaudited write receipt: Delete was dropped before codex::audit::append\n"
+            .to_vec(),
+    };
+    let report = std::panic::catch_unwind(|| {
+        codex::checked("e2e_codex_login", "positive-control-receipt", aborted, &NEEDLES, &[]);
+    })
+    .expect_err("a run that dropped a receipt is refused");
+    let report = report
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| report.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+        .unwrap_or_default();
+    assert_eq!(
+        report,
+        "positive-control-receipt: the binary dropped a Codex write receipt before the audit log: \
+         agctl unaudited write receipt: Delete was dropped before codex::audit::append"
+    );
+
+    // The other door: two Codex e2e launches read an exit status rather than
+    // an `Output` and call the rejection directly (`e2e_codex::run`, and the
+    // signalled pass in `e2e_codex_status`). Same helper, so prove the same
+    // message arrives through it.
+    let direct = std::panic::catch_unwind(|| {
+        codex::assert_receipts_were_audited(
+            "positive-control-receipt",
+            b"agctl unaudited write receipt: Delete was dropped before codex::audit::append\n",
+        );
+    })
+    .expect_err("the exported rejection refuses it too");
+    assert_eq!(
+        direct
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| direct.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+            .unwrap_or_default(),
+        report,
+        "both doors report the same thing"
+    );
+
+    // The twin: a clean stderr passes through both.
+    codex::assert_receipts_were_audited("positive-control-clean-receipt", b"nothing to see here");
+}
+
 /// Runs `agctl codex login` through [`checked`].
 fn login(fixture: &CodexFixture, name: &str) -> Output {
     checked(name, fixture.cmd().args(["codex", "login"]).output().expect("the binary runs"))

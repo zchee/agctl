@@ -80,6 +80,7 @@ cannot, so they are not listed). **The seam names, every one of which must be ab
 | `AGCTL_CODEX_TOKEN_URL` | `src/provider/codex/oauth.rs` (phase 3, S32; `scripts/phase3-greps.sh` pins it to that one file) |
 | `codex_login_before_install` | `src/commands/codex/login.rs` (phase 3, S34: the pause point between `verify_login` and `install`) |
 | `agctl lock order violated: ` | `src/runtime/lock_order.rs` (phase 3, S34: the prefix of the lock-order witness's three messages) |
+| `agctl unaudited write receipt` | `src/provider/codex/auth_store.rs` (phase 3, S34 C2-a: `UNAUDITED_RECEIPT`, the prefix of the unaudited-receipt drop check's one message) |
 
 **Four production names, every one of which must be present:** `AGCTL_CONFIG_DIR`,
 `AGCTL_CLAUDE_USER_AGENT`, `AGCTL_CLAUDE_OAUTH_SCOPES`, and — from S33, once
@@ -98,6 +99,13 @@ deliberately outside the array — `AGCTL_LOCK_CHILD_ROLE` and `AGCTL_LOCK_CHILD
 live only in a `#[cfg(test)]` sibling and are covered more strongly by `tests/e2e_lock.rs`,
 and `AGCTL_E2E_MARKER`, which a test sets on a child and the crate never reads. The script
 says so in a comment; do not "tidy" them in.
+
+`AGCTL_FAKE_CODEX_` is outside the array for a different reason: it is only ever a
+`starts_with` argument, so no build carries it as a string at all and an artifact grep
+could not fail for it. `scripts/phase3-greps.sh` guards it with a source rule,
+`fake_prefix`, that pins the single spelling and the `#[cfg(feature = "testing")]`
+directly above it. The drop check's prefix has a second guard of the same shape,
+`receipt_check`, **as well as** its entry in the array above.
 
 ## The documentation gates
 

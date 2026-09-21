@@ -331,6 +331,39 @@ pub fn assert_no_needle(test: &str, what: &str, text: &[u8], needles: &[Needle])
     }
 }
 
+/// The unaudited-receipt drop check's panic prefix, as the binary prints it.
+///
+/// Spelled here a second time on purpose: `tests/` is not compiled into the
+/// crate, so it cannot reach `UNAUDITED_RECEIPT` in `auth_store.rs`. The two
+/// spellings are held together by `scripts/release-gate.sh`, whose absent-seam
+/// entry is this same string — a drift in the source spelling makes the gate
+/// look for a string no build carries, and the gate's own plant-and-prove
+/// half reports it.
+const UNAUDITED_RECEIPT: &str = "agctl unaudited write receipt";
+
+/// Panics if `stderr` carries the unaudited-receipt line.
+///
+/// The dev profile is `panic = "abort"`, so a receipt the real binary drops
+/// before `codex::audit::append` shows up as this line plus exit 134. A test
+/// asserting a successful run already fails on the status; one asserting a
+/// refusal would not, and would report a wrong exit code rather than the
+/// invariant that broke. This names it instead.
+///
+/// [`checked`] calls it, and so must every Codex e2e launch that does not go
+/// through `checked` — a test that reads only an exit status would otherwise
+/// be a hole in the one guard this invariant has left. The C2-a request
+/// carries the table of every launch and which of the two routes it takes.
+pub fn assert_receipts_were_audited(test: &str, stderr: &[u8]) {
+    let hit = stderr
+        .windows(UNAUDITED_RECEIPT.len())
+        .position(|window| window == UNAUDITED_RECEIPT.as_bytes());
+    if let Some(at) = hit {
+        let tail = String::from_utf8_lossy(&stderr[at..]);
+        let line = tail.lines().next().unwrap_or_default();
+        panic!("{test}: the binary dropped a Codex write receipt before the audit log: {line}");
+    }
+}
+
 /// Asserts neither stream of `output` carries a needle, then copies the
 /// `keep` streams to `AGCTL_E2E_TRACE_DIR/<prefix>-<test>.<stream>` when that
 /// directory is named. Every e2e crate's `checked` is this one.
@@ -343,6 +376,7 @@ pub fn checked(
 ) -> Output {
     assert_no_needle(test, "stdout", &output.stdout, needles);
     assert_no_needle(test, "stderr", &output.stderr, needles);
+    assert_receipts_were_audited(test, &output.stderr);
     if let Some(dir) = std::env::var_os("AGCTL_E2E_TRACE_DIR") {
         let dir = PathBuf::from(dir);
         for stream in keep {

@@ -174,6 +174,10 @@ const CLASSES: [&str; 11] = [
 /// caller whose write has already landed logs the failure at `warn` and marks
 /// the row `audit log refused`; the write stands (plan AC117).
 pub fn append(paths: &Paths, receipt: WriteReceipt) -> Result<(), AppError> {
+    // First, before anything here can fail: the receipt has reached the log,
+    // which is what the `testing`-only drop check asks. A refused entry below
+    // leaves the write standing, so the receipt is audited either way.
+    receipt.reached_audit();
     let outcome = match receipt.kind() {
         WriteKind::RefreshApplied => CodexOutcome::Applied,
         WriteKind::RefreshSavedToPending => CodexOutcome::SavedToPending,
