@@ -311,7 +311,10 @@ fn confirm_overwrite(shown: &str, stdin_is_tty: bool, io: &mut dyn Prompt) -> Re
     if !stdin_is_tty {
         return Err(AppError::Refused {
             reason: format!(
-                "`{shown}` is already logged in and standard input is not a terminal, so there                  is nobody to confirm replacing its stored grant; the grant agctl holds was left                  alone. Run this from a terminal, or `agctl codex accounts remove {shown}` first"
+                "`{shown}` is already logged in and standard input is not a terminal, so \
+                 there is nobody to confirm replacing its stored grant; the grant agctl holds \
+                 was left alone. Run this from a terminal, or `agctl codex accounts remove \
+                 {shown}` first"
             ),
         });
     }

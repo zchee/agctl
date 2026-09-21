@@ -259,6 +259,23 @@ pub fn clean_survey() -> crate::provider::codex::proof::ScratchSurvey {
     }
 }
 
+/// A [`PostExitReport`](crate::provider::codex::proof::PostExitReport) for a
+/// child that exited with `code` and left the scratch home spotless.
+///
+/// `PostExitReport::from_child` is `pub(super)` and `commands/` cannot reach
+/// it (AC122 clause 7, `phase3-structural.sh`), so a command-side test that
+/// needs one builds it here — the same reason `clean_survey` lives here, and
+/// with the same caveat: "the child left nothing behind" is a claim, and a
+/// fixture is the only place it should be cheap to make.
+pub fn clean_report(code: i32) -> crate::provider::codex::proof::PostExitReport {
+    crate::provider::codex::proof::PostExitReport::from_child(
+        Vec::new(),
+        Vec::new(),
+        clean_survey(),
+        exit_status(code),
+    )
+}
+
 /// A survey that differs from a clean one only where `edit` says, by field name.
 ///
 /// Named, not positional: four arguments of two adjacent `Vec<PathBuf>` and
