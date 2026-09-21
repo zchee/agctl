@@ -549,7 +549,7 @@ fn the_carrier_closure_is_a_fixed_point_not_a_pass_count() {
          struct Cb { a: Option<Box<Ca>>, r: WriteReceipt }\n\
          struct Na { b: Box<Nb> }\n\
          struct Nb { a: Box<Na> }\n\
-                  struct Borrowing<'r> { r: &'r WriteReceipt }\n\
+         struct Borrowing<'r> { r: &'r WriteReceipt }\n\
          use self::Renamed as Renamed2;\n\
          use crate::provider::codex::auth_store::WriteReceipt as Renamed;\n\
          struct Zz { r: Renamed }\n\

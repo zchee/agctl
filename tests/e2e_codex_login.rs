@@ -120,35 +120,56 @@ fn checked(name: &str, output: Output) -> Output {
 fn checked_reports_a_needle_by_name_and_offset_never_by_value() {
     use std::os::unix::process::ExitStatusExt;
 
-    let leaky = Output {
-        status: std::process::ExitStatus::from_raw(0),
-        stdout: format!("before {REFRESH_TOKEN} after").into_bytes(),
-        stderr: Vec::new(),
+    let refused = |test: &str, stdout: String, stderr: String| {
+        let leaky = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.into_bytes(),
+            stderr: stderr.into_bytes(),
+        };
+        // The `;` makes the closure return `()`: when `checked` does NOT
+        // refuse, `expect_err` prints that `()`, never the `Output` (both
+        // streams, the needle included).
+        let report = std::panic::catch_unwind(|| {
+            codex::checked("e2e_codex_login", test, leaky, &NEEDLES, &[]);
+        })
+        .expect_err("a stream carrying a needle is refused");
+        report
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| report.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+            .unwrap_or_default()
     };
-    let report = std::panic::catch_unwind(|| {
-        codex::checked("e2e_codex_login", "positive-control", leaky, &NEEDLES, &[])
-    })
-    .expect_err("a stream carrying a needle is refused");
-    let message = report
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| report.downcast_ref::<&str>().map(|text| (*text).to_owned()))
-        .unwrap_or_default();
-    assert!(
-        message.contains("stdout carries the needle `the refresh token` at byte 7"),
-        "{message:?}"
+    // The whole report is pinned: it names the test, the stream, the
+    // needle's NAME and its offset, and nothing else — not the value, not
+    // the text around it. Each value guard runs BEFORE its `assert_eq!`,
+    // whose failure would print the report.
+    let first = refused("positive-control", format!("before {REFRESH_TOKEN} after"), String::new());
+    assert!(!first.contains(REFRESH_TOKEN), "the report printed the needle's value");
+    assert_eq!(first, "positive-control: stdout carries the needle `the refresh token` at byte 7");
+    // stderr is scanned too, not only stdout.
+    let on_stderr =
+        refused("positive-control-stderr", "clean".to_owned(), format!("x {JWT_SIGNATURE} y"));
+    assert!(!on_stderr.contains(JWT_SIGNATURE), "the report printed the needle's value");
+    assert_eq!(
+        on_stderr,
+        "positive-control-stderr: stderr carries the needle `the JWT signature` at byte 2"
     );
-    assert!(!message.contains(REFRESH_TOKEN), "the report printed the needle's value");
-    assert!(!message.contains("before"), "the report printed the stream");
+    // Every needle is scanned, not only the first: the LAST one alone.
+    let last = refused("positive-control-last", "abc bearer xyz".to_owned(), String::new());
+    assert_eq!(
+        last,
+        "positive-control-last: stdout carries the needle `a bearer header` at byte 4"
+    );
 
-    // The twin: a clean stream passes and comes back unchanged.
+    // The twin: clean streams pass and come back unchanged.
     let clean = Output {
         status: std::process::ExitStatus::from_raw(0),
         stdout: b"nothing to see".to_vec(),
-        stderr: Vec::new(),
+        stderr: b"nor here".to_vec(),
     };
     let back = codex::checked("e2e_codex_login", "positive-control-clean", clean, &NEEDLES, &[]);
     assert_eq!(back.stdout, b"nothing to see");
+    assert_eq!(back.stderr, b"nor here");
 }
 
 /// Runs `agctl codex login` through [`checked`].

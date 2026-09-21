@@ -1166,19 +1166,23 @@ fn spawn_with(fixture: &CodexFixture, args: &[&str], env: &[(&str, &str)]) -> st
         .expect("the binary runs")
 }
 
-/// Waits for `ready`, signals the child, and reaps it. Never leaves a child
+/// Waits for `marker` to exist, signals the child, and reaps it. Never leaves a child
 /// behind: a signal that does not land is followed by a kill.
 fn signal_when(
     child: &mut std::process::Child,
     signal: rustix::process::Signal,
     what: &str,
-    ready: impl Fn() -> bool,
+    marker: &Path,
 ) -> std::process::ExitStatus {
     let start = std::time::Instant::now();
-    while !ready() && start.elapsed() < std::time::Duration::from_secs(10) {
+    while !marker.exists() && start.elapsed() < std::time::Duration::from_secs(10) {
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    assert!(ready(), "{what}: the pass never reached the point this test signals at");
+    assert!(
+        marker.exists(),
+        "{what}: the pass never reached the point this test signals at ({} never appeared)",
+        marker.display()
+    );
     let pid =
         rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("a pid fits in an i32"))
             .expect("a live pid");
@@ -1196,6 +1200,24 @@ fn signal_when(
             None => std::thread::sleep(std::time::Duration::from_millis(5)),
         }
     }
+}
+
+/// N-1's twin: a wait that never sees its marker fails with a message that
+/// names the marker path (10 s: the helper's only wait). The helper panics
+/// before it signals, so the test reaps its own child.
+#[test]
+fn a_failed_wait_names_the_marker_it_waited_for() {
+    let fixture = CodexFixture::new();
+    let marker = fixture.root().join("never.reached");
+    let mut child = std::process::Command::new("sleep").arg("30").spawn().expect("sleep runs");
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        signal_when(&mut child, rustix::process::Signal::TERM, "n1-twin", &marker);
+    }));
+    let _ = child.kill();
+    let _ = child.wait();
+    let report = failed.expect_err("a marker that never appears fails the wait");
+    let text = report.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(text.contains(&marker.display().to_string()), "the failure names the marker: {text}");
 }
 
 /// The staged `<name>.tmp.<8hex>` files in the owned namespace.
@@ -1234,8 +1256,7 @@ fn interrupted_before_rename(
         &["codex", "status", "--account", USER],
         &[("AGCTL_FAULT", "pause_codex_before_rename"), ("AGCTL_FAULT_RESUME", &resume_env)],
     );
-    let at_pause = || reached.exists();
-    signal_when(&mut child, signal, what, at_pause)
+    signal_when(&mut child, signal, what, &reached)
 }
 
 #[test]

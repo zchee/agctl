@@ -32,6 +32,16 @@ type Source = (String, String);
 
 /// Every `.rs` file under `src/`.
 fn tree() -> Vec<Source> {
+    let out = tree_at(Path::new(env!("CARGO_MANIFEST_DIR")));
+    assert!(
+        out.iter().any(|(path, _)| path == "src/provider/codex/auth_store.rs"),
+        "the scan found the tree"
+    );
+    out
+}
+
+/// Every `.rs` file under `<root>/src/`, paths relative to `root`.
+fn tree_at(root: &Path) -> Vec<Source> {
     fn walk(dir: &Path, root: &Path, out: &mut Vec<Source>) {
         let mut entries: Vec<_> = fs::read_dir(dir)
             .unwrap_or_else(|err| panic!("read_dir {}: {err}", dir.display()))
@@ -60,14 +70,37 @@ fn tree() -> Vec<Source> {
             }
         }
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut out = Vec::new();
     walk(&root.join("src"), root, &mut out);
-    assert!(
-        out.iter().any(|(path, _)| path == "src/provider/codex/auth_store.rs"),
-        "the scan found the tree"
-    );
     out
+}
+
+/// The scan refuses a symlink under `src/` rather than follow it; the twin
+/// shows the same tree without the link is read. The real `src/` is never
+/// written: the tree is a temporary directory.
+#[test]
+fn the_scan_refuses_a_symlink_inside_src() {
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let src = root.path().join("src");
+    fs::create_dir(&src).expect("src/ is created");
+    fs::write(src.join("a.rs"), "fn a() {}\n").expect("a.rs is written");
+
+    let clean = tree_at(root.path());
+    assert_eq!(clean, vec![("src/a.rs".to_owned(), "fn a() {}\n".to_owned())]);
+
+    let link = src.join("b.rs");
+    std::os::unix::fs::symlink(src.join("a.rs"), &link).expect("the symlink is made");
+    let refused = std::panic::catch_unwind(|| tree_at(root.path()))
+        .expect_err("a symlink inside src/ is refused");
+    let message = refused
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| refused.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+        .unwrap_or_default();
+    assert_eq!(
+        message,
+        format!("{} is a symlink inside src/; the scan refuses it", link.display())
+    );
 }
 
 fn is_test_file(path: &str) -> bool {
@@ -372,6 +405,15 @@ fn violations(sources: &[Source], parsed: &[&Parsed]) -> Vec<String> {
                 rest = &rest[at + variant.len()..];
             }
         }
+        // Textual, so it both misses and over-reports (C1b-3b, carried to
+        // C1b-3c): it reads the nearest `let (` BEFORE the call, in this fn
+        // or an earlier one. Misses: a binding that is not `let (` —
+        // `let Ok((d, _, e)) = ns.resolve_pending(c) else { … };` — and a
+        // `let (x, y)` nested in the initializer, which is read instead of
+        // the outer `let (d, _, e) = { …; ns.resolve_pending(c)? };`.
+        // Over-reports: a call with no `let (` of its own takes an earlier
+        // fn's `let (a, _b, …)`. R6c (R6d for a statement) reports each;
+        // shown by rows R6b-probe-1..5.
         let mut rest = code.as_str();
         while let Some(at) = rest.find(".resolve_pending(") {
             let offset = code.len() - rest.len() + at;
@@ -413,6 +455,13 @@ fn violations(sources: &[Source], parsed: &[&Parsed]) -> Vec<String> {
     // type exists to prevent. (8b) It has no `Default`, derived or written.
     found.extend(survey_violations(parsed));
 
+    // No finding names line 0 (round 2, F-3): `file:0` is no place to look.
+    // Every plant, legitimate shape and the real tree pass through here.
+    for finding in &found {
+        let place = finding.split_once(": ").and_then(|(_, rest)| rest.split(": ").next());
+        let number = place.and_then(|at| at.rsplit_once(':')).map(|(_, n)| n.parse::<usize>());
+        assert!(!matches!(number, Some(Ok(0))), "a finding names line 0: {finding}");
+    }
     found
 }
 
@@ -750,6 +799,11 @@ fn the_receipt_rule_follows_every_real_receipt_binding() {
         ("src/provider/codex/refresh.rs:drive:resolved", 1, 0),
         ("src/provider/codex/refresh.rs:drive:receipt", 2, 2),
         ("src/provider/codex/refresh.rs:applied:receipt", 4, 4),
+        // `drive`'s outer receipt is accounted for by `if let Some(receipt) =
+        // receipt`: its HEAD is scanned. That `let` only moves the receipt in,
+        // so the chain face does not run there (round 2, F-1): no real site
+        // has a producing chain `let`, and the chain face has no row here.
+        ("src/provider/codex/refresh.rs:drive:receipt:head", 0, 1),
     ];
     // A floor, not an exact count (round-2 ruling A7). Visiting a site is
     // not checking it: the second list is pushed ONLY where the statement
@@ -819,24 +873,23 @@ fn a_ref_binding_of_a_receipt_is_a_drop() {
         .collect();
     let found = violations(&sources, &parsed);
     assert!(
-        found.iter().any(
-            |line| line.starts_with("R6c: ") && line.contains("binds it by reference as `got`")
-        ),
+        found.iter().any(|line| line.starts_with("R6c: ")
+            && line.contains("binds it by reference as `got` (bind it by value)")),
         "a `ref` binding was not reported as a drop: {found:?}"
     );
 }
 
 /// How a plant changes a real file.
-enum Edit {
+enum Edit<'a> {
     /// Appends one item (or several) at the end of the file.
-    Append(&'static str),
+    Append(&'a str),
     /// Replaces exactly one occurrence of the first text with the second.
-    Replace(&'static str, &'static str),
+    Replace(&'a str, &'a str),
 }
 
 /// A copy of `base` with `edit` applied to `file`, which must exist: a plant
 /// proves a rule only against a file that already has legitimate content.
-fn planted(base: &[Source], file: &str, edit: &Edit) -> Vec<Source> {
+fn planted(base: &[Source], file: &str, edit: &Edit<'_>) -> Vec<Source> {
     let mut sources = base.to_vec();
     let Some((_, text)) = sources.iter_mut().find(|(path, _)| path == file) else {
         panic!("the plant target {file} does not exist: a plant must go INTO a real file");
@@ -872,7 +925,7 @@ fn every_rule_reports_its_plant() {
     // Includes the plan's named plant: a `from_locked_read` call in
     // `provider/codex/discovery.rs`, which compiles and must fail this test.
     let (base, base_parsed) = parsed_tree();
-    let plants: [(&str, &str, &str, Edit); 69] = [
+    let plants: [(&str, &str, &str, Edit<'static>); 115] = [
         (
             "discovery from_locked_read",
             "R2",
@@ -1255,6 +1308,372 @@ fn every_rule_reports_its_plant() {
                 "            Ok(CodexWrite::Landed { receipt, .. }) if plant_guard()? => {\n",
             ),
         ),
+        // Round C1b-3b: the HEAD of the statement that accounts for a live
+        // receipt (an `if`/`while` condition, a `match` scrutinee), and the
+        // operands of a let chain after a `let` that PRODUCES one.
+        (
+            "P-if: an exit in the head of the if that audits",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_ok()? {\n        audit::append(p, receipt)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "P-match: an exit in the scrutinee of the match that audits",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    match review_step()? {\n        _ => audit::append(p, receipt)?,\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "P-while: an exit in the condition of the loop that audits",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    while review_ok()? {\n        audit::append(p, receipt)?;\n        break;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "P-if with the receipt inside a carrier struct",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "struct PlantGot {\n    receipt: WriteReceipt,\n}\nfn plant_make() -> PlantGot {\n    todo!()\n}\nfn p(p: &Paths) -> Result<(), AppError> {\n    let got = plant_make();\n    if review_ok()? {\n        audit::append(p, got.receipt)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "K-h: an exit right of the let that produces the receipt, in an if",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    if let Ok((receipt, _)) = i.install(f) && review_ok()? {\n        audit::append(p, receipt)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "K-h: an exit right of the let that produces the receipt, in a while",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    while let Ok((receipt, _)) = i.install(f) && review_ok()? {\n        audit::append(p, receipt)?;\n        break;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "a block operand that exits after the producing let",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    if let Ok((receipt, _)) = i.install(f) && {\n        if review_c() {\n            return Ok(());\n        }\n        true\n    } {\n        audit::append(p, receipt)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "an exit two operands after the producing let",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    if let Ok((receipt, _)) = i.install(f) && review_a() && review_b()? {\n        audit::append(p, receipt)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "an exit in a parenthesised operand after the producing let",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    if let Ok((receipt, _)) = i.install(f) && (review_ok()?) {\n        audit::append(p, receipt)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "K-h+ on the real drive: an exit LEFT of the let that moves the receipt in",
+            "R6e",
+            "src/provider/codex/refresh.rs",
+            Edit::Replace(
+                "        if let Some(receipt) = receipt {",
+                "        if plant_ok()? && let Some(receipt) = receipt {",
+            ),
+        ),
+        (
+            "LC-real-if on the real drive: an exit right of the let that moves the receipt in",
+            "R6e",
+            "src/provider/codex/refresh.rs",
+            Edit::Replace(
+                "        if let Some(receipt) = receipt {",
+                "        if let Some(receipt) = receipt && plant_ok()? {",
+            ),
+        ),
+        (
+            "an exit in the moving-in let's own initializer",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if let (Some(r), _) = (Some(receipt), review_step()?) {\n        audit::append(p, r)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "a while whose head exits left of the let that moves the receipt in",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    let slot = Some(receipt);\n    while review_ok()? && let Some(r) = slot {\n        audit::append(p, r)?;\n        break;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "an if with an exiting head BETWEEN the receipt and its audit (the statement scan)",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_step()? {\n        plant_log();\n    }\n    audit::append(p, receipt)?;\n    Ok(())\n}",
+            ),
+        ),
+        // Round C1b-3b: the descent into the body of the statement that
+        // holds the use (the lead's ruling of 21:12).
+        (
+            "descent: an exit in the then-body before the use",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_c() {\n        review_step()?;\n        audit::append(p, receipt)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "descent: an exit in the else body before the use",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_c() {\n        plant_log();\n    } else {\n        review_step()?;\n        audit::append(p, receipt)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "descent: an exit in an else-if head",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_c() {\n        plant_log();\n    } else if review_ok()? {\n        audit::append(p, receipt)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "descent: an exit nested twice",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_a() {\n        if review_b() {\n            review_step()?;\n            audit::append(p, receipt)?;\n        }\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "descent: an exit in a match arm block on a non-receipt scrutinee",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    match plant_kind() {\n        _ => {\n            review_step()?;\n            audit::append(p, receipt)?;\n        }\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "descent: an exit in a while body before the use",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    while review_c() {\n        review_step()?;\n        audit::append(p, receipt)?;\n        break;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "descent: an exit in a loop body before the use",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    loop {\n        review_step()?;\n        audit::append(p, receipt)?;\n        break;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "descent: an exit in a let initializer's if body",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    let k = if review_c() {\n        review_step()?;\n        audit::append(p, receipt)?;\n        1\n    } else {\n        0\n    };\n    plant_use(k);\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "descent: an exit in a bare block before the use",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    {\n        review_step()?;\n        audit::append(p, receipt)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "descent: an exit in the then-body before a carrier's field is audited",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "struct PlantGot {\n    receipt: WriteReceipt,\n}\nfn plant_make() -> PlantGot {\n    todo!()\n}\nfn p(p: &Paths) -> Result<(), AppError> {\n    let got = plant_make();\n    if review_c() {\n        review_step()?;\n        audit::append(p, got.receipt)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        // Round C1b-3b, K-i: what is moved out of a `&mut` parameter.
+        (
+            "K-i: a receipt taken out of a &mut parameter and dropped",
+            "R6c",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>) {\n    let x = r.take();\n    drop(x);\n}",
+            ),
+        ),
+        (
+            "K-i: std::mem::take on a &mut parameter, never audited",
+            "R6c",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>) {\n    let x = std::mem::take(r);\n    drop(x);\n}",
+            ),
+        ),
+        (
+            "K-i: mem::replace on a &mut parameter, never audited",
+            "R6c",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>) {\n    let x = mem::replace(r, None);\n    drop(x);\n}",
+            ),
+        ),
+        (
+            "K-i: an exit right of a let that takes the receipt out of a &mut parameter",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>, p: &Paths) -> Result<(), AppError> {\n    if let Some(x) = r.take() && review_ok()? {\n        audit::append(p, x)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "K-i: an exit between the take and the audit",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>, p: &Paths) -> Result<(), AppError> {\n    let x = r.take();\n    review_step()?;\n    if let Some(x) = x {\n        audit::append(p, x)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        // Round C1b-3b, F1: a statement whose value carries a receipt drops
+        // it (`#[must_use]` does not look through `Option`).
+        (
+            "F1: a resolve_pending statement drops the receipt in its tuple",
+            "R6d",
+            "src/provider/codex/refresh.rs",
+            Edit::Append(
+                "fn p(ns: &OwnedNamespace<'_>, c: &Cancel) -> Result<(), AppError> {\n    ns.resolve_pending(c)?;\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "F1: r.take(); on a &mut parameter",
+            "R6d",
+            "src/commands/codex/login.rs",
+            Edit::Append("fn p(r: &mut Option<WriteReceipt>) {\n    r.take();\n}"),
+        ),
+        (
+            "F1: std::mem::take(r); on a &mut parameter",
+            "R6d",
+            "src/commands/codex/login.rs",
+            Edit::Append("fn p(r: &mut Option<WriteReceipt>) {\n    std::mem::take(r);\n}"),
+        ),
+        (
+            "F1: std::mem::replace(r, None); on a &mut parameter",
+            "R6d",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>) {\n    std::mem::replace(r, None);\n}",
+            ),
+        ),
+        (
+            "F1: a match statement whose arm yields the receipt",
+            "R6d",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, c: bool) -> Result<(), AppError> {\n    match c {\n        true => i.install(f).map_err(refused)?,\n        false => return Ok(()),\n    };\n    Ok(())\n}",
+            ),
+        ),
+        // Round C1b-3b r2, F-1: a `let` that only moves the receipt in is the
+        // HEAD face's, not the chain's.
+        (
+            "D1: an exit right of a let that moves the receipt in, in an if",
+            "R6e",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if let Some(r2) = Some(receipt) && review_ok()? {\n        audit::append(p, r2)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        // Round C1b-3b r2, F-4: every one-line form of moving a receipt out
+        // of a `&mut` parameter.
+        (
+            "K-i: r.replace(x) on a &mut parameter, never audited",
+            "R6c",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>) {\n    let old = r.replace(plant_new());\n    drop(old);\n}",
+            ),
+        ),
+        (
+            "K-i: r.take_if(f) on a &mut parameter, never audited",
+            "R6c",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>) {\n    let x = r.take_if(|_| true);\n    drop(x);\n}",
+            ),
+        ),
+        (
+            "K-i: Option::take(r) on a &mut parameter, never audited",
+            "R6c",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>) {\n    let x = Option::take(r);\n    drop(x);\n}",
+            ),
+        ),
+        (
+            "K-i: Option::replace(r, x) on a &mut parameter, never audited",
+            "R6c",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>) {\n    let x = Option::replace(r, plant_new());\n    drop(x);\n}",
+            ),
+        ),
+        (
+            "K-i: an imported take(r) on a &mut parameter, never audited",
+            "R6c",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>) {\n    let x = take(r);\n    drop(x);\n}",
+            ),
+        ),
+        (
+            "K-i: an imported replace(r, x) on a &mut parameter, never audited",
+            "R6c",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>) {\n    let x = replace(r, None);\n    drop(x);\n}",
+            ),
+        ),
+        (
+            "K-i: mem::take(&mut *r) on a &mut parameter, never audited",
+            "R6c",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>) {\n    let x = std::mem::take(&mut *r);\n    drop(x);\n}",
+            ),
+        ),
+        (
+            "K-i: mem::replace(&mut *r, x) on a &mut parameter, never audited",
+            "R6c",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>) {\n    let x = std::mem::replace(&mut *r, None);\n    drop(x);\n}",
+            ),
+        ),
+        (
+            "K-i: r.replace(x); as a statement",
+            "R6d",
+            "src/commands/codex/login.rs",
+            Edit::Append("fn p(r: &mut Option<WriteReceipt>) {\n    r.replace(plant_new());\n}"),
+        ),
+        (
+            "K-i: Option::take(r); as a statement",
+            "R6d",
+            "src/commands/codex/login.rs",
+            Edit::Append("fn p(r: &mut Option<WriteReceipt>) {\n    Option::take(r);\n}"),
+        ),
         (
             // Round 3, A3: a `&mut` getter to a carrier stays a producer.
             "a receipt taken out through a &mut getter",
@@ -1432,6 +1851,21 @@ fn every_rule_reports_its_plant() {
                 "#[derive(Debug, Default)]\npub struct ScratchSurvey {",
             ),
         ),
+        (
+            // Round 4, F-1r3: the shape the `fields.is_empty()` guard of
+            // `flows` exists to keep reported, on the `call_takes` side.
+            // Struct-update moves from the base only the fields the literal
+            // does NOT name, so `w.r` never reaches the audit; following the
+            // operand here would read the call as an audit of `w` and drop
+            // the receipt in silence. Removing the guard makes this plant
+            // unreported, which is what `M-flows-rest-guard-off` shows.
+            "a struct update beside a named field is not an audit of its base",
+            "R6c",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "struct Pair {\n    r: Option<WriteReceipt>,\n    n: u8,\n}\n\nfn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    let w = Pair { r: Some(receipt), n: 0 };\n    audit::append(p, (Pair { r: None, ..w }))?;\n    Ok(())\n}",
+            ),
+        ),
     ];
     let mut missed = Vec::new();
     for (name, rule, file, edit) in &plants {
@@ -1458,6 +1892,614 @@ fn every_rule_reports_its_plant() {
         }
     }
     assert!(missed.is_empty(), "plants not reported by their rule:\n{}", missed.join("\n"));
+}
+
+/// The plant harness asks only whether SOME R6e names the file; this pins
+/// the EXACT findings of every R6e face — how many, and which face reports
+/// each (head, chain, the audit call's arguments, the statement scan and its
+/// descent) — so a scan that runs twice, or an exit that two faces report,
+/// fails here (round 2, F-B2).
+#[test]
+fn every_r6e_exit_is_reported_once_by_its_own_face() {
+    const HEAD: &str = "in the head of the statement";
+    const CHAIN: &str = "later in the let chain";
+    const CALL: &str = "inside the call that takes the receipt";
+    let (base, base_parsed) = parsed_tree();
+    let tests: [(&str, &str, Edit<'static>, &[&str]); 30] = [
+        (
+            "an exit in the audit call's arguments inside a nested body",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_c() {\n        audit::append(plant_paths()?, receipt)?;\n    }\n    Ok(())\n}",
+            ),
+            &[CALL],
+        ),
+        (
+            "a head let that moves the receipt in, the exit in the body before the use",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    let r = Some(receipt);\n    if let Some(r2) = r {\n        review_step()?;\n        audit::append(p, r2)?;\n    }\n    Ok(())\n}",
+            ),
+            &["`?` can leave before the receipt `r2`"],
+        ),
+        (
+            "an exit nested twice",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_a() {\n        if review_b() {\n            review_step()?;\n            audit::append(p, receipt)?;\n        }\n    }\n    Ok(())\n}",
+            ),
+            &["`?` can leave before the receipt `receipt`"],
+        ),
+        (
+            "LC-real-if: an exit right of the let that moves the receipt in, on the real drive",
+            "src/provider/codex/refresh.rs",
+            Edit::Replace(
+                "        if let Some(receipt) = receipt {",
+                "        if let Some(receipt) = receipt && plant_ok()? {",
+            ),
+            &[HEAD],
+        ),
+        (
+            "P-if: an exit in the head of the if that audits",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_ok()? {\n        audit::append(p, receipt)?;\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD],
+        ),
+        (
+            "K-h: an exit right of the let that produces the receipt",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    if let Ok((r, _)) = i.install(f) && review_ok()? {\n        audit::append(p, r)?;\n    }\n    Ok(())\n}",
+            ),
+            &[CHAIN],
+        ),
+        (
+            "K-i: an exit right of the let that takes the receipt out of a &mut parameter",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>, p: &Paths) -> Result<(), AppError> {\n    if let Some(x) = r.take() && review_ok()? {\n        audit::append(p, x)?;\n    }\n    Ok(())\n}",
+            ),
+            &[CHAIN],
+        ),
+        (
+            "D1: an exit right of a let that moves the receipt in, in an if",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if let Some(r2) = Some(receipt) && review_ok()? {\n        audit::append(p, r2)?;\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD],
+        ),
+        (
+            "D2: the same in a while let",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    let slot = Some(receipt);\n    while let Some(r2) = slot && review_ok()? {\n        audit::append(p, r2)?;\n        break;\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD],
+        ),
+        (
+            "D7: the same nested in a descended body",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_c() {\n        if let Some(r2) = Some(receipt) && review_ok()? {\n            audit::append(p, r2)?;\n        }\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD],
+        ),
+        (
+            "D14: a block operand that exits right of a moving-in let",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if let Some(r2) = Some(receipt) && {\n        if review_c() {\n            return Ok(());\n        }\n        true\n    } {\n        audit::append(p, r2)?;\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD],
+        ),
+        (
+            "S16: an else-if head that moves the receipt in, the exit right of it",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_c() {\n        plant_log();\n    } else if let Some(r2) = Some(receipt) && review_ok()? {\n        audit::append(p, r2)?;\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD],
+        ),
+        (
+            "D12: an exit before the audit call in the same head operand",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_ok()? || audit::append(p, receipt).is_ok() {\n        plant_log();\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD],
+        ),
+        (
+            "D3: an exit in the audit call's arguments in an if head",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if audit::append(plant_paths()?, receipt).is_ok() {\n        plant_log();\n    }\n    Ok(())\n}",
+            ),
+            &[CALL],
+        ),
+        (
+            "D4: the same in a match scrutinee",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    match audit::append(plant_paths()?, receipt) {\n        Ok(()) => {}\n        Err(e) => plant_warn(e),\n    }\n    Ok(())\n}",
+            ),
+            &[CALL],
+        ),
+        (
+            "D5: the same in an if-let head",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if let Ok(()) = audit::append(plant_paths()?, receipt) {\n        plant_log();\n    }\n    Ok(())\n}",
+            ),
+            &[CALL],
+        ),
+        (
+            "D6: the same nested in a descended body",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_c() {\n        if audit::append(plant_paths()?, receipt).is_ok() {\n            plant_log();\n        }\n    }\n    Ok(())\n}",
+            ),
+            &[CALL],
+        ),
+        (
+            "D9: the same in an else-if head",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_c() {\n        plant_log();\n    } else if audit::append(plant_paths()?, receipt).is_ok() {\n        plant_log();\n    }\n    Ok(())\n}",
+            ),
+            &[CALL],
+        ),
+        (
+            "S5: the same in a while head",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    while audit::append(plant_paths()?, receipt).is_ok() {\n        break;\n    }\n    Ok(())\n}",
+            ),
+            &[CALL],
+        ),
+        (
+            "D10: the same in an arm-expression if",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    let slot = Some(receipt);\n    match slot {\n        Some(r) => if audit::append(plant_paths()?, r).is_ok() {\n            plant_log();\n        },\n        None => {}\n    }\n    Ok(())\n}",
+            ),
+            &[CALL],
+        ),
+        (
+            "D11: a moving-in let, then a producing let, then the exit",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if let Some(a) = Some(receipt) && let Ok((b, _)) = i.install(f) && review_ok()? {\n        audit::append(p, a)?;\n        audit::append(p, b)?;\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD, CHAIN, "`?` can leave before the receipt `b`"],
+        ),
+        (
+            "A3: one let that both moves in and produces (a written residual)",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if let (Some(a), Ok((b, _))) = (Some(receipt), i.install(f)) && review_ok()? {\n        audit::append(p, a)?;\n        plant_log();\n        audit::append(p, b)?;\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD, CHAIN, CHAIN, "`?` can leave before the receipt `b`"],
+        ),
+        (
+            "F-2a: the audit on one branch of an if in the head, an exit on the other",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if (if review_c() { audit::append(p, receipt).is_ok() } else { review_ok()? }) {\n        plant_log();\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD],
+        ),
+        (
+            "F-2b: the audit right of ||, an exit after the operator",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if (review_c() || audit::append(p, receipt).is_ok()) && review_ok()? {\n        plant_log();\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD],
+        ),
+        (
+            "F-2c: the audit in one arm of a match in the head, an exit in another",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if match review_k() {\n        0 => audit::append(p, receipt).is_ok(),\n        _ => review_ok()?,\n    } {\n        plant_log();\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD],
+        ),
+        (
+            "F-1r2 match: an exit right of a let that moves the receipt in through a match",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if let Some(r2) = match review_k() { _ => Some(receipt) } && review_ok()? {\n        audit::append(p, r2)?;\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD],
+        ),
+        (
+            "F-1r2 if: an exit right of a let that moves the receipt in through an if",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if let Some(r2) = if review_c() { Some(receipt) } else { None } && review_ok()? {\n        audit::append(p, r2)?;\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD],
+        ),
+        (
+            // Round 4, F-1r3, the `walk_condition` side of the guard. The kind
+            // table's residual row could not measure this: only its CHAIN
+            // plant was built and the shared format string gave it no setup
+            // line, so `..w` named nothing. Here the base is LIVE. With the
+            // guard, `flows` refuses the operand, `moved_in` is false and the
+            // chain face takes the exit; without it the operand is followed,
+            // the head face reports `w` instead and this row goes red.
+            "the residual: a named field beside a struct-update operand keeps the base live",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "struct Pair {\n    r: Option<WriteReceipt>,\n    n: u8,\n}\n\nfn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    let w = Pair { r: Some(receipt), n: 0 };\n    if let Pair { r: Some(r2), .. } = (Pair { n: 1, ..w }) && review_ok()? {\n        audit::append(p, r2)?;\n    }\n    Ok(())\n}",
+            ),
+            &[CHAIN],
+        ),
+        (
+            // Round 4, F-A1r3: the OWN disjunct of `produces_in`'s `Struct`
+            // arm. `produces_in` is asked only where a live receipt moves in,
+            // and in a single literal the part it flows through is
+            // `carried`-Some, which falsifies that disjunct — so the pin must
+            // be NESTED. Here the tuple moves `receipt` in while `Wrap { r:
+            // None }` carries by its OWN type with no live part, which is the
+            // one case the disjunct decides: it makes the chain face run
+            // beside the head face.
+            "F-A1r3: a moved-in receipt beside a literal that carries by its own type",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "struct Wrap {\n    r: Option<WriteReceipt>,\n}\n\nfn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if let (Some(a), Wrap { r: Some(b) }) = (Some(receipt), Wrap { r: None }) && review_ok()? {\n        audit::append(p, a)?;\n        audit::append(p, b)?;\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD, CHAIN, CHAIN, "`?` can leave before the receipt `b`"],
+        ),
+        (
+            // Round 4, C-A1: the RELAY disjunct of the same arm, which the row
+            // above cannot reach. Here the literal carries because a PART of
+            // it produces (`r.take()` out of the `&mut` parameter), so the OWN
+            // disjunct is false and only the relay can make `produces_in`
+            // answer true for the tuple. The two rows separate the disjuncts:
+            // this one is red under `M-produces-struct-relay-off` and green
+            // under `M-produces-struct-own-off`, the row above the other way.
+            "C-A1: a moved-in receipt beside a literal whose own field produces",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "struct Wrap {\n    r: Option<WriteReceipt>,\n}\n\nfn p(i: InstallNamespace<'_>, f: &Fault, r: &mut Option<WriteReceipt>, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if let (Some(a), Wrap { r: Some(b) }) = (Some(receipt), Wrap { r: r.take() }) && review_ok()? {\n        audit::append(p, a)?;\n        audit::append(p, b)?;\n    }\n    Ok(())\n}",
+            ),
+            &[HEAD, CHAIN, CHAIN, "`?` can leave before the receipt `b`"],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, file, edit, faces) in &tests {
+        let sources = planted(&base, file, edit);
+        let replanted =
+            sources.iter().find(|(path, _)| path == file).map(syntax::parse_one).expect("planted");
+        let parsed: Vec<&Parsed> = base_parsed
+            .iter()
+            .map(|parsed| if parsed.path == *file { &replanted } else { parsed })
+            .collect();
+        let found: Vec<String> =
+            violations(&sources, &parsed).into_iter().filter(|line| line.contains(file)).collect();
+        // Only R6e is pinned here; another rule on the same shape (D10's
+        // `None =>` arm, R6c) is not this test's business.
+        let mut left: Vec<&String> =
+            found.iter().filter(|line| line.starts_with("R6e: ")).collect();
+        let mut missing = Vec::new();
+        for face in *faces {
+            match left.iter().position(|line| line.contains(face)) {
+                Some(index) => {
+                    left.remove(index);
+                }
+                None => missing.push(*face),
+            }
+        }
+        if !left.is_empty() || !missing.is_empty() {
+            wrong.push(format!(
+                "`{name}`: expected R6e faces {faces:?}; missing {missing:?}, extra {left:?}; found: {found:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "R6e findings are not exact:\n{}", wrong.join("\n"));
+}
+
+/// `produces_in` looks through every expression kind [`flows`] looks through
+/// (round 3, F-1r2). For each wrapper kind W, over one exit right of the
+/// `let`: an initializer that only MOVES the live `receipt` in through W
+/// belongs to the HEAD face alone, and one that PRODUCES a receipt through
+/// the same W to the CHAIN face alone. A kind that one function relays
+/// through while the other sends it to `carried` reads a pure move-in as
+/// producing, and that single exit is then reported twice, once per face.
+///
+/// The two halves do not pin the same thing, and this is measured rather than
+/// assumed (round 4). The HEAD half pins `produces_in` answering FALSE: force
+/// it to answer `true` and all 14 head cells report twice. The CHAIN half does
+/// not consult `produces_in` at all — nothing live moves into a producing
+/// initializer, so `walk_condition`'s `!moved_in ||` short-circuit gives the
+/// exit to the chain face and only `carried` has to see the producer through
+/// W; force `produces_in` to answer `false` and no cell here moves. Where
+/// `produces_in` answering TRUE is pinned is the mixed `let` of
+/// [`every_r6e_exit_is_reported_once_by_its_own_face`] — a `let` that moves a
+/// receipt in AND produces one — and the two nested rows there that separate
+/// the `Struct` arm's disjuncts.
+///
+/// Two kinds `flows` knows have no row, by reason and not by omission:
+/// `Expr::Group` has no source syntax — syn builds one only around an
+/// expression a macro captured, so no plant can write it — and `Expr::Path`
+/// is the base case both functions end on, not a wrapper.
+#[test]
+fn produces_in_looks_through_every_kind_flows_looks_through() {
+    const HEAD: &str = "in the head of the statement";
+    const CHAIN: &str = "later in the let chain";
+    // The wrapper types the `Struct` rows need; inert for every other row.
+    const WRAP: &str = "struct Wrap {\n    r: Option<WriteReceipt>,\n}\n\nstruct Shorthand {\n    receipt: WriteReceipt,\n}\n\n";
+    let (base, base_parsed) = parsed_tree();
+    let file = "src/commands/codex/login.rs";
+    // label, a statement before the `if let`, the `let` pattern, an
+    // initializer that only MOVES the live `receipt` in, an initializer that
+    // PRODUCES one out of `r`. An empty initializer means that face has no
+    // row for the kind, and the comment beside it says why.
+    let kinds: [(&str, &str, &str, &str, &str); 14] = [
+        ("Paren", "", "Some(r2)", "(Some(receipt))", "(r.take())"),
+        ("Try", "", "Some(r2)", "Some(receipt)?", "r.take()?"),
+        ("Await", "", "Some(r2)", "Some(receipt).await", "r.take().await"),
+        ("Tuple", "", "(Some(r2), _)", "(Some(receipt), 1)", "(r.take(), 1)"),
+        ("Array", "", "[Some(r2)]", "[Some(receipt)]", "[r.take()]"),
+        // A struct literal is illegal bare in scrutinee position (rustc and
+        // syn both refuse it: "struct literals are not allowed here"), so
+        // every `Struct` row writes it inside the parens BOTH functions look
+        // through — the `Struct` arm is still the arm under test. The three
+        // rows are the three ways a receipt enters a literal: a named field,
+        // a shorthand field, and the functional-update operand. Whether the
+        // literal's carrier-ness is its OWN or INHERITED is NOT decided here:
+        // `produces_in` is asked only where a live receipt moves in, and no
+        // single literal can combine that with carrying by its own type, so
+        // both disjuncts of the arm are pinned by the two nested rows of
+        // `every_r6e_exit_is_reported_once_by_its_own_face` instead (round 4,
+        // F-A1r3 and C-A1).
+        (
+            "Struct, a named field",
+            "",
+            "Wrap { r: Some(r2) }",
+            "(Wrap { r: Some(receipt) })",
+            "(Wrap { r: r.take() })",
+        ),
+        (
+            "Struct, a shorthand field",
+            "",
+            "Shorthand { receipt: r2 }",
+            "(Shorthand { receipt })",
+            // `r.take()` cannot be written shorthand: shorthand is a path.
+            "",
+        ),
+        (
+            "Struct, the update operand",
+            "    let w = Wrap { r: Some(receipt) };\n",
+            "Wrap { r: Some(r2) }",
+            "(Wrap { ..w })",
+            // No producing row here. A producing update operand is the
+            // residual, pinned outside this table by the exact-findings row
+            // `the residual: a named field beside a struct-update operand
+            // keeps the base live` and the plant `a struct update beside a
+            // named field is not an audit of its base`; a literal carrying
+            // by its own type is pinned by the nested rows `F-A1r3: a
+            // moved-in receipt beside a literal that carries by its own
+            // type` and `C-A1: a moved-in receipt beside a literal whose
+            // own field produces`.
+            "",
+        ),
+        ("Call", "", "Some(Some(r2))", "Some(Some(receipt))", "Some(r.take())"),
+        ("MethodCall", "", "Some(r2)", "Some(receipt).inspect(|_| ())", "r.take().inspect(|_| ())"),
+        ("Block", "", "Some(r2)", "{ Some(receipt) }", "{ r.take() }"),
+        ("Unsafe", "", "Some(r2)", "unsafe { Some(receipt) }", "unsafe { r.take() }"),
+        (
+            "If",
+            "",
+            "Some(r2)",
+            "if review_c() { Some(receipt) } else { None }",
+            "if review_c() { r.take() } else { None }",
+        ),
+        (
+            "Match",
+            "",
+            "Some(r2)",
+            "match review_k() { _ => Some(receipt) }",
+            "match review_k() { _ => r.take() }",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (label, setup, pat, moves_the_receipt_in, produces) in &kinds {
+        let plants = [
+            (
+                HEAD,
+                *moves_the_receipt_in,
+                format!(
+                    "{WRAP}fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {{\n    let (receipt, _) = i.install(f).map_err(refused)?;\n{setup}    if let {pat} = {moves_the_receipt_in} && review_ok()? {{\n        audit::append(p, r2)?;\n    }}\n    Ok(())\n}}"
+                ),
+            ),
+            (
+                CHAIN,
+                *produces,
+                format!(
+                    "{WRAP}fn p(r: &mut Option<WriteReceipt>, p: &Paths) -> Result<(), AppError> {{\n    if let {pat} = {produces} && review_ok()? {{\n        audit::append(p, r2)?;\n    }}\n    Ok(())\n}}"
+                ),
+            ),
+        ];
+        for (face, init, text) in &plants {
+            if init.is_empty() {
+                continue;
+            }
+            let sources = planted(&base, file, &Edit::Append(text.as_str()));
+            let replanted = sources
+                .iter()
+                .find(|(path, _)| path == file)
+                .map(syntax::parse_one)
+                .expect("planted");
+            let parsed: Vec<&Parsed> = base_parsed
+                .iter()
+                .map(|parsed| if parsed.path == file { &replanted } else { parsed })
+                .collect();
+            let found: Vec<String> = violations(&sources, &parsed)
+                .into_iter()
+                .filter(|line| line.starts_with("R6e: ") && line.contains(file))
+                .collect();
+            if found.len() != 1 || !found[0].contains(face) {
+                wrong.push(format!(
+                    "`{label}` by `{face}`: expected exactly one R6e finding; found: {found:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "`produces_in` and `flows` disagree about a kind:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// R6b names the line its pattern is on even with comment lines above it
+/// in the same file and inside the planted fn: comment lines are blanked,
+/// not dropped, so an offset maps to its real line.
+#[test]
+fn r6b_names_the_real_line_after_interleaved_comments() {
+    let (base, base_parsed) = parsed_tree();
+    let file = "src/provider/codex/refresh.rs";
+    let sources = planted(
+        &base,
+        file,
+        &Edit::Append(
+            "fn p(w: CodexWrite) {\n    // one\n    // two\n    if let CodexWrite::Landed {\n        outcome, ..\n    } = w {}\n}",
+        ),
+    );
+    let text = &sources.iter().find(|(path, _)| path == file).expect("planted").1;
+    let expected = text
+        .lines()
+        .collect::<Vec<_>>()
+        .iter()
+        .rposition(|line| *line == "    if let CodexWrite::Landed {")
+        .expect("the plant is in the file")
+        + 1;
+    let replanted =
+        sources.iter().find(|(path, _)| path == file).map(syntax::parse_one).expect("planted");
+    let parsed: Vec<&Parsed> = base_parsed
+        .iter()
+        .map(|parsed| if parsed.path == file { &replanted } else { parsed })
+        .collect();
+    let found: Vec<String> = violations(&sources, &parsed)
+        .into_iter()
+        .filter(|line| line.starts_with("R6b: "))
+        .collect();
+    assert_eq!(
+        found,
+        vec![format!("R6b: {file}:{expected}: a `Landed {{ .. }}` pattern drops its receipt")]
+    );
+}
+
+/// F1: a statement drop is reported ONCE, by R6d, on the statement's own
+/// line, for every kind of expression that can carry a receipt (round 2,
+/// F-3: nine kinds used to name line 0).
+#[test]
+fn a_statement_drop_names_its_own_line() {
+    let (base, base_parsed) = parsed_tree();
+    let tests: [(&str, &str, &str, &str, &str); 10] = [
+        (
+            "resolve_pending under `?`, a comment line above it",
+            "src/provider/codex/refresh.rs",
+            "fn p(ns: &OwnedNamespace<'_>, c: &Cancel) -> Result<(), AppError> {\n    // one\n    ns.resolve_pending(c)?;\n    Ok(())\n}",
+            "    ns.resolve_pending(c)?;",
+            "a statement drops the receipt from `resolve_pending` — to comply,",
+        ),
+        (
+            "F1-path-stmt",
+            "src/commands/codex/login.rs",
+            "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    receipt;\n    Ok(())\n}",
+            "    receipt;",
+            "a statement drops the receipt",
+        ),
+        (
+            "L0-paren-path",
+            "src/commands/codex/login.rs",
+            "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    (receipt);\n    Ok(())\n}",
+            "    (receipt);",
+            "a statement drops the receipt",
+        ),
+        (
+            "L0-adapter-over-path",
+            "src/commands/codex/login.rs",
+            "fn p(r: &mut Option<WriteReceipt>) {\n    let o = r.take();\n    o.expect(\"x\");\n}",
+            "    o.expect(\"x\");",
+            "a statement drops the receipt",
+        ),
+        (
+            "F1-tuple-stmt",
+            "src/commands/codex/login.rs",
+            "fn p(i: InstallNamespace<'_>, f: &Fault) -> Result<(), AppError> {\n    (i.install(f)?, 1);\n    Ok(())\n}",
+            "    (i.install(f)?, 1);",
+            "a statement drops the receipt",
+        ),
+        (
+            "L0-array",
+            "src/commands/codex/login.rs",
+            "fn p(i: InstallNamespace<'_>, f: &Fault) -> Result<(), AppError> {\n    [i.install(f)?];\n    Ok(())\n}",
+            "    [i.install(f)?];",
+            "a statement drops the receipt",
+        ),
+        (
+            "F1-if-stmt",
+            "src/commands/codex/login.rs",
+            "fn p(r: &mut Option<WriteReceipt>) {\n    if plant_c() { r.take() } else { None };\n}",
+            "    if plant_c() { r.take() } else { None };",
+            "a statement drops the receipt",
+        ),
+        (
+            "F1-block-stmt",
+            "src/commands/codex/login.rs",
+            "fn p(r: &mut Option<WriteReceipt>) {\n    { r.take() };\n}",
+            "    { r.take() };",
+            "a statement drops the receipt",
+        ),
+        (
+            "L0-unsafe",
+            "src/commands/codex/login.rs",
+            "fn p(r: &mut Option<WriteReceipt>) {\n    unsafe { r.take() };\n}",
+            "    unsafe { r.take() };",
+            "a statement drops the receipt",
+        ),
+        (
+            "L0-await",
+            "src/commands/codex/login.rs",
+            "fn p(i: InstallNamespace<'_>, f: &Fault) -> Result<(), AppError> {\n    i.install(f).await?;\n    Ok(())\n}",
+            "    i.install(f).await?;",
+            "a statement drops the receipt",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, file, text, statement, says) in tests {
+        let sources = planted(&base, file, &Edit::Append(text));
+        let planted_text = &sources.iter().find(|(path, _)| path == file).expect("planted").1;
+        let expected = planted_text
+            .lines()
+            .collect::<Vec<_>>()
+            .iter()
+            .rposition(|line| *line == statement)
+            .expect("the plant is in the file")
+            + 1;
+        let replanted =
+            sources.iter().find(|(path, _)| path == file).map(syntax::parse_one).expect("planted");
+        let parsed: Vec<&Parsed> = base_parsed
+            .iter()
+            .map(|parsed| if parsed.path == file { &replanted } else { parsed })
+            .collect();
+        let found: Vec<String> = violations(&sources, &parsed)
+            .into_iter()
+            .filter(|line| line.starts_with("R6d: ") && line.contains("a statement drops"))
+            .collect();
+        let prefix = format!("R6d: {file}:{expected}: in `p`, ");
+        if found.len() != 1 || !found[0].starts_with(&prefix) || !found[0].contains(says) {
+            wrong.push(format!("`{name}`: expected one `{prefix}…{says}…`; found {found:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "statement drops on the wrong line:\n{}", wrong.join("\n"));
 }
 
 /// A plant of the retired `impl Default` shape, kept apart from the table
@@ -1534,7 +2576,7 @@ fn every_legitimate_shape_stays_clean() {
             "use Other as G; G::wrap",
             "src/provider/codex/auth_store.rs",
             Edit::Append(
-                "use crate::provider::codex::plant_m::Other as PlantOg;\nfn p() -> u8 {\n    PlantOg::wrap(1)\n}",
+                "mod plant_m {\n    pub struct Other;\n    impl Other {\n        pub fn wrap(n: u8) -> u8 {\n            n\n        }\n    }\n}\nuse crate::provider::codex::auth_store::plant_m::Other as PlantOg;\nfn p() -> u8 {\n    PlantOg::wrap(1)\n}",
             ),
         ),
         (
@@ -1545,9 +2587,13 @@ fn every_legitimate_shape_stays_clean() {
             ),
         ),
         (
-            "<Other as Trait>::wrap",
+            // A trait's own `wrap` on the guard type: not the pinned inherent
+            // fn. It turns RED if R2s reads `<T as Trait>::` as `<T>::`.
+            "<CodexNamespaceGuard as Trait>::wrap",
             "src/provider/codex/auth_store.rs",
-            Edit::Append("fn p() -> u8 {\n    <PlantO as PlantT>::wrap(1)\n}"),
+            Edit::Append(
+                "trait PlantT {\n    fn wrap(g: NamespaceLockGuard) -> Self;\n}\nimpl PlantT for CodexNamespaceGuard {\n    fn wrap(g: NamespaceLockGuard) -> Self {\n        todo!()\n    }\n}\nfn p(g: NamespaceLockGuard) -> CodexNamespaceGuard {\n    <CodexNamespaceGuard as PlantT>::wrap(g)\n}",
+            ),
         ),
         (
             "Self::wrap inside the home lock.rs",
@@ -1583,6 +2629,171 @@ fn every_legitimate_shape_stays_clean() {
             Edit::Replace(
                 "        audit::append(paths, receipt)?;\n",
                 "        let pair = (receipt, kind);\n        audit::append(paths, pair.0)?;\n",
+            ),
+        ),
+        // Round C1b-3b: head and chain shapes that must stay clean.
+        (
+            "a head with no exit",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_ok() {\n        audit::append(p, receipt)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "a fallible step before the receipt is produced, then an if",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let ok = review_ok()?;\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if ok {\n        audit::append(p, receipt)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "an exiting head after the audit, the body touching no receipt",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    audit::append(p, receipt)?;\n    if review_step()? {\n        plant_log();\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "a let chain that carries no receipt",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(opt: Option<u8>) -> Result<(), AppError> {\n    if let Some(n) = opt && review_ok()? {\n        plant_use(n);\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "a chain that only READS the receipt it moved in",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if let Some(r) = Some(receipt) && r.kind() == plant_kind() {\n        audit::append(p, r)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "an exit LEFT of the let that produces the receipt",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    if review_ok()? && let Ok((receipt, _)) = i.install(f) {\n        audit::append(p, receipt)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "an exit two operands left of the producing let",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    if review_a()? && review_b() && let Ok((receipt, _)) = i.install(f) {\n        audit::append(p, receipt)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        // Round C1b-3b: shapes the descent must leave clean.
+        (
+            "descent: an exit AFTER the use inside the body",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_c() {\n        audit::append(p, receipt)?;\n        review_step()?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "descent: both branches audit before any exit",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_c() {\n        audit::append(p, receipt)?;\n        review_step()?;\n    } else {\n        audit::append(p, receipt)?;\n        review_step()?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "descent: a branch that does not touch the receipt is not entered",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_c() {\n        audit::append(p, receipt)?;\n    } else {\n        let n = review_step()?;\n        plant_use(n);\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "descent: a head let that moves the receipt in ends the descent",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    let slot = Some(receipt);\n    if let Some(r) = slot {\n        audit::append(p, r)?;\n        review_step()?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        // Round C1b-3b, K-i: `&mut` parameter shapes that stay clean.
+        (
+            "K-i: a receipt taken out of a &mut parameter and audited",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>, p: &Paths) -> Result<(), AppError> {\n    if let Some(x) = r.take() {\n        audit::append(p, x)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "K-i: mem::take on a &mut parameter, then audited",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>, p: &Paths) -> Result<(), AppError> {\n    if let Some(x) = std::mem::take(r) {\n        audit::append(p, x)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "K-i: a &mut parameter that is only read owes nothing",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>, p: &Paths) -> Result<(), AppError> {\n    if r.is_some() {\n        plant_log();\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "K-i: take on a &mut parameter that cannot hold a receipt",
+            "src/commands/codex/login.rs",
+            Edit::Append("fn p(n: &mut Option<u8>) {\n    let x = n.take();\n    drop(x);\n}"),
+        ),
+        // Round C1b-3b, F1: statements and results that stay clean.
+        (
+            "F1: resolve_pending bound and its receipt audited",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(ns: &OwnedNamespace<'_>, c: &Cancel, p: &Paths) -> Result<(), AppError> {\n    let (_decision, receipt, _evidence) = ns.resolve_pending(c)?;\n    if let Some(r) = receipt {\n        audit::append(p, r)?;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "F1: r.take() as the returned tail",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(r: &mut Option<WriteReceipt>) -> Option<WriteReceipt> {\n    r.take()\n}",
+            ),
+        ),
+        (
+            "F1: a unit if statement beside a receipt that is audited",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if review_c() {\n        plant_log();\n    }\n    audit::append(p, receipt)?;\n    Ok(())\n}",
+            ),
+        ),
+        // Round C1b-3b r2, F-2: an exit evaluated AFTER the call that takes
+        // the receipt runs after the audit.
+        (
+            "F-2: an exit right of the audit in an if head",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if audit::append(p, receipt).is_ok() && review_ok()? {\n        plant_log();\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "F-2: an exit after the audit in a match scrutinee tuple",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    match (audit::append(p, receipt), review_step()?) {\n        _ => plant_log(),\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "F-2: an exit right of the audit in a while head",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    while audit::append(p, receipt).is_ok() && review_ok()? {\n        break;\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "F-2: every branch of an if in the head audits, then an exit",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if (if review_c() {\n        audit::append(p, receipt).is_ok()\n    } else {\n        audit::append(p, receipt).is_ok()\n    }) && review_ok()?\n    {\n        plant_log();\n    }\n    Ok(())\n}",
+            ),
+        ),
+        (
+            "F-2: the audit LEFT of ||, then an exit",
+            "src/commands/codex/login.rs",
+            Edit::Append(
+                "fn p(i: InstallNamespace<'_>, f: &Fault, p: &Paths) -> Result<(), AppError> {\n    let (receipt, _) = i.install(f).map_err(refused)?;\n    if (audit::append(p, receipt).is_ok() || review_c()) && review_ok()? {\n        plant_log();\n    }\n    Ok(())\n}",
             ),
         ),
         (

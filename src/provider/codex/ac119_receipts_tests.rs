@@ -20,7 +20,9 @@
 //! - **R6d — no receipt is used where nothing follows it.** A producer call
 //!   (or a receipt literal) as the receiver of a non-adapter method, an
 //!   argument of a non-consumer, an operand, an assignment's right side:
-//!   `drop(ns.install(f)?)`, `ns.write(..).is_ok()`.
+//!   `drop(ns.install(f)?)`, `ns.write(..).is_ok()`; and a statement whose
+//!   value carries a receipt, which drops it where it stands:
+//!   `ns.resolve_pending(c)?;`, `r.take();` on a `&mut` parameter.
 //! - **R6e — the early exit.** Between a receipt's binding and the statement
 //!   that accounts for it, no `?`, `return`, `break` or `continue` at that
 //!   depth: `let r = install(..)?; step()?; audit::append(p, r)?;` drops `r`
@@ -28,13 +30,39 @@
 //!   statement list, a `match` arm, an `if let`/`while let` body — and
 //!   inside the auditing call itself: a `?` in any OTHER argument (or the
 //!   receiver) of the call that takes the receipt drops it too
-//!   (`audit::append(paths()?, receipt)?`).
+//!   (`audit::append(paths()?, receipt)?`). Three more places:
+//!   - the HEAD of the statement that accounts for the receipt — an
+//!     `if`/`while` condition (every operand of a `&&` chain, also either
+//!     side of a `let` that moves the receipt in) or a `match` scrutinee:
+//!     `if review_ok()? { audit::append(p, r)?; }`. Evaluation order counts:
+//!     the scan stops at the call that takes the receipt, whose arguments
+//!     and receiver are the audit call's (above), and what runs after that
+//!     call runs after the audit (`if audit::append(p, r).is_ok() && x()?`).
+//!     A call reached on one branch of an `if`/`match`, right of `&&`/`||`
+//!     or in a loop body may not run, so the scan goes on past it
+//!     (`if (c || audit::append(p, r).is_ok()) && x()?` reports `x()?`);
+//!   - a let CHAIN after a `let` that PRODUCES the receipt:
+//!     `if let Ok((r, _)) = i.install(f) && x()? { … }` (left of that `let`
+//!     no receipt exists yet, so an exit there drops nothing). A `let` that
+//!     only moves a live receipt in is the head's; one that does both
+//!     (`if let (Some(a), Ok((b, _))) = (Some(r), i.install(f)) && x()?`)
+//!     has its exit reported by both faces, once per receipt;
+//!   - the BODY that holds the use, entered from that statement — the then
+//!     or `else` branch, an `else if` (its head too), a `match` arm block, a
+//!     `while`/`loop` body, a bare block, the initializer of a `let` — and
+//!     scanned as a statement list of its own, as deep as the use sits:
+//!     `if c { step()?; audit::append(p, r)?; }`. A head that hands the
+//!     receipt on (`if let Some(r2) = r`, `match r { … }`) ends the descent:
+//!     the new binding is checked on its own. In a descended loop body a
+//!     `break` before the use is an exit (it leaves with the receipt
+//!     unaudited), and so is a `continue` (fail-safe).
 //! - **R6f — no stale allow row.** An exception names a file, a function and
 //!   a binding, carries its reason, and fails when it matches nothing.
 //!
-//! The statement-position drop (`ns.install(f)?;`) is the compiler's:
-//! `WriteReceipt` and `CodexWrite` carry `#[must_use]` and the gate runs
-//! clippy with `-D warnings`.
+//! The statement-position drop is R6d's for every carrier, `ns.install(f)?;`
+//! included, although `#[must_use]` on `WriteReceipt` and `CodexWrite` also
+//! warns there: which types that lint looks through (a tuple yes, an
+//! `Option` no) is a toolchain detail the rule must not depend on.
 //!
 //! A field of a binding handed to the auditing call counts as a use of the
 //! binding (`audit::append(p, got.receipt)`). A `&WriteReceipt` is not a
@@ -42,39 +70,83 @@
 //! `Clone` nor `Copy` and nothing owned comes out of `&`. A fn that RETURNS
 //! `&mut` to a carrier stays a producer (`Option::take` and `mem::replace`
 //! move an owned receipt out of it). A `ref`/`ref mut` binding of a receipt
-//! is a drop ("binds it by reference").
+//! is a drop ("binds it by reference … (bind it by value)").
 //!
 //! **Unsupported shape: a collection of receipts.** A `for` over a binding
 //! that holds receipts is not a use of it — the binding is reported (R6c),
 //! and a producer's result iterated directly is R6d. Every producer today
 //! returns ONE receipt and audits it where it is produced; audit each one
-//! there, or add an `ALLOW` row with a reason. (Round 3 removed round 2's
-//! `for` support: a `break`, `return` or `?` after the first audit dropped
-//! the rest, and nothing could see it.)
+//! there, or add an `ALLOW` row with a reason.
 //!
 //! **Residuals, stated rather than hidden.**
+//! - The `Group` arm of `flows`, `carried` and `produces_in` is UNPINNED.
+//!   syn builds `Expr::Group` only around an expression a macro captured, so
+//!   `syn::parse_file` of source text never yields one, and a parsed tree is
+//!   the only entry the tests have (`violations` takes a `Vocabulary` built
+//!   from one). The arms are kept all the same, so that no kind [`flows`]
+//!   looks through reaches `produces_in`'s catch-all — dropping the arm
+//!   would restore on paper the asymmetry this rule removes.
+//! - A struct literal that names a field BESIDE a functional-update operand
+//!   (`Pair { n: 1, ..w }`): struct-update moves from the base only the
+//!   fields the literal does not name, and the analyser cannot tell `n: 1`
+//!   from `r: None`, so the operand is NOT followed. Rust DOES move `w.r`
+//!   there — the literal names `n`, not `r` — so "the base stays live" is
+//!   the ANALYSER's conservative reading of a base it cannot resolve, not a
+//!   claim about Rust; its cost is an over-report, never a silent drop. The
+//!   exit right of such a `let` is reported by the CHAIN face and `w` is
+//!   reported by R6c — 2 findings, where the head face alone would be ideal,
+//!   and this is the one written exception to "the chain owns what a `let`
+//!   PRODUCES": nothing is produced here. Both findings are PINNED, each by
+//!   its own row: the CHAIN face by `the residual: a named field beside a
+//!   struct-update operand keeps the base live` in
+//!   [`every_r6e_exit_is_reported_once_by_its_own_face`], and the R6c by the
+//!   plant `a struct update beside a named field is not an audit of its
+//!   base`. Following the operand would make
+//!   `audit::append(p, Pair { r: None, ..w })` read as an audit of `w`,
+//!   which is a SILENT drop; removing the guard turns both rows red. A pure
+//!   re-wrap (`Wrap { ..w }`, no named field) IS followed and is the head's.
 //! - Flow-insensitive within a scope: a receipt audited on one branch only
-//!   (`if c { audit::append(p, r)?; }`) passes. So does a receipt that flows
-//!   into a block tail whose value is then discarded.
+//!   (`if c { audit::append(p, r)?; }`) passes, and so does one whose other
+//!   branch LEAVES without it (`if c { audit::append(p, r)?; } else {
+//!   return Err(e); }`): a branch that does not use the receipt is not
+//!   scanned. So does a receipt that flows into a block tail whose value is
+//!   then discarded.
 //! - A carrier holding TWO receipts, one handed to the audit by field: the
 //!   field use counts for the whole binding, so the other is not followed.
-//! - An early exit elsewhere in the auditing statement, outside the call's
-//!   own arguments (`x()?.then(audit::append(p, r))`): not scanned.
-//! - An early exit in a let chain AFTER the `let` that binds a receipt
-//!   (`if let Some(r) = slot && x()? { … }`, `while let … && x()?`): the
-//!   operands right of that `let` are not scanned. To comply, run the
-//!   fallible step before the receipt is produced, or after it is audited.
+//! - An early exit in the auditing statement outside a head, a descended
+//!   body and the audit call's own arguments — in a method chain around the
+//!   call (`x()?.then(audit::append(p, r))`), in an argument's block
+//!   (`f({ step()?; audit::append(p, r)? })`), in an `if`/`match` that is an
+//!   operand or an argument rather than the statement itself, in the
+//!   guard of an arm that uses an enclosing receipt
+//!   (`match k { _ if step()? => audit::append(p, r)?, _ => … }`), in a
+//!   `for` iterator expression or a `for` body
+//!   (`for n in list()? { audit::append(p, r)?; break; }`), or in an `async`
+//!   block the receipt is moved into (`async move { x()?; audit::append(p,
+//!   r) }`): not scanned. The descent enters only the shapes named under
+//!   R6e.
 //! - Renames are keyed by name: `use …::WriteReceipt as X` is followed; a
 //!   rename of a PRODUCER function (`use …::install as i`) is not — the
 //!   producer set is keyed by the defined name.
 //! - An early exit inside a CLOSURE that has captured the receipt
 //!   (`(|| { if c { return; } audit::append(p, receipt) })()`): `EarlyExit`
 //!   does not enter closures, by design (their exits leave the closure).
-//! - Moving a receipt out of a `&mut` carrier FIELD or `&mut` PARAMETER with
-//!   no getter (`h.slot.take()` on `h: &mut Holder`;
-//!   `fn f(r: &mut Option<WriteReceipt>) { let x = r.take(); }`) is not
-//!   followed; a getter that returns `&mut` to a carrier is (it stays a
-//!   producer).
+//! - Moving a receipt out of a `&mut` carrier FIELD with no getter
+//!   (`h.slot.take()` on `h: &mut Holder`) is not followed; a getter that
+//!   returns `&mut` to a carrier is (it stays a producer). A `&mut`
+//!   PARAMETER is followed where it is named: `r.take()`, `r.replace(x)`,
+//!   `r.take_if(f)`, and `take(r)` / `replace(r, x)` under any path
+//!   (`std::mem::`, `Option::`, an import), `r` also spelled `&mut *r`,
+//!   yield an owned receipt, checked like any binding
+//!   (`fn f(r: &mut Option<WriteReceipt>) { let x = r.take(); drop(x); }` is
+//!   R6c). Not followed: a reborrow alias (`let s = &mut *r; let x =
+//!   s.take();`), `std::mem::swap(r, &mut other)`, and an assignment through
+//!   the parameter (`*r = None;`), which drops the receipt it held with no
+//!   binding to report.
+//! - What is moved out of a `&mut` parameter and used where nothing follows
+//!   it without a binding or a statement of its own: `drop(r.take());`,
+//!   `_ = r.take();`. R6d asks those positions for a PRODUCER, and `take`
+//!   on a parameter is not one (a statement `r.take();` is reported).
 //! - Names, not places: a later `let receipt = other;` that shadows a
 //!   receipt and is then audited satisfies the first binding.
 //! - Macro token streams are opaque: a producer or a receipt inside
@@ -196,6 +268,7 @@ fn run(vocab: &Vocabulary<'_>) -> (Vec<Finding>, Census) {
             findings: Vec::new(),
             followed: Vec::new(),
             exit_checked: Vec::new(),
+            mut_params: Vec::new(),
         };
         checker.check_fn();
         findings.extend(checker.findings);
@@ -257,6 +330,9 @@ struct Checker<'v, 'a> {
     findings: Vec<Finding>,
     followed: Vec<String>,
     exit_checked: Vec<String>,
+    /// The `&mut` parameters that can hold a receipt, with the type behind
+    /// the reference: they owe nothing, what is moved out of them does.
+    mut_params: Vec<(String, syn::Type)>,
 }
 
 impl Checker<'_, '_> {
@@ -289,6 +365,16 @@ impl Checker<'_, '_> {
                 };
                 self.check_scope(&bound, &Scope::Stmts(&body.stmts));
                 env.push((name, Some(bound.ty)));
+            }
+            for input in &self.def.sig.inputs {
+                if let syn::FnArg::Typed(typed) = input
+                    && let syn::Type::Reference(reference) = &*typed.ty
+                    && reference.mutability.is_some()
+                    && self.vocab.carries(&reference.elem, Some(self.owner()))
+                    && let syn::Pat::Ident(ident) = &*typed.pat
+                {
+                    self.mut_params.push((ident.ident.to_string(), (*reference.elem).clone()));
+                }
             }
         }
         self.walk_block(body, &mut env, Ctx::Kept);
@@ -371,8 +457,10 @@ impl Checker<'_, '_> {
                 if carrying && ident.by_ref.is_some() {
                     // Round 3 (K-a): `let ref got = producer()?` keeps a
                     // borrow and drops the owned receipt at the end of scope.
-                    out.drops
-                        .push((ident.ident.span(), format!("binds it by reference as `{name}`")));
+                    out.drops.push((
+                        ident.ident.span(),
+                        format!("binds it by reference as `{name}` (bind it by value)"),
+                    ));
                 } else if carrying && name.starts_with('_') {
                     out.drops.push((ident.ident.span(), format!("binds it to `{name}`")));
                 } else {
@@ -559,12 +647,30 @@ impl Checker<'_, '_> {
                 if is_ctor(&func.path) {
                     return call.args.iter().find_map(|arg| self.carried(arg, env));
                 }
+                // `take(r)` / `replace(r, x)` on a `&mut` parameter move its
+                // receipt out, however the path is spelled (`std::mem::`,
+                // `Option::`, an import): the ambiguous direction is the safe
+                // one.
+                let moves_out = match func.path.segments.last() {
+                    Some(last) if last.ident == "take" => call.args.len() == 1,
+                    Some(last) if last.ident == "replace" => call.args.len() == 2,
+                    _ => false,
+                };
+                if moves_out {
+                    return call.args.first().and_then(|param| self.mut_param(param, env));
+                }
                 None
             }
             syn::Expr::MethodCall(call) => {
                 let name = call.method.to_string();
                 if let Some(def) = self.vocab.method_producers(&name, call.args.len()).first() {
                     return return_type(def);
+                }
+                let argc = call.args.len();
+                if (name == "take" && argc == 0)
+                    || (matches!(name.as_str(), "replace" | "take_if") && argc == 1)
+                {
+                    return self.mut_param(&call.receiver, env);
                 }
                 ADAPTERS
                     .contains(&name.as_str())
@@ -633,6 +739,83 @@ impl Checker<'_, '_> {
         }
     }
 
+    /// Whether a value position of `expr` makes a receipt rather than naming
+    /// one: a producer, a literal, something moved out of a `&mut`
+    /// parameter — inside a tuple, an array, a constructor or an adapter.
+    ///
+    /// It looks through EVERY kind [`flows`] looks through, and the catch-all
+    /// is left to the kinds [`flows`] does not know. The two must agree: a
+    /// kind one relays through and the other sends to `carried` reads a pure
+    /// move-in as producing, and the head and the chain face then report the
+    /// same exit twice (round 3, F-1r2).
+    fn produces_in(&self, expr: &syn::Expr, env: &Env) -> bool {
+        match expr {
+            syn::Expr::Tuple(tuple) => tuple.elems.iter().any(|elem| self.produces_in(elem, env)),
+            syn::Expr::Array(array) => array.elems.iter().any(|elem| self.produces_in(elem, env)),
+            syn::Expr::Call(call) if matches!(&*call.func, syn::Expr::Path(func) if is_ctor(&func.path)) => {
+                call.args.iter().any(|arg| self.produces_in(arg, env))
+            }
+            syn::Expr::MethodCall(call) if ADAPTERS.contains(&call.method.to_string().as_str()) => {
+                self.produces_in(&call.receiver, env)
+            }
+            syn::Expr::Paren(inner) => self.produces_in(&inner.expr, env),
+            syn::Expr::Try(inner) => self.produces_in(&inner.expr, env),
+            syn::Expr::Group(inner) => self.produces_in(&inner.expr, env),
+            syn::Expr::Await(inner) => self.produces_in(&inner.base, env),
+            // The one kind that can itself BE the carrier. Its PARTS are the
+            // fields and the functional-update operand (`X { f: 1, ..base }`),
+            // which hands the literal a receipt without naming a field. So it
+            // produces only when its carrier-ness is its OWN (`WriteReceipt
+            // { … }` out of plain parts), and relays whenever any part
+            // already carries one (round 3, the lead's ruling on `rest`).
+            syn::Expr::Struct(literal) => {
+                let parts = || {
+                    literal.fields.iter().map(|field| &field.expr).chain(literal.rest.as_deref())
+                };
+                parts().any(|part| self.produces_in(part, env))
+                    || (self.produces(expr).is_some()
+                        && parts().all(|part| self.carried(part, env).is_none()))
+            }
+            syn::Expr::Block(block) => {
+                block_tail(&block.block).is_some_and(|tail| self.produces_in(tail, env))
+            }
+            syn::Expr::Unsafe(block) => {
+                block_tail(&block.block).is_some_and(|tail| self.produces_in(tail, env))
+            }
+            syn::Expr::If(branch) => {
+                block_tail(&branch.then_branch).is_some_and(|tail| self.produces_in(tail, env))
+                    || branch
+                        .else_branch
+                        .as_ref()
+                        .is_some_and(|(_, other)| self.produces_in(other, env))
+            }
+            syn::Expr::Match(matched) => {
+                matched.arms.iter().any(|arm| self.produces_in(&arm.body, env))
+            }
+            syn::Expr::Path(_) => false,
+            other => self.carried(other, env).is_some_and(|ty| self.ty_carries(&ty)),
+        }
+    }
+
+    /// The type behind a `&mut` parameter that can hold a receipt, when
+    /// `expr` names it and no local shadows it.
+    fn mut_param(&self, expr: &syn::Expr, env: &Env) -> Option<Ty> {
+        // `&mut *r` is `r` itself (a reborrow in place, not an alias).
+        if let syn::Expr::Reference(reference) = expr
+            && let syn::Expr::Unary(syn::ExprUnary { op: syn::UnOp::Deref(_), expr, .. }) =
+                &*reference.expr
+        {
+            return self.mut_param(expr, env);
+        }
+        let syn::Expr::Path(path) = expr else { return None };
+        let ident = path.path.get_ident()?.to_string();
+        if path.qself.is_some() || env.iter().any(|(bound, _)| *bound == ident) {
+            return None;
+        }
+        let (_, ty) = self.mut_params.iter().find(|(param, _)| *param == ident)?;
+        Some(known(ty.clone(), self.owner().to_owned()))
+    }
+
     /// The producer `expr` calls or builds itself, by name.
     fn produces(&self, expr: &syn::Expr) -> Option<String> {
         match expr {
@@ -673,12 +856,39 @@ impl Checker<'_, '_> {
                 }
                 syn::Stmt::Expr(expr, semi) => {
                     let tail = semi.is_none() && index + 1 == block.stmts.len();
+                    if !tail && self.carried(expr, env).is_some_and(|ty| self.ty_carries(&ty)) {
+                        self.statement_drop(expr);
+                    }
                     self.walk_expr(expr, env, if tail { ctx } else { Ctx::Kept });
                 }
                 _ => {}
             }
         }
         env.truncate(mark);
+    }
+
+    /// R6d for a statement whose value carries a receipt: the value is
+    /// dropped where it stands. Named by its producer when it calls one
+    /// (under the `?`, parentheses and adapters), on the statement's line.
+    fn statement_drop(&mut self, expr: &syn::Expr) {
+        let mut inner = expr;
+        loop {
+            inner = match inner {
+                syn::Expr::Try(next) => &next.expr,
+                syn::Expr::Paren(next) => &next.expr,
+                syn::Expr::MethodCall(call)
+                    if ADAPTERS.contains(&call.method.to_string().as_str()) =>
+                {
+                    &call.receiver
+                }
+                _ => break,
+            };
+        }
+        let what = self.produces(inner).unwrap_or_default();
+        let from =
+            if what.is_empty() { "its value carries".to_owned() } else { format!("from `{what}`") };
+        let message = format!("a statement drops the receipt {from}{COMPLY_LOST}");
+        self.push("R6d", start_line(expr), &what, message);
     }
 
     /// Reports what `aligned` drops, checks each receipt it binds in
@@ -867,19 +1077,37 @@ impl Checker<'_, '_> {
     /// The `let`s of an `if`/`while` condition (a `&&` chain included):
     /// each binds for `body`; the rest of the condition is a plain operand.
     fn walk_condition(&mut self, cond: &syn::Expr, body: &syn::Block, env: &mut Env) {
-        match cond {
-            syn::Expr::Let(binding) => {
-                self.walk_expr(&binding.expr, env, Ctx::Kept);
-                let ty = self.carried(&binding.expr, env);
-                let aligned = self.align_top(&binding.pat, ty);
-                self.bind(aligned, &Scope::Stmts(&body.stmts), env);
+        let chain = operands(cond);
+        for (index, operand) in chain.iter().enumerate() {
+            match operand {
+                syn::Expr::Let(binding) => {
+                    self.walk_expr(&binding.expr, env, Ctx::Kept);
+                    let ty = self.carried(&binding.expr, env);
+                    let aligned = self.align_top(&binding.pat, ty);
+                    let produced: Vec<(String, usize)> = aligned
+                        .bound
+                        .iter()
+                        .filter(|bound| bound.carrying)
+                        .map(|bound| (bound.name.clone(), line(bound.span)))
+                        .collect();
+                    // A `let` that only MOVES a live receipt in is the head
+                    // face's (it scans the whole head); the chain face owns
+                    // what a `let` PRODUCES (round 2, F-1).
+                    let live = |name: &str| {
+                        env.iter()
+                            .rev()
+                            .find(|(bound, _)| bound == name)
+                            .is_some_and(|(_, ty)| ty.is_some())
+                    };
+                    let moved_in =
+                        env.iter().any(|(bound, _)| live(bound) && flows(&binding.expr, bound));
+                    if !produced.is_empty() && (!moved_in || self.produces_in(&binding.expr, env)) {
+                        self.exits_in_chain(&produced, &chain[index + 1..]);
+                    }
+                    self.bind(aligned, &Scope::Stmts(&body.stmts), env);
+                }
+                other => self.walk_expr(other, env, Ctx::Lost),
             }
-            syn::Expr::Binary(binary) if matches!(binary.op, syn::BinOp::And(_)) => {
-                self.walk_condition(&binary.left, body, env);
-                self.walk_condition(&binary.right, body, env);
-            }
-            syn::Expr::Paren(inner) => self.walk_condition(&inner.expr, body, env),
-            other => self.walk_expr(other, env, Ctx::Lost),
         }
     }
 
@@ -908,6 +1136,8 @@ impl Checker<'_, '_> {
                 }
                 // Not recorded as `exit_checked`: that list proves the
                 // statement scan ran, and none does here (round 3, A4).
+                self.exits_in_head(expr, name, at, &site);
+                self.descend(expr, name, at, &site);
                 self.exits_in_audit_call(|v| v.visit_expr(expr), name, at);
             }
             Scope::Stmts(stmts) => self.check_stmts(bound, stmts, site),
@@ -939,17 +1169,31 @@ impl Checker<'_, '_> {
     fn check_stmts(&mut self, bound: &Bound, stmts: &[syn::Stmt], site: String) {
         let name = bound.name.as_str();
         let at = line(bound.span);
-        let last = stmts.len().checked_sub(1);
-        let used = stmts.iter().enumerate().position(|(index, stmt)| {
-            let tail_flows = Some(index) == last
-                && matches!(stmt, syn::Stmt::Expr(expr, None) if flows(expr, name));
-            tail_flows || self.uses(|v| v.visit_stmt(stmt), name)
-        });
-        let Some(used) = used else {
+        let Some(used) = self.first_use(stmts, name) else {
             self.never(bound, at);
             return;
         };
-        self.exit_checked.push(site);
+        self.exit_checked.push(site.clone());
+        self.scan_stmts(stmts, used, name, at, &site);
+        // Once, at the top: it visits the whole subtree of the statement,
+        // the audit calls of every descended body included.
+        self.exits_in_audit_call(|v| v.visit_stmt(&stmts[used]), name, at);
+    }
+
+    /// The index of the first statement that uses `name`.
+    fn first_use(&self, stmts: &[syn::Stmt], name: &str) -> Option<usize> {
+        let last = stmts.len().checked_sub(1);
+        stmts.iter().enumerate().position(|(index, stmt)| {
+            let tail_flows = Some(index) == last
+                && matches!(stmt, syn::Stmt::Expr(expr, None) if flows(expr, name));
+            tail_flows || self.uses(|v| v.visit_stmt(stmt), name)
+        })
+    }
+
+    /// R6e over one statement list that holds the use: the statement scan
+    /// before `used`, the head scan of `used`, then the descent into the
+    /// body of `used` that holds the use.
+    fn scan_stmts(&mut self, stmts: &[syn::Stmt], used: usize, name: &str, at: usize, site: &str) {
         for stmt in &stmts[..used] {
             let mut exits = EarlyExit::default();
             exits.visit_stmt(stmt);
@@ -964,8 +1208,138 @@ impl Checker<'_, '_> {
                 );
             }
         }
-        let used_stmt = &stmts[used];
-        self.exits_in_audit_call(|v| v.visit_stmt(used_stmt), name, at);
+        let top = match &stmts[used] {
+            syn::Stmt::Expr(expr, _) => Some(expr),
+            syn::Stmt::Local(local) => local.init.as_ref().map(|init| &*init.expr),
+            _ => None,
+        };
+        if let Some(top) = top {
+            self.exits_in_head(top, name, at, site);
+            self.descend(top, name, at, site);
+        }
+    }
+
+    /// Where the use sits INSIDE the statement `top` whose head was just
+    /// scanned: the branch, arm or body that holds it, scanned as a statement
+    /// list of its own (`if c { step()?; audit::append(p, r)?; }`). A head
+    /// that hands the receipt on (`if let Some(r2) = r`, `match r { … }`)
+    /// ends the descent: the new binding is checked on its own.
+    fn descend(&mut self, top: &syn::Expr, name: &str, at: usize, site: &str) {
+        let hands_on = match top {
+            syn::Expr::If(branch) => moves_in(&branch.cond, name),
+            syn::Expr::While(looped) => moves_in(&looped.cond, name),
+            syn::Expr::Match(matched) => flows(&matched.expr, name),
+            _ => false,
+        };
+        if hands_on {
+            return;
+        }
+        match top {
+            syn::Expr::If(branch) => {
+                self.enter(&branch.then_branch, name, at, site);
+                match branch.else_branch.as_ref().map(|(_, other)| &**other) {
+                    Some(other @ syn::Expr::If(_)) if self.uses(|v| v.visit_expr(other), name) => {
+                        self.exits_in_head(other, name, at, site);
+                        self.descend(other, name, at, site);
+                    }
+                    Some(syn::Expr::Block(block)) => self.enter(&block.block, name, at, site),
+                    _ => {}
+                }
+            }
+            syn::Expr::While(looped) => self.enter(&looped.body, name, at, site),
+            syn::Expr::Loop(looped) => self.enter(&looped.body, name, at, site),
+            syn::Expr::Block(block) => self.enter(&block.block, name, at, site),
+            syn::Expr::Unsafe(block) => self.enter(&block.block, name, at, site),
+            syn::Expr::Match(matched) => {
+                for arm in &matched.arms {
+                    match &*arm.body {
+                        syn::Expr::Block(block) => self.enter(&block.block, name, at, site),
+                        syn::Expr::Unsafe(block) => self.enter(&block.block, name, at, site),
+                        body if self.uses(|v| v.visit_expr(body), name) => {
+                            self.exits_in_head(body, name, at, site);
+                            self.descend(body, name, at, site);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A body entered by [`Self::descend`], when it holds the use.
+    fn enter(&mut self, block: &syn::Block, name: &str, at: usize, site: &str) {
+        let Some(used) = self.first_use(&block.stmts, name) else { return };
+        self.exit_checked.push(format!("{site}:body"));
+        self.scan_stmts(&block.stmts, used, name, at, site);
+    }
+
+    /// R6e over the HEAD of the statement that accounts for a live receipt:
+    /// the condition of an `if`/`while` (a `&&` chain or not) and the
+    /// scrutinee of a `match`. The receipt is live until the call that takes
+    /// it, so a `?`, `return`, `break` or `continue` evaluated before that
+    /// call drops it — `if review_ok()? { audit::append(p, receipt)?; }`,
+    /// and either side of a `let` of the chain that moves it in (`if x()? &&
+    /// let Some(r) = receipt`); none is a take, so that whole head counts.
+    fn exits_in_head(&mut self, top: &syn::Expr, name: &str, at: usize, site: &str) {
+        let head = match top {
+            syn::Expr::If(branch) => operands(&branch.cond),
+            syn::Expr::While(looped) => operands(&looped.cond),
+            syn::Expr::Match(matched) => vec![&*matched.expr],
+            _ => return,
+        };
+        self.exit_checked.push(format!("{site}:head"));
+        // One visitor over the operands in evaluation order, stopped at the
+        // call that takes the receipt: that call's arguments and receiver
+        // are the call face's, and what runs after it runs after the audit.
+        let mut exits = EarlyExit { stop: Some((self.vocab, name)), ..EarlyExit::default() };
+        for operand in head {
+            exits.visit_expr(operand);
+            if exits.stopped && exits.first.is_none() {
+                return;
+            }
+            if let Some((what, exit_line)) = exits.first {
+                self.push(
+                    "R6e",
+                    exit_line,
+                    name,
+                    format!(
+                        "`{what}` in the head of the statement that accounts for the receipt `{name}` (bound at line {at}) can leave before it is audited{COMPLY}"
+                    ),
+                );
+                return;
+            }
+        }
+    }
+
+    /// R6e over a let chain for the receipts one of its `let`s PRODUCES:
+    /// they are live from the next operand on, so an exit in any later
+    /// operand drops them (`if let Ok((r, _)) = i.install(f) && x()? {…}`).
+    /// An exit LEFT of the producing `let` drops nothing: no receipt exists
+    /// yet. A `let` that only moves a live receipt in is not scanned here
+    /// ([`Self::walk_condition`]); one that both moves in and produces is,
+    /// so an exit right of it is reported by both faces (a written residual).
+    fn exits_in_chain(&mut self, bound: &[(String, usize)], later: &[&syn::Expr]) {
+        for (name, _) in bound {
+            self.exit_checked.push(format!("{}:{}:{name}:chain", self.def.file, self.def.name()));
+        }
+        for operand in later {
+            let mut exits = EarlyExit::default();
+            exits.visit_expr(operand);
+            if let Some((what, exit_line)) = exits.first {
+                for (name, at) in bound {
+                    self.push(
+                        "R6e",
+                        exit_line,
+                        name,
+                        format!(
+                            "`{what}` later in the let chain can leave before the receipt `{name}` (bound at line {at}) is audited{COMPLY}"
+                        ),
+                    );
+                }
+                return;
+            }
+        }
     }
 
     /// R6e inside the statement that audits: Rust evaluates a call's
@@ -1163,23 +1537,42 @@ impl<'ast> Visit<'ast> for AuditCall<'_, '_> {
 
 /// The first early exit in a statement: a `?` or a `return` anywhere
 /// outside a closure or a nested item, a `break`/`continue` outside a loop
-/// nested in the statement.
+/// nested in the statement. With `stop`, the visit ends at the first call
+/// that takes the receipt `stop` names (the head face, round 2, F-2).
 #[derive(Default)]
-struct EarlyExit {
+struct EarlyExit<'v, 'n> {
     loops: usize,
     first: Option<(&'static str, usize)>,
+    stop: Option<(&'v Vocabulary<'v>, &'n str)>,
+    stopped: bool,
 }
 
-impl EarlyExit {
+impl EarlyExit<'_, '_> {
     fn note(&mut self, what: &'static str, span: Span) {
-        if self.first.is_none() {
+        if self.first.is_none() && !self.stopped {
             self.first = Some((what, line(span)));
         }
     }
 }
 
-impl<'ast> Visit<'ast> for EarlyExit {
+impl<'ast> Visit<'ast> for EarlyExit<'_, '_> {
     fn visit_item(&mut self, _: &'ast syn::Item) {}
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        match self.stop {
+            Some((vocab, name)) if call_takes(vocab, call, name) => self.stopped = true,
+            _ if !self.stopped => syn::visit::visit_expr_call(self, call),
+            _ => {}
+        }
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        match self.stop {
+            Some((vocab, name)) if method_takes(vocab, call, name) => self.stopped = true,
+            _ if !self.stopped => syn::visit::visit_expr_method_call(self, call),
+            _ => {}
+        }
+    }
 
     fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
 
@@ -1209,21 +1602,90 @@ impl<'ast> Visit<'ast> for EarlyExit {
         syn::visit::visit_expr_continue(self, continued);
     }
 
+    // Source order is not evaluation order across ALTERNATIVES: a stop
+    // reached on one branch, on the right of `&&`/`||`, or in a loop body
+    // survives only where the audit surely ran (every branch stopped).
+
+    fn visit_expr_if(&mut self, branch: &'ast syn::ExprIf) {
+        if self.stopped {
+            return;
+        }
+        self.visit_expr(&branch.cond);
+        if self.stopped {
+            return;
+        }
+        self.visit_block(&branch.then_branch);
+        let then_stopped = std::mem::take(&mut self.stopped);
+        if let Some((_, other)) = &branch.else_branch {
+            self.visit_expr(other);
+            self.stopped &= then_stopped;
+        }
+    }
+
+    fn visit_expr_match(&mut self, matched: &'ast syn::ExprMatch) {
+        if self.stopped {
+            return;
+        }
+        self.visit_expr(&matched.expr);
+        if self.stopped {
+            return;
+        }
+        let mut every = !matched.arms.is_empty();
+        for arm in &matched.arms {
+            if let syn::Pat::Guard(guarded) = &arm.pat {
+                self.visit_expr(&guarded.guard);
+            }
+            self.visit_expr(&arm.body);
+            every &= std::mem::take(&mut self.stopped);
+        }
+        self.stopped = every;
+    }
+
+    fn visit_expr_binary(&mut self, binary: &'ast syn::ExprBinary) {
+        if self.stopped {
+            return;
+        }
+        self.visit_expr(&binary.left);
+        if self.stopped {
+            return;
+        }
+        self.visit_expr(&binary.right);
+        if matches!(binary.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) {
+            self.stopped = false;
+        }
+    }
+
     fn visit_expr_loop(&mut self, looped: &'ast syn::ExprLoop) {
+        if self.stopped {
+            return;
+        }
         self.loops += 1;
-        syn::visit::visit_expr_loop(self, looped);
+        self.visit_block(&looped.body);
+        self.stopped = false;
         self.loops -= 1;
     }
 
     fn visit_expr_while(&mut self, looped: &'ast syn::ExprWhile) {
+        if self.stopped {
+            return;
+        }
         self.loops += 1;
-        syn::visit::visit_expr_while(self, looped);
+        self.visit_expr(&looped.cond);
+        let cond_stopped = self.stopped;
+        self.visit_block(&looped.body);
+        self.stopped = cond_stopped;
         self.loops -= 1;
     }
 
     fn visit_expr_for_loop(&mut self, looped: &'ast syn::ExprForLoop) {
+        if self.stopped {
+            return;
+        }
         self.loops += 1;
-        syn::visit::visit_expr_for_loop(self, looped);
+        self.visit_expr(&looped.expr);
+        let iter_stopped = self.stopped;
+        self.visit_block(&looped.body);
+        self.stopped = iter_stopped;
         self.loops -= 1;
     }
 }
@@ -1240,7 +1702,15 @@ fn flows(expr: &syn::Expr, name: &str) -> bool {
         syn::Expr::Await(inner) => flows(&inner.base, name),
         syn::Expr::Tuple(tuple) => tuple.elems.iter().any(|elem| flows(elem, name)),
         syn::Expr::Array(array) => array.elems.iter().any(|elem| flows(elem, name)),
-        syn::Expr::Struct(literal) => literal.fields.iter().any(|field| flows(&field.expr, name)),
+        // A `rest` operand moves from the base only the fields the literal
+        // does NOT name, so it hands the WHOLE base on only when the literal
+        // names none. A literal that names a field beside its `rest` leaves
+        // the base live, and the base goes on being scanned (residual :82).
+        syn::Expr::Struct(literal) => {
+            literal.fields.iter().any(|field| flows(&field.expr, name))
+                || (literal.fields.is_empty()
+                    && literal.rest.as_ref().is_some_and(|rest| flows(rest, name)))
+        }
         syn::Expr::Call(call) => {
             matches!(&*call.func, syn::Expr::Path(func) if is_ctor(&func.path))
                 && call.args.iter().any(|arg| flows(arg, name))
@@ -1268,6 +1738,48 @@ fn flows_into_call(expr: &syn::Expr, name: &str) -> bool {
         syn::Expr::Field(field) => flows_into_call(&field.base, name),
         other => flows(other, name),
     }
+}
+
+/// Whether `call` takes `name`: by an argument, into the sink or a consumer
+/// (the test [`Uses`] applies).
+fn call_takes(vocab: &Vocabulary<'_>, call: &syn::ExprCall, name: &str) -> bool {
+    let syn::Expr::Path(func) = &*call.func else { return false };
+    let argc = call.args.len();
+    call.args.iter().enumerate().any(|(index, arg)| {
+        flows_into_call(arg, name)
+            && (is_sink(&func.path) || vocab.path_consumes(&func.path, argc, index))
+    })
+}
+
+/// Whether the method `call` takes `name`, as its receiver or an argument.
+fn method_takes(vocab: &Vocabulary<'_>, call: &syn::ExprMethodCall, name: &str) -> bool {
+    let method = call.method.to_string();
+    let argc = call.args.len();
+    (flows(&call.receiver, name) && vocab.method_consumes(&method, argc, None))
+        || call.args.iter().enumerate().any(|(index, arg)| {
+            flows_into_call(arg, name) && vocab.method_consumes(&method, argc, Some(index))
+        })
+}
+
+/// The operands of an `if`/`while` condition, left to right: a `&&` chain
+/// flattened, parentheses looked through; any other condition is one operand.
+fn operands(cond: &syn::Expr) -> Vec<&syn::Expr> {
+    match cond {
+        syn::Expr::Binary(binary) if matches!(binary.op, syn::BinOp::And(_)) => {
+            let mut all = operands(&binary.left);
+            all.extend(operands(&binary.right));
+            all
+        }
+        syn::Expr::Paren(inner) => operands(&inner.expr),
+        other => vec![other],
+    }
+}
+
+/// Whether a `let` of an `if`/`while` condition moves `name` in.
+fn moves_in(cond: &syn::Expr, name: &str) -> bool {
+    operands(cond)
+        .into_iter()
+        .any(|operand| matches!(operand, syn::Expr::Let(binding) if flows(&binding.expr, name)))
 }
 
 /// A block's tail expression.
@@ -1306,6 +1818,28 @@ fn return_type(def: &FnDef<'_>) -> Option<Ty> {
     match &def.sig.output {
         syn::ReturnType::Type(_, ty) => Some(known((**ty).clone(), def.owner.clone())),
         syn::ReturnType::Default => None,
+    }
+}
+
+/// The line of an expression's first token, for every kind `carried` can
+/// hold a receipt in (round 2, F-3: never line 0 for a statement).
+fn start_line(expr: &syn::Expr) -> usize {
+    match expr {
+        syn::Expr::Path(path) => path.path.segments.first().map_or(0, |seg| line(seg.ident.span())),
+        syn::Expr::Paren(inner) => line(inner.paren_token.span.open()),
+        syn::Expr::Group(inner) => start_line(&inner.expr),
+        syn::Expr::Try(inner) => start_line(&inner.expr),
+        syn::Expr::Await(inner) => start_line(&inner.base),
+        syn::Expr::Field(field) => start_line(&field.base),
+        syn::Expr::Tuple(tuple) => line(tuple.paren_token.span.open()),
+        syn::Expr::Array(array) => line(array.bracket_token.span.open()),
+        syn::Expr::Call(call) => start_line(&call.func),
+        syn::Expr::MethodCall(call) => start_line(&call.receiver),
+        syn::Expr::Match(matched) => line(matched.match_token.span),
+        syn::Expr::If(branch) => line(branch.if_token.span),
+        syn::Expr::Block(block) => line(block.block.brace_token.span.open()),
+        syn::Expr::Unsafe(block) => line(block.unsafe_token.span),
+        other => expr_line(other),
     }
 }
 

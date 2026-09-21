@@ -237,8 +237,9 @@ fn a_contended_config_lock_without_a_guard_is_refused_not_a_panic() {
 
 /// Round N3: the underflow panic (a token dropped on a thread that did not
 /// make it) carries the same `agctl lock order violated: ` prefix the release
-/// gate lists, so it cannot reach a release artifact unseen. The assertion's
-/// message is pinned by the tests above; the overflow cannot be reached.
+/// gate lists, so it cannot reach a release artifact unseen. Its whole
+/// message is pinned here, as the assertion's is by the tests above; the
+/// overflow cannot be reached.
 #[cfg(feature = "testing")]
 #[test]
 fn a_token_dropped_on_another_thread_panics_with_the_gated_prefix() {
@@ -254,7 +255,10 @@ fn a_token_dropped_on_another_thread_panics_with_the_gated_prefix() {
         .cloned()
         .or_else(|| payload.downcast_ref::<&str>().map(|text| (*text).to_owned()))
         .unwrap_or_default();
-    assert!(message.starts_with("agctl lock order violated: "), "{message:?}");
+    assert_eq!(
+        message,
+        "agctl lock order violated: a Codex namespace guard was dropped on a thread that did not create it"
+    );
     // The count of 1 this thread keeps (it made the token and never saw it
     // dropped) belongs to this test's own thread and ends with it.
 }
