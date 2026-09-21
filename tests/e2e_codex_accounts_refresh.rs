@@ -213,6 +213,7 @@ fn run(fixture: &CodexFixture, name: &str, args: &[&str]) -> Output {
         fixture.cmd().args(args).output().expect("the binary runs"),
         &NEEDLES,
         &[Stream::Stdout, Stream::Stderr],
+        Some(&fixture.security_log_path()),
     )
 }
 

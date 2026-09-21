@@ -72,14 +72,21 @@ const NEEDLES: [Needle; 9] = [
 ];
 
 /// Asserts neither stream carries a needle, then keeps both for the log sweep.
-fn checked(name: &str, output: Output) -> Output {
-    codex::checked("e2e_codex_doctor", name, output, &NEEDLES, &[Stream::Stdout, Stream::Stderr])
+fn checked(fixture: &CodexFixture, name: &str, output: Output) -> Output {
+    codex::checked(
+        "e2e_codex_doctor",
+        name,
+        output,
+        &NEEDLES,
+        &[Stream::Stdout, Stream::Stderr],
+        Some(&fixture.security_log_path()),
+    )
 }
 
 /// Runs `agctl <args>` through [`checked`]. Every launch in this file is one
 /// of these.
 fn run(fixture: &CodexFixture, name: &str, args: &[&str]) -> Output {
-    checked(name, fixture.cmd().args(args).output().expect("the binary runs"))
+    checked(fixture, name, fixture.cmd().args(args).output().expect("the binary runs"))
 }
 
 /// `agctl codex doctor`, as a table.
@@ -599,14 +606,18 @@ fn a_keychain_account_agctl_did_not_write_never_reaches_a_command() {
     // The home must resolve, so that the well-formed account below is foreign
     // to it rather than foreign for want of a home to compare against.
     live_home(&fixture);
+    // S35 C6: the command-substitution payload targets a path INSIDE the
+    // fixture, never a shared `/tmp` path another concurrent run could also
+    // write.
+    let ran = fixture.root().join("command-substitution-ran");
     let hostile = [
-        "agctl-test-codex-ak-0006",
-        "cli|$(id > /tmp/agctl-owned)",
-        "cli|`id`",
-        "cli|\u{1b}]0;pwned\u{7}",
+        "agctl-test-codex-ak-0006".to_owned(),
+        format!("cli|$(id > {})", ran.display()),
+        "cli|`id`".to_owned(),
+        "cli|\u{1b}]0;pwned\u{7}".to_owned(),
     ];
     let mut items: Vec<(&str, &str)> = vec![("Codex Auth", "cli|00112233abcdefff")];
-    items.extend(hostile.iter().map(|account| ("Codex Auth", *account)));
+    items.extend(hostile.iter().map(|account| ("Codex Auth", account.as_str())));
     keychain_listing(&fixture, &items);
 
     let table = doctor(&fixture, "hostile-account");
@@ -624,13 +635,16 @@ fn a_keychain_account_agctl_did_not_write_never_reaches_a_command() {
     assert!(table.contains("agctl will not print an account string it did not make"), "{table}");
 
     let rendered = format!("{table}\n{report}");
-    for account in hostile {
-        assert!(!rendered.contains(account), "an account agctl did not write reached a stream");
+    for account in &hostile {
+        assert!(
+            !rendered.contains(account.as_str()),
+            "an account agctl did not write reached a stream"
+        );
     }
     for fragment in ["$(id", "`id`", "\u{1b}]0;"] {
         assert!(!rendered.contains(fragment), "`{fragment}` reached a stream");
     }
-    assert!(!std::path::Path::new("/tmp/agctl-owned").exists(), "a planted account ran");
+    assert!(!ran.exists(), "a planted account ran");
 }
 
 #[test]

@@ -55,14 +55,21 @@ const NEEDLES: [Needle; 6] = [
     ("a bearer header", "bearer "),
 ];
 
-fn checked(name: &str, output: Output) -> Output {
-    codex::checked("e2e_codex_accounts", name, output, &NEEDLES, &[Stream::Stdout, Stream::Stderr])
+fn checked(fixture: &CodexFixture, name: &str, output: Output) -> Output {
+    codex::checked(
+        "e2e_codex_accounts",
+        name,
+        output,
+        &NEEDLES,
+        &[Stream::Stdout, Stream::Stderr],
+        Some(&fixture.security_log_path()),
+    )
 }
 
 /// Runs `agctl <args>` through [`checked`]. Every launch in this file is one
 /// of these.
 fn run(fixture: &CodexFixture, name: &str, args: &[&str]) -> Output {
-    checked(name, fixture.cmd().args(args).output().expect("the binary runs"))
+    checked(fixture, name, fixture.cmd().args(args).output().expect("the binary runs"))
 }
 
 fn stdout(output: &Output) -> String {
@@ -237,6 +244,17 @@ fn ac115_remove_delete_secret_unlinks_exactly_its_own_files() {
     let dir = seeded_namespace(&fixture);
     let locks = fixture.inner().config_dir().join("codex").join(".locks");
     assert!(dir.is_dir(), "the fixture seeded a namespace");
+    // Carry 3 (S34 C3 review): the refusal twin plants a marker and asserts it
+    // survives; this, the deleting twin, must plant one too and assert it is
+    // gone — otherwise "the marker is deleted" is unasserted at the command
+    // level. `auth_store_tests.rs` owns `remove_named_files`'s own proof.
+    let marker = fixture
+        .inner()
+        .config_dir()
+        .join("codex")
+        .join(".state")
+        .join(format!("{USER}+{ACCT}.refresh"));
+    write_0600(&marker, b"{}");
 
     let output = run(
         &fixture,
@@ -252,6 +270,7 @@ fn ac115_remove_delete_secret_unlinks_exactly_its_own_files() {
     );
     assert!(locks.is_dir(), "the shared lock directory was removed with the namespace");
     assert!(codex_rows(&fixture).is_empty(), "the row is still recorded");
+    assert!(!marker.exists(), "the refresh marker outlived the delete");
 
     let log = fs::read_to_string(audit_log(&fixture)).expect("the Codex audit log");
     assert!(log.contains("\"delete\""), "the removal was not audited: {log}");

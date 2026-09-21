@@ -18,7 +18,11 @@
 
 mod common;
 
+#[path = "common/codex.rs"]
+mod codex;
+
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command as StdCommand;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -27,6 +31,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use codex::CodexFixture;
 use common::ACCT;
 use common::EMAIL;
 use common::Fixture;
@@ -37,6 +44,7 @@ use common::USAGE_PATH;
 use httpmock::Method::GET;
 use httpmock::Method::POST;
 use httpmock::MockServer;
+use serde_json::Value;
 use serde_json::json;
 
 /// The token prefixes and header shapes that must never be printed.
@@ -252,4 +260,168 @@ fn section_9_4_a_traced_failure_path_prints_no_token_material() {
     // The server echoed a token-shaped string back in its error description.
     // Whatever the client does with that body, it must not print it.
     assert_no_token_material("a rejected refresh", &finished.stdout, &finished.stderr);
+}
+
+// ---------------------------------------------------------------------------
+// The Codex twin (S36; plan AC98's stated exception for this file)
+// ---------------------------------------------------------------------------
+
+const CODEX_TOKEN_PATH: &str = "/oauth/token";
+const CODEX_USAGE_PATH: &str = "/backend-api/wham/usage";
+const CODEX_USER: &str = "user-tracing-0001";
+const CODEX_ACCT: &str = "22222222-3333-4444-8888-555555555555";
+const CODEX_EMAIL: &str = "codex-tracing@example.invalid";
+
+/// Codex's own token shapes: this file's `FORBIDDEN` is the Claude prefixes
+/// (`sk-ant-*`), so the Codex case checks its own sentinels against the same
+/// generic Bearer-header entries `assert_no_token_material` already covers.
+const CODEX_FORBIDDEN: [&str; 4] = [
+    "agctl-test-codex-at-",
+    "agctl-test-codex-rt-",
+    "Authorization: Bearer",
+    "authorization: bearer",
+];
+
+/// The Codex twin of [`assert_no_token_material`].
+#[track_caller]
+fn assert_no_codex_token_material(what: &str, stdout: &str, stderr: &str) {
+    for needle in CODEX_FORBIDDEN {
+        assert!(
+            !stdout.contains(needle),
+            "{what}: `{needle}` reached standard output\n--- stdout ---\n{stdout}"
+        );
+        assert!(
+            !stderr.contains(needle),
+            "{what}: `{needle}` reached standard error\n--- stderr ---\n{stderr}"
+        );
+    }
+}
+
+fn codex_jwt(payload: &Value) -> String {
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).expect("serializes"));
+    format!("{header}.{body}.codex-tracing-sig")
+}
+
+/// A ChatGPT-mode `auth.json`, in the same shape `tests/e2e_codex_status.rs`
+/// writes.
+fn codex_auth_doc(exp: i64, rt: &str) -> Value {
+    json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "id_token": codex_jwt(&json!({
+                "email": CODEX_EMAIL,
+                "https://api.openai.com/auth": {
+                    "chatgpt_user_id": CODEX_USER,
+                    "chatgpt_account_id": CODEX_ACCT,
+                    "chatgpt_plan_type": "pro",
+                },
+                "exp": exp,
+            })),
+            "access_token": codex_jwt(&json!({ "exp": exp, "jti": "tracing" })),
+            "refresh_token": rt,
+            "account_id": CODEX_ACCT,
+        },
+        "last_refresh": "2026-09-01T00:00:00Z",
+    })
+}
+
+fn codex_usage_body() -> Value {
+    json!({
+        "plan_type": "pro",
+        "email": CODEX_EMAIL,
+        "user_id": CODEX_USER,
+        "account_id": CODEX_ACCT,
+        "rate_limit": {
+            "allowed": true,
+            "limit_reached": false,
+            "primary_window": { "used_percent": 12.0, "limit_window_seconds": 18_000, "reset_after_seconds": 3_600 },
+            "secondary_window": { "used_percent": 3.0, "limit_window_seconds": 604_800, "reset_after_seconds": 86_400 },
+        },
+        "credits": { "has_credits": true, "unlimited": false, "balance": "0" },
+    })
+}
+
+fn codex_write_0600(path: &std::path::Path, bytes: &[u8]) {
+    fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+    fs::write(path, bytes).expect("write");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod");
+}
+
+/// A registry with one owned Codex account whose namespace holds `doc`.
+fn codex_owned(fixture: &CodexFixture, doc: &Value) {
+    fixture.inner().write_registry_document(&json!({
+        "version": 2,
+        "accounts": [],
+        "forgotten_services": [],
+        "codex_accounts": [{
+            "chatgpt_user_id": CODEX_USER,
+            "chatgpt_account_id": CODEX_ACCT,
+            "email": CODEX_EMAIL,
+            "plan_type": "pro",
+            "label": null,
+            "kind": { "kind": "owned", "export_spelling": "/x", "refresh": "auto" },
+            "forgotten": false,
+            "created_at": "2026-09-17T00:00:00Z",
+        }],
+    }));
+    let ns = fixture.inner().config_dir().join("codex").join(CODEX_USER).join(CODEX_ACCT);
+    codex_write_0600(&ns.join("auth.json"), &serde_json::to_vec_pretty(doc).expect("serializes"));
+}
+
+#[test]
+fn section_9_4_a_traced_codex_refresh_and_fetch_print_no_token_material() {
+    // The Codex twin of `section_9_4_a_traced_refresh_and_fetch_print_no_token_material`
+    // above: a credential parsed off disk, a refresh POST carrying a refresh
+    // token in its body, and a usage GET carrying an access token in its
+    // header — the same shape, the other provider (plan AC98's exception for
+    // this file, S36).
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path(CODEX_USAGE_PATH);
+        then.status(200).json_body(codex_usage_body());
+    });
+    server.mock(|when, then| {
+        when.method(POST).path(CODEX_TOKEN_PATH);
+        then.status(200).json_body(json!({
+            "access_token": codex_jwt(&json!({ "exp": 9_999_999_999_i64 })),
+            "refresh_token": "agctl-test-codex-rt-rotated",
+            "id_token": codex_jwt(&json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_user_id": CODEX_USER, "chatgpt_account_id": CODEX_ACCT,
+                },
+            })),
+            "expires_in": 864_000,
+        }));
+    });
+
+    let mut fixture = CodexFixture::new();
+    fixture.set("AGCTL_CODEX_USAGE_URL", &server.base_url());
+    fixture.set("AGCTL_CODEX_TOKEN_URL", &server.url(CODEX_TOKEN_PATH));
+    fixture.set("RUST_LOG", "agctl=trace");
+    codex_owned(&fixture, &codex_auth_doc(1_000, "agctl-test-codex-rt-stale"));
+
+    let child = fixture
+        .raw()
+        .args(["codex", "status", "--account", CODEX_USER])
+        .spawn()
+        .expect("agctl should start");
+    let finished = common::finish(child);
+
+    assert_no_codex_token_material("codex status --account", &finished.stdout, &finished.stderr);
+
+    // The rotated token really did land on disk, so the assertion above is
+    // about redaction rather than about a refresh that never happened.
+    let stored = fs::read_to_string(
+        fixture
+            .inner()
+            .config_dir()
+            .join("codex")
+            .join(CODEX_USER)
+            .join(CODEX_ACCT)
+            .join("auth.json"),
+    )
+    .expect("readable");
+    assert!(stored.contains("agctl-test-codex-rt-rotated"), "the refresh did happen");
 }

@@ -143,14 +143,21 @@ fn live_home(fixture: &CodexFixture) -> PathBuf {
     fixture.inner().home().join(".codex")
 }
 
-fn checked(name: &str, output: Output) -> Output {
-    codex::checked("e2e_codex_import", name, output, &NEEDLES, &[Stream::Stdout, Stream::Stderr])
+fn checked(fixture: &CodexFixture, name: &str, output: Output) -> Output {
+    codex::checked(
+        "e2e_codex_import",
+        name,
+        output,
+        &NEEDLES,
+        &[Stream::Stdout, Stream::Stderr],
+        Some(&fixture.security_log_path()),
+    )
 }
 
 /// Runs `agctl <args>` through [`checked`]. Every launch in this file is one
 /// of these.
 fn run(fixture: &CodexFixture, name: &str, args: &[&str]) -> Output {
-    checked(name, fixture.cmd().args(args).output().expect("the binary runs"))
+    checked(fixture, name, fixture.cmd().args(args).output().expect("the binary runs"))
 }
 
 /// `agctl codex import --from codex-home --codex-home <home>`, plus `extra`.
@@ -290,7 +297,8 @@ fn ac106_is_idempotent() {
     assert_eq!(first.status.code(), Some(0), "{}", String::from_utf8_lossy(&first.stderr));
     let path = fixture.inner().config_dir().join("config.json");
     let bytes = fs::read(&path).expect("the registry file");
-    let mtime = fs::metadata(&path).expect("stat").mtime_nsec();
+    let meta = fs::metadata(&path).expect("stat");
+    let (mtime, mtime_ns) = (meta.mtime(), meta.mtime_nsec());
 
     let second = import(&fixture, "idempotent-2", &home, &[]);
     assert_eq!(second.status.code(), Some(0), "{}", String::from_utf8_lossy(&second.stderr));
@@ -301,9 +309,14 @@ fn ac106_is_idempotent() {
     );
     assert_eq!(codex_rows(&fixture).len(), 1, "no second row");
     assert_eq!(fs::read(&path).expect("the registry file"), bytes, "the registry changed");
+    let meta = fs::metadata(&path).expect("stat");
+    // C2b-3: both halves of the mtime, not `mtime_nsec()` alone — a rewrite
+    // that happened to land in the same nanosecond of a different second would
+    // otherwise pass unnoticed. The byte comparison above carries the real
+    // weight; this is belt and braces.
     assert_eq!(
-        fs::metadata(&path).expect("stat").mtime_nsec(),
-        mtime,
+        (meta.mtime(), meta.mtime_nsec()),
+        (mtime, mtime_ns),
         "the registry was rewritten with the same bytes"
     );
 }

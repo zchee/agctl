@@ -276,6 +276,8 @@ impl CodexFixture {
         envs: impl Iterator<Item = (&'a std::ffi::OsStr, Option<&'a std::ffi::OsStr>)>,
     ) {
         let home = self.inner.home();
+        let mut security_bin: Option<PathBuf> = None;
+        let mut backend_none = false;
         for (key, value) in envs {
             if key == CODEX_HOME_ENV {
                 assert!(
@@ -291,6 +293,36 @@ impl CodexFixture {
                     "HOME must point inside the fixture"
                 );
             }
+            if key == "AGCTL_SECURITY_BIN" {
+                security_bin = value.map(PathBuf::from);
+            }
+            if key == "AGCTL_KEYCHAIN_BACKEND" {
+                backend_none = value == Some(std::ffi::OsStr::new("none"));
+            }
+        }
+        // AC109's anti-vacuity arm (fix loop 1, F2): a log check alone is
+        // vacuous for a fixture that never calls `with_keychain()` — no fake
+        // `security` runs, so no log is ever written, and "zero
+        // `find-generic-password` lines" would be trivially true. This proves
+        // the OTHER half instead, on the same route every `cmd()`/`raw()`
+        // already takes: every launch either wires a fake `security` INSIDE
+        // the fixture root (so `checked`'s log check means something) or has
+        // the keychain backend disabled outright, which fails closed before
+        // any keychain call (`secret::default_reader`) — never neither, which
+        // would leave a real `security(1)` reachable.
+        match (backend_none, &security_bin) {
+            (true, None) => {}
+            (false, Some(bin)) => assert!(
+                bin.starts_with(self.root()),
+                "AGCTL_SECURITY_BIN ({}) is not inside the fixture root ({})",
+                bin.display(),
+                self.root().display()
+            ),
+            _ => panic!(
+                "this fixture wires neither the fake `security` (`AGCTL_SECURITY_BIN`) nor the \
+                 disabled backend (`AGCTL_KEYCHAIN_BACKEND=none`), so a keychain call here could \
+                 reach the real one; call `with_keychain()` if the test needs a keychain"
+            ),
         }
     }
 }
@@ -364,19 +396,57 @@ pub fn assert_receipts_were_audited(test: &str, stderr: &[u8]) {
     }
 }
 
-/// Asserts neither stream of `output` carries a needle, then copies the
-/// `keep` streams to `AGCTL_E2E_TRACE_DIR/<prefix>-<test>.<stream>` when that
-/// directory is named. Every e2e crate's `checked` is this one.
+/// Plan AC109's per-account lookup clause, enforced on the fake `security`
+/// log itself rather than on the Rust source (fix loop 1, F1): a Codex
+/// command never needs one account's password, only a listing
+/// (`dump-keychain`), and a source-string grep cannot see a call that
+/// reaches `KeychainReader::read` (`src/secret/mod.rs:130`) without spelling
+/// `find-generic-password` anywhere in Codex's own modules — as a planted
+/// `reader.read(KEYRING_SERVICE)` in `login.rs`/`pass.rs` proved.
+///
+/// Non-vacuous by construction, not by assumption: every fixture is in
+/// exactly one of two states — the fake `security` wired
+/// (`CodexFixture::with_keychain`), whose log this reads, or the keychain
+/// backend disabled outright (`Fixture::new`'s default), which fails closed
+/// before any lookup could happen (`secret::default_reader`,
+/// `keychain_write::security_bin`) and asserted on every launch by
+/// `Fixture::assert_keychain_seam` (`cmd()`/`raw()`, `tests/common/mod.rs:815,839`).
+/// So a missing log is never "the check didn't run" — it is either "the
+/// keychain is off" (proven elsewhere) or "this launch never touched a fake
+/// `security` that exists" (nothing to find). A `with_keychain()` fixture's
+/// own `dumps == N` assertions (`e2e_codex_login.rs`,
+/// `e2e_codex_import.rs`) already prove the log is live when one is wired.
+fn assert_no_keychain_lookup(test: &str, security_log: Option<&Path>) {
+    let Some(path) = security_log else { return };
+    let Ok(text) = fs::read_to_string(path) else { return };
+    let lookups: Vec<&str> =
+        text.lines().filter(|line| line.starts_with("find-generic-password")).collect();
+    assert!(
+        lookups.is_empty(),
+        "{test}: a Codex launch issued a per-account keychain lookup, which no Codex command \
+         needs:\n{}",
+        lookups.join("\n")
+    );
+}
+
+/// Asserts neither stream of `output` carries a needle, that the fake
+/// `security` log — when `security_log` names one that exists — carries no
+/// per-account lookup, then copies the `keep` streams to
+/// `AGCTL_E2E_TRACE_DIR/<prefix>-<test>.<stream>` when that directory is
+/// named. Every e2e crate's `checked` is this one: the one route every
+/// Codex launch already goes through.
 pub fn checked(
     prefix: &str,
     test: &str,
     output: Output,
     needles: &[Needle],
     keep: &[Stream],
+    security_log: Option<&Path>,
 ) -> Output {
     assert_no_needle(test, "stdout", &output.stdout, needles);
     assert_no_needle(test, "stderr", &output.stderr, needles);
     assert_receipts_were_audited(test, &output.stderr);
+    assert_no_keychain_lookup(test, security_log);
     if let Some(dir) = std::env::var_os("AGCTL_E2E_TRACE_DIR") {
         let dir = PathBuf::from(dir);
         for stream in keep {

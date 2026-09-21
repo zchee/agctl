@@ -109,8 +109,15 @@ fn armed() -> (CodexFixture, PathBuf) {
 }
 
 /// Asserts neither stream carries a needle and captures both streams.
-fn checked(name: &str, output: Output) -> Output {
-    codex::checked("e2e_codex_login", name, output, &NEEDLES, &[Stream::Stdout, Stream::Stderr])
+fn checked(fixture: &CodexFixture, name: &str, output: Output) -> Output {
+    codex::checked(
+        "e2e_codex_login",
+        name,
+        output,
+        &NEEDLES,
+        &[Stream::Stdout, Stream::Stderr],
+        Some(&fixture.security_log_path()),
+    )
 }
 
 /// The shared `checked` reports a leaked needle by NAME and byte offset, and
@@ -130,7 +137,7 @@ fn checked_reports_a_needle_by_name_and_offset_never_by_value() {
         // refuse, `expect_err` prints that `()`, never the `Output` (both
         // streams, the needle included).
         let report = std::panic::catch_unwind(|| {
-            codex::checked("e2e_codex_login", test, leaky, &NEEDLES, &[]);
+            codex::checked("e2e_codex_login", test, leaky, &NEEDLES, &[], None);
         })
         .expect_err("a stream carrying a needle is refused");
         report
@@ -167,7 +174,8 @@ fn checked_reports_a_needle_by_name_and_offset_never_by_value() {
         stdout: b"nothing to see".to_vec(),
         stderr: b"nor here".to_vec(),
     };
-    let back = codex::checked("e2e_codex_login", "positive-control-clean", clean, &NEEDLES, &[]);
+    let back =
+        codex::checked("e2e_codex_login", "positive-control-clean", clean, &NEEDLES, &[], None);
     assert_eq!(back.stdout, b"nothing to see");
     assert_eq!(back.stderr, b"nor here");
 }
@@ -194,7 +202,7 @@ fn checked_refuses_a_run_that_dropped_a_write_receipt() {
             .to_vec(),
     };
     let report = std::panic::catch_unwind(|| {
-        codex::checked("e2e_codex_login", "positive-control-receipt", aborted, &NEEDLES, &[]);
+        codex::checked("e2e_codex_login", "positive-control-receipt", aborted, &NEEDLES, &[], None);
     })
     .expect_err("a run that dropped a receipt is refused");
     let report = report
@@ -235,7 +243,11 @@ fn checked_refuses_a_run_that_dropped_a_write_receipt() {
 
 /// Runs `agctl codex login` through [`checked`].
 fn login(fixture: &CodexFixture, name: &str) -> Output {
-    checked(name, fixture.cmd().args(["codex", "login"]).output().expect("the binary runs"))
+    checked(
+        fixture,
+        name,
+        fixture.cmd().args(["codex", "login"]).output().expect("the binary runs"),
+    )
 }
 
 /// Drops the registry row for `(USER, ACCT)` — the credential and its
@@ -248,6 +260,7 @@ fn login(fixture: &CodexFixture, name: &str) -> Output {
 /// nothing claiming it, which `login` adopts.
 fn drop_the_record(fixture: &CodexFixture, name: &str) {
     let output = checked(
+        fixture,
         name,
         fixture
             .cmd()
@@ -608,7 +621,7 @@ fn run_paused_before_install(
             .output()
             .expect("the binary runs")
     });
-    checked(name, output)
+    checked(fixture, name, output)
 }
 
 /// Architect M5: a scratch document swapped while agctl is paused between
@@ -810,7 +823,8 @@ fn c1_a_closed_stdout_never_decides_whether_the_credential_is_removed() {
     // `codex` inherits this stdout too; it writes nothing there.
     drop(child.stdout.take());
     drop(child.stdin.take());
-    let output = checked("closed-stdout", child.wait_with_output().expect("the binary ends"));
+    let output =
+        checked(&fixture, "closed-stdout", child.wait_with_output().expect("the binary ends"));
 
     use std::os::unix::process::ExitStatusExt;
     assert_ne!(
@@ -872,9 +886,115 @@ fn e1_a_closed_stderr_never_decides_whether_the_credential_is_removed() {
     // `codex` inherits this stderr too; on the happy path it writes nothing.
     drop(child.stderr.take());
     drop(child.stdin.take());
-    let output = checked("closed-stderr", child.wait_with_output().expect("the binary ends"));
+    let output =
+        checked(&fixture, "closed-stderr", child.wait_with_output().expect("the binary ends"));
 
     use std::os::unix::process::ExitStatusExt;
     assert_ne!(output.status.signal(), Some(libc::SIGABRT), "a closed stderr must not abort");
     assert!(scratch_leaves(&fixture).is_empty(), "and the scratch home is removed");
+}
+
+/// S36's owed e2e half of AC105 (`p3-s34-review-request.md` §8): `Scratch::create`
+/// registers `<scratch>/auth.json` with `runtime::cleanup` **before** the child
+/// spawns. Holding the login at [`run_paused_before_install`]'s pause proves the
+/// registration already covers the file the fake wrote — a document that exists
+/// only because the child ran — and a SIGTERM there proves the registration is
+/// live, not merely present: the signal handler (`signals.rs`) runs the
+/// emergency cleanup and removes it, with nothing installed.
+#[test]
+fn ac105_a_sigterm_while_paused_before_install_removes_the_registered_scratch_document() {
+    let (mut fixture, _doc) = armed();
+    let resume = fixture.root().join("resume");
+    let reached = fixture.root().join("resume.reached");
+    fixture.set("AGCTL_FAULT", "pause_codex_login_before_install");
+    fixture.set("AGCTL_FAULT_RESUME", &resume.to_string_lossy());
+
+    let mut command = fixture.raw();
+    command
+        .args(["codex", "login"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().expect("the binary starts");
+
+    let start = std::time::Instant::now();
+    while !reached.exists() && start.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(reached.exists(), "agctl never reported reaching the pause before install");
+
+    let root = scratch_root(&fixture);
+    let leaf = fs::read_dir(&root)
+        .expect("the scratch root exists")
+        .flatten()
+        .map(|entry| entry.path())
+        .next()
+        .expect("the scratch home the fake wrote into still exists while agctl waits");
+    let scratch_auth = leaf.join("auth.json");
+    assert!(
+        scratch_auth.is_file(),
+        "the scratch document must exist before a signal here proves anything"
+    );
+
+    let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("a pid fits an i32"))
+        .expect("a live pid");
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM)
+        .expect("the signal is delivered");
+    let status = child.wait().expect("the child is waitable");
+
+    use std::os::unix::process::ExitStatusExt;
+    assert!(!status.success(), "a SIGTERM exit is not success");
+    assert_ne!(status.signal(), Some(libc::SIGABRT), "a SIGTERM must not abort");
+    assert!(
+        !scratch_auth.exists(),
+        "the registered scratch document survived a SIGTERM taken before the spawn"
+    );
+    // Only the registered document is the emergency cleanup's job (invariant
+    // AC105's "the file is gone", not "the scratch tree is gone"): the rest of
+    // the scratch home's residue — `Scratch::drop`'s ordinary job — is not
+    // reached by a signal handler that never unwinds through it.
+    assert!(leaf.is_dir(), "the scratch home itself is a `Scratch::drop` matter, not this one");
+    assert!(!namespace(&fixture, USER, ACCT).join("auth.json").exists(), "nothing was installed");
+}
+
+/// AC126 (d'): a re-login over a namespace already in the terminal 401 state
+/// resets its refresh marker — `install` calls `reset_for_login` under the
+/// guard (S30), which S36 proves end to end with a real 401 fixture rather than
+/// by reading the unit test alone.
+#[test]
+fn ac126_a_relogin_over_a_terminal_namespace_resets_its_refresh_state() {
+    let (fixture, _doc) = armed();
+    let first = login(&fixture, "relogin-terminal-first");
+    assert!(first.status.success(), "{}", stderr(&first));
+
+    let marker_path = fixture
+        .inner()
+        .config_dir()
+        .join("codex")
+        .join(".state")
+        .join(format!("{USER}+{ACCT}.refresh"));
+    fs::create_dir_all(marker_path.parent().expect("a parent")).expect("mkdir");
+    // A terminal 401 state (plan AC114): three counted failures, a raised
+    // floor, and an already-spent re-send — everything `install`'s reset must
+    // clear.
+    fs::write(
+        &marker_path,
+        json!({ "schema": 1, "floor_min": 240, "did_not_help": 3, "resent": true }).to_string(),
+    )
+    .expect("the marker is writable");
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+    drop_the_record(&fixture, "relogin-terminal-drop-record");
+    let second = login(&fixture, "relogin-terminal-second");
+    assert!(second.status.success(), "{}", stderr(&second));
+
+    let marker: Value =
+        serde_json::from_slice(&fs::read(&marker_path).expect("the marker still exists"))
+            .expect("the marker parses");
+    assert_eq!(marker["did_not_help"], json!(0), "the terminal count is reset: {marker}");
+    assert_eq!(marker["floor_min"], json!(60), "the floor is reset: {marker}");
+    assert_eq!(marker["resent"], json!(false), "the spent re-send is reset: {marker}");
+    assert!(
+        marker.get("inflight").is_none_or(Value::is_null),
+        "no send is left in flight: {marker}"
+    );
 }

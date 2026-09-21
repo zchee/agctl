@@ -107,6 +107,7 @@ fn login(fixture: &CodexFixture, name: &str) -> Output {
         fixture.cmd().args(["codex", "login"]).output().expect("the binary runs"),
         &NEEDLES,
         &[Stream::Stdout, Stream::Stderr],
+        Some(&fixture.security_log_path()),
     )
 }
 

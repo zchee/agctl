@@ -171,12 +171,19 @@ fn owned(fixture: &CodexFixture, doc: &Value, refresh: &str) {
 /// Runs `agctl <args>`, asserts neither stream carries a needle, and hands
 /// the captured standard error to the trace directory when one is named.
 fn run(fixture: &CodexFixture, name: &str, args: &[&str]) -> Output {
-    checked(name, fixture.cmd().args(args).output().expect("the binary runs"))
+    checked(fixture, name, fixture.cmd().args(args).output().expect("the binary runs"))
 }
 
 /// Asserts neither stream carries a needle and captures the standard error.
-fn checked(name: &str, output: Output) -> Output {
-    codex::checked("e2e_codex_status", name, output, &NEEDLES, &[Stream::Stderr])
+fn checked(fixture: &CodexFixture, name: &str, output: Output) -> Output {
+    codex::checked(
+        "e2e_codex_status",
+        name,
+        output,
+        &NEEDLES,
+        &[Stream::Stderr],
+        Some(&fixture.security_log_path()),
+    )
 }
 
 #[test]
@@ -545,6 +552,15 @@ fn usage_mock(server: &MockServer, status: u16) -> httpmock::Mock<'_> {
     })
 }
 
+/// The fake `security`'s cumulative `dump-keychain` call count (plan AC109
+/// fold-in, fix loop 1): no log at all reads as zero, the same as a fixture
+/// that never wired the keychain.
+fn dump_count(fixture: &CodexFixture) -> usize {
+    fs::read_to_string(fixture.security_log_path())
+        .map(|text| text.lines().filter(|line| line.starts_with("dump-keychain")).count())
+        .unwrap_or(0)
+}
+
 #[test]
 fn ac92_a_permanent_class_needs_login_after_one_post_and_no_retry() {
     let server = MockServer::start();
@@ -753,6 +769,7 @@ fn ac128_an_abort_after_the_marker_leaves_the_next_pass_with_no_post() {
     owned(&fixture, &auth_doc(USER, ACCT, 1_000, false, "agctl-test-codex-rt-0001"), "auto");
 
     let aborted = checked(
+        &fixture,
         "ac128-abort",
         fixture.cmd().args(["codex", "status", "--account", USER]).output().expect("runs"),
     );
@@ -857,7 +874,7 @@ fn run_paused(
             .output()
             .expect("the binary runs")
     });
-    checked(name, output)
+    checked(fixture, name, output)
 }
 
 /// An external writer rotating the namespace's grant in place, as Codex does.
@@ -1042,6 +1059,41 @@ fn ac95_the_live_home_is_read_from_the_environment_and_only_when_it_is_there() {
 }
 
 #[test]
+fn ac109_status_dumps_the_keychain_only_under_store_mode_auto() {
+    // AC109 fold-in (review C3, fix loop 1): this file wires no keychain
+    // anywhere else, so the "status under store_mode: auto" half of AC109's
+    // suite-wide claim had no dynamic proof of any kind. One fixture, both
+    // directions, the same live home.
+    let server = MockServer::start();
+    let usage = usage_mock(&server, 200);
+    let mut fixture = fixture(&server);
+    fixture.with_keychain();
+
+    let live = fixture.inner().home().join(".codex");
+    let doc = auth_doc(USER, ACCT, now_s() + 86_400, false, "agctl-test-codex-rt-0001");
+    write_0600(&live.join("auth.json"), &serde_json::to_vec_pretty(&doc).expect("serializes"));
+
+    let file_mode = run(&fixture, "ac109-file-mode", &["codex", "status"]);
+    assert_eq!(file_mode.status.code(), Some(0), "{}", String::from_utf8_lossy(&file_mode.stdout));
+    assert_eq!(
+        dump_count(&fixture),
+        0,
+        "a default (`file`) store mode must never dump the keychain"
+    );
+
+    fs::write(live.join("config.toml"), "cli_auth_credentials_store = \"auto\"\n").expect("config");
+    let auto_mode = run(&fixture, "ac109-auto-mode", &["codex", "status"]);
+    assert_eq!(auto_mode.status.code(), Some(0), "{}", String::from_utf8_lossy(&auto_mode.stdout));
+    assert_eq!(dump_count(&fixture), 1, "`store_mode: auto` must dump the keychain exactly once");
+    assert_eq!(
+        usage.calls(),
+        1,
+        "the first pass fetched the live credential; the second served the fresh cache — no \
+         item was listed for this home, so `auto` still resolved to the file, never `not read`"
+    );
+}
+
+#[test]
 fn ac113_a_parked_grant_is_replayed_on_the_next_pass_without_a_second_post() {
     let server = MockServer::start();
     let usage = usage_mock(&server, 200);
@@ -1156,6 +1208,15 @@ fn spawn_with(fixture: &CodexFixture, args: &[&str], env: &[(&str, &str)]) -> st
         };
     }
     for (key, value) in env {
+        // Review C1 (fix loop 1): this function rebuilds the environment by
+        // hand, so it is the one place a caller's extra `env` could quietly
+        // widen what `assert_isolated` already closed — a route neither
+        // `codex_env`/`AGCTL_SECURITY_BIN` should ever reach through.
+        assert_ne!(*key, "CODEX_HOME", "spawn_with must not be given a Codex home to pass through");
+        assert_ne!(
+            *key, "AGCTL_SECURITY_BIN",
+            "spawn_with must not be given a keychain override to pass through"
+        );
         command.env(key, value);
     }
     command

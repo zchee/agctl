@@ -444,6 +444,17 @@ CREDITS_STATE_FORBIDDEN=(
 # The file that must not read the process environment (invariant I25).
 CODEX_HOME_MODULE=src/provider/codex/home.rs
 
+# The only callers of a keychain LISTING (`security dump-keychain`) in the
+# Codex commands (plan AC109): `doctor`'s own report, `pass::list_keyring`
+# (shared by `status`, `watch` and `import`, gated on `store_mode: auto`), and
+# `login`'s two listings (S34 C1). A per-account lookup (`find-generic-password`)
+# is never one of them — checked separately, by string, not by caller.
+CODEX_KEYRING_LISTING_ALLOWED=(
+    src/commands/codex/doctor.rs
+    src/commands/codex/login.rs
+    src/commands/codex/pass.rs
+)
+
 LEAK_NEEDLES=(
     agctl-test-codex-at-
     agctl-test-codex-rt-
@@ -1194,6 +1205,44 @@ check_removal_helpers() {
     return "$bad"
 }
 
+# AC109, re-run at S36 (fix loop 1, F1): a Codex module never SPELLS
+# `find-generic-password` — the literal string lives in exactly one place in
+# the whole crate, `security_cli.rs`'s `READ_ARGV_FLAGS` — so this catches a
+# call written the same way the crate's own Claude-side callers write it, or
+# a stray mention in a comment that would mislead a future caller. It does
+# NOT catch a call through the Rust name, `KeychainReader::read`, which never
+# spells the subcommand: `tests/common/codex.rs::checked` is what enforces
+# the actual clause (plan AC109's words, "the fake `security` log contains no
+# `find-generic-password`"), on the fake `security` log every Codex launch
+# produces. This grep is the second line of defence, not the first.
+check_codex_no_password_lookup() {
+    local hits
+    hits=$(scoped_code_hits "$1" 'find[-_]generic[-_]password' src/provider/codex src/commands/codex) \
+        || scan_failed check_codex_no_password_lookup
+    [[ -z $hits ]] && return 0
+    printf '  a Codex module names find-generic-password, a per-account lookup it never needs:\n%s\n' \
+        "$hits"
+    return 1
+}
+
+# AC109's other half: every keychain LISTING call in the Codex commands traces
+# to `${CODEX_KEYRING_LISTING_ALLOWED[@]}` — scoped to Codex's own two
+# directories, so this never flags the Claude-side callers of the same method
+# name.
+check_codex_keyring_listing_callers() {
+    local hits file bad=0
+    hits=$(scoped_code_hits "$1" '\blist_services(?:_uncached)?\b' \
+        src/provider/codex src/commands/codex) || scan_failed check_codex_keyring_listing_callers
+    while IFS= read -r file; do
+        [[ -z $file ]] && continue
+        if ! contains "$file" "${CODEX_KEYRING_LISTING_ALLOWED[@]}"; then
+            printf '  %s calls a keychain listing and is not in its allow-list\n' "$file"
+            bad=1
+        fi
+    done < <(printf '%s\n' "$hits" | cut -d: -f1 | LC_ALL=C sort -u)
+    return "$bad"
+}
+
 # Each plant_<name> <root> adds exactly one violation of its check.
 PLANT_FILE=src/main.rs
 # plant_line <root> <line> [file]: appends one line to <file> (default the
@@ -1212,6 +1261,14 @@ plant_unlink_alias() { plant_line "$1" 'use crate::secret::file_store::unlink_at
 plant_remove_dir_under_root() { plant_line "$1" 'fn _phase3_plant(p: &Paths, d: &Path) { let _ = file_store::remove_dir_under_root(p, d); }'; }
 plant_remove_dir_under() { plant_line "$1" 'fn _phase3_plant(a: &Path, p: &Path) { let _ = file_store::remove_dir_under(a, p); }'; }
 plant_fake_prefix() { plant_line "$1" 'fn _phase3_plant(t: &str) -> bool { t.starts_with("AGCTL_FAKE_CODEX_") }'; }
+plant_codex_find_generic_password() {
+    plant_line "$1" 'const _PHASE3_PLANT: &str = "find-generic-password";' src/provider/codex/home.rs
+}
+plant_codex_keyring_listing_elsewhere() {
+    plant_line "$1" \
+        'fn _phase3_plant(r: &dyn crate::secret::KeychainReader) { let _ = r.list_services("x"); }' \
+        src/commands/codex/status.rs
+}
 # The commented-out attribute (review C1b-r2 P-cfg): the literal is still spelled
 # once, but its `#[cfg]` is a comment, so it compiles into a default build.
 plant_fake_prefix_cfg_commented() {
@@ -1490,7 +1547,7 @@ CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers expose
     codex_debug_assert state_path codex_flock wham_usage codex_usage_url codex_timeouts codex_redirects codex_decoded_cap credits_state
     auth_host codex_token_url oauth_cancelled oauth_refresh_callers consent_callers refresh_usage_cache receipt_type
     receipt_destructure refresh_drivers refresh_client post_permit permit_mint permit_mint_count daemon_pid_names watch_no_post usage_client_new
-    fake_prefix receipt_check reached_audit)
+    fake_prefix receipt_check reached_audit codex_no_password_lookup codex_keyring_listing_callers)
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
@@ -1591,6 +1648,8 @@ PLANTS=(
     "daemon_pid_names plant_daemon_pid_name_elsewhere"
     "daemon_pid_names plant_daemon_pid_legacy_name_elsewhere"
     "usage_client_new plant_usage_client_new"
+    "codex_no_password_lookup plant_codex_find_generic_password"
+    "codex_keyring_listing_callers plant_codex_keyring_listing_elsewhere"
 )
 
 main() {
