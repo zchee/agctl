@@ -26,6 +26,7 @@
 //! anything would be a write nobody asked for, on a path the reviewer of the
 //! real command has not seen yet.
 
+pub mod accounts;
 pub mod import;
 pub mod login;
 pub mod pass;
@@ -57,6 +58,7 @@ pub fn run(cli: &Cli, command: &CodexCommand, cancel: &Cancel) -> Result<i32, Ap
         CodexCommand::Watch(args) => watch::run(cli, args, cancel).map(|()| 0),
         CodexCommand::Login(args) => login::run(cli, args, cancel).map(|()| 0),
         CodexCommand::Import(args) => import::run(cli, args, cancel).map(|()| 0),
+        CodexCommand::Accounts { command } => accounts::run(cli, command, cancel).map(|()| 0),
         other => Err(AppError::not_implemented(&name(other))),
     }
 }

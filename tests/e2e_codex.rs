@@ -253,13 +253,16 @@ fn codex_tree(config_dir: &Path) -> bool {
 fn every_codex_subcommand_refuses_without_touching_the_store() {
     let fixture = CodexFixture::new();
     // `status` and `watch` landed at S33 (`tests/e2e_codex_status.rs`),
-    // `login` at S34 C1 (`tests/e2e_codex_login.rs`) and `import` at S34 C2-b
-    // (`tests/e2e_codex_import.rs`); the rest are still stubs. A command that
-    // lands leaves this list in the commit that lands it, otherwise "no stub
-    // may touch a file" quietly stops covering anything.
+    // `login` at S34 C1 (`tests/e2e_codex_login.rs`), `import` at S34 C2-b
+    // (`tests/e2e_codex_import.rs`) and `accounts list/show/remove/forget/
+    // unforget` at S34 C3 (`tests/e2e_codex_accounts.rs`); the rest are still
+    // stubs. A command that lands leaves this list in the commit that lands
+    // it, otherwise "no stub may touch a file" quietly stops covering
+    // anything. `accounts set` and `accounts refresh` stay: they change the
+    // refresh policy and send POSTs, which is C4's capability.
     let lines: [(&[&str], &str); 3] = [
         (&["codex", "doctor"], "agctl codex doctor"),
-        (&["codex", "accounts", "list"], "agctl codex accounts list"),
+        (&["codex", "accounts", "set", "x", "--refresh", "never"], "agctl codex accounts set"),
         (&["codex", "accounts", "refresh", "x", "--reset-floor"], "agctl codex accounts refresh"),
     ];
 
