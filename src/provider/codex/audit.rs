@@ -34,12 +34,30 @@ use crate::error::AppError;
 use crate::provider::codex::auth_store::UnknownClass;
 use crate::provider::codex::auth_store::WriteKind;
 use crate::provider::codex::auth_store::WriteReceipt;
+use crate::provider::codex::home;
 use crate::provider::codex::oauth::PermanentClass;
 use crate::secret::audit;
 use crate::secret::file_store;
 
 /// The log's file name under `codex_root()`.
 pub const LOG_FILE: &str = "writes.jsonl";
+
+/// The `user_id` and `account_id` of a line that belongs to no namespace.
+///
+/// A valid namespace segment, so the field guard is unchanged, and a word no
+/// ChatGPT id is: the pair says "not a namespace" rather than leaving two
+/// required fields to be guessed at.
+const NO_NAMESPACE: &str = "none";
+
+/// The longest line a reader will assemble before it gives up on it.
+///
+/// An entry agctl writes is a timestamp, a pid, two namespace segments, a
+/// fixed word and up to three short hex strings — a few hundred bytes, and
+/// bounded by the field guard that wrote it. Four kilobytes is far above
+/// that and far below anything that would matter as an allocation, so a line
+/// past it was not written by this crate and is no use to a reader looking
+/// for this crate's own entries.
+const MAX_ENTRY_BYTES: usize = 4096;
 
 /// Where the Codex log lives for one agctl store.
 pub fn log_path(paths: &Paths) -> PathBuf {
@@ -77,6 +95,9 @@ pub enum CodexOutcome {
     Resend,
     /// The user lifted the 401 floor.
     FloorReset,
+    /// A login child agctl spawned left a `Codex Auth` keychain item behind,
+    /// and the login was refused because of it.
+    LoginKeychainGained,
 }
 
 /// One line of the Codex log.
@@ -105,6 +126,16 @@ pub struct CodexAuditEntry {
     /// The refresh digest prefix of the credential the event concerned.
     #[serde(default)]
     pub digest8_after: Option<String>,
+    /// The `Codex Auth` keychain account a refused login child gained, on a
+    /// [`CodexOutcome::LoginKeychainGained`] line and on no other.
+    ///
+    /// Always `cli|` and sixteen lowercase hex digits ([`home::is_home_account`]),
+    /// which is a digest prefix of a path and names no person — the same
+    /// standing as the two `digest8_*` fields under invariant I24.
+    ///
+    /// [`home::is_home_account`]: crate::provider::codex::home::is_home_account
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keychain_account: Option<String>,
 }
 
 /// A refresh event that wrote no credential file.
@@ -147,6 +178,15 @@ pub enum CodexEvent<'a> {
     },
     /// The user lifted the 401 floor.
     FloorReset,
+    /// A login child left a `Codex Auth` keychain item behind and the login
+    /// was refused. Written by `commands::codex::login`, read back by
+    /// `doctor`: it is the only evidence that an item in somebody's keychain
+    /// is one agctl caused, and therefore the only ground on which `doctor`
+    /// offers to remove it.
+    LoginKeychainGained {
+        /// The account of the item the second listing gained.
+        keychain_account: &'a str,
+    },
 }
 
 /// The classes an [`CodexEvent::Ambiguous`] or [`CodexEvent::NeedsLogin`] may
@@ -220,8 +260,78 @@ pub fn append_event(
             entry(ids, CodexOutcome::Resend, None, Some(sent_digest8), None)
         }
         CodexEvent::FloorReset => entry(ids, CodexOutcome::FloorReset, None, None, None),
+        CodexEvent::LoginKeychainGained { keychain_account } => {
+            // `ids` is deliberately ignored. A login is refused on the child's
+            // evidence *before* its credential is parsed (`verify_login`:
+            // evidence before trust), so at this point no identity has been
+            // read and there is no namespace this line belongs to. The fixed
+            // word says that, and saying it here rather than trusting the
+            // caller keeps a real pair out of a line that did not earn one.
+            let mut entry = entry(
+                (NO_NAMESPACE, NO_NAMESPACE),
+                CodexOutcome::LoginKeychainGained,
+                None,
+                None,
+                None,
+            );
+            entry.keychain_account = Some(keychain_account.to_owned());
+            entry
+        }
     };
     write_entry(paths, &entry)
+}
+
+/// The `Codex Auth` accounts this log records a refused login child as having
+/// gained, oldest first and each named once.
+///
+/// `doctor` asks this before it offers to remove a keychain item: an item is
+/// agctl's to name only when agctl's own log says agctl caused it (plan
+/// section 3.3, "a `Codex Auth` keychain item agctl's login child caused and
+/// refused (`listing gained` in the audit)"). The whole log is read, not the
+/// tail `doctor` displays — a login refused a thousand writes ago still left
+/// the item behind.
+///
+/// Every account is re-checked against [`home::is_home_account`] on the way
+/// out, exactly as [`entry_line`] checked it on the way in. It was checked
+/// when it was written, but a log is a file on a disk, and the caller puts
+/// this string inside a command a person is invited to paste: a line whose
+/// field has any other shape is not a gained item, it is a malformed line,
+/// and it is passed over like any other.
+///
+/// The log is read a line at a time ([`audit::for_each_line_at`]), never as
+/// one string: this asks a question about the whole history, and the history
+/// only grows. [`MAX_ENTRY_BYTES`] bounds what one line may cost.
+///
+/// # Errors
+///
+/// As [`read`]. A log that cannot be read is not an empty log, and the caller
+/// must not be left unable to tell the two apart; it is told.
+///
+/// [`home::is_home_account`]: crate::provider::codex::home::is_home_account
+/// [`audit::for_each_line_at`]: crate::secret::audit::for_each_line_at
+pub fn gained_keychain_accounts(paths: &Paths) -> Result<Vec<String>, AppError> {
+    let shown = log_path(paths);
+    let root = match file_store::open_dir_under(paths.config_dir(), &paths.codex_root()) {
+        Ok(root) => root,
+        Err(file_store::FileStoreError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(err) => return Err(AppError::Config(err.to_string())),
+    };
+    let mut found: Vec<String> = Vec::new();
+    audit::for_each_line_at(root.as_fd(), LOG_FILE, &shown, MAX_ENTRY_BYTES, |line| {
+        let Ok(entry) = serde_json::from_str::<CodexAuditEntry>(line) else { return };
+        if entry.outcome != CodexOutcome::LoginKeychainGained {
+            return;
+        }
+        let Some(account) = entry.keychain_account else { return };
+        if home::is_home_account(&account) && !found.contains(&account) {
+            found.push(account);
+        }
+    })?;
+    Ok(found)
 }
 
 /// The whole log, or `None` when there is none (for `doctor`).
@@ -259,6 +369,7 @@ fn entry(
         class: class.map(str::to_owned),
         digest8_before: digest8_before.map(str::to_owned),
         digest8_after: digest8_after.map(str::to_owned),
+        keychain_account: None,
     }
 }
 
@@ -283,6 +394,28 @@ fn entry_line(entry: &CodexAuditEntry) -> Result<String, AppError> {
                 value.len()
             )));
         }
+    }
+    // Two-sided, so neither half can drift: the keychain account belongs to
+    // that one outcome and to no other, that outcome is meaningless without
+    // it, and its spelling is the one agctl itself writes. `doctor` puts this
+    // value into a command a person pastes into a shell, so the line is
+    // refused rather than written if any of the three fails.
+    match (entry.outcome, &entry.keychain_account) {
+        (CodexOutcome::LoginKeychainGained, Some(account)) if home::is_home_account(account) => {}
+        (CodexOutcome::LoginKeychainGained, _) => {
+            return Err(AppError::Config(
+                "a Codex audit entry claims a gained keychain item without an account spelled \
+                 `cli|` and sixteen lowercase hex digits"
+                    .to_owned(),
+            ));
+        }
+        (_, Some(_)) => {
+            return Err(AppError::Config(
+                "a Codex audit entry carries a keychain account on an outcome that has none"
+                    .to_owned(),
+            ));
+        }
+        (_, None) => {}
     }
     if let Some(class) = &entry.class
         && !CLASSES.contains(&class.as_str())

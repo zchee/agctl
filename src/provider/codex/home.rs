@@ -352,6 +352,30 @@ pub fn keyring_account(home: &Path) -> String {
     format!("cli|{}", &digest[..16])
 }
 
+/// Whether `account` is spelled the way [`keyring_account`] spells one (fact
+/// F94): `cli|` and exactly sixteen lowercase hexadecimal digits.
+///
+/// # Why anything else is only ever counted
+///
+/// The account is an attribute of a keychain item, and **any** application on
+/// this machine can create a `Codex Auth` item with any account string it
+/// likes. `doctor` offers a removal command for an item agctl's own login
+/// child left behind, and a command is something a reader pastes into a
+/// shell: a quote, a `$(…)`, a backtick or an escape byte in that string
+/// would ride into their shell and into `--json` (review S35 C1). So a
+/// command — and the audit line that explains one — is built only from a
+/// string this predicate accepted, whose every byte is then one agctl itself
+/// would have written; anything else is counted, and the reader is sent to
+/// the keychain to look at it themselves.
+///
+/// The check is on the value, not on its source: it holds however the string
+/// was obtained, and it does not depend on a keychain listing, a log line or
+/// a test fake being well behaved.
+pub fn is_home_account(account: &str) -> bool {
+    let Some(digest) = account.strip_prefix("cli|") else { return false };
+    digest.len() == 16 && digest.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// What the read-only keychain listing said about a home's item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyringProbe {

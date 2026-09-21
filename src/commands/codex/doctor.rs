@@ -72,6 +72,7 @@ use crate::provider::codex::home::DaemonEvidence;
 use crate::provider::codex::home::FileInEffect;
 use crate::provider::codex::home::KeyringProbe;
 use crate::provider::codex::home::StoreMode;
+use crate::provider::codex::home::is_home_account;
 use crate::provider::codex::proof;
 use crate::provider::codex::refresh;
 use crate::render::codex_doctor::CodexDoctorReport;
@@ -248,6 +249,10 @@ pub fn build(
     let live = live_section(home_dir.as_deref(), &store.read, accounts, paths, cancel);
     let namespaces = namespace_sections(paths, accounts, cancel);
     let orphans = orphan_entries(paths, accounts)?;
+    // A log that cannot be read explains nothing, so it explains no keychain
+    // item either: the failure costs removal commands, never adds one. The
+    // reader still sees the log's own error in the `audit` section.
+    let caused = audit::gained_keychain_accounts(paths).unwrap_or_default();
 
     Ok(CodexDoctorReport {
         version: VERSION,
@@ -262,7 +267,7 @@ pub fn build(
             .map(|name| EnvVar { name, present: env.set.contains(&name) })
             .collect(),
         live,
-        foreign: foreign_section(home_dir.as_deref(), listings),
+        foreign: foreign_section(home_dir.as_deref(), listings, &caused),
         namespaces,
         orphans,
         audit: audit_lines(paths),
@@ -467,7 +472,26 @@ fn daemon_word(evidence: DaemonEvidence) -> &'static str {
 }
 
 /// The Codex credentials on this machine that are not agctl's.
-fn foreign_section(home_dir: Option<&Path>, listings: &Listings) -> ForeignSection {
+///
+/// `caused` are the accounts agctl's own write log records a refused login
+/// child as having gained ([`audit::gained_keychain_accounts`]).
+///
+/// # Why only those get a removal command
+///
+/// A `Codex Auth` item whose account is not this home's is very often nothing
+/// to do with agctl: it is how Codex stores the credential of **another** of
+/// the user's Codex homes. Printing a paste-me `security
+/// delete-generic-password` line for every one of them invites a person to
+/// destroy a working login of theirs, which is the data loss the plan avoids
+/// by scoping the command to "a `Codex Auth` keychain item agctl's login
+/// child caused and refused (`listing gained` in the audit)" (plan §3.3,
+/// ledger #186). An item agctl cannot show it caused is therefore only
+/// counted, and the reader is told where to look.
+fn foreign_section(
+    home_dir: Option<&Path>,
+    listings: &Listings,
+    caused: &[String],
+) -> ForeignSection {
     let multi_auth_present = home_dir.is_some_and(|dir| {
         fs::symlink_metadata(dir.join(MULTI_AUTH_DIR)).is_ok_and(|meta| meta.is_dir())
     });
@@ -480,15 +504,22 @@ fn foreign_section(home_dir: Option<&Path>, listings: &Listings) -> ForeignSecti
         .filter(|account| expected.as_deref() != Some(account));
 
     let mut unexplained_removals = Vec::new();
+    let mut unexplained_items = 0usize;
     let mut unnameable_items = 0usize;
     for account in foreign {
-        if is_home_account(account) {
+        // Both halves, in this order: the spelling check decides whether the
+        // string may be rendered at all, the log decides whether agctl may
+        // claim it. A string the log names but the check rejects is still
+        // never printed.
+        if !is_home_account(account) {
+            unnameable_items += 1;
+        } else if caused.iter().any(|caused| caused == account) {
             unexplained_removals.push(format!(
                 "security delete-generic-password -s \"{}\" -a \"{account}\"",
                 home::KEYRING_SERVICE
             ));
         } else {
-            unnameable_items += 1;
+            unexplained_items += 1;
         }
     }
 
@@ -497,31 +528,9 @@ fn foreign_section(home_dir: Option<&Path>, listings: &Listings) -> ForeignSecti
         switcher_items: listings.switcher.unwrap_or(0),
         codex_auth_items: entries.len(),
         unexplained_removals,
+        unexplained_items,
         unnameable_items,
     }
-}
-
-/// Whether `account` is spelled the way Codex spells a home's keychain account
-/// (fact F94): `cli|` and exactly sixteen lowercase hexadecimal digits.
-///
-/// # Why a command is built only from one of these
-///
-/// The account is an attribute of a keychain item, and **any** application on
-/// this machine can create a `Codex Auth` item with any account string it
-/// likes. `doctor` offers a removal command for an item it cannot explain, and
-/// a command is something a reader pastes into a shell: a quote, a `$(…)`, a
-/// backtick or an escape byte in that string would ride into their shell and
-/// into `--json` (review S35 C1). So the command is built only from a string
-/// this predicate accepted, whose every byte is then one agctl itself would
-/// have written; anything else is counted, and the reader is sent to the
-/// keychain to look at it themselves.
-///
-/// The check is on the value, not on its source: it holds however the listing
-/// was obtained, and it does not depend on the fake being well behaved.
-fn is_home_account(account: &str) -> bool {
-    let Some(digest) = account.strip_prefix("cli|") else { return false };
-    digest.len() == 16
-        && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// One section per owned namespace, in registry order.

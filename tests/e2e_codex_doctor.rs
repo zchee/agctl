@@ -140,6 +140,29 @@ fn audit_log(fixture: &CodexFixture) -> PathBuf {
     fixture.inner().config_dir().join("codex").join("writes.jsonl")
 }
 
+/// Seeds the Codex write log with one `login_keychain_gained` line per
+/// account, as a refused `agctl codex login` would have written it.
+fn gained_lines(fixture: &CodexFixture, accounts: &[&str]) {
+    let text: String = accounts
+        .iter()
+        .map(|account| {
+            format!(
+                "{}\n",
+                json!({
+                    "ts": "2026-09-22T00:00:00Z",
+                    "agctl_pid": 1,
+                    "provider": "codex",
+                    "user_id": "none",
+                    "account_id": "none",
+                    "outcome": "login_keychain_gained",
+                    "keychain_account": account,
+                })
+            )
+        })
+        .collect();
+    write_0600(&audit_log(fixture), text.as_bytes());
+}
+
 fn write_0600(path: &Path, bytes: &[u8]) {
     fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
     fs::write(path, bytes).expect("write");
@@ -486,6 +509,12 @@ fn the_three_login_orphans_are_reported() {
 
 #[test]
 fn every_write_path_the_log_records_is_rendered() {
+    /// How many lines `doctor` shows, spelled in `commands/codex/doctor.rs`.
+    /// A binary crate has no library to import it from; a window larger than
+    /// the real one would make this test silently weaker, so if it changes
+    /// there, the first assertion below fails here.
+    const AUDIT_LINES: usize = 10;
+
     // Plan AC117's `doctor` half (invariant I30): each outcome the Codex
     // writers append is shown, through the same reader `agctl claude doctor`
     // uses for its own log.
@@ -505,32 +534,55 @@ fn every_write_path_the_log_records_is_rendered() {
         "delete",
         "adopted_external",
         "ambiguous",
+        "login_keychain_gained",
     ];
-    let lines: Vec<String> = outcomes
-        .iter()
-        .map(|outcome| {
-            json!({
+    let line_for = |outcome: &str| {
+        // The gained-item line belongs to no namespace and carries the
+        // account instead; every other line is a namespace's.
+        if outcome == "login_keychain_gained" {
+            return json!({
                 "ts": "2026-09-22T00:00:00Z",
                 "agctl_pid": 1,
                 "provider": "codex",
-                "user_id": USER,
-                "account_id": ACCT,
+                "user_id": "none",
+                "account_id": "none",
                 "outcome": outcome,
+                "keychain_account": "cli|00112233abcdefff",
             })
-            .to_string()
+            .to_string();
+        }
+        json!({
+            "ts": "2026-09-22T00:00:00Z",
+            "agctl_pid": 1,
+            "provider": "codex",
+            "user_id": USER,
+            "account_id": ACCT,
+            "outcome": outcome,
         })
-        .collect();
-    write_0600(&audit_log(&fixture), format!("{}\n", lines.join("\n")).as_bytes());
+        .to_string()
+    };
 
-    let table = doctor(&fixture, "write-log");
-    let report = doctor_json(&fixture, "write-log-json");
+    // `doctor` shows the log's last AUDIT_LINES lines, so the outcomes are
+    // seeded a window at a time: the point is that each one RENDERS, not that
+    // eleven of them fit in a ten-line tail.
+    let mut table = String::new();
+    for (index, window) in outcomes.chunks(AUDIT_LINES).enumerate() {
+        let lines: Vec<String> = window.iter().map(|outcome| line_for(outcome)).collect();
+        write_0600(&audit_log(&fixture), format!("{}\n", lines.join("\n")).as_bytes());
 
-    let rendered = report["audit"].to_string();
-    for outcome in outcomes {
-        assert!(rendered.contains(outcome), "the log line for `{outcome}` is not rendered");
+        table = doctor(&fixture, &format!("write-log-{index}"));
+        let report = doctor_json(&fixture, &format!("write-log-json-{index}"));
+
+        let rendered = report["audit"].to_string();
+        for outcome in window {
+            assert!(rendered.contains(outcome), "the log line for `{outcome}` is not rendered");
+        }
+        assert!(!rendered.contains('@'), "an audit line carries an address");
+        if window.contains(&"login_overwrite") {
+            assert!(table.contains("login_overwrite"), "{table}");
+        }
     }
-    assert!(table.contains("login_overwrite"), "{table}");
-    assert!(!rendered.contains('@'), "an audit line carries an address");
+    assert!(!table.is_empty(), "at least one window was rendered");
 }
 
 #[test]
@@ -594,6 +646,33 @@ fn a_run_changes_nothing_and_creates_nothing() {
 }
 
 #[test]
+fn a_codex_auth_item_agctl_cannot_explain_gets_no_command_in_any_stream() {
+    // The plan's scope (section 3.3, ledger #186): a `Codex Auth` item that
+    // is not this home's is most often ANOTHER Codex home of this user's, and
+    // a paste-me removal line for it invites them to destroy a working login.
+    // A well-formed account with nothing in the write log is therefore a
+    // count, and its spelling appears in no stream at all.
+    let mut fixture = CodexFixture::new();
+    fixture.with_keychain();
+    live_home(&fixture);
+    let account = "cli|00112233abcdefff";
+    keychain_listing(&fixture, &[("Codex Auth", account)]);
+
+    let table = doctor(&fixture, "unexplained-item");
+    let report = doctor_json(&fixture, "unexplained-item-json");
+
+    let removals = report["foreign"]["unexplained_removals"].as_array().expect("an array");
+    assert!(removals.is_empty(), "{removals:?}\n{table}");
+    assert_eq!(report["foreign"]["unexplained_items"], json!(1), "{table}");
+    assert_eq!(report["foreign"]["unnameable_items"], json!(0), "{table}");
+    assert!(table.contains("agctl offers no removal command for it"), "{table}");
+
+    let rendered = format!("{table}\n{report}");
+    assert!(!rendered.contains(account), "an item agctl cannot explain was named:\n{rendered}");
+    assert!(!rendered.contains("delete-generic-password"), "{rendered}");
+}
+
+#[test]
 fn a_keychain_account_agctl_did_not_write_never_reaches_a_command() {
     // Review S35 C1, end to end. The `acct` attribute of a keychain item is
     // set by whoever created the item, and `doctor` offers a removal command
@@ -619,6 +698,9 @@ fn a_keychain_account_agctl_did_not_write_never_reaches_a_command() {
     let mut items: Vec<(&str, &str)> = vec![("Codex Auth", "cli|00112233abcdefff")];
     items.extend(hostile.iter().map(|account| ("Codex Auth", account.as_str())));
     keychain_listing(&fixture, &items);
+    // The command is offered only for an item agctl's own log says a refused
+    // login left behind, so the well-formed account needs its audit line.
+    gained_lines(&fixture, &["cli|00112233abcdefff"]);
 
     let table = doctor(&fixture, "hostile-account");
     let report = doctor_json(&fixture, "hostile-account-json");

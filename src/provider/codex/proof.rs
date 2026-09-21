@@ -257,6 +257,16 @@ impl PostExitReport {
         Self { gained_codex_auth, survivors, survey, exit }
     }
 
+    /// The `Codex Auth` item accounts the second listing gained.
+    ///
+    /// Read-only, and the one reader outside this module is
+    /// `commands::codex::login`, which records them in the write log when the
+    /// login is refused: an item nothing recorded is an item `doctor` can
+    /// never offer to remove, because nothing says agctl caused it.
+    pub fn gained_codex_auth(&self) -> &[String] {
+        &self.gained_codex_auth
+    }
+
     /// Whether the child exited successfully and left nothing behind.
     pub(super) fn clean(&self) -> bool {
         // Destructured exhaustively, with no `..`: a field added to either

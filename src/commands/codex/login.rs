@@ -50,9 +50,11 @@ use crate::config::codex::RefreshPolicy;
 use crate::config::paths::Paths;
 use crate::error::AppError;
 use crate::provider::codex::audit;
+use crate::provider::codex::audit::CodexEvent;
 use crate::provider::codex::auth_store;
 use crate::provider::codex::auth_store::InstallNamespace;
 use crate::provider::codex::auth_store::WriteKind;
+use crate::provider::codex::home;
 use crate::provider::codex::home::KEYRING_SERVICE;
 use crate::provider::codex::lock;
 use crate::provider::codex::lock::LockBudget;
@@ -169,7 +171,13 @@ fn install_verified(
 ) -> Result<(), AppError> {
     // Step 7. Evidence first: the report decides whether the document is even
     // read, and `verify_login` parses it exactly once.
-    let login = auth_store::verify_login(scratch.path(), report).map_err(refused)?;
+    let login = match auth_store::verify_login(scratch.path(), report) {
+        Ok(login) => login,
+        Err(err) => {
+            record_gained_keychain_items(paths, report);
+            return Err(refused(err));
+        }
+    };
 
     // Step 8. Who this is, and whether it is the account the live home already
     // holds (fact F82).
@@ -340,6 +348,41 @@ fn say(line: &str) {
 /// A refusal carrying `err`'s own sentence.
 fn refused(err: impl std::fmt::Display) -> AppError {
     AppError::Refused { reason: err.to_string() }
+}
+
+/// Records, in the write log, each `Codex Auth` keychain item this login
+/// child gained before the login was refused.
+///
+/// agctl deletes no keychain item (plan §1.4), so an item a refused child
+/// left behind can only be removed by hand — and `doctor` offers that command
+/// for an item **this** log names and for no other, because an unexplained
+/// `Codex Auth` item can just as easily be another Codex home's working
+/// credential, whose removal would be data loss. The refusal is where the
+/// fact is known, so the refusal is where it is written down.
+///
+/// An account spelled any other way is not recorded: `doctor` would refuse to
+/// name it anyway, and the log takes ids and digest prefixes only (I24).
+///
+/// The login has already failed. A log that will not take the line is a
+/// warning, never a second failure replacing the first: the user's problem is
+/// the refusal they are about to read, and the reason for it is printed to
+/// them whether or not it also reached the log.
+fn record_gained_keychain_items(paths: &Paths, report: &PostExitReport) {
+    for account in report.gained_codex_auth() {
+        if !home::is_home_account(account) {
+            continue;
+        }
+        if let Err(err) = audit::append_event(
+            paths,
+            ("", ""),
+            CodexEvent::LoginKeychainGained { keychain_account: account },
+        ) {
+            tracing::warn!(
+                error = %err,
+                "a `Codex Auth` item this login left behind could not be recorded in the write log"
+            );
+        }
+    }
 }
 
 /// Takes one fresh keychain listing, or an empty one when this build has no

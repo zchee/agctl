@@ -214,6 +214,7 @@
         "switcher_items",
         "codex_auth_items",
         "unexplained_removals",
+        "unexplained_items",
         "unnameable_items"
       ],
       "properties": {
@@ -232,12 +233,17 @@
           "minimum": 0
         },
         "unexplained_removals": {
-          "description": "The manual removal command for each listed `Codex Auth` item whose account is not this home's AND is spelled `cli|` plus sixteen lowercase hexadecimal digits — the item a login child may have gained. An account is an attribute any application can set, so a command is built only from a string agctl itself could have written (review S35 C1).",
+          "description": "The manual removal command for each listed `Codex Auth` item that agctl's own write log records a refused login child as having gained, and whose account is spelled `cli|` plus sixteen lowercase hexadecimal digits. Both halves are required: an account is an attribute any application can set, so a command is built only from a string agctl itself could have written (review S35 C1), and an item agctl cannot show it caused is very often another Codex home's working credential, so removing it would be data loss (plan section 3.3).",
           "type": "array",
           "items": {
             "type": "string",
             "pattern": "^security delete-generic-password -s \"[A-Za-z ]+\" -a \"cli\\|[0-9a-f]{16}\"$"
           }
+        },
+        "unexplained_items": {
+          "description": "How many further `Codex Auth` items are listed under an account spelled the way Codex spells one that agctl's write log does not explain. A COUNT, and never a command.",
+          "type": "integer",
+          "minimum": 0
         },
         "unnameable_items": {
           "description": "How many further `Codex Auth` items are listed under an account agctl would not have written. A COUNT: the account string is never emitted.",

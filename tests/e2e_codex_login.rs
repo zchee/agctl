@@ -557,6 +557,39 @@ fn ac105_keychain_a_child_that_creates_a_codex_auth_item_is_refused() {
     assert!(text.contains("Codex Auth"), "the refusal names the kind of item: {text}");
     assert!(text.contains("cli|0123456789abcdef"), "and the item itself: {text}");
     assert_nothing_installed(&fixture, "keychain-gain");
+
+    // agctl deletes no keychain item, so the only way this one can ever be
+    // cleaned up is by hand — and `doctor` offers that command for an item
+    // agctl's own log says agctl caused. The refusal is where that is known,
+    // so the refusal writes it down. Mutant: delete the
+    // `record_gained_keychain_items` call in `login.rs` — red here.
+    assert_eq!(audit_outcomes(&fixture), ["login_keychain_gained"], "the gain is recorded");
+    assert_eq!(
+        audit_keychain_accounts(&fixture),
+        ["cli|0123456789abcdef"],
+        "the line names the item, and nothing else"
+    );
+}
+
+#[test]
+fn ac105_keychain_an_item_a_child_gained_is_named_only_in_agctls_spelling() {
+    // The write-side guard on a credential path: what the second listing
+    // gained is a string from outside agctl, and `doctor` will put it inside
+    // a command a person pastes into a shell. A spelling agctl would not have
+    // written reaches no log line at all — so `doctor` can never name it.
+    let (mut fixture, _doc) = armed();
+    fixture.with_keychain();
+    let dump = fixture.keychain_dump_path();
+    fixture.set("AGCTL_FAKE_CODEX_KEYCHAIN_GAIN", &dump.to_string_lossy());
+    fixture.set("AGCTL_FAKE_CODEX_KEYCHAIN_GAIN_ACCOUNT", "cli|0123456789abcdef\"; id; \"");
+
+    let output = login(&fixture, "keychain-gain-hostile");
+
+    assert!(!output.status.success(), "a child that created a keychain item is refused");
+    assert!(audit_keychain_accounts(&fixture).is_empty(), "a hostile spelling reached the log");
+    let text = stderr(&output);
+    assert!(text.contains("Codex Auth"), "the refusal still names the kind of item: {text}");
+    assert_nothing_installed(&fixture, "keychain-gain-hostile");
 }
 
 #[test]
@@ -780,6 +813,16 @@ fn audit_outcomes(fixture: &CodexFixture) -> Vec<String> {
     text.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter_map(|value| value.get("outcome")?.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The `keychain_account` of every line the Codex write log holds.
+fn audit_keychain_accounts(fixture: &CodexFixture) -> Vec<String> {
+    let log = fixture.inner().config_dir().join("codex").join("writes.jsonl");
+    let Ok(text) = fs::read_to_string(&log) else { return Vec::new() };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|value| value.get("keychain_account")?.as_str().map(str::to_owned))
         .collect()
 }
 

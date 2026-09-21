@@ -31,6 +31,10 @@
 #                               a fake `security` dump file: append one
 #                               `Codex Auth` record to it, as a child that put
 #                               its credential in the keychain would
+#   AGCTL_FAKE_CODEX_KEYCHAIN_GAIN_ACCOUNT
+#                               that record's `acct` attribute (default
+#                               `cli|0123456789abcdef`), so a test can plant a
+#                               spelling agctl would never have written
 #   AGCTL_FAKE_CODEX_TOUCH      create this file (a marker another fake reads)
 #   AGCTL_FAKE_CODEX_SENTINEL   a directory OUTSIDE the scratch: link it from
 #                               inside the residue, so a cleanup that followed
@@ -146,14 +150,15 @@ fi
 # to (fact F95): one `Codex Auth` record appended to the fake `security` dump,
 # in `security(1)`'s own format, between agctl's two listings.
 if [ -n "${AGCTL_FAKE_CODEX_KEYCHAIN_GAIN:-}" ]; then
-	cat >>"$AGCTL_FAKE_CODEX_KEYCHAIN_GAIN" <<'RECORD'
-class: "genp"
-attributes:
-    0x00000007 <blob>="Codex Auth"
-    "acct"<blob>="cli|0123456789abcdef"
-    "svce"<blob>="Codex Auth"
-    "type"<uint32>=<NULL>
-RECORD
+	gained_account="${AGCTL_FAKE_CODEX_KEYCHAIN_GAIN_ACCOUNT:-cli|0123456789abcdef}"
+	{
+		printf 'class: "genp"\n'
+		printf 'attributes:\n'
+		printf '    0x00000007 <blob>="Codex Auth"\n'
+		printf '    "acct"<blob>="%s"\n' "$gained_account"
+		printf '    "svce"<blob>="Codex Auth"\n'
+		printf '    "type"<uint32>=<NULL>\n'
+	} >>"$AGCTL_FAKE_CODEX_KEYCHAIN_GAIN"
 fi
 
 if [ -n "${AGCTL_FAKE_CODEX_TOUCH:-}" ]; then

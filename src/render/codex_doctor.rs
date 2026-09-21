@@ -149,11 +149,20 @@ pub struct ForeignSection {
     pub switcher_items: usize,
     /// How many `Codex Auth` keychain items are listed.
     pub codex_auth_items: usize,
-    /// The removal command for each listed `Codex Auth` item whose account is
-    /// not this home's **and is spelled the way Codex spells one**, so a login
-    /// child that gained one can be cleaned up by hand. Empty when the listing
-    /// could not be taken.
+    /// The removal command for each listed `Codex Auth` item that agctl's own
+    /// write log records a refused login child as having gained, so an item
+    /// agctl caused can be cleaned up by hand. Empty when the listing could
+    /// not be taken, and empty when the log could not be read.
     pub unexplained_removals: Vec<String>,
+    /// How many further `Codex Auth` items are listed under an account that
+    /// is spelled the way Codex spells one but that agctl's write log does
+    /// not explain.
+    ///
+    /// A **count**, and never a command: such an item is most often the
+    /// working credential of another Codex home of the user's, and a
+    /// paste-me removal line for it would be an invitation to destroy a
+    /// login (plan §3.3, ledger #186).
+    pub unexplained_items: usize,
     /// How many further `Codex Auth` items are listed under an account agctl
     /// would not have written.
     ///
@@ -356,7 +365,19 @@ fn foreign_section(out: &mut String, report: &CodexDoctorReport) {
     push(out, 1, &format!("codex-switcher keychain items: {}", foreign.switcher_items));
     push(out, 1, &format!("`Codex Auth` keychain items: {}", foreign.codex_auth_items));
     for command in &foreign.unexplained_removals {
-        push(out, 1, &format!("not this home's; remove it yourself with: {command}"));
+        push(out, 1, &format!("left by a refused agctl login; remove it yourself with: {command}"));
+    }
+    if foreign.unexplained_items > 0 {
+        push(
+            out,
+            1,
+            &format!(
+                "{} further `Codex Auth` item(s) are not this home's and are not agctl's doing; \
+                 one of them is likely another Codex home of yours, so agctl offers no removal \
+                 command for it",
+                foreign.unexplained_items
+            ),
+        );
     }
     if foreign.unnameable_items > 0 {
         push(

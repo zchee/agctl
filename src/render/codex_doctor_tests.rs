@@ -48,6 +48,7 @@ fn full() -> CodexDoctorReport {
                 "security delete-generic-password -s \"Codex Auth\" -a \"cli|00112233abcdefff\""
                     .to_owned(),
             ],
+            unexplained_items: 4,
             unnameable_items: 2,
         },
         namespaces: vec![NamespaceSection {
@@ -122,6 +123,7 @@ fn empty() -> CodexDoctorReport {
             switcher_items: 0,
             codex_auth_items: 0,
             unexplained_removals: Vec::new(),
+            unexplained_items: 0,
             unnameable_items: 0,
         },
         namespaces: Vec::new(),

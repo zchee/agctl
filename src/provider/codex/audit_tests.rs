@@ -161,3 +161,160 @@ fn a_refused_log_is_an_error_and_names_no_secret() {
     append_event(&paths, (testkit::USER, testkit::ACCT), CodexEvent::FloorReset)
         .expect_err("a log that is not 0600 is refused");
 }
+
+#[test]
+fn a_gained_keychain_item_is_recorded_and_read_back() {
+    // The one ground on which `doctor` may offer to remove a keychain item:
+    // agctl's own log saying agctl's own login child caused it.
+    let (_dir, paths) = testkit::store();
+    let account = "cli|00112233abcdefff";
+
+    append_event(
+        &paths,
+        (testkit::USER, testkit::ACCT),
+        CodexEvent::LoginKeychainGained { keychain_account: account },
+    )
+    .expect("the event is recorded");
+
+    let entries = lines(&paths);
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.outcome, CodexOutcome::LoginKeychainGained);
+    assert_eq!(entry.keychain_account.as_deref(), Some(account));
+    // The ids the caller passed are NOT used: a refused login has no verified
+    // identity, and the line must not claim one.
+    assert_eq!(entry.user_id, NO_NAMESPACE);
+    assert_eq!(entry.account_id, NO_NAMESPACE);
+
+    assert_eq!(gained_keychain_accounts(&paths).expect("reads"), vec![account.to_owned()]);
+
+    let text = fs::read_to_string(log_path(&paths)).expect("read");
+    testkit::assert_no_needles(&text, "the Codex audit log");
+    assert!(!text.contains('@'), "{text}");
+}
+
+#[test]
+fn a_gained_account_agctl_would_not_have_written_is_refused_on_write() {
+    let (_dir, paths) = testkit::store();
+    let hostile = [
+        "cli|00112233ABCDEFFF",
+        "cli|00112233abcdeff",
+        "cli|00112233abcdefff0",
+        "cli|",
+        "00112233abcdefff",
+        "cli|00112233abcdefff\"; id; \"",
+        "cli|00112233abcdefff\u{1b}[2J",
+        testkit::RT_SENTINEL,
+        "",
+    ];
+
+    for account in hostile {
+        let err = append_event(
+            &paths,
+            (testkit::USER, testkit::ACCT),
+            CodexEvent::LoginKeychainGained { keychain_account: account },
+        )
+        .expect_err("a spelling agctl would not have written is refused");
+        let shown = err.to_string();
+        assert!(shown.contains("sixteen lowercase hex"), "{shown}");
+        testkit::assert_no_needles(&shown, "the refusal");
+    }
+    assert_eq!(read(&paths).expect("reads"), None, "nothing was written");
+}
+
+#[test]
+fn a_keychain_account_on_any_other_outcome_is_refused_on_write() {
+    // The other half of the two-sided guard: the field belongs to that one
+    // outcome, so a line cannot carry it under cover of another.
+    let mut entry =
+        entry((testkit::USER, testkit::ACCT), CodexOutcome::Applied, None, None, Some("0123abcd"));
+    entry.keychain_account = Some("cli|00112233abcdefff".to_owned());
+
+    let err = entry_line(&entry).expect_err("refused");
+    assert!(err.to_string().contains("outcome that has none"), "{err}");
+}
+
+#[test]
+fn a_gained_outcome_without_an_account_is_refused_on_write() {
+    let entry =
+        entry((NO_NAMESPACE, NO_NAMESPACE), CodexOutcome::LoginKeychainGained, None, None, None);
+
+    let err = entry_line(&entry).expect_err("refused");
+    assert!(err.to_string().contains("sixteen lowercase hex"), "{err}");
+}
+
+#[test]
+fn a_log_written_before_this_field_existed_still_parses() {
+    // An agctl that predates the field wrote lines without it, and a reader
+    // that refused them would refuse the whole history.
+    let (_dir, paths) = testkit::store();
+    append(&paths, install_receipt(&paths)).expect("appends");
+
+    let text = fs::read_to_string(log_path(&paths)).expect("read");
+    assert!(!text.contains("keychain_account"), "the field is absent when there is none: {text}");
+    let entry: CodexAuditEntry = serde_json::from_str(text.lines().next().expect("a line"))
+        .expect("an old-shaped line still parses");
+    assert_eq!(entry.keychain_account, None);
+    assert!(gained_keychain_accounts(&paths).expect("reads").is_empty());
+}
+
+#[test]
+fn a_gained_line_the_log_holds_is_read_only_when_its_account_is_agctls_spelling() {
+    // The read side is as strict as the write side: a line planted in the
+    // file, rather than written through `append_event`, explains nothing.
+    let (_dir, paths) = testkit::store();
+    let hostile = "cli|00112233abcdefff\"; id; \"";
+    let planted = format!(
+        "{}\n{}\n",
+        serde_json::json!({
+            "ts": "2026-09-22T00:00:00Z",
+            "agctl_pid": 1,
+            "provider": "codex",
+            "user_id": NO_NAMESPACE,
+            "account_id": NO_NAMESPACE,
+            "outcome": "login_keychain_gained",
+            "keychain_account": hostile,
+        }),
+        serde_json::json!({
+            "ts": "2026-09-22T00:00:00Z",
+            "agctl_pid": 1,
+            "provider": "codex",
+            "user_id": NO_NAMESPACE,
+            "account_id": NO_NAMESPACE,
+            "outcome": "login_keychain_gained",
+            "keychain_account": "cli|00112233abcdefff",
+        }),
+    );
+    fs::create_dir_all(paths.codex_root()).expect("the codex root");
+    testkit::write_0600(&log_path(&paths), planted.as_bytes());
+
+    let found = gained_keychain_accounts(&paths).expect("reads");
+
+    assert_eq!(found, vec!["cli|00112233abcdefff".to_owned()]);
+}
+
+#[test]
+fn a_line_past_the_entry_bound_is_passed_over_and_the_next_one_is_not() {
+    // The reader walks the whole history, so it walks it a line at a time and
+    // one absurd line costs time rather than memory. The line after it is
+    // still read, which is what proves the reader resynchronised.
+    let (_dir, paths) = testkit::store();
+    let good = serde_json::json!({
+        "ts": "2026-09-22T00:00:00Z",
+        "agctl_pid": 1,
+        "provider": "codex",
+        "user_id": NO_NAMESPACE,
+        "account_id": NO_NAMESPACE,
+        "outcome": "login_keychain_gained",
+        "keychain_account": "cli|00112233abcdefff",
+    })
+    .to_string();
+    let planted = format!("{}\n{good}\n", "x".repeat(MAX_ENTRY_BYTES + 1));
+    fs::create_dir_all(paths.codex_root()).expect("the codex root");
+    testkit::write_0600(&log_path(&paths), planted.as_bytes());
+
+    assert_eq!(
+        gained_keychain_accounts(&paths).expect("reads"),
+        vec!["cli|00112233abcdefff".to_owned()]
+    );
+}

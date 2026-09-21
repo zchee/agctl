@@ -365,10 +365,28 @@ fn the_account_format_check_is_exact() {
     assert!(!is_home_account(""));
 }
 
+/// Seeds the Codex write log with one `login_keychain_gained` line naming
+/// `account`, as a refused login would have written it.
+fn gained_line(paths: &Paths, account: &str) {
+    fs::create_dir_all(paths.codex_root()).expect("the codex root");
+    let line = json!({
+        "ts": "2026-09-22T00:00:00Z",
+        "agctl_pid": 1,
+        "provider": "codex",
+        "user_id": "none",
+        "account_id": "none",
+        "outcome": "login_keychain_gained",
+        "keychain_account": account,
+    })
+    .to_string();
+    testkit::write_0600(&paths.codex_root().join("writes.jsonl"), format!("{line}\n").as_bytes());
+}
+
 #[test]
-fn a_codex_auth_item_that_is_not_this_homes_gets_a_removal_command() {
+fn a_codex_auth_item_a_refused_login_left_gets_a_removal_command() {
     let (dir, paths) = bare_store();
     let home = home_with(dir.path(), None, None);
+    gained_line(&paths, "cli|00112233abcdefff");
     let listings = Listings::from_reader(
         &FakeReader::unlocked().with_entry_for(home::KEYRING_SERVICE, Some("cli|00112233abcdefff")),
     );
@@ -376,11 +394,84 @@ fn a_codex_auth_item_that_is_not_this_homes_gets_a_removal_command() {
     let report = build(&paths, &[], &env_for(&home), &listings, &Cancel::new()).expect("a report");
 
     assert_eq!(report.foreign.unexplained_removals.len(), 1);
+    assert_eq!(report.foreign.unexplained_items, 0);
     assert!(
         report.foreign.unexplained_removals[0].contains("delete-generic-password"),
         "{:?}",
         report.foreign.unexplained_removals
     );
+    drop(dir);
+}
+
+#[test]
+fn a_codex_auth_item_agctl_did_not_cause_is_counted_and_never_named() {
+    // The scope the plan asks for (section 3.3, ledger #186): an unexplained
+    // `Codex Auth` item is very often ANOTHER Codex home of this user's, and
+    // a paste-me removal line for it is an invitation to destroy a working
+    // login. Well spelled is not enough; the audit must say agctl caused it.
+    let (dir, paths) = bare_store();
+    let home = home_with(dir.path(), None, None);
+    let account = "cli|00112233abcdefff";
+    let listings = Listings::from_reader(
+        &FakeReader::unlocked().with_entry_for(home::KEYRING_SERVICE, Some(account)),
+    );
+
+    let report = build(&paths, &[], &env_for(&home), &listings, &Cancel::new()).expect("a report");
+
+    assert!(report.foreign.unexplained_removals.is_empty(), "{:?}", report.foreign);
+    assert_eq!(report.foreign.unexplained_items, 1);
+    assert_eq!(report.foreign.unnameable_items, 0);
+    let rendered =
+        format!("{}\n{}", document(&report), crate::render::codex_doctor::render(&report));
+    assert!(!rendered.contains(account), "an item agctl cannot explain reached a stream");
+    assert!(!rendered.contains("delete-generic-password"), "{rendered}");
+    drop(dir);
+}
+
+#[test]
+fn a_gained_line_whose_account_agctl_would_not_have_written_explains_nothing() {
+    // The read side of the guard is the write side: a log is a file, and this
+    // value goes into a command a person is invited to paste.
+    let (dir, paths) = bare_store();
+    let home = home_with(dir.path(), None, None);
+    let hostile = "cli|00112233abcdefff\"; id; \"";
+    gained_line(&paths, hostile);
+    let listings = Listings::from_reader(
+        &FakeReader::unlocked().with_entry_for(home::KEYRING_SERVICE, Some(hostile)),
+    );
+
+    let report = build(&paths, &[], &env_for(&home), &listings, &Cancel::new()).expect("a report");
+
+    assert!(report.foreign.unexplained_removals.is_empty(), "{:?}", report.foreign);
+    assert_eq!(report.foreign.unnameable_items, 1);
+    // The planted line is still shown in the `write log` section, verbatim,
+    // the way every log line is (`the_write_log_is_rendered_and_its_last_lines_kept`).
+    // What must not happen is that it becomes a command: the removal rule
+    // reads the log, so the log must not be able to write the reader a shell
+    // line through it.
+    let rendered =
+        format!("{}\n{}", document(&report), crate::render::codex_doctor::render(&report));
+    assert!(!rendered.contains("delete-generic-password"), "{rendered}");
+    drop(dir);
+}
+
+#[test]
+fn a_write_log_that_cannot_be_read_offers_no_removal_command() {
+    // Fail-safe: an unreadable log explains nothing, so it explains no
+    // keychain item either. The failure costs a command; it never adds one.
+    let (dir, paths) = bare_store();
+    let home = home_with(dir.path(), None, None);
+    let account = "cli|00112233abcdefff";
+    fs::create_dir_all(paths.codex_root()).expect("the codex root");
+    fs::create_dir_all(paths.codex_root().join("writes.jsonl")).expect("a directory in its place");
+    let listings = Listings::from_reader(
+        &FakeReader::unlocked().with_entry_for(home::KEYRING_SERVICE, Some(account)),
+    );
+
+    let report = build(&paths, &[], &env_for(&home), &listings, &Cancel::new()).expect("a report");
+
+    assert!(report.foreign.unexplained_removals.is_empty(), "{:?}", report.foreign);
+    assert_eq!(report.foreign.unexplained_items, 1);
     drop(dir);
 }
 
