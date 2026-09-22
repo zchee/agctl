@@ -78,5 +78,9 @@ pub fn codex_env_from_process() -> CodexEnv {
 }
 
 #[cfg(test)]
+#[path = "testkit_tests.rs"]
+pub(crate) mod testkit;
+
+#[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;

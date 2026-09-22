@@ -16,13 +16,13 @@ use std::fs;
 use std::path::PathBuf;
 
 use httpmock::Method::POST;
-use httpmock::Mock;
 use httpmock::MockServer;
 use jiff::Timestamp;
 use serde_json::Value;
 use serde_json::json;
 
 use super::*;
+use crate::commands::codex::testkit::Scripted;
 use crate::config::codex::CodexAccountRecord;
 use crate::provider::codex::audit;
 use crate::provider::codex::audit::CodexAuditEntry;
@@ -32,39 +32,10 @@ use crate::provider::codex::auth_store::RefreshState;
 use crate::provider::codex::credentials::Credentials;
 use crate::provider::codex::oauth::RefreshClient;
 use crate::provider::codex::testkit;
+use crate::provider::codex::testkit::mock;
 
 const TOKEN_PATH: &str = "/oauth/token";
 const NEW_RT: &str = "agctl-test-codex-rt-0002";
-
-/// A `Prompt` that answers every question the same way and keeps both sides
-/// of the conversation, so a test can assert on the words a person read.
-struct Scripted {
-    answer: bool,
-    asked: Vec<String>,
-    told: Vec<String>,
-}
-
-impl Scripted {
-    fn saying(answer: bool) -> Self {
-        Self { answer, asked: Vec::new(), told: Vec::new() }
-    }
-
-    /// Everything printed, joined — for a `contains` assertion.
-    fn output(&self) -> String {
-        self.told.join("\n")
-    }
-}
-
-impl Prompt for Scripted {
-    fn tell(&mut self, message: &str) {
-        self.told.push(message.to_owned());
-    }
-
-    fn confirm(&mut self, question: &str) -> Result<bool, AppError> {
-        self.asked.push(question.to_owned());
-        Ok(self.answer)
-    }
-}
 
 /// A store holding one owned Codex account.
 struct Fixture {
@@ -208,13 +179,6 @@ impl Fixture {
     }
 }
 
-fn mock<'a>(server: &'a MockServer, status: u16, body: &Value) -> Mock<'a> {
-    server.mock(|when, then| {
-        when.method(POST).path(TOKEN_PATH);
-        then.status(status).json_body(body.clone());
-    })
-}
-
 /// A token response in fact F80's shape, carrying a rotated refresh token.
 fn grant_body() -> Value {
     json!({
@@ -301,7 +265,7 @@ fn ac127_yes_without_a_terminal_is_refused_and_sends_nothing() {
     // returns `Err` before a `SendMode::Resend` exists, so the POST count is
     // the proof that no send was even attempted.
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body());
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body());
     let fixture = Fixture::new(9);
     fixture.write_interrupted_marker(61 * 60);
 
@@ -321,7 +285,7 @@ fn ac127_yes_without_a_terminal_is_refused_and_sends_nothing() {
 #[test]
 fn ac127_a_no_answer_sends_nothing_and_is_not_a_failure() {
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body());
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body());
     let fixture = Fixture::new(9);
     fixture.write_interrupted_marker(61 * 60);
 
@@ -378,7 +342,7 @@ fn ac127_the_re_send_is_recorded_in_the_write_that_sends_it_and_never_happens_tw
     // A 5xx leaves the row unknown, which is what makes the second attempt
     // reach the `already resent` gate rather than the `not unknown` one.
     let server = MockServer::start();
-    let post = mock(&server, 503, &json!({}));
+    let post = mock(&server, TOKEN_PATH, 503, &json!({}));
     let fixture = Fixture::new(9);
     fixture.write_interrupted_marker(61 * 60);
     let before = fixture.marker().expect("marker");
@@ -413,7 +377,7 @@ fn ac127_the_re_send_is_recorded_in_the_write_that_sends_it_and_never_happens_tw
 #[test]
 fn ac127_a_row_that_is_not_in_refresh_outcome_unknown_has_nothing_to_re_send() {
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body());
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body());
     let fixture = Fixture::new(9);
 
     let mut io = Scripted::saying(true);
@@ -428,7 +392,7 @@ fn ac127_a_row_that_is_not_in_refresh_outcome_unknown_has_nothing_to_re_send() {
 #[test]
 fn ac127_a_send_thirty_minutes_old_is_refused_and_names_the_hour() {
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body());
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body());
     let fixture = Fixture::new(9);
     fixture.write_interrupted_marker(30 * 60);
 
@@ -446,7 +410,7 @@ fn ac127_a_send_thirty_minutes_old_is_refused_and_names_the_hour() {
 #[test]
 fn ac127_a_stray_staged_temporary_refuses_the_re_send_and_names_it() {
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body());
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body());
     let fixture = Fixture::new(9);
     fixture.write_interrupted_marker(61 * 60);
     testkit::write_0600(&fixture.ns_dir().join("auth.json.tmp.0123abcd"), b"{}");
@@ -473,7 +437,7 @@ fn ac127_a_parked_credential_is_resolved_first_and_the_stale_marker_refuses_the_
     // changes the file's refresh digest — so the marker that named the old
     // grant is stale, and there is nothing this command may re-send.
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body());
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body());
     let fixture = Fixture::new(9);
     fixture.write_interrupted_marker(61 * 60);
 

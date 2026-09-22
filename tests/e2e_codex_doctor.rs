@@ -36,13 +36,20 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Output;
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex::CodexFixture;
 use codex::Needle;
 use codex::Stream;
+use codex::audit_log;
+use codex::jwt;
+use codex::keyring_account;
+use codex::write_0600;
 use serde_json::Value;
 use serde_json::json;
+
+/// The namespace directory this file's account installs into.
+fn namespace(fixture: &CodexFixture) -> PathBuf {
+    codex::namespace(fixture, USER, ACCT)
+}
 
 const USER: &str = "user-doctor-0001";
 const ACCT: &str = "11111111-2222-4333-8444-555555555555";
@@ -130,16 +137,6 @@ fn live_home(fixture: &CodexFixture) -> PathBuf {
     home
 }
 
-/// The namespace directory `<store>/codex/<user>/<acct>`.
-fn namespace(fixture: &CodexFixture) -> PathBuf {
-    fixture.inner().config_dir().join("codex").join(USER).join(ACCT)
-}
-
-/// The Codex write log, `<store>/codex/writes.jsonl`.
-fn audit_log(fixture: &CodexFixture) -> PathBuf {
-    fixture.inner().config_dir().join("codex").join("writes.jsonl")
-}
-
 /// Seeds the Codex write log with one `login_keychain_gained` line per
 /// account, as a refused `agctl codex login` would have written it.
 fn gained_lines(fixture: &CodexFixture, accounts: &[&str]) {
@@ -161,12 +158,6 @@ fn gained_lines(fixture: &CodexFixture, accounts: &[&str]) {
         })
         .collect();
     write_0600(&audit_log(fixture), text.as_bytes());
-}
-
-fn write_0600(path: &Path, bytes: &[u8]) {
-    fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
-    fs::write(path, bytes).expect("write");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod");
 }
 
 /// Writes a registry holding `codex_rows`.
@@ -191,14 +182,6 @@ fn owned_row() -> Value {
         "forgotten": false,
         "created_at": "2026-09-22T00:00:00Z",
     })
-}
-
-/// A JWT in the shape the claims parser reads, with `signature` as its third
-/// segment.
-fn jwt(payload: &Value, signature: &str) -> String {
-    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
-    let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).expect("serializes"));
-    format!("{header}.{body}.{signature}")
 }
 
 /// A ChatGPT `auth.json` whose every token is a sentinel.
@@ -230,16 +213,6 @@ fn auth_document() -> Value {
         },
         "last_refresh": "2026-09-20T00:00:00Z",
     })
-}
-
-/// `cli|<first 16 hex of sha256(canonical home)>`, the account Codex gives a
-/// home's keychain item (fact F94). Computed here rather than imported: an
-/// integration test sees only the binary.
-fn keyring_account(home: &Path) -> String {
-    let canonical = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
-    let digest =
-        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(canonical.to_string_lossy().as_bytes()));
-    format!("cli|{}", &digest[..16])
 }
 
 /// Writes a `dump-keychain` listing in `security(1)`'s own format.

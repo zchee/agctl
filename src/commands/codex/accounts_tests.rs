@@ -4,38 +4,11 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use super::*;
+use crate::commands::codex::testkit::Scripted;
 use crate::config::codex::RefreshPolicy;
 use crate::provider::codex::testkit;
-
-/// A `Prompt` that answers every question the same way and keeps what it was
-/// told, so a test can assert on the words a person would have read.
-struct Scripted {
-    answer: bool,
-    asked: Vec<String>,
-    told: Vec<String>,
-}
-
-impl Scripted {
-    fn saying(answer: bool) -> Self {
-        Self { answer, asked: Vec::new(), told: Vec::new() }
-    }
-
-    /// Everything printed, joined — for a `contains` assertion.
-    fn output(&self) -> String {
-        self.told.join("\n")
-    }
-}
-
-impl Prompt for Scripted {
-    fn tell(&mut self, message: &str) {
-        self.told.push(message.to_owned());
-    }
-
-    fn confirm(&mut self, question: &str) -> Result<bool, AppError> {
-        self.asked.push(question.to_owned());
-        Ok(self.answer)
-    }
-}
+use crate::provider::codex::testkit::ns_dir;
+use crate::provider::codex::testkit::rows;
 
 /// An owned row for the testkit's ids.
 fn owned_row() -> CodexAccountRecord {
@@ -72,14 +45,6 @@ fn live_row() -> CodexAccountRecord {
 
 fn seed(paths: &Paths, rows: Vec<CodexAccountRecord>) {
     AgctlConfig::update(paths, |config| config.codex_accounts = rows).expect("seeds the registry");
-}
-
-fn rows(paths: &Paths) -> Vec<CodexAccountRecord> {
-    AgctlConfig::load(paths).expect("loads").codex_accounts
-}
-
-fn ns_dir(paths: &Paths) -> PathBuf {
-    paths.codex_namespace_dir(testkit::USER, testkit::ACCT).expect("valid ids")
 }
 
 /// A namespace holding a credential, the way a login leaves it.

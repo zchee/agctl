@@ -37,8 +37,17 @@ use std::process::Output;
 use codex::CodexFixture;
 use codex::Needle;
 use codex::Stream;
+use codex::audit_log;
+use codex::stderr;
+use codex::stdout;
+use codex::write_0600;
 use serde_json::Value;
 use serde_json::json;
+
+/// The namespace directory this file's account installs into.
+fn namespace(fixture: &CodexFixture) -> PathBuf {
+    codex::namespace(fixture, USER, ACCT)
+}
 
 const USER: &str = "user-accounts-0001";
 const ACCT: &str = "11111111-2222-4333-8444-555555555555";
@@ -72,14 +81,6 @@ fn run(fixture: &CodexFixture, name: &str, args: &[&str]) -> Output {
     checked(fixture, name, fixture.cmd().args(args).output().expect("the binary runs"))
 }
 
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
 /// One Codex row, in the shape `config::codex` deserializes.
 fn codex_row(user: &str, acct: &str, email: &str, kind: Value) -> Value {
     json!({
@@ -106,22 +107,6 @@ fn registry(fixture: &CodexFixture, codex_rows: Vec<Value>, claude_rows: Vec<Val
         "forgotten_services": [],
         "codex_accounts": codex_rows,
     }));
-}
-
-/// The Codex write log, `<store>/codex/writes.jsonl` (`audit::LOG_FILE`).
-fn audit_log(fixture: &CodexFixture) -> PathBuf {
-    fixture.inner().config_dir().join("codex").join("writes.jsonl")
-}
-
-/// The namespace directory `<store>/codex/<user>/<acct>`.
-fn namespace(fixture: &CodexFixture) -> PathBuf {
-    fixture.inner().config_dir().join("codex").join(USER).join(ACCT)
-}
-
-fn write_0600(path: &Path, bytes: &[u8]) {
-    fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
-    fs::write(path, bytes).expect("write");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod");
 }
 
 /// A namespace holding everything a login and a parked refresh leave behind.

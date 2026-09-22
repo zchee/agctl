@@ -36,13 +36,19 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Output;
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex::CodexFixture;
 use codex::Needle;
 use codex::Stream;
+use codex::audit_outcomes;
+use codex::namespace;
+use codex::stderr;
 use serde_json::Value;
 use serde_json::json;
+
+/// A JWT signed with this file's own signature needle.
+fn jwt(payload: &Value) -> String {
+    codex::jwt(payload, JWT_SIGNATURE)
+}
 
 const USER: &str = "user-login-0001";
 const ACCT: &str = "acct-login-0001";
@@ -60,12 +66,6 @@ const NEEDLES: [Needle; 5] = [
     ("a Bearer header", "Bearer "),
     ("a bearer header", "bearer "),
 ];
-
-fn jwt(payload: &Value) -> String {
-    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
-    let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).expect("serializes"));
-    format!("{header}.{body}.{JWT_SIGNATURE}")
-}
 
 /// A ChatGPT-mode `auth.json` the fake writes into its scratch home.
 fn auth_doc(user: &str, acct: &str, mode: &str) -> Value {
@@ -269,15 +269,6 @@ fn drop_the_record(fixture: &CodexFixture, name: &str) {
             .expect("the binary runs"),
     );
     assert!(output.status.success(), "{}", stderr(&output));
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-/// The namespace `login` installs into.
-fn namespace(fixture: &CodexFixture, user: &str, acct: &str) -> PathBuf {
-    fixture.inner().config_dir().join("codex").join(user).join(acct)
 }
 
 /// The scratch root, which must be empty after every run.
@@ -873,16 +864,6 @@ fn a1_a_symlinked_scratch_root_is_refused_and_nothing_behind_it_is_swept() {
     assert!(text.contains("symbolic link"), "and the refusal says why: {text}");
     assert!(aged.exists(), "nothing behind the link was swept");
     assert!(!fixture.codex_log_path().exists(), "and no child was ever started");
-}
-
-/// The `outcome` of every line in the Codex audit log, oldest first.
-fn audit_outcomes(fixture: &CodexFixture) -> Vec<String> {
-    let log = fixture.inner().config_dir().join("codex").join("writes.jsonl");
-    let Ok(text) = fs::read_to_string(&log) else { return Vec::new() };
-    text.lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|value| value.get("outcome")?.as_str().map(str::to_owned))
-        .collect()
 }
 
 /// The `keychain_account` of every line the Codex write log holds.

@@ -45,6 +45,9 @@ use std::path::PathBuf;
 use std::process::Output;
 
 use assert_cmd::Command;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde_json::Value;
 
 use crate::common::Fixture;
 
@@ -459,4 +462,74 @@ pub fn checked(
         }
     }
     output
+}
+
+// ---------------------------------------------------------------------------
+// Helpers each `e2e_codex*.rs` used to define for itself. Every one below had
+// an identical body in two or more of them. A helper whose body read a
+// per-file constant (`USER`, `ACCT`, `JWT_SIGNATURE` — all different per file)
+// takes that value as an argument here, and the caller keeps a one-line
+// binding rather than a copy of the body.
+// ---------------------------------------------------------------------------
+
+/// The current second.
+pub fn now_s() -> i64 {
+    jiff::Timestamp::now().as_second()
+}
+
+/// A JWT with the usual header, `payload` as its body and `signature` verbatim.
+pub fn jwt(payload: &Value, signature: &str) -> String {
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).expect("serializes"));
+    format!("{header}.{body}.{signature}")
+}
+
+/// Writes `bytes` to `path`, creating its parent, at mode 0600.
+pub fn write_0600(path: &Path, bytes: &[u8]) {
+    fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+    fs::write(path, bytes).expect("write");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod");
+}
+
+/// A run's stdout, lossily decoded.
+pub fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// A run's stderr, lossily decoded.
+pub fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// The Codex write log, `<store>/codex/writes.jsonl` (`audit::LOG_FILE`).
+pub fn audit_log(fixture: &CodexFixture) -> PathBuf {
+    fixture.inner().config_dir().join("codex").join("writes.jsonl")
+}
+
+/// The `outcome` of every line in the Codex audit log, oldest first.
+pub fn audit_outcomes(fixture: &CodexFixture) -> Vec<String> {
+    let log = audit_log(fixture);
+    let Ok(text) = fs::read_to_string(&log) else { return Vec::new() };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|value| value.get("outcome")?.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The keychain account name agctl derives for the Codex home at `home`.
+pub fn keyring_account(home: &Path) -> String {
+    let canonical = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let digest =
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(canonical.to_string_lossy().as_bytes()));
+    format!("cli|{}", &digest[..16])
+}
+
+/// The namespace directory `<store>/codex/<user>/<acct>`.
+pub fn namespace(fixture: &CodexFixture, user: &str, acct: &str) -> PathBuf {
+    fixture.inner().config_dir().join("codex").join(user).join(acct)
+}
+
+/// The refresh marker for `<user>/<acct>`.
+pub fn marker_path(fixture: &CodexFixture, user: &str, acct: &str) -> PathBuf {
+    fixture.inner().config_dir().join("codex").join(".state").join(format!("{user}+{acct}.refresh"))
 }

@@ -24,20 +24,32 @@ mod common;
 mod codex;
 
 use std::fs;
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::Output;
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex::CodexFixture;
 use codex::Needle;
 use codex::Stream;
+use codex::jwt;
+use codex::now_s;
+use codex::stderr;
+use codex::stdout;
+use codex::write_0600;
 use httpmock::Method::GET;
 use httpmock::Method::POST;
 use httpmock::MockServer;
 use serde_json::Value;
 use serde_json::json;
+
+/// The namespace directory this file's account installs into.
+fn namespace(fixture: &CodexFixture) -> PathBuf {
+    codex::namespace(fixture, USER, ACCT)
+}
+
+/// The refresh marker for this file's account.
+fn marker_path(fixture: &CodexFixture) -> PathBuf {
+    codex::marker_path(fixture, USER, ACCT)
+}
 
 const USAGE_PATH: &str = "/backend-api/wham/usage";
 const TOKEN_PATH: &str = "/oauth/token";
@@ -56,16 +68,6 @@ const NEEDLES: [Needle; 6] = [
     ("a Bearer header", "Bearer "),
     ("a bearer header", "bearer "),
 ];
-
-fn now_s() -> i64 {
-    jiff::Timestamp::now().as_second()
-}
-
-fn jwt(payload: &Value, signature: &str) -> String {
-    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
-    let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).expect("serializes"));
-    format!("{header}.{body}.{signature}")
-}
 
 /// An `auth.json` whose access token expires at `exp`.
 fn auth_doc(exp: i64) -> Value {
@@ -119,13 +121,6 @@ fn grant_body() -> Value {
     })
 }
 
-fn write_0600(path: &Path, bytes: &[u8]) {
-    use std::os::unix::fs::PermissionsExt;
-    fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
-    fs::write(path, bytes).expect("write");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod");
-}
-
 /// A Codex fixture with both endpoint seams pointed at `server`.
 fn fixture(server: &MockServer) -> CodexFixture {
     let mut fixture = CodexFixture::new();
@@ -156,14 +151,6 @@ fn owned(fixture: &CodexFixture, doc: &Value, refresh: &str) {
 
 fn pretty(doc: &Value) -> Vec<u8> {
     serde_json::to_vec_pretty(doc).expect("serializes")
-}
-
-fn namespace(fixture: &CodexFixture) -> PathBuf {
-    fixture.inner().config_dir().join("codex").join(USER).join(ACCT)
-}
-
-fn marker_path(fixture: &CodexFixture) -> PathBuf {
-    fixture.inner().config_dir().join("codex").join(".state").join(format!("{USER}+{ACCT}.refresh"))
 }
 
 /// A marker that says a grant was sent an hour and a minute ago and nothing
@@ -215,14 +202,6 @@ fn run(fixture: &CodexFixture, name: &str, args: &[&str]) -> Output {
         &[Stream::Stdout, Stream::Stderr],
         Some(&fixture.security_log_path()),
     )
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 // ---------------------------------------------------------------------------

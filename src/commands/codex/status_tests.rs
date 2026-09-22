@@ -31,6 +31,12 @@ use crate::provider::codex::home::DaemonEvidence;
 use crate::provider::codex::home::StoreMode;
 use crate::provider::codex::oauth::RefreshClient;
 use crate::provider::codex::testkit;
+use crate::provider::codex::testkit::ago;
+use crate::provider::codex::testkit::doc;
+use crate::provider::codex::testkit::grant;
+use crate::provider::codex::testkit::now_s;
+use crate::provider::codex::testkit::only;
+use crate::provider::codex::testkit::usage_body;
 use crate::render::json_v2::assert_valid_v2;
 use crate::secret::ServiceEntry;
 use crate::usage::cache;
@@ -39,49 +45,8 @@ const USAGE_PATH: &str = "/backend-api/wham/usage";
 const TOKEN_PATH: &str = "/oauth/token";
 const NEW_RT: &str = "agctl-test-codex-rt-0002";
 
-fn now_s() -> i64 {
-    Timestamp::now().as_second()
-}
-
-fn ago(seconds: i64) -> Timestamp {
-    Timestamp::from_second(now_s() - seconds).expect("a valid time")
-}
-
-/// A usage body with a five-hour and a weekly window.
-fn usage_body() -> Value {
-    json!({
-        "plan_type": "plus",
-        "email": "agctl-test-codex-email-0001",
-        "rate_limit": {
-            "allowed": true,
-            "limit_reached": false,
-            "primary_window": { "used_percent": 12.0, "limit_window_seconds": 18_000, "reset_after_seconds": 3_600 },
-            "secondary_window": { "used_percent": 34.0, "limit_window_seconds": 604_800, "reset_after_seconds": 86_400 },
-        },
-        "credits": { "has_credits": true, "unlimited": false, "balance": "5.00" },
-    })
-}
-
-/// An `auth.json` whose access token expires at `exp` and refresh token is `rt`.
-fn doc(exp: i64, rt: &str) -> Value {
-    let mut doc = testkit::chatgpt_doc(Some(exp), Some("2026-09-06T21:40:50.123456Z"));
-    doc["tokens"]["refresh_token"] = json!(rt);
-    doc
-}
-
 fn bearer_of(doc: &Value) -> String {
     format!("Bearer {}", doc["tokens"]["access_token"].as_str().expect("an access token"))
-}
-
-/// A token response in fact F80's shape.
-fn grant(rt: &str) -> Value {
-    json!({
-        "access_token": testkit::access_token(Some(now_s() + 10 * 86_400)),
-        "refresh_token": rt,
-        "id_token": testkit::id_token(&testkit::IdClaims::default()),
-        "token_type": "Bearer",
-        "expires_in": 864_000,
-    })
 }
 
 struct Store {
@@ -191,11 +156,6 @@ fn plan(index: usize, source: PlanSource) -> RowPlan {
 
 fn owned_plan(record: CodexAccountRecord) -> RowPlan {
     plan(0, PlanSource::Owned { record, evidence: DaemonEvidence::None })
-}
-
-fn only(rows: Vec<CodexRowOutcome>) -> CodexRowOutcome {
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    rows.into_iter().next().expect("one row")
 }
 
 // --- the deadline (D-035, review S31 F9) ----------------------------------

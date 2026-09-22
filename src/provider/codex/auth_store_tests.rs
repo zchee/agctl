@@ -14,6 +14,7 @@ use crate::provider::codex::lock::LockBudget;
 use crate::provider::codex::proof;
 use crate::provider::codex::testkit;
 use crate::provider::codex::testkit::IdClaims;
+use crate::provider::codex::testkit::ns_dir;
 use crate::secret::pending::PendingDiscardReason;
 
 const OTHER_ACCT: &str = "99999999-2222-4333-8444-555555555555";
@@ -43,10 +44,6 @@ fn clean_report() -> PostExitReport {
 
 fn record() -> CodexAccountRecord {
     testkit::owned_record(testkit::USER, testkit::ACCT)
-}
-
-fn ns_dir(paths: &Paths) -> PathBuf {
-    paths.codex_namespace_dir(testkit::USER, testkit::ACCT).expect("valid ids")
 }
 
 fn auth_path(paths: &Paths) -> PathBuf {

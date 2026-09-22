@@ -39,11 +39,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Output;
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex::CodexFixture;
 use codex::Needle;
 use codex::Stream;
+use codex::jwt;
+use codex::keyring_account;
+use codex::now_s;
+use codex::write_0600;
 use httpmock::Method::GET;
 use httpmock::MockServer;
 use serde_json::Value;
@@ -69,16 +71,6 @@ const NEEDLES: [Needle; 8] = [
     ("a Bearer header", "Bearer "),
     ("a bearer header", "bearer "),
 ];
-
-fn now_s() -> i64 {
-    jiff::Timestamp::now().as_second()
-}
-
-fn jwt(payload: &Value, signature: &str) -> String {
-    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
-    let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).expect("serializes"));
-    format!("{header}.{body}.{signature}")
-}
 
 /// A ChatGPT `auth.json` for `user`/`acct`, with `rt` as its refresh token.
 fn auth_doc(user: &str, acct: &str, rt: &str) -> Value {
@@ -106,12 +98,6 @@ fn auth_doc(user: &str, acct: &str, rt: &str) -> Value {
         },
         "last_refresh": "2026-09-16T00:00:00Z",
     })
-}
-
-fn write_0600(path: &Path, bytes: &[u8]) {
-    fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
-    fs::write(path, bytes).expect("write");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod");
 }
 
 fn write_doc(path: &Path, doc: &Value) {
@@ -504,20 +490,6 @@ fn ac95_a_keyring_home_is_refused_without_reading_its_credential() {
         "the credential was read after all: {stderr}"
     );
     assert!(registry(&fixture).is_none(), "nothing was recorded");
-}
-
-/// The keychain account Codex uses for a home (fact F94):
-/// `cli|<first 16 hex digits of sha256(canonical home)>`.
-///
-/// Spelled here rather than taken from the crate: a test that computed it the
-/// way the code does would agree with a wrong implementation. `Fixture::dump`
-/// cannot be used for this — it writes `acct="example"`, which matches no
-/// home — so the listing is written by hand, in the same format.
-fn keyring_account(home: &Path) -> String {
-    let canonical = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
-    let digest =
-        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(canonical.to_string_lossy().as_bytes()));
-    format!("cli|{}", &digest[..16])
 }
 
 /// Writes a `security dump-keychain` listing naming one `Codex Auth` item for

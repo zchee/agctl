@@ -6,6 +6,7 @@ use super::*;
 use crate::config::codex::RefreshPolicy;
 use crate::provider::codex::home::StoreMode;
 use crate::provider::codex::testkit;
+use crate::provider::codex::testkit::rows;
 use crate::secret::ServiceEntry;
 
 /// A Codex home holding a fresh ChatGPT credential.
@@ -33,11 +34,6 @@ fn import(
     keyring: &KeyringListing,
 ) -> Result<Vec<String>, AppError> {
     run_with(&Import { paths, args, home, keyring })
-}
-
-/// The registry's Codex rows.
-fn rows(paths: &Paths) -> Vec<CodexAccountRecord> {
-    AgctlConfig::load(paths).expect("loads").codex_accounts
 }
 
 /// A `Codex Auth` listing naming `home`'s item (fact F94).

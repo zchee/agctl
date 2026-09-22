@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use httpmock::HttpMockRequest;
 use httpmock::Method::POST;
 use httpmock::MockServer;
 use rustls::pki_types::PrivateKeyDer;
@@ -24,6 +23,7 @@ use crate::provider::codex::auth_store::NamespaceRead;
 use crate::provider::codex::auth_store::OwnedNamespace;
 use crate::provider::codex::proof;
 use crate::provider::codex::testkit;
+use crate::provider::codex::testkit::record_header_names;
 
 const TOKEN_PATH: &str = "/oauth/token";
 
@@ -90,17 +90,6 @@ fn client_for(url: &str) -> RefreshClient {
 
 fn mock_client(server: &MockServer) -> RefreshClient {
     client_for(&server.url(TOKEN_PATH))
-}
-
-/// Records every request's header names, lowercased.
-fn record_header_names(names: Arc<Mutex<Vec<Vec<String>>>>) -> impl Fn(&HttpMockRequest) -> bool {
-    move |request: &HttpMockRequest| {
-        let mut seen: Vec<String> =
-            request.headers().keys().map(|name| name.as_str().to_ascii_lowercase()).collect();
-        seen.sort();
-        names.lock().expect("the header record is not poisoned").push(seen);
-        true
-    }
 }
 
 fn assert_ambiguous(outcome: &RefreshOutcome, class: AmbiguousClass) {

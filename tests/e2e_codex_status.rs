@@ -27,16 +27,27 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Output;
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex::CodexFixture;
 use codex::Needle;
 use codex::Stream;
+use codex::jwt;
+use codex::now_s;
+use codex::write_0600;
 use httpmock::Method::GET;
 use httpmock::Method::POST;
 use httpmock::MockServer;
 use serde_json::Value;
 use serde_json::json;
+
+/// The namespace directory this file's account installs into.
+fn namespace(fixture: &CodexFixture) -> PathBuf {
+    codex::namespace(fixture, USER, ACCT)
+}
+
+/// The refresh marker for this file's account.
+fn marker_path(fixture: &CodexFixture) -> PathBuf {
+    codex::marker_path(fixture, USER, ACCT)
+}
 
 const USAGE_PATH: &str = "/backend-api/wham/usage";
 const TOKEN_PATH: &str = "/oauth/token";
@@ -62,16 +73,6 @@ const NEEDLES: [Needle; 8] = [
 
 /// The published version-2 schema.
 const SCHEMA_V2: &str = include_str!("../schemas/status.v2.json");
-
-fn now_s() -> i64 {
-    jiff::Timestamp::now().as_second()
-}
-
-fn jwt(payload: &Value, signature: &str) -> String {
-    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
-    let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).expect("serializes"));
-    format!("{header}.{body}.{signature}")
-}
 
 /// An `auth.json` for `user`/`acct` whose access token expires at `exp`.
 fn auth_doc(user: &str, acct: &str, exp: i64, fedramp: bool, rt: &str) -> Value {
@@ -124,13 +125,6 @@ fn body_for(account: &str) -> Value {
         },
         "credits": { "has_credits": true, "unlimited": false, "balance": "0" },
     })
-}
-
-fn write_0600(path: &Path, bytes: &[u8]) {
-    use std::os::unix::fs::PermissionsExt;
-    fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
-    fs::write(path, bytes).expect("write");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod");
 }
 
 /// A Codex fixture with both endpoint seams pointed at `server` and tracing on.
@@ -512,16 +506,6 @@ fn grant(rt: &str) -> Value {
         }), "agctl-test-codex-jwt-new"),
         "expires_in": 864_000,
     })
-}
-
-/// The owned namespace's directory inside a fixture.
-fn namespace(fixture: &CodexFixture) -> PathBuf {
-    fixture.inner().config_dir().join("codex").join(USER).join(ACCT)
-}
-
-/// The refresh marker for the owned account.
-fn marker_path(fixture: &CodexFixture) -> PathBuf {
-    fixture.inner().config_dir().join("codex").join(".state").join(format!("{USER}+{ACCT}.refresh"))
 }
 
 /// The marker, when one is on disk.

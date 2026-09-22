@@ -29,13 +29,19 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::Output;
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex::CodexFixture;
 use codex::Needle;
 use codex::Stream;
+use codex::audit_outcomes;
+use codex::namespace;
+use codex::stderr;
 use serde_json::Value;
 use serde_json::json;
+
+/// A JWT signed with this file's own signature needle.
+fn jwt(payload: &Value) -> String {
+    codex::jwt(payload, JWT_SIGNATURE)
+}
 
 const USER: &str = "user-confirm-0001";
 const ACCT: &str = "acct-confirm-0001";
@@ -53,12 +59,6 @@ const NEEDLES: [Needle; 5] = [
     ("a Bearer header", "Bearer "),
     ("a bearer header", "bearer "),
 ];
-
-fn jwt(payload: &Value) -> String {
-    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
-    let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).expect("serializes"));
-    format!("{header}.{body}.{JWT_SIGNATURE}")
-}
 
 /// The ChatGPT-mode `auth.json` the fake writes into its scratch home.
 fn auth_doc(user: &str, acct: &str) -> Value {
@@ -111,14 +111,6 @@ fn login(fixture: &CodexFixture, name: &str) -> Output {
     )
 }
 
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-fn namespace(fixture: &CodexFixture, user: &str, acct: &str) -> PathBuf {
-    fixture.inner().config_dir().join("codex").join(user).join(acct)
-}
-
 /// Every scratch home left behind.
 fn scratch_leaves(fixture: &CodexFixture) -> Vec<PathBuf> {
     let root = fixture.inner().config_dir().join("codex").join(".scratch");
@@ -134,16 +126,6 @@ fn registry(fixture: &CodexFixture) -> Value {
 /// How many Codex rows the registry holds.
 fn codex_rows(fixture: &CodexFixture) -> usize {
     registry(fixture)["codex_accounts"].as_array().map_or(0, Vec::len)
-}
-
-/// Every audited outcome, in order.
-fn audit_outcomes(fixture: &CodexFixture) -> Vec<String> {
-    let log = fixture.inner().config_dir().join("codex").join("writes.jsonl");
-    let Ok(text) = fs::read_to_string(&log) else { return Vec::new() };
-    text.lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|value| value.get("outcome")?.as_str().map(str::to_owned))
-        .collect()
 }
 
 #[test]

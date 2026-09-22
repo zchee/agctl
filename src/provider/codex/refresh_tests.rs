@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use httpmock::Method::POST;
-use httpmock::Mock;
 use httpmock::MockServer;
 use serde_json::Value;
 use serde_json::json;
@@ -28,6 +27,10 @@ use crate::provider::codex::oauth::RefreshClient;
 use crate::provider::codex::permit::PostPermit;
 use crate::provider::codex::proof;
 use crate::provider::codex::testkit;
+use crate::provider::codex::testkit::ago;
+use crate::provider::codex::testkit::doc;
+use crate::provider::codex::testkit::mock;
+use crate::provider::codex::testkit::now_s;
 
 const TOKEN_PATH: &str = "/oauth/token";
 
@@ -44,17 +47,6 @@ const OTHER_RT: &str = "agctl-test-codex-rt-external";
 const CHILD_CONFIG_ENV: &str = "AGCTL_S32_CHILD_CONFIG";
 const CHILD_URL_ENV: &str = "AGCTL_S32_CHILD_URL";
 const CHILD_FAULT_ENV: &str = "AGCTL_S32_CHILD_FAULT";
-
-fn now_s() -> i64 {
-    Timestamp::now().as_second()
-}
-
-/// An `auth.json` whose access token expires at `exp` with refresh token `rt`.
-fn doc(exp: i64, rt: &str) -> Value {
-    let mut doc = testkit::chatgpt_doc(Some(exp), Some("2026-09-06T21:40:50.123456Z"));
-    doc["tokens"]["refresh_token"] = json!(rt);
-    doc
-}
 
 fn digest8(bytes: &[u8]) -> String {
     Credentials::parse(bytes).expect("parses").refresh_digest8().expect("a refresh token")
@@ -179,23 +171,12 @@ fn permit(url: &str) -> PostPermit {
     PostPermit::with_client(RefreshClient::new(url, "agctl/test"))
 }
 
-fn mock<'a>(server: &'a MockServer, status: u16, body: &Value) -> Mock<'a> {
-    server.mock(|when, then| {
-        when.method(POST).path(TOKEN_PATH);
-        then.status(status).json_body(body.clone());
-    })
-}
-
 fn state_with_inflight(sent_digest8: &str, sent_at: Timestamp) -> RefreshState {
     RefreshState {
         inflight: Some(Inflight { sent_digest8: sent_digest8.to_owned(), sent_at }),
         last_sent_at: Some(sent_at),
         ..RefreshState::default()
     }
-}
-
-fn ago(seconds: i64) -> Timestamp {
-    Timestamp::from_second(now_s() - seconds).expect("a valid time")
 }
 
 fn is_unknown(step: &RefreshStep, class: UnknownClass) -> bool {
@@ -350,7 +331,7 @@ fn an_expired_owned_grant_is_refreshed_with_one_post() {
     let before_ino = fs::metadata(fixture.auth_path()).expect("stat").ino();
     let sent = digest8(&before);
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
 
     let report = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH)));
 
@@ -402,7 +383,7 @@ fn a_response_without_a_refresh_token_keeps_the_old_one() {
     let fixture = Fixture::expired();
     let sent = digest8(&fixture.auth());
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(None));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(None));
     let report = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH)));
     assert_eq!(report.step, RefreshStep::Refreshed { parked: false }, "{report:?}");
     post.assert_calls(1);
@@ -433,7 +414,7 @@ fn an_audit_log_that_refuses_after_a_landed_write_leaves_the_write() {
     let fixture = Fixture::expired();
     fs::create_dir_all(audit::log_path(&fixture.paths)).expect("a directory at the log's name");
     let server = MockServer::start();
-    mock(&server, 200, &grant_body(Some(NEW_RT)));
+    mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let report = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH)));
     assert_eq!(report.step, RefreshStep::Refreshed { parked: false }, "{report:?}");
     assert!(report.notes.contains(&RefreshNote::AuditLogRefused), "{report:?}");
@@ -452,7 +433,7 @@ fn nothing_is_sent_without_the_time_the_send_needs() {
     // Plan AC124 (g): one second short of lock + budget + allowance.
     let fixture = Fixture::expired();
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let cancel = Cancel::new();
     let permit = permit(&server.url(TOKEN_PATH));
     let ctx = RefreshCtx {
@@ -471,7 +452,7 @@ fn nothing_is_sent_without_the_time_the_send_needs() {
 #[test]
 fn fresh_disabled_cancelled_and_busy_send_nothing() {
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let permit = permit(&server.url(TOKEN_PATH));
 
     let fresh = Fixture::new(&doc(now_s() + 9 * 86_400, testkit::RT_SENTINEL));
@@ -512,7 +493,7 @@ fn fresh_disabled_cancelled_and_busy_send_nothing() {
 #[test]
 fn daemon_evidence_under_the_lock() {
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let permit = permit(&server.url(TOKEN_PATH));
 
     let live = Fixture::expired();
@@ -542,7 +523,7 @@ fn daemon_evidence_under_the_lock() {
 #[test]
 fn a_torn_file_is_stale_or_unknown_never_needs_login() {
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let permit = permit(&server.url(TOKEN_PATH));
 
     let fixture = Fixture::expired();
@@ -569,7 +550,7 @@ fn the_server_floor_blocks_an_automatic_refresh_of_its_grant() {
         ..RefreshState::default()
     });
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let permit = permit(&server.url(TOKEN_PATH));
     assert_eq!(fixture.run(SendMode::Proactive, &permit).step, RefreshStep::NotBefore(at));
     post.assert_calls(0);
@@ -597,7 +578,7 @@ fn a_marker_left_by_a_dead_process_is_interrupted_and_blocks_the_send() {
     let sent_at = ago(120);
     fixture.write_marker(&state_with_inflight(&sent, sent_at));
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let permit = permit(&server.url(TOKEN_PATH));
 
     for _ in 0..3 {
@@ -625,7 +606,7 @@ fn a_marker_for_another_grant_is_cleared_and_the_pass_proceeds() {
     let fixture = Fixture::expired();
     fixture.write_marker(&state_with_inflight("0badc0de", ago(60)));
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let report = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH)));
     assert_eq!(report.step, RefreshStep::Refreshed { parked: false }, "{report:?}");
     assert!(report.notes.contains(&RefreshNote::StaleMarkerCleared));
@@ -635,7 +616,7 @@ fn a_marker_for_another_grant_is_cleared_and_the_pass_proceeds() {
 #[test]
 fn an_unreadable_or_unwritable_marker_sends_nothing() {
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let permit = permit(&server.url(TOKEN_PATH));
 
     let unreadable = Fixture::expired();
@@ -665,7 +646,7 @@ fn deleting_the_state_directory_re_arms_one_send() {
     fixture.write_marker(&state_with_inflight(&digest8(&fixture.auth()), ago(60)));
     fs::remove_dir_all(fixture.paths.codex_state_dir()).expect("rm -rf .state");
     let server = MockServer::start();
-    let post = mock(&server, 503, &json!({}));
+    let post = mock(&server, TOKEN_PATH, 503, &json!({}));
     let step = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH))).step;
     assert!(is_unknown(&step, UnknownClass::ServerError), "{step:?}");
     post.assert_calls(1);
@@ -767,7 +748,7 @@ fn a_proven_pre_send_failure_clears_the_marker_and_the_next_pass_sends_once() {
     assert_eq!(fixture.marker().and_then(|marker| marker.inflight), None);
 
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let step = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH))).step;
     assert_eq!(step, RefreshStep::Refreshed { parked: false });
     post.assert_calls(1);
@@ -777,7 +758,7 @@ fn a_proven_pre_send_failure_clears_the_marker_and_the_next_pass_sends_once() {
 fn a_rejected_answer_clears_the_marker() {
     let fixture = Fixture::expired();
     let server = MockServer::start();
-    let post = mock(&server, 403, &json!({"error": "forbidden"}));
+    let post = mock(&server, TOKEN_PATH, 403, &json!({"error": "forbidden"}));
     let step = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH))).step;
     assert_eq!(step, RefreshStep::Stale(StaleReason::Rejected(403)));
     assert_eq!(fixture.marker().and_then(|marker| marker.inflight), None);
@@ -789,7 +770,7 @@ fn a_dead_grant_needs_login_and_is_never_sent_again() {
     let fixture = Fixture::expired();
     let before = fixture.auth();
     let server = MockServer::start();
-    let post = mock(&server, 400, &json!({"error": "invalid_grant"}));
+    let post = mock(&server, TOKEN_PATH, 400, &json!({"error": "invalid_grant"}));
     let permit = permit(&server.url(TOKEN_PATH));
     assert_eq!(
         fixture.run(SendMode::Proactive, &permit).step,
@@ -900,7 +881,7 @@ fn a_file_changed_before_the_post_is_adopted_when_fresh() {
         testkit::write_0600(&auth, &testkit::pretty(&doc(now_s() + 10 * 86_400, OTHER_RT)));
     });
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let fault = Fault::from_list("pause_codex_before_post_snapshot");
     let step = fixture.run_with(SendMode::Proactive, &permit(&server.url(TOKEN_PATH)), &fault).step;
     writer.join().expect("writer");
@@ -917,7 +898,7 @@ fn a_file_changed_before_the_post_is_adopted_when_fresh() {
 fn a_failed_rename_parks_the_grant_and_the_next_pass_replays_it() {
     let fixture = Fixture::expired();
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let permit = permit(&server.url(TOKEN_PATH));
     let step =
         fixture.run_with(SendMode::Proactive, &permit, &Fault::from_list("codex_rename_fail")).step;
@@ -941,7 +922,7 @@ fn a_write_that_lands_and_reports_an_error_is_not_written_twice() {
     // another writer's grant and reported as a discard.
     let fixture = Fixture::expired();
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let fault = Fault::from_list("codex_error_after_rename");
     let report = fixture.run_with(SendMode::Proactive, &permit(&server.url(TOKEN_PATH)), &fault);
     assert_eq!(report.step, RefreshStep::Refreshed { parked: false }, "{report:?}");
@@ -974,7 +955,7 @@ fn an_unreadable_file_after_the_post_parks_the_grant_and_blocks_the_next_send() 
 
     // While the pending grant cannot be resolved nothing is sent (INFO-1).
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let permit = permit(&server.url(TOKEN_PATH));
     let step = fixture.run(SendMode::Proactive, &permit).step;
     assert!(matches!(step, RefreshStep::Failed(_)), "{step:?}");
@@ -1018,7 +999,7 @@ fn when_nothing_can_be_written_the_outcome_is_unknown_and_the_marker_stays() {
     assert!(marker.inflight.is_some(), "no definite outcome: the marker stays");
 
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let later = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH))).step;
     assert!(is_unknown(&later, UnknownClass::WriteFailed), "{later:?}");
     post.assert_calls(0);
@@ -1044,7 +1025,7 @@ fn after_401(rejected: &str) -> SendMode {
 #[test]
 fn the_401_floor_counts_sent_refreshes_that_did_not_help() {
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let permit = permit(&server.url(TOKEN_PATH));
     let cancel = Cancel::new();
 
@@ -1152,7 +1133,7 @@ fn consent() -> SendMode {
 #[test]
 fn resend_sends_once_per_marker_and_only_when_eligible() {
     let server = MockServer::start();
-    let post = mock(&server, 503, &json!({}));
+    let post = mock(&server, TOKEN_PATH, 503, &json!({}));
     let permit = permit(&server.url(TOKEN_PATH));
 
     let none = Fixture::expired();
@@ -1261,7 +1242,7 @@ fn spawn_child(fixture: &Fixture, url: &str, fault: &str) -> std::process::Child
 fn an_abort_after_the_marker_leaves_a_send_the_next_pass_will_not_repeat() {
     let fixture = Fixture::expired();
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let url = server.url(TOKEN_PATH);
     let status = spawn_child(&fixture, &url, "codex_abort_after_marker").wait().expect("wait");
     assert_eq!(status.signal(), Some(libc::SIGABRT), "{status:?}");
@@ -1297,7 +1278,7 @@ fn a_sigkill_during_the_post_leaves_a_send_the_next_pass_will_not_repeat() {
     hold.join().expect("listener");
 
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let step = fixture.run(SendMode::Proactive, &permit(&server.url(TOKEN_PATH))).step;
     assert!(is_unknown(&step, UnknownClass::Interrupted), "{step:?}");
     post.assert_calls(0);
@@ -1307,7 +1288,7 @@ fn a_sigkill_during_the_post_leaves_a_send_the_next_pass_will_not_repeat() {
 fn an_abort_between_the_parked_grant_and_the_marker_clear_is_recovered_pending_first() {
     let fixture = Fixture::expired();
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let url = server.url(TOKEN_PATH);
     let status = spawn_child(&fixture, &url, "codex_rename_fail,codex_abort_after_pending")
         .wait()
@@ -1355,7 +1336,7 @@ fn a_resend_that_never_left_restores_the_unknown_marker_and_arms_nothing() {
 
     // The next automatic pass sends nothing.
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let permit = permit(&server.url(TOKEN_PATH));
     for _ in 0..2 {
         let later = fixture.run(SendMode::Proactive, &permit).step;
@@ -1369,7 +1350,7 @@ fn a_rejected_resend_spends_the_resend_and_arms_nothing() {
     let fixture = Fixture::expired();
     fixture.write_marker(&unknown_marker(&fixture, 7200, UnknownClass::ServerError));
     let server = MockServer::start();
-    let post = mock(&server, 403, &json!({"error": "forbidden"}));
+    let post = mock(&server, TOKEN_PATH, 403, &json!({"error": "forbidden"}));
     let permit = permit(&server.url(TOKEN_PATH));
 
     let step = fixture.run(consent(), &permit).step;
@@ -1395,7 +1376,7 @@ fn a_rejected_resend_spends_the_resend_and_arms_nothing() {
 fn a_resend_is_stopped_by_daemon_evidence() {
     // Review S32-C2 F2: deviation D25 pinned.
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let permit = permit(&server.url(TOKEN_PATH));
 
     let live = Fixture::expired();
@@ -1435,7 +1416,7 @@ fn a_resend_is_stopped_by_daemon_evidence() {
 #[test]
 fn d32_a_live_daemon_under_the_second_name_stops_a_proactive_refresh() {
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let permit = permit(&server.url(TOKEN_PATH));
     let me = std::process::id();
 
@@ -1462,7 +1443,7 @@ fn d32_a_live_daemon_under_the_second_name_stops_a_proactive_refresh() {
 #[test]
 fn d32_a_live_daemon_under_the_second_name_stops_a_resend() {
     let server = MockServer::start();
-    let post = mock(&server, 200, &grant_body(Some(NEW_RT)));
+    let post = mock(&server, TOKEN_PATH, 200, &grant_body(Some(NEW_RT)));
     let permit = permit(&server.url(TOKEN_PATH));
     let me = std::process::id();
 

@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use httpmock::HttpMockRequest;
 use httpmock::Method::GET;
 use httpmock::Method::POST;
 use httpmock::MockServer;
@@ -18,6 +17,7 @@ use crate::provider::codex::testkit;
 use crate::provider::codex::testkit::IdClaims;
 
 use super::*;
+use crate::provider::codex::testkit::record_header_names;
 
 const F78: &str = include_str!("../../../fixtures/codex/usage-2026-09-16.json");
 const CREDITS_ABSENT: &str = include_str!("../../../fixtures/codex/usage-credits-absent.json");
@@ -82,17 +82,6 @@ impl UsageAuth for FakeAuth {
 
     fn extra_headers(&self) -> Vec<(&'static str, String)> {
         self.extra.clone()
-    }
-}
-
-/// Records the lower-cased header names of every request the mock matched.
-fn record_header_names(names: Arc<Mutex<Vec<Vec<String>>>>) -> impl Fn(&HttpMockRequest) -> bool {
-    move |request: &HttpMockRequest| {
-        let mut seen: Vec<String> =
-            request.headers().keys().map(|name| name.as_str().to_ascii_lowercase()).collect();
-        seen.sort();
-        names.lock().expect("the header record is not poisoned").push(seen);
-        true
     }
 }
 
