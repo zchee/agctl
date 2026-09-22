@@ -4,8 +4,8 @@
 # Builds agctl the way a release is built (default features, release profile)
 # into a scratch target directory, then proves two things about the artifact:
 #
-#   1. none of the thirteen test-seam environment-variable names appear in it, and
-#   2. the three production-visible names do.
+#   1. none of the test-seam names in the `seams` array appear in it, and
+#   2. every production-visible name in the `production` array does.
 #
 # It also runs scripts/docs-gate.sh first (AC77 and AC83), so that one command
 # covers everything a release must satisfy that the three check-skill commands
@@ -16,11 +16,10 @@
 # and the `testing` builds get `serde_json/float_roundtrip` (the live
 # `.claude.json` guard's exact float parsing).
 #
-# The thirteen are one representative name per seam-owning module, not the whole
-# test-only surface — fixtures/fake-security.sh alone defines ten
-# AGCTL_FAKE_SECURITY_* names on its own. The fake's write knob is the one
-# exception to "one per owner": the keychain *write* path is the only seam that
-# can change a keychain, so it is gated by name rather than by family. A new
+# The seam names are one representative per seam-owning module, not the whole
+# test-only surface. A name is listed only if a `testing` build of the binary
+# CAN carry it as a string; one no build carries would be absent here whatever
+# the release did, so it would prove nothing (see the notes in the array). A new
 # seam-owning module adds its representative to the `seams` array below and to
 # the table in .claude/skills/check/SKILL.md, in the same change that
 # introduces it.
@@ -56,10 +55,33 @@
 # Codex client, so the name is folded out of a release artifact (ledger #268);
 # the step whose command first reads it adds the presence check.
 #
+# S32 adds AGCTL_CODEX_TOKEN_URL: the Codex token endpoint, read only by
+# src/provider/codex/oauth.rs under `testing`. A release binary that honoured
+# it would POST a Codex refresh token wherever an environment variable pointed
+# it — the same exfiltration AGCTL_CLAUDE_TOKEN_URL is gated against.
+#
+# S33 adds AGCTL_CODEX_USER_AGENT to the production list (plan AC110): from
+# S33 `agctl codex status` builds the Codex usage client, so the name is no
+# longer folded out of a release artifact — verified with `strings` on a
+# default-feature release build before this line was added (ledger #268).
+#
+# S37 removed `agctl unaudited write receipt` (S34 C2-a's drop-check witness):
+# measured absent from an all-features release build, flags cleared and with
+# this project's own build flags applied, 2026-09-22. The counts and the
+# remaining guards — the testing-only drop test, and phase3-greps.sh's
+# receipt_check / reached_audit rules — are recorded in
+# .claude/skills/check/SKILL.md.
+#
 # Phase 2 added no other seam: AGCTL_SECURITY_BIN (the write transport) and
-# AGCTL_CLAUDE_PROFILE_URL (the live swap's profile GET) are both listed, and
-# `rg -o 'AGCTL_[A-Z0-9_]+' src --glob '!*_tests.rs'` enumerates nothing else
-# outside this array and the production list below.
+# AGCTL_CLAUDE_PROFILE_URL (the live swap's profile GET) are both listed.
+# `rg -o 'AGCTL_[A-Z0-9_]+' src --glob '!*_tests.rs'` is a starting point for
+# reviewing a name that is new to this array, not a closed enumeration: it
+# also finds AGCTL_FAKE_SECURITY_* (src/secret/fake_security.rs, since
+# e6c00e9) and AGCTL_FAKE_CODEX_ (src/provider/codex/login_child.rs), both
+# deliberately outside this array for the reasons given where each name is
+# declared — the first is dead code in every binary this crate ships, the
+# second is only ever a `starts_with` argument, so neither can appear in a
+# grep of a built artifact.
 #
 # The first is the one that matters. The `testing` feature compiles overrides for
 # the OAuth token endpoint, the authorize endpoint, the profile endpoint and the
@@ -133,11 +155,34 @@ seams=(
 	AGCTL_CLAUDE_TOKEN_URL
 	AGCTL_CLAUDE_AUTHORIZE_URL
 	AGCTL_CLAUDE_PROFILE_URL
-	AGCTL_FAKE_SECURITY_LOG
-	AGCTL_FAKE_SECURITY_WRITE_EXIT
+	# No knob name of the `security(1)` stand-in is listed. It is embedded
+	# (`include_str!` in `src/secret/fake_security.rs`, `testing` only) for
+	# the UNIT tests alone: its one reader is called from unit tests only,
+	# so it is dead code in every binary, `testing` builds included, and no
+	# build can carry its knobs. A name no build carries would be absent
+	# here whatever the release did, so listing it would prove nothing.
 	AGCTL_NO_BROWSER
 	AGCTL_CODEX_BIN
 	AGCTL_CODEX_USAGE_URL
+	AGCTL_CODEX_TOKEN_URL
+	# S34: the pause point between `verify_login` and `install`.
+	#
+	# Not listed: the login child's `testing`-only allowlist prefix
+	# `AGCTL_FAKE_CODEX_`. It is used only in a `starts_with`, which compiles
+	# to immediate compares, so no build — `testing` included — carries it
+	# as a string. What guards it is `scripts/phase3-greps.sh`'s `fake_prefix`
+	# rule (the literal spelled once, under `#[cfg(feature = "testing")]`)
+	# plus the default-feature clippy gate. The fake `codex`'s own knob names
+	# are not listed either: `fixtures/fake-codex.sh` is never compiled into
+	# the crate, so no build carries them.
+	codex_login_before_install
+	# S34 C1b-2 (numbered deviation 13): the `testing`-only lock-order
+	# witness in src/runtime/lock_order.rs. All three of its messages (the
+	# assertion, the overflow and the underflow panic) start with this one
+	# prefix inside a single literal with nothing interpolated, so a `testing`
+	# build carries it whole and this entry proves none of them — nor the
+	# witness — reaches a release artifact.
+	'agctl lock order violated: '
 )
 
 # The production surface. Every one of these must be PRESENT.
@@ -145,6 +190,7 @@ production=(
 	AGCTL_CONFIG_DIR
 	AGCTL_CLAUDE_USER_AGENT
 	AGCTL_CLAUDE_OAUTH_SCOPES
+	AGCTL_CODEX_USER_AGENT
 )
 
 if [ -n "${AGCTL_RELEASE_GATE_TARGET:-}" ]; then

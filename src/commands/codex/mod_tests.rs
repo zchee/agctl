@@ -3,6 +3,7 @@
 use clap::Parser;
 
 use super::*;
+use crate::cli::CodexAccountsCommand;
 
 /// Parses a command line, or panics naming it.
 fn parse(args: &[&str]) -> Cli {
@@ -17,34 +18,13 @@ fn codex(args: &[&str]) -> CodexCommand {
     }
 }
 
-#[test]
-fn every_subcommand_refuses_and_names_itself() {
-    let lines: [(&[&str], &str); 8] = [
-        (&["agctl", "codex", "status"], "agctl codex status"),
-        (&["agctl", "codex", "watch"], "agctl codex watch"),
-        (&["agctl", "codex", "login"], "agctl codex login"),
-        (&["agctl", "codex", "import", "--from", "codex-home"], "agctl codex import"),
-        (&["agctl", "codex", "doctor"], "agctl codex doctor"),
-        (&["agctl", "codex", "accounts", "list"], "agctl codex accounts list"),
-        (&["agctl", "codex", "accounts", "show", "x"], "agctl codex accounts show"),
-        (
-            &["agctl", "codex", "accounts", "refresh", "x", "--resend"],
-            "agctl codex accounts refresh",
-        ),
-    ];
-
-    for (args, expected) in lines {
-        let cli = parse(args);
-        let crate::cli::Command::Codex { command } = &cli.command else {
-            panic!("`{}` is not a codex command", args.join(" "));
-        };
-        let err = run(&cli, command, &Cancel::new()).expect_err("no stub may report success");
-        let message = err.to_string();
-        assert!(message.contains(expected), "{message}");
-        assert!(message.contains("not implemented"), "{message}");
-        assert_eq!(err.exit_code(), crate::error::EXIT_FATAL, "a stub must not exit 0");
-    }
-}
+// `every_subcommand_refuses_and_names_itself` stood here until S34 C4. It
+// walked the subcommands that were still stubs and proved each refused,
+// named itself and exited non-zero; `accounts set` and `accounts refresh`
+// were the last two, and with them implemented the list is empty and the
+// test had no subject left. `run` above now dispatches every arm, so a stub
+// cannot be added without adding an arm — and a stub that ever comes back
+// brings this test back with it.
 
 #[test]
 fn status_takes_the_phase_one_flags_and_the_same_default_timeout() {

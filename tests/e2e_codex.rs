@@ -23,6 +23,7 @@ mod codex;
 use std::fs;
 use std::path::Path;
 
+use assert_cmd::assert::OutputAssertExt;
 use codex::CODEX_HOME_ENV;
 use codex::CodexFixture;
 use common::ACCT;
@@ -66,9 +67,31 @@ fn codex_record(user: &str, acct: &str, email: &str, kind: Value) -> Value {
     })
 }
 
+/// Runs `command` and hands its stderr to the unaudited-receipt rejection
+/// before anything else looks at it, then returns an `Output` the ordinary
+/// `assert_cmd` matchers still work on (`Output::assert()`).
+///
+/// `assert_cmd`'s own `.assert()` launches the binary and yields an `Assert`,
+/// never an `Output`, so a test written that way cannot reach the rejection —
+/// and four of the five sites in this file assert a NON-ZERO exit, where a
+/// dropped write receipt would have arrived as an abort the matcher happily
+/// accepted. This is the whole reason the helper exists (S34 C2-a, the launch
+/// table's second correction).
+fn launched(name: &str, command: &mut assert_cmd::Command) -> std::process::Output {
+    let output = command.output().expect("the binary runs");
+    codex::assert_receipts_were_audited(name, &output.stderr);
+    output
+}
+
 /// What one `agctl` run produced: status, stdout and stderr, normalised.
+///
+/// Every launch in this file goes through here, so the unaudited-receipt
+/// rejection goes here too (S34 C2-a). This crate compares whole normalised
+/// transcripts rather than exit codes, so without it a dropped write receipt
+/// would arrive as a diff in a snapshot about something else.
 fn run(fixture: &Fixture, args: &[&str]) -> String {
     let output = fixture.cmd().args(args).output().expect("the binary should run");
+    codex::assert_receipts_were_audited(&args.join(" "), &output.stderr);
     format!(
         "exit: {:?}\n--- stdout\n{}\n--- stderr\n{}",
         output.status.code(),
@@ -203,19 +226,18 @@ fn ac112_a_claude_command_does_not_resolve_a_codex_account() {
         "codex_accounts": [codex_record("user-01", "acct-01", EMAIL, json!({ "kind": "live" }))],
     }));
 
-    fixture
-        .cmd()
-        .args(["claude", "accounts", "show", EMAIL])
+    launched("accounts-show-email", fixture.cmd().args(["claude", "accounts", "show", EMAIL]))
         .assert()
         .success()
         .stdout(contains(ACCT));
 
-    fixture
-        .cmd()
-        .args(["claude", "accounts", "show", "user-01"])
-        .assert()
-        .failure()
-        .stderr(contains("no account matches `user-01`"));
+    launched(
+        "accounts-show-unknown",
+        fixture.cmd().args(["claude", "accounts", "show", "user-01"]),
+    )
+    .assert()
+    .failure()
+    .stderr(contains("no account matches `user-01`"));
 }
 
 // ---------------------------------------------------------------------------
@@ -228,74 +250,61 @@ fn codex_tree(config_dir: &Path) -> bool {
 }
 
 #[test]
-fn every_codex_subcommand_refuses_without_touching_the_store() {
+fn a_codex_command_that_refuses_its_argument_still_touches_no_file() {
+    // This test used to walk the subcommands that were still stubs: `status`
+    // and `watch` landed at S33, `login` at S34 C1, `import` at S34 C2-b,
+    // `accounts list/show/remove/forget/unforget` at S34 C3, `doctor` at S35,
+    // and `accounts set` / `accounts refresh` at S34 C4 — so the list is
+    // empty and every `agctl codex` subcommand is a command now.
+    //
+    // What it guarded is still worth guarding, on the commands themselves: a
+    // run that gets no further than "no such account" must not have created
+    // the store on its way there. `accounts set` and `accounts refresh` are
+    // the strictest cases — plan AC127 gives `set` the registry and nothing
+    // else, so neither may so much as make `codex/` (`ensure_codex_dirs`).
     let fixture = CodexFixture::new();
-    let lines: [(&[&str], &str); 8] = [
-        (&["codex", "status"], "agctl codex status"),
-        (&["codex", "status", "--json"], "agctl codex status"),
-        (&["codex", "watch"], "agctl codex watch"),
-        (&["codex", "login"], "agctl codex login"),
-        (&["codex", "import", "--from", "codex-home"], "agctl codex import"),
-        (&["codex", "doctor"], "agctl codex doctor"),
-        (&["codex", "accounts", "list"], "agctl codex accounts list"),
+    let lines: [(&[&str], &str); 2] = [
+        (&["codex", "accounts", "set", "x", "--refresh", "never"], "agctl codex accounts set"),
         (&["codex", "accounts", "refresh", "x", "--reset-floor"], "agctl codex accounts refresh"),
     ];
 
     for (args, named) in lines {
-        fixture
-            .cmd()
-            .args(args)
+        launched(named, fixture.cmd().args(args))
             .assert()
             .failure()
-            .stderr(contains("not implemented"))
-            .stderr(contains(named));
+            .stderr(contains("no account matches `x`"));
     }
 
     assert!(
         !codex_tree(&fixture.inner().config_dir()),
-        "a stub created a `codex/` tree; no stub may touch a file"
+        "a command that refused its argument created a `codex/` tree"
     );
     assert!(
         !fixture.codex_log_path().exists(),
-        "a stub spawned the fake `codex`; no stub may spawn a child"
+        "a command that refused its argument spawned the fake `codex`"
     );
 }
 
 #[test]
-fn the_codex_flags_parse_before_the_commands_exist() {
+fn the_codex_flags_parse_and_reach_their_commands() {
     // A refusal from the command, not from the parser: every flag plan §3.2
     // names is accepted today, so completions and `--help` describe the real
-    // surface rather than half of it.
+    // surface rather than half of it. (`status`'s flags are exercised by the
+    // command itself in `tests/e2e_codex_status.rs`.)
     let fixture = CodexFixture::new();
 
-    fixture
-        .cmd()
-        .args([
-            "codex",
-            "status",
-            "--all",
-            "--json",
-            "--raw",
-            "--refresh",
-            "--no-cache",
-            "--account",
-            "one",
-            "--timeout",
-            "5m",
-        ])
-        .assert()
-        .failure()
-        .stderr(contains("not implemented"));
-
-    fixture
-        .cmd()
-        .args(["codex", "accounts", "set", "x", "--refresh", "never"])
-        .assert()
-        .failure()
-        .stderr(contains("not implemented"));
+    launched(
+        "accounts-set-unknown-id",
+        fixture.cmd().args(["codex", "accounts", "set", "x", "--refresh", "never"]),
+    )
+    .assert()
+    .failure()
+    .stderr(contains("no account matches `x`"));
 
     // And a flag it does not name is still a usage error.
-    fixture.cmd().args(["codex", "status", "--by-identity"]).assert().code(2);
+    launched("unknown-flag", fixture.cmd().args(["codex", "status", "--by-identity"]))
+        .assert()
+        .code(2);
 }
 
 // ---------------------------------------------------------------------------

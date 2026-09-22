@@ -133,9 +133,28 @@ impl Fault {
     ///
     /// Without the `testing` feature this returns immediately and the
     /// parameter is unused.
+    ///
+    /// **Observable.** Before it waits, an active pause creates
+    /// `<AGCTL_FAULT_RESUME>.reached` next to the resume file the test already
+    /// owns. A test that acts inside the window can therefore wait for proof
+    /// that agctl is actually held here, rather than inferring it from some
+    /// other side effect — without it, deleting a pause leaves every test that
+    /// relies on it green while the window it guarded closes by timing alone.
+    /// Additive: a caller that never looks for the marker is unaffected.
     #[cfg(feature = "testing")]
     pub fn pause_point(&self, name: &str) {
-        self.wait_if(&format!("pause_{name}"));
+        let fault = format!("pause_{name}");
+        if self.is(&fault)
+            && let Some(resume) = std::env::var_os(FAULT_RESUME_ENV)
+        {
+            let mut reached = resume;
+            reached.push(".reached");
+            // Best-effort: a marker that cannot be written makes the waiting
+            // test fail loudly on its missing marker, which is the right
+            // outcome; it must not stop the pause itself.
+            let _ = std::fs::write(std::path::PathBuf::from(reached), b"");
+        }
+        self.wait_if(&fault);
     }
 
     /// Blocks at a named pause point. Inert without the `testing` feature.

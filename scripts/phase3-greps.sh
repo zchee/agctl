@@ -105,6 +105,106 @@
 #   account_header  unchanged (ledger #277): usage.rs requires the header through
 #                 `credentials::ACCOUNT_ID_HEADER`, so the literal keeps one site
 #
+# S32 appends seven more and widens two:
+#
+#   auth_host     `auth.openai.com` on a code line                         → only
+#                 provider/codex/oauth.rs, the one client of the token endpoint
+#   codex_token_url  the `AGCTL_CODEX_TOKEN_URL` name (the test-only token
+#                 endpoint override)                                       → only
+#                 provider/codex/oauth.rs; it is also on the release gate's seam list
+#   oauth_cancelled  `Cancelled` on a code line in provider/codex/oauth.rs → none
+#                 (plan ledger #198: a cancel is observable only before the send)
+#   oauth_refresh_callers  `oauth::refresh(`                               → only
+#                 provider/codex/refresh.rs, the one POST path (invariant I26)
+#   consent_callers  `ResendConsent::after_confirmation(` and
+#                 `ResetConsent::after_confirmation(`                      → only
+#                 commands/codex/accounts_refresh.rs (the constructors are `pub`
+#                 for that one caller; S34 C4 numbered deviation 1)
+#   refresh_usage_cache  `usage::cache` in provider/codex/refresh.rs      → none
+#                 (the refresh marker is a fail-closed file, never the cache)
+#   receipt_type  `WriteReceipt` on a code line                            → only
+#                 provider/codex/auth_store.rs (which builds receipts) and
+#                 provider/codex/audit.rs (which consumes them, invariant I30)
+#   receipt_destructure  (C2, review S30 LOW-2) across lines, any receiver: a
+#                 `Landed { .. }`/`ChangedSinceRead { .. }` pattern that does not
+#                 bind `receipt` (or binds `receipt: _`), and a `let (a, _b, c)`
+#                 tuple bound from `resolve_pending(`, outside auth_store.rs → none.
+#                 (Its file-level clause — "a file that takes receipts calls
+#                 `audit::append(`" — is retired: see check_receipt_destructure.)
+#                 `marker_mutators` also pins `settle_inflight`/`record_did_not_help`.
+#   codex_redirects, codex_decoded_cap  now per client: exactly one
+#                 `.max_redirects(0)` in each of usage.rs and oauth.rs, no other
+#                 `max_redirects(` in src/provider/codex, and each client's own
+#                 decoded-byte cap (`MAX_BODY_BYTES`, `MAX_RESPONSE_BYTES`). The
+#                 `codex_timeouts` scope already covers every file in the tree.
+#
+# S33 appends five more (U44 = option 5: `watch` never POSTs). Each matches the
+# PATH and not the call, so an aliased import is a hit on its own `use` line —
+# review S33-C2 F1 defeated the call-shaped versions with `use …::run as drive;`:
+#
+#   refresh_drivers  `refresh::run` / `refresh::record_retry_get`         → only
+#                 commands/codex/status.rs, whose pre-pass and 401 post-pass run
+#                 on the command thread (ledger #233). The pass they wrap lives
+#                 in commands/codex/pass.rs, which is deliberately not listed.
+#   refresh_client  `RefreshClient`                                       → only
+#                 provider/codex/{oauth,permit}.rs: no command names the token
+#                 client at all now that the permit carries it
+#   post_permit   `PostPermit`                                            → only
+#                 provider/codex/{permit,refresh}.rs and commands/codex/status.rs
+#   watch_no_post  every file under src/commands/codex except status.rs:
+#                 `refresh::run`, `refresh::record_retry_get`, `RefreshClient`,
+#                 `PostPermit`, `refresh_pre_pass`, `after_unauthorized`,
+#                 `codex::status`/`super::status`                          → none;
+#                 and, in watch.rs alone, `proof::owned` (the pass needs an
+#                 `OwnedRecord` to take the namespace lock; `watch.rs` does not)
+#   daemon_pid_names  `"app-server.pid"` / `"daemon.pid"`                  → only
+#                 provider/codex/home.rs. F83's name is conditional upstream, so
+#                 a second reader knowing one name would be fail-open (D32).
+#   usage_client_new  `UsageClient::new(` in src/commands/codex            → none
+#                 (review S31 N2: commands build the client through `from_env`)
+#   permit_mint   who may MINT a permit, which is narrower than who may name one:
+#                 `PostPermit…::from_env` → only provider/codex/permit.rs and
+#                 commands/codex/status.rs. Review S33-C2-r2 F2: `refresh.rs` may
+#                 name the capability and calls its own driver as bare `run(`, so
+#                 a `pub(crate) fn settle()` there minted and spent a permit with
+#                 no textual trace any other check looks at. The same check also
+#                 refuses a second `impl PostPermit` block (which would make
+#                 `Self::from_env` a second spelling), any rename of the type
+#                 (`PostPermit as …`, `type X = …PostPermit`) — tests included,
+#                 since a rename anywhere teaches the next author the spelling —
+#                 and any `from_env` on a code line of refresh.rs, which reads
+#                 nothing from the environment today.
+#   permit_mint_count  `permit.rs` mints in exactly 2 places and has exactly 2
+#                 constructors returning `Self` in any wrapper (both counted on
+#                 code lines only, so prose cannot trip them), and
+#                 no function anywhere in `src` returns a `PostPermit` in any
+#                 wrapper — `Box`, `Option`, `Result`, `Arc`, a reference. Review S33-C2-r2 probe E moved the mint into a
+#                 third constructor inside `permit.rs` — the one file a mint may
+#                 live in — and every name-scoped check went quiet. A count is
+#                 what makes the residual reliance "review a 61-line file whose
+#                 whole purpose is this invariant" rather than "review a
+#                 1146-line refresh.rs". Modelled on `exposure_count`.
+#
+# S34 C2-a appends one:
+#
+#   receipt_check  the unaudited-receipt drop check's panic prefix, `agctl
+#                 unaudited write receipt`                                 → spelled
+#                 exactly once in non-test source, on the line directly under
+#                 `#[cfg(feature = "testing")]`. The release gate cannot prove
+#                 this one either: every build it makes is optimizing, and an
+#                 optimizing build folds the message away because every receipt
+#                 in the binary reaches `audit::append` first. Modelled on
+#                 `fake_prefix`, for the same reason.
+#
+# S34 C2-b appends one (the C2-a review's carry C-1):
+#
+#   reached_audit  callers of `reached_audit(` (not its `fn`)             → exactly
+#                 one, in provider/codex/audit.rs. It is the method that disarms
+#                 the unaudited-receipt drop check and it is `pub(super)`, so any
+#                 new code in `provider::codex` could disarm a receipt and drop
+#                 it. Pinned by count AND by file: the count alone would accept
+#                 the one call moving somewhere else.
+#
 # With `--log`, the `LOG_ONLY_NEEDLES` are counted too: the sentinel email a
 # usage fixture carries (ledger #274). They are deliberately not code needles
 # — the fixture that carries the sentinel is how a leak test proves anything —
@@ -137,8 +237,25 @@ REMOVE_ALLOWED=(
     src/secret/file_store.rs
     src/secret/secret_file.rs
     src/provider/codex/auth_store.rs
+    # S34: the scratch home's fd-relative removal — `remove_tree_at`,
+    # `sweep_stale_at` and `Scratch`'s `Drop` — all live here, and every one
+    # acts through a descriptor, never a path. `commands/codex/login.rs`
+    # removes nothing itself and is deliberately NOT listed.
     src/provider/codex/login_child.rs
 )
+
+# Files allowed to name `flock` inside the Codex trees, with the count they
+# may spell. `login_child.rs`'s two are the held-lock PROBE (S34, ledger #310):
+# it opens a `*.lock` in agctl's OWN scratch home read-only, asks for the lock
+# non-blockingly, and releases it in the same breath. It never takes a lock to
+# hold, and never touches a lock inside a Codex home, so invariant I21 is not
+# in play — but the grep cannot tell "asks and releases" from "takes", which is
+# why this is an allow-list entry with a pinned count rather than a silent
+# exemption. A third `flock` line here fails the check.
+CODEX_FLOCK_ALLOWED=(
+    src/provider/codex/login_child.rs
+)
+CODEX_FLOCK_EXPECTED=2
 
 BEARER_ALLOWED=(
     src/provider/claude/credentials.rs
@@ -221,6 +338,102 @@ CODEX_USAGE_URL_ALLOWED=(
     src/provider/codex/usage.rs
 )
 
+# S32: the one client of the token endpoint, and of its test-only override.
+AUTH_HOST_ALLOWED=(
+    src/provider/codex/oauth.rs
+)
+
+CODEX_TOKEN_URL_ALLOWED=(
+    src/provider/codex/oauth.rs
+)
+
+OAUTH_REFRESH_ALLOWED=(
+    src/provider/codex/refresh.rs
+)
+
+CONSENT_ALLOWED=(
+    src/commands/codex/accounts_refresh.rs
+)
+
+# The commands that refresh, and only on their command thread (U44 = 5).
+# S34 C4 added `src/commands/codex/accounts_refresh.rs` — the `--resend` arm —
+# here and to the three lists below, and nowhere else. It is the whole of
+# `accounts`'s POST surface: `accounts.rs` itself must still fail every one of
+# these rules (numbered deviation 1; the plan's wording said `accounts.rs`).
+REFRESH_DRIVER_ALLOWED=(
+    src/commands/codex/status.rs
+    src/commands/codex/accounts_refresh.rs
+)
+
+# The token client is the permit's own field; no command names it.
+REFRESH_CLIENT_ALLOWED=(
+    src/provider/codex/oauth.rs
+    src/provider/codex/permit.rs
+)
+
+# Who may name the capability: the module that defines it, the driver that
+# demands it, and the command that builds one.
+POST_PERMIT_ALLOWED=(
+    src/provider/codex/permit.rs
+    src/provider/codex/refresh.rs
+    src/commands/codex/status.rs
+    src/commands/codex/accounts_refresh.rs
+)
+
+# Who may MINT a permit. Narrower than POST_PERMIT_ALLOWED on purpose:
+# `refresh.rs` must name the capability to demand it, and must not be able to
+# hand itself one (review S33-C2-r2 F2, probe C). S34 C4 added
+# `src/commands/codex/accounts_refresh.rs` here as well, one line.
+PERMIT_MINT_ALLOWED=(
+    src/commands/codex/status.rs
+    src/commands/codex/accounts_refresh.rs
+)
+
+# Every spelling of a call to a mint: `PostPermit::from_env`,
+# `PostPermit :: from_env`, `<PostPermit>::with_client`. `permit.rs` itself needs
+# no allow-list entry, because it spells its own constructors `fn from_env` and
+# `Self { … }`. `Self::from_env` is a mint only inside an `impl PostPermit`
+# block, and PERMIT_IMPL below proves there is exactly one.
+PERMIT_MINT='\bPostPermit\s*>?\s*::\s*(?:from_env|with_client)\b'
+
+# A function that hands a permit back, in ANY return type that mentions one:
+# `-> PostPermit`, `-> Box<PostPermit>`, `-> Option<PostPermit>`,
+# `-> Result<PostPermit, _>`, `-> Arc<PostPermit>`, `-> &'static PostPermit`.
+# Review S33-C2-r3 F3: anchoring the name straight after the arrow let probe F
+# escape with `-> Box<PostPermit>` inside `permit.rs`'s own impl block. `[^;{]*`
+# stops at the body brace and at a statement end, so a parameter of type
+# `&PostPermit` before the arrow is not a hit. There are none anywhere in `src`
+# today — `permit.rs`'s two constructors return `Self` — so any hit is a mint
+# under another name, `permit.rs` included.
+PERMIT_FACTORY='->[^;{]*\bPostPermit\b'
+
+# An impl block for the capability, however it is written.
+PERMIT_IMPL='\bimpl\s+(?:<[^>]*>\s*)?PostPermit\b|\bimpl\b.*\bfor\s+PostPermit\b'
+
+# A rename, which would make PERMIT_MINT unable to see the mint.
+PERMIT_RENAME='\bPostPermit\s+as\b|\btype\s+\w+\s*=\s*[^;]*\bPostPermit\b'
+
+# The daemon pid record is read in exactly one place, so both of F83's names
+# stay together. Upstream renamed it conditionally at 0.155.0-alpha.12
+# (`app-server.pid` under `packages/standalone`, `daemon.pid` otherwise), and a
+# second reader that learned only one name would be fail-open: a live daemon
+# would read as `ArtefactOnly`, which the refresh gate passes with a note.
+# That the two names are read *together* is pinned by
+# `d32_a_live_daemon_is_seen_under_either_pid_record_name`, which fails if
+# either is dropped; this pins that nowhere else names one at all.
+DAEMON_PID_ALLOWED=(
+    src/provider/codex/home.rs
+)
+
+# What no Codex command file other than `status.rs` and `accounts_refresh.rs`
+# may name.
+WATCH_FORBIDDEN='\brefresh::(?:run|record_retry_get)\b|\bRefreshClient\b|\bPostPermit\b|\brefresh_pre_pass\b|\bafter_unauthorized\b|\bcodex::status\b|\bsuper::status\b'
+
+RECEIPT_TYPE_ALLOWED=(
+    src/provider/codex/auth_store.rs
+    src/provider/codex/audit.rs
+)
+
 # Where `CreditsState` (Claude's credits) must not appear (plan §9.3 m2).
 CREDITS_STATE_FORBIDDEN=(
     src/provider/codex
@@ -230,6 +443,17 @@ CREDITS_STATE_FORBIDDEN=(
 
 # The file that must not read the process environment (invariant I25).
 CODEX_HOME_MODULE=src/provider/codex/home.rs
+
+# The only callers of a keychain LISTING (`security dump-keychain`) in the
+# Codex commands (plan AC109): `doctor`'s own report, `pass::list_keyring`
+# (shared by `status`, `watch` and `import`, gated on `store_mode: auto`), and
+# `login`'s two listings (S34 C1). A per-account lookup (`find-generic-password`)
+# is never one of them — checked separately, by string, not by caller.
+CODEX_KEYRING_LISTING_ALLOWED=(
+    src/commands/codex/doctor.rs
+    src/commands/codex/login.rs
+    src/commands/codex/pass.rs
+)
 
 LEAK_NEEDLES=(
     agctl-test-codex-at-
@@ -464,7 +688,7 @@ check_locked_read() {
     check_callers_not_fn "$1" '\b' 'from_locked_read' 'from_locked_read' "${LOCKED_READ_ALLOWED[@]}"
 }
 
-MARKER_MUTATORS='write_inflight|write_resend|clear_inflight|mark_interrupted|mark_unknown|reset_floor'
+MARKER_MUTATORS='write_inflight|write_resend|clear_inflight|mark_interrupted|mark_unknown|reset_floor|settle_inflight|record_did_not_help|restore_unknown'
 
 check_marker_mutators() {
     local bad=0
@@ -490,8 +714,24 @@ check_codex_flock() {
         [[ -n $hits ]] && found+="$hits"$'\n'
     done
     [[ -z $found ]] && return 0
-    printf '  `flock` in Codex code; take locks through namespace_lock only:\n%s' "$found"
-    return 1
+
+    local bad=0 file count
+    while IFS= read -r file; do
+        [[ -z $file ]] && continue
+        if ! contains "$file" "${CODEX_FLOCK_ALLOWED[@]}"; then
+            printf '  %s names `flock`; take locks through namespace_lock only\n' "$file"
+            bad=1
+        fi
+    done < <(printf '%s\n' "$found" | cut -d: -f1 | LC_ALL=C sort -u)
+
+    # The allowed file's count is pinned, so the exemption cannot widen.
+    count=$(printf '%s\n' "$found" | grep -c 'login_child\.rs:' || true)
+    if [[ -n $found && ${count:-0} -ne 0 && ${count:-0} -ne $CODEX_FLOCK_EXPECTED ]]; then
+        printf '  src/provider/codex/login_child.rs names `flock` %s time(s), not %s (the probe acquires and releases, and does nothing else)\n' \
+            "$count" "$CODEX_FLOCK_EXPECTED"
+        bad=1
+    fi
+    return "$bad"
 }
 
 check_stop_policy() {
@@ -564,30 +804,272 @@ check_codex_timeouts() {
 }
 
 CODEX_USAGE_MODULE=src/provider/codex/usage.rs
+CODEX_OAUTH_MODULE=src/provider/codex/oauth.rs
+
+# The Codex HTTP clients, each with the decoded-byte cap it must read through.
+CODEX_CLIENTS=(
+    "$CODEX_USAGE_MODULE MAX_BODY_BYTES"
+    "$CODEX_OAUTH_MODULE MAX_RESPONSE_BYTES"
+)
 
 check_codex_redirects() {
-    local root=$1 hits zero others count
-    # Vacuous before S31 writes the client; the plant below needs it to exist.
-    [[ -f $root/$CODEX_USAGE_MODULE ]] || return 0
+    local root=$1 hits pair module cap zero count others bad=0 pattern=""
+    for pair in "${CODEX_CLIENTS[@]}"; do
+        read -r module cap <<<"$pair"
+        # Vacuous before the step that writes the client; its plant needs it.
+        [[ -f $root/$module ]] || continue
+        hits=$(scoped_code_hits "$root" '\bmax_redirects\(' "$module") || scan_failed check_codex_redirects
+        zero=$(printf '%s' "$hits" | rg -e '\.max_redirects\(0\)' || true)
+        count=$(printf '%s' "$zero" | grep -c . || true)
+        if [[ $count -ne 1 ]]; then
+            printf '  the Codex client %s must follow no redirect: %s `.max_redirects(0)` line(s) (expected 1)\n' \
+                "$module" "$count"
+            bad=1
+        fi
+        pattern+="${pattern:+|}^${module}:[0-9]+:.*\\.max_redirects\\(0\\)"
+    done
     hits=$(scoped_code_hits "$root" '\bmax_redirects\(' src/provider/codex) || scan_failed check_codex_redirects
-    zero=$(printf '%s' "$hits" | rg -e "^${CODEX_USAGE_MODULE}:[0-9]+:.*\.max_redirects\(0\)" || true)
-    others=$(printf '%s' "$hits" | rg -v -e "^${CODEX_USAGE_MODULE}:[0-9]+:.*\.max_redirects\(0\)" || true)
-    count=$(printf '%s' "$zero" | grep -c . || true)
-    [[ $count -eq 1 && -z $others ]] && return 0
-    printf '  the Codex usage client must follow no redirect: %s `.max_redirects(0)` line(s) in %s (expected 1)%s\n' \
-        "$count" "$CODEX_USAGE_MODULE" "${others:+, and other max_redirects settings:}"
-    [[ -n $others ]] && printf '%s\n' "$others"
-    return 1
+    others=$(printf '%s' "$hits" | rg -v -e "${pattern:-^$}" || true)
+    if [[ -n $others ]]; then
+        printf '  other max_redirects settings in Codex code:\n%s\n' "$others"
+        bad=1
+    fi
+    return "$bad"
 }
 
 check_codex_decoded_cap() {
-    local root=$1 hits
-    [[ -f $root/$CODEX_USAGE_MODULE ]] || return 0
-    hits=$(scoped_code_hits "$root" '\.take\(MAX_BODY_BYTES' "$CODEX_USAGE_MODULE") || scan_failed check_codex_decoded_cap
-    [[ -n $hits ]] && return 0
-    printf '  %s reads the body with no decoded-byte cap (`.take(MAX_BODY_BYTES…)`); gzip can expand past the wire limit\n' \
-        "$CODEX_USAGE_MODULE"
+    local root=$1 hits pair module cap bad=0
+    for pair in "${CODEX_CLIENTS[@]}"; do
+        read -r module cap <<<"$pair"
+        [[ -f $root/$module ]] || continue
+        hits=$(scoped_code_hits "$root" "\\.take\\(${cap}" "$module") || scan_failed check_codex_decoded_cap
+        [[ -n $hits ]] && continue
+        printf '  %s reads the body with no decoded-byte cap (`.take(%s…)`); gzip can expand past the wire limit\n' \
+            "$module" "$cap"
+        bad=1
+    done
+    return "$bad"
+}
+
+check_auth_host() {
+    check_helper_callers "$1" 'auth\.openai\.com' '`auth.openai.com`' "${AUTH_HOST_ALLOWED[@]}"
+}
+
+check_codex_token_url() {
+    check_helper_callers "$1" '\bAGCTL_CODEX_TOKEN_URL\b' 'AGCTL_CODEX_TOKEN_URL' "${CODEX_TOKEN_URL_ALLOWED[@]}"
+}
+
+check_oauth_cancelled() {
+    local hits
+    hits=$(scoped_code_hits "$1" '\bCancelled\b' "$CODEX_OAUTH_MODULE") || scan_failed check_oauth_cancelled
+    [[ -z $hits ]] && return 0
+    printf '  `Cancelled` in the refresh client; a cancel after the send is unobservable (ledger #198):\n%s' "$hits"
     return 1
+}
+
+# Claude's own `oauth::refresh(` shares the spelling, so a caller counts when
+# it is in a Codex tree or its file names `codex::oauth` at all (an import or a
+# path) — the two ways Codex's function can be in scope.
+check_oauth_refresh_callers() {
+    local root=$1 hits file bad=0 status=0
+    hits=$(code_hits "$root" '\boauth::refresh\(') || scan_failed check_oauth_refresh_callers
+    while IFS= read -r file; do
+        [[ -z $file ]] && continue
+        case $file in
+            src/provider/codex/* | src/commands/codex/*) ;;
+            *)
+                status=0
+                rg -q -e 'codex::oauth\b' "$root/$file" || status=$?
+                [[ $status -gt 1 ]] && phase3_die "check_oauth_refresh_callers: rg could not read $file"
+                [[ $status -eq 0 ]] || continue
+                ;;
+        esac
+        if ! contains "$file" "${OAUTH_REFRESH_ALLOWED[@]}"; then
+            printf '  %s calls `oauth::refresh` and is not in its allow-list\n' "$file"
+            bad=1
+        fi
+    done < <(printf '%s\n' "$hits" | rg -v -e '\bfn\s+refresh\b' | cut -d: -f1 | LC_ALL=C sort -u)
+    return "$bad"
+}
+
+check_consent_callers() {
+    check_helper_callers "$1" '\b(?:ResendConsent|ResetConsent)::after_confirmation\(' 'a consent constructor' \
+        "${CONSENT_ALLOWED[@]}"
+}
+
+check_refresh_drivers() {
+    check_helper_callers "$1" '\brefresh::(?:run|record_retry_get)\b' 'a refresh driver' \
+        "${REFRESH_DRIVER_ALLOWED[@]}"
+}
+
+check_refresh_client() {
+    check_helper_callers "$1" '\bRefreshClient\b' 'the refresh client' \
+        "${REFRESH_CLIENT_ALLOWED[@]}"
+}
+
+check_post_permit() {
+    check_helper_callers "$1" '\bPostPermit\b' 'the POST capability' "${POST_PERMIT_ALLOWED[@]}"
+}
+
+# Who may hand themselves the capability. `post_permit` scopes the NAME;
+# this scopes the MINT, which is the half review S33-C2-r2 F2 found missing.
+check_permit_mint() {
+    local root=$1 bad=0 hits file status=0
+    check_helper_callers "$root" "$PERMIT_MINT" 'the POST capability constructor' \
+        "${PERMIT_MINT_ALLOWED[@]}" || bad=1
+
+    hits=$(code_hits "$root" "$PERMIT_IMPL") || scan_failed check_permit_mint
+    while IFS= read -r file; do
+        [[ -z $file ]] && continue
+        if ! contains "$file" src/provider/codex/permit.rs; then
+            printf '  %s implements the POST capability; a second impl block makes `Self::from_env` a second mint\n' "$file"
+            bad=1
+        fi
+    done < <(printf '%s\n' "$hits" | cut -d: -f1 | LC_ALL=C sort -u)
+
+    # Deliberately not `code_hits`: a rename inside a test file teaches the next
+    # author a spelling the mint check cannot see, so tests are scanned too.
+    hits=$(cd "$root" && rg --line-number --no-heading --color never \
+        -e "^\\s*(?:[^/\\s].*)?(?:${PERMIT_RENAME})" src) || status=$?
+    [[ $status -gt 1 ]] && scan_failed check_permit_mint
+    if [[ -n $hits ]]; then
+        printf '  the POST capability is renamed; `PostPermit::from_env` must stay its only spelling:\n%s\n' "$hits"
+        bad=1
+    fi
+
+    # Belt over the brace: the driver's own module reads nothing from the
+    # environment today, so it cannot mint anything either.
+    hits=$(scoped_code_hits "$root" '\bfrom_env\b' src/provider/codex/refresh.rs) \
+        || scan_failed check_permit_mint
+    if [[ -n $hits ]]; then
+        printf '  the refresh driver reads the environment; it may demand a permit but must never mint one:\n%s' "$hits"
+        bad=1
+    fi
+    return "$bad"
+}
+
+# …and that `permit.rs` still mints in exactly the two places it documents.
+# Review S33-C2-r2 probe E moved the mint into a THIRD constructor inside
+# `permit.rs` — the one file allowed to hold one — and every name-scoped check
+# went quiet. Modelled on check_exposure_count.
+check_permit_mint_count() {
+    local root=$1 file=$1/src/provider/codex/permit.rs bad=0 mints ctors hits
+    [[ -f $file ]] || return 0
+    # Code lines only, per the `code_hits` convention: a doc comment that quotes
+    # `Self { client` or `-> Self` is prose, not a mint (review S33-C2-r3 N3).
+    mints=$(rg -c -e "^\\s*(?:[^/\\s].*)?Self \\{ client" "$file" || true)
+    if [[ ${mints:-0} -ne 2 ]]; then
+        printf '  src/provider/codex/permit.rs mints a permit in %s place(s), not 2; a new constructor is a new POST path\n' \
+            "${mints:-0}"
+        bad=1
+    fi
+    # `->[^;{]*\bSelf\b`, not `-> Self`: review S33-C2-r3 probe G returned
+    # `Box<Self>`, which names neither `PostPermit` nor a bare `Self` return.
+    # `\bSelf\b` is case-sensitive, so `fn client(&self) -> &RefreshClient` is
+    # not a constructor and not a hit.
+    ctors=$(rg -c -e "^\\s*(?:[^/\\s].*)?->[^;{]*\\bSelf\\b" "$file" || true)
+    if [[ ${ctors:-0} -ne 2 ]]; then
+        printf '  src/provider/codex/permit.rs has %s constructor(s) returning Self, not 2 (`from_env` and the #[cfg(test)] `with_client`)\n' \
+            "${ctors:-0}"
+        bad=1
+    fi
+    # Any return type that mentions a permit, `permit.rs` included: a wrapper is
+    # how probe F walked past the arrow-anchored version of this (F3).
+    hits=$(code_hits "$root" "$PERMIT_FACTORY") || scan_failed check_permit_mint_count
+    if [[ -n $hits ]]; then
+        printf '  a function hands a permit back; a permit leaves `permit.rs` only as the value `from_env` returns:\n%s\n' "$hits"
+        bad=1
+    fi
+    return "$bad"
+}
+
+check_daemon_pid_names() {
+    check_helper_callers "$1" '"app-server\.pid"|"daemon\.pid"' 'a daemon pid-record name' \
+        "${DAEMON_PID_ALLOWED[@]}"
+}
+
+# Every Codex command file but `status.rs` and `accounts_refresh.rs` — the pass
+# in `pass.rs` included, because that is the file `watch` calls into (review
+# S33-C2, probe B). `accounts_refresh.rs` is the user's audited one-shot
+# re-send (S34 C4): it is a command thread, never a pass, and nothing `watch`
+# calls reaches it.
+check_watch_no_post() {
+    local root=$1 hits status=0 bad=0
+    [[ -d $root/src/commands/codex ]] || return 0
+    hits=$(cd "$root" && rg --line-number --no-heading --color never \
+        --glob '!*_tests.rs' --glob '!status.rs' --glob '!accounts_refresh.rs' \
+        -e "^\\s*(?:[^/\\s].*)?(?:${WATCH_FORBIDDEN})" src/commands/codex) || status=$?
+    [[ $status -gt 1 ]] && scan_failed check_watch_no_post
+    if [[ -n $hits ]]; then
+        printf '  a Codex command file that is not `status.rs` names a refresh path; only `status` may POST (U44 = 5):\n%s\n' "$hits"
+        bad=1
+    fi
+    hits=$(scoped_code_hits "$root" '\bproof::owned\b' src/commands/codex/watch.rs) \
+        || scan_failed check_watch_no_post
+    if [[ -n $hits ]]; then
+        printf '  `agctl codex watch` names an owned-namespace handle; the pass reads for it:\n%s' "$hits"
+        bad=1
+    fi
+    return "$bad"
+}
+
+check_usage_client_new() {
+    local hits
+    hits=$(scoped_code_hits "$1" '\bUsageClient::new\(' src/commands/codex) || scan_failed check_usage_client_new
+    [[ -z $hits ]] && return 0
+    printf '  a Codex command builds its usage client without `from_env` (review S31 N2):\n%s' "$hits"
+    return 1
+}
+
+check_refresh_usage_cache() {
+    local hits
+    hits=$(scoped_code_hits "$1" '\busage::cache\b' src/provider/codex/refresh.rs) || scan_failed check_refresh_usage_cache
+    [[ -z $hits ]] && return 0
+    printf '  the refresh path reaches the usage cache; its marker must fail closed:\n%s' "$hits"
+    return 1
+}
+
+# check_receipt_destructure: multi-line (`rg -U -P`), whole non-test files under
+# the Codex trees; comment lines are stripped first so a doc example is not a
+# pattern.
+check_receipt_destructure() {
+    local root=$1 file code bad=0 dir
+    for dir in src/provider/codex src/commands/codex; do
+        [[ -d $root/$dir ]] || continue
+        while IFS= read -r file; do
+            [[ $file == src/provider/codex/auth_store.rs ]] && continue
+            code=$(grep -v -E '^\s*//' "$root/$file" || true)
+            if printf '%s' "$code" | rg -U -P -q -e '(?:Landed|ChangedSinceRead)\s*\{(?![^}]*\breceipt\b\s*[,}])[^}]*\}'; then
+                printf '  %s: a Landed/ChangedSinceRead pattern that does not bind `receipt`\n' "$file"
+                bad=1
+            fi
+            if printf '%s' "$code" | rg -U -P -q -e 'receipt\s*:\s*_'; then
+                printf '  %s: a receipt bound to `_`\n' "$file"
+                bad=1
+            fi
+            if printf '%s' "$code" | rg -U -P -q -e 'let\s*\(\s*\w+\s*,\s*_\w*\s*,[^)]*\)\s*=[^;]*?\.resolve_pending\('; then
+                printf '  %s: a resolve_pending receipt bound to `_`\n' "$file"
+                bad=1
+            fi
+            # RETIRED (S34 C1b-1, bead agctl-meqv): the file-level clause "a
+            # file that takes receipts calls audit::append( somewhere". A
+            # second, unaudited receipt in a file that audits a first one
+            # passed it, and no line-oriented grep can follow a receipt from
+            # its binding to its audit. Following one is a RUN-TIME job now:
+            # every receipt is born armed and panics if it is dropped before
+            # `audit::append` disarms it, and `check_receipt_check` and
+            # `check_reached_audit` below prove that guard is present and has
+            # exactly one disarmer. (The static per-binding rule that held
+            # this from S34 until 2026-09-22 went with plan item AC119,
+            # ledger #460.) The three clauses above stay: each is a
+            # per-pattern check a grep does hold.
+        done < <(cd "$root" && rg --files --glob '*.rs' --glob '!*_tests.rs' "$dir" | LC_ALL=C sort)
+    done
+    return "$bad"
+}
+
+check_receipt_type() {
+    check_helper_callers "$1" '\bWriteReceipt\b' 'WriteReceipt' "${RECEIPT_TYPE_ALLOWED[@]}"
 }
 
 check_credits_state() {
@@ -600,6 +1082,104 @@ check_credits_state() {
 
 check_codex_bin() {
     check_helper_callers "$1" '\bAGCTL_CODEX_BIN\b' 'AGCTL_CODEX_BIN' "${CODEX_BIN_ALLOWED[@]}"
+}
+
+# check_fake_prefix: order B3. The `testing`-only prefix that lets the fake
+# `codex`'s knobs through the login child's environment allowlist is spelled
+# exactly ONCE in non-test source, on the line directly under
+# `#[cfg(feature = "testing")]`. The release gate cannot prove this, and no
+# longer lists the prefix: a `starts_with` against a short constant is
+# compiled to immediate compares, so NO build — the `testing` one included —
+# carries the literal as a string for `strings` to find (review C1b F4,
+# mutant R1; S34 C1b-3a counted it: 0 in an all-features binary). This rule
+# and the default-feature clippy gate are what guard the prefix; the plants
+# `plant_fake_prefix` and `plant_fake_prefix_cfg_commented` show it fires.
+check_fake_prefix() {
+    local root=$1 hits count file line prev
+    hits=$(code_hits "$root" 'AGCTL_FAKE_CODEX_') || scan_failed check_fake_prefix
+    count=$(printf '%s\n' "$hits" | sed '/^$/d' | wc -l | tr -d ' ')
+    if [[ $count -ne 1 ]]; then
+        printf '  `AGCTL_FAKE_CODEX_` is spelled %s time(s) in non-test source, not once:\n%s\n' "$count" "$hits"
+        return 1
+    fi
+    file=${hits%%:*}
+    line=${hits#*:}
+    line=${line%%:*}
+    prev=$(sed -n "$((line - 1))p" "$root/$file")
+    # Anchored: the whole line must be the attribute. A substring test
+    # accepted `// #[cfg(feature = "testing")]` — a commented-out attribute
+    # that leaves the prefix compiled into every build (review C1b-r2 F2).
+    if ! [[ $prev =~ ^[[:space:]]*\#\[cfg\(feature\ =\ \"testing\"\)\][[:space:]]*$ ]]; then
+        printf '  %s:%s spells `AGCTL_FAKE_CODEX_` without `#[cfg(feature = "testing")]` directly above it\n' \
+            "$file" "$line"
+        return 1
+    fi
+    return 0
+}
+
+# check_receipt_check: S34 C2-a. The `testing`-only unaudited-receipt drop
+# check's panic prefix is spelled exactly ONCE in non-test source, on the line
+# directly under `#[cfg(feature = "testing")]`. The release gate deliberately
+# does not list it (its comment carries the measurement): the check panics only
+# on a receipt dropped still armed, every receipt in the binary disarms first,
+# so an optimizing build — every build that gate makes — proves the branch dead
+# and drops the message. Only opt-level 0 carries it, so an artifact grep would
+# pass whether or not the attribute is doing anything. This rule and the
+# default-feature clippy gate are what guard it; the plants
+# `plant_receipt_check` and `plant_receipt_check_cfg_commented` show it fires.
+check_receipt_check() {
+    local root=$1 hits count file line prev
+    hits=$(code_hits "$root" 'agctl unaudited write receipt') || scan_failed check_receipt_check
+    count=$(printf '%s\n' "$hits" | sed '/^$/d' | wc -l | tr -d ' ')
+    if [[ $count -ne 1 ]]; then
+        printf '  `agctl unaudited write receipt` is spelled %s time(s) in non-test source, not once:\n%s\n' "$count" "$hits"
+        return 1
+    fi
+    file=${hits%%:*}
+    line=${hits#*:}
+    line=${line%%:*}
+    prev=$(sed -n "$((line - 1))p" "$root/$file")
+    # Anchored, as check_fake_prefix is: a commented-out attribute would leave
+    # the witness compiled into every build (review C1b-r2 F2).
+    if ! [[ $prev =~ ^[[:space:]]*\#\[cfg\(feature\ =\ \"testing\"\)\][[:space:]]*$ ]]; then
+        printf '  %s:%s spells the unaudited-receipt prefix without `#[cfg(feature = "testing")]` directly above it\n' \
+            "$file" "$line"
+        return 1
+    fi
+    return 0
+}
+
+# check_reached_audit: S34 C2-b, from the C2-a review (carry C-1). The drop
+# check of C2-a is disarmed by `WriteReceipt::reached_audit`, which is
+# `pub(super)` — reachable from anywhere in `provider::codex`. Nothing in the
+# type system stops a future writer there from disarming a receipt and then
+# dropping it, which would silence the run-time guard exactly where it matters.
+# So the call is pinned by COUNT and by FILE: exactly one caller in non-test
+# source, in the audit log's own module, which is the one place a receipt is
+# legitimately consumed. The `fn` that declares it is filtered out, the way
+# `check_callers_not_fn` does, so `auth_store.rs` is not a hit for defining it.
+# The plants `plant_reached_audit_second_caller` and
+# `plant_reached_audit_elsewhere` show both halves fire.
+REACHED_AUDIT_FILE=src/provider/codex/audit.rs
+
+check_reached_audit() {
+    local root=$1 hits count file status=0
+    hits=$(code_hits "$root" '\breached_audit\(') || scan_failed check_reached_audit
+    hits=$(printf '%s\n' "$hits" | rg -v -e '\bfn\s+reached_audit\b') || status=$?
+    [[ $status -gt 1 ]] && phase3_die "check_reached_audit: rg failed filtering the definition"
+    count=$(printf '%s\n' "$hits" | sed '/^$/d' | wc -l | tr -d ' ')
+    if [[ $count -ne 1 ]]; then
+        printf '  `reached_audit(` is called %s time(s) in non-test source, not once; it disarms the unaudited-receipt drop check, so a second caller is a second way to silence it:\n%s\n' \
+            "$count" "$hits"
+        return 1
+    fi
+    file=${hits%%:*}
+    if [[ $file != "$REACHED_AUDIT_FILE" ]]; then
+        printf '  `reached_audit(` is called from %s, not %s; only the audit log may disarm a receipt\n' \
+            "$file" "$REACHED_AUDIT_FILE"
+        return 1
+    fi
+    return 0
 }
 
 check_codex_env() {
@@ -628,6 +1208,44 @@ check_removal_helpers() {
     return "$bad"
 }
 
+# AC109, re-run at S36 (fix loop 1, F1): a Codex module never SPELLS
+# `find-generic-password` — the literal string lives in exactly one place in
+# the whole crate, `security_cli.rs`'s `READ_ARGV_FLAGS` — so this catches a
+# call written the same way the crate's own Claude-side callers write it, or
+# a stray mention in a comment that would mislead a future caller. It does
+# NOT catch a call through the Rust name, `KeychainReader::read`, which never
+# spells the subcommand: `tests/common/codex.rs::checked` is what enforces
+# the actual clause (plan AC109's words, "the fake `security` log contains no
+# `find-generic-password`"), on the fake `security` log every Codex launch
+# produces. This grep is the second line of defence, not the first.
+check_codex_no_password_lookup() {
+    local hits
+    hits=$(scoped_code_hits "$1" 'find[-_]generic[-_]password' src/provider/codex src/commands/codex) \
+        || scan_failed check_codex_no_password_lookup
+    [[ -z $hits ]] && return 0
+    printf '  a Codex module names find-generic-password, a per-account lookup it never needs:\n%s\n' \
+        "$hits"
+    return 1
+}
+
+# AC109's other half: every keychain LISTING call in the Codex commands traces
+# to `${CODEX_KEYRING_LISTING_ALLOWED[@]}` — scoped to Codex's own two
+# directories, so this never flags the Claude-side callers of the same method
+# name.
+check_codex_keyring_listing_callers() {
+    local hits file bad=0
+    hits=$(scoped_code_hits "$1" '\blist_services(?:_uncached)?\b' \
+        src/provider/codex src/commands/codex) || scan_failed check_codex_keyring_listing_callers
+    while IFS= read -r file; do
+        [[ -z $file ]] && continue
+        if ! contains "$file" "${CODEX_KEYRING_LISTING_ALLOWED[@]}"; then
+            printf '  %s calls a keychain listing and is not in its allow-list\n' "$file"
+            bad=1
+        fi
+    done < <(printf '%s\n' "$hits" | cut -d: -f1 | LC_ALL=C sort -u)
+    return "$bad"
+}
+
 # Each plant_<name> <root> adds exactly one violation of its check.
 PLANT_FILE=src/main.rs
 # plant_line <root> <line> [file]: appends one line to <file> (default the
@@ -645,6 +1263,38 @@ plant_unlink_helper() { plant_line "$1" 'fn _phase3_plant(d: BorrowedFd<'"'"'_>)
 plant_unlink_alias() { plant_line "$1" 'use crate::secret::file_store::unlink_at as _phase3_plant;'; }
 plant_remove_dir_under_root() { plant_line "$1" 'fn _phase3_plant(p: &Paths, d: &Path) { let _ = file_store::remove_dir_under_root(p, d); }'; }
 plant_remove_dir_under() { plant_line "$1" 'fn _phase3_plant(a: &Path, p: &Path) { let _ = file_store::remove_dir_under(a, p); }'; }
+plant_fake_prefix() { plant_line "$1" 'fn _phase3_plant(t: &str) -> bool { t.starts_with("AGCTL_FAKE_CODEX_") }'; }
+plant_codex_find_generic_password() {
+    plant_line "$1" 'const _PHASE3_PLANT: &str = "find-generic-password";' src/provider/codex/home.rs
+}
+plant_codex_keyring_listing_elsewhere() {
+    plant_line "$1" \
+        'fn _phase3_plant(r: &dyn crate::secret::KeychainReader) { let _ = r.list_services("x"); }' \
+        src/commands/codex/status.rs
+}
+# The commented-out attribute (review C1b-r2 P-cfg): the literal is still spelled
+# once, but its `#[cfg]` is a comment, so it compiles into a default build.
+plant_fake_prefix_cfg_commented() {
+    mkdir -p "$1/src/provider/codex"
+    sed -i.bak -e 's|^\([[:space:]]*\)#\[cfg(feature = "testing")\]\([[:space:]]*\)$|\1// #[cfg(feature = "testing")]\2|' \
+        "$1/src/provider/codex/login_child.rs" && rm -f "$1/src/provider/codex/login_child.rs.bak"
+}
+plant_receipt_check() { plant_line "$1" 'const _PHASE3_PLANT: &str = "agctl unaudited write receipt";'; }
+# The commented-out attribute: the prefix is still spelled once, but its
+# `#[cfg]` is a comment, so the witness compiles into every build.
+plant_receipt_check_cfg_commented() {
+    mkdir -p "$1/src/provider/codex"
+    sed -i.bak -e 's|^\([[:space:]]*\)#\[cfg(feature = "testing")\]\([[:space:]]*\)$|\1// #[cfg(feature = "testing")]\2|' \
+        "$1/src/provider/codex/auth_store.rs" && rm -f "$1/src/provider/codex/auth_store.rs.bak"
+}
+# A second caller, in the one file that is allowed to hold the first.
+plant_reached_audit_second_caller() { plant_line "$1" 'fn _phase3_plant(r: &WriteReceipt) { r.reached_audit(); }' "$REACHED_AUDIT_FILE"; }
+# The only caller, but in another file: the count alone would pass this.
+plant_reached_audit_elsewhere() {
+    sed -i.bak -e 's|^\( *\)receipt\.reached_audit();|\1|' "$1/$REACHED_AUDIT_FILE" \
+        && rm -f "$1/$REACHED_AUDIT_FILE.bak"
+    plant_line "$1" 'fn _phase3_plant(r: &WriteReceipt) { r.reached_audit(); }'
+}
 plant_codex_bin() { plant_line "$1" 'const _PHASE3_PLANT: &str = "AGCTL_CODEX_BIN";'; }
 plant_expose_elsewhere() { plant_line "$1" 'fn _phase3_plant(s: &SecretString) -> String { s.expose_secret().to_owned() }'; }
 plant_expose_public() { plant_line "$1" 'pub(crate) fn exposed<R>(s: &SecretString, f: impl FnOnce(&str) -> R) -> R { f("") }'; }
@@ -706,6 +1356,182 @@ plant_codex_decoded_cap_removed() {
     [[ -f $1/$CODEX_USAGE_MODULE ]] || phase3_die "plant_codex_decoded_cap_removed: $CODEX_USAGE_MODULE is missing from the snapshot"
     perl -ni -e 'print unless /\.take\(MAX_BODY_BYTES/' "$1/$CODEX_USAGE_MODULE"
 }
+plant_oauth_redirects_removed() {
+    [[ -f $1/$CODEX_OAUTH_MODULE ]] || phase3_die "plant_oauth_redirects_removed: $CODEX_OAUTH_MODULE is missing from the snapshot"
+    perl -ni -e 'print unless /\.max_redirects\(0\)/' "$1/$CODEX_OAUTH_MODULE"
+}
+plant_oauth_decoded_cap_removed() {
+    [[ -f $1/$CODEX_OAUTH_MODULE ]] || phase3_die "plant_oauth_decoded_cap_removed: $CODEX_OAUTH_MODULE is missing from the snapshot"
+    perl -ni -e 'print unless /\.take\(MAX_RESPONSE_BYTES/' "$1/$CODEX_OAUTH_MODULE"
+}
+plant_oauth_timeouts() {
+    plant_line "$1" $'fn _phase3_plant(b: ConfigBuilder) -> ConfigBuilder {\n    b\n        .timeout_per_call(None)\n}' "$CODEX_OAUTH_MODULE"
+}
+plant_auth_host() { plant_line "$1" 'const _PHASE3_PLANT: &str = "https://auth.openai.com/oauth/token";'; }
+plant_codex_token_url() { plant_line "$1" 'const _PHASE3_PLANT: &str = "AGCTL_CODEX_TOKEN_URL";'; }
+plant_oauth_cancelled() {
+    plant_line "$1" 'fn _phase3_plant() -> RefreshOutcome { RefreshOutcome::Cancelled }' "$CODEX_OAUTH_MODULE"
+}
+plant_oauth_refresh_caller() {
+    plant_line "$1" 'fn _phase3_plant(c: &LockedCredentials<'"'"'_>, t: InflightToken<'"'"'_>, r: &RefreshClient, x: &Cancel) { let _ = oauth::refresh(c, t, r, x); }' src/provider/codex/usage.rs
+}
+plant_oauth_refresh_caller_fmt() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" $'fn _phase3_plant(c: &C, t: T, r: &R, x: &Cancel) {\n    crate::provider::codex::oauth::refresh(\n        c, t, r, x,\n    );\n}' src/commands/codex/mod.rs
+}
+plant_oauth_refresh_caller_import() {
+    plant_line "$1" $'use crate::provider::codex::oauth;\nfn _phase3_plant(c: &C, t: T, r: &R, x: &Cancel) { let _ = oauth::refresh(c, t, r, x); }' src/commands/status.rs
+}
+plant_consent_caller() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" '    let c = ResendConsent::after_confirmation("yes", true, false);' src/commands/codex/mod.rs
+}
+plant_reset_consent_caller() {
+    plant_line "$1" $'fn _phase3_plant() {\n    let _ = ResetConsent::after_confirmation(\n        "yes", true, false,\n    );\n}' src/provider/codex/usage.rs
+}
+plant_refresh_driver_watch() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" $'fn _phase3_plant(o: OwnedRecord<\'_>, c: &RefreshCtx<\'_>) {\n    let _ = refresh::run(\n        o, SendMode::Proactive, c,\n    );\n}' src/commands/codex/watch.rs
+}
+plant_refresh_retry_elsewhere() {
+    plant_line "$1" 'fn _phase3_plant(o: OwnedRecord<'"'"'_>, c: &RefreshCtx<'"'"'_>) { let _ = crate::provider::codex::refresh::record_retry_get(o, RetryGet::Succeeded, c); }' src/commands/status.rs
+}
+plant_refresh_client_watch() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'fn _phase3_plant() -> RefreshClient { RefreshClient::from_env() }' src/commands/codex/mod.rs
+}
+plant_post_permit_elsewhere() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" $'fn _phase3_plant(client: RefreshClient) -> PostPermit {\n    PostPermit { client }\n}' src/commands/codex/mod.rs
+}
+plant_watch_names_permit() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'fn _phase3_plant(p: &crate::provider::codex::permit::PostPermit) {}' src/commands/codex/watch.rs
+}
+# The alias route review S33-C2 probe A used: an import under another name, so
+# the call site never spells the driver. Caught on the `use` line.
+plant_refresh_driver_alias() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'use crate::provider::codex::refresh::run as drive;' src/commands/codex/pass.rs
+}
+# Probe B: the POST written in full inside the shared pass.
+plant_refresh_driver_in_pass() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" $'fn _phase3_plant(p: &PostPermit, o: OwnedRecord<\'_>, c: &RefreshCtx<\'_>) {\n    let _ = refresh::run(\n        p, o, SendMode::Proactive, c,\n    );\n}' src/commands/codex/pass.rs
+}
+plant_refresh_client_alias() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'use crate::provider::codex::oauth::RefreshClient as Rc;' src/commands/codex/mod.rs
+}
+plant_post_permit_alias() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'use crate::provider::codex::permit::PostPermit as Cap;' src/commands/codex/pass.rs
+}
+plant_pass_names_status() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'use crate::commands::codex::status as st;' src/commands/codex/pass.rs
+}
+plant_pass_retry_alias() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'use crate::provider::codex::refresh::record_retry_get as rec;' src/commands/codex/pass.rs
+}
+plant_watch_reads_owned() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'fn _phase3_plant(r: &CodexAccountRecord) { let _ = proof::owned(r); }' src/commands/codex/watch.rs
+}
+plant_watch_names_post_pass() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" $'fn _phase3_plant() {\n    let _ = status::after_unauthorized;\n}' src/commands/codex/watch.rs
+}
+# Review S33-C2-r2 probe C: the wrapper inside the driver's own module.
+plant_permit_mint_in_refresh() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'fn _phase3_plant() -> PostPermit { PostPermit::from_env() }' src/provider/codex/refresh.rs
+}
+plant_permit_mint_in_pass() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'fn _phase3_plant() -> PostPermit { PostPermit::from_env() }' src/commands/codex/pass.rs
+}
+# The spaced and fully-qualified spellings of the same mint.
+plant_permit_mint_spaced() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'fn _phase3_plant() -> Cap { <PostPermit> :: from_env() }' src/commands/codex/mod.rs
+}
+plant_permit_impl_elsewhere() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" $'impl PostPermit {\n    fn _phase3_plant() -> Self { Self::from_env() }\n}' src/provider/codex/refresh.rs
+}
+plant_permit_alias() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'use crate::provider::codex::permit::PostPermit as Cap;' src/provider/codex/refresh.rs
+}
+plant_permit_type_alias() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'type Cap = crate::provider::codex::permit::PostPermit;' src/provider/codex/refresh.rs
+}
+plant_permit_alias_in_tests() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'use crate::provider::codex::permit::PostPermit as Cap;' src/provider/codex/refresh_tests.rs
+}
+plant_refresh_from_env() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'fn _phase3_plant() { let _ = Client::from_env(); }' src/provider/codex/refresh.rs
+}
+# Review S33-C2-r2 probe E: a third constructor inside permit.rs itself.
+plant_permit_third_ctor() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" $'fn _phase3_plant() -> Self {\n    Self { client: RefreshClient::from_env() }\n}' src/provider/codex/permit.rs
+}
+plant_permit_factory_in_refresh() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'fn _phase3_plant() -> PostPermit { unreachable!() }' src/provider/codex/refresh.rs
+}
+# Review S33-C2-r3 probes F and G: the same mint behind a wrapper, inside
+# `permit.rs` itself — the shape the bare plant above proves nothing about.
+# Both spellings are planted: `Box<PostPermit>` exercises PERMIT_FACTORY, and
+# `Box<Self>`, which names the type nowhere, exercises the constructor count.
+plant_permit_wrapped_factory() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'pub(crate) fn _phase3_plant() -> Box<PostPermit> { Box::new(Self::from_env()) }' src/provider/codex/permit.rs
+}
+plant_permit_wrapped_self_ctor() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'pub(crate) fn _phase3_plant() -> Box<Self> { Box::new(Self::from_env()) }' src/provider/codex/permit.rs
+}
+plant_daemon_pid_name_elsewhere() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'const _PHASE3_PLANT: &str = "daemon.pid";' src/provider/codex/discovery.rs
+}
+plant_daemon_pid_legacy_name_elsewhere() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'const _PHASE3_PLANT: &str = "app-server.pid";' src/commands/codex/pass.rs
+}
+plant_usage_client_new() {
+    mkdir -p "$1/src/commands/codex"
+    plant_line "$1" 'fn _phase3_plant() -> UsageClient { UsageClient::new("http://x", "ua", Duration::ZERO) }' src/commands/codex/status.rs
+}
+plant_refresh_usage_cache() {
+    mkdir -p "$1/src/provider/codex"
+    plant_line "$1" 'use crate::usage::cache;' src/provider/codex/refresh.rs
+}
+plant_receipt_dotdot() {
+    plant_line "$1" $'fn _phase3_plant(w: CodexWrite) {\n    if let CodexWrite::Landed {\n        outcome, ..\n    } = w {}\n}' src/provider/codex/refresh.rs
+}
+plant_receipt_underscore() {
+    plant_line "$1" 'fn _phase3_plant(w: CodexWrite) { if let CodexWrite::ChangedSinceRead { receipt: _ } = w {} }' src/provider/codex/refresh.rs
+}
+plant_receipt_tuple() {
+    plant_line "$1" $'fn _phase3_plant(owned: &OwnedNamespace<\'_>, c: &Cancel) {\n    let (decision,\n        _receipt, evidence) = owned.resolve_pending(c).unwrap_or_else(|_| todo!());\n}' src/provider/codex/refresh.rs
+}
+# plant_receipt_unaudited is RETIRED with the clause it proved (S34 C1b-1,
+# bead agctl-meqv): see check_receipt_destructure. Its shape — a receipt
+# dropped in `watch.rs` — is caught at run time instead, by the panic-on-drop
+# guard that `check_receipt_check` and `check_reached_audit` below prove is
+# present and has exactly one disarmer.
+plant_marker_mutator_settle() {
+    plant_line "$1" 'fn _phase3_plant(s: &RefreshStateFile) { let _ = s.settle_inflight(DefiniteOutcome::Applied, Settled::default()); }' src/provider/codex/discovery.rs
+}
+plant_receipt_type() { plant_line "$1" 'fn _phase3_plant(r: WriteReceipt) {}' src/provider/codex/usage.rs; }
 plant_credits_state() {
     mkdir -p "$1/src/provider/codex"
     plant_line "$1" 'fn _phase3_plant(c: &crate::usage::model::CreditsState) {}' src/provider/codex/account.rs
@@ -722,7 +1548,10 @@ plant_remove_dir_under_fmt() { plant_line "$1" $'fn _phase3_plant(a: &Path, p: &
 
 CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers exposed codex_bin codex_env
     exposure_count auth_json account_header toml locked_read marker_mutators stop_policy
-    codex_debug_assert state_path codex_flock wham_usage codex_usage_url codex_timeouts codex_redirects codex_decoded_cap credits_state)
+    codex_debug_assert state_path codex_flock wham_usage codex_usage_url codex_timeouts codex_redirects codex_decoded_cap credits_state
+    auth_host codex_token_url oauth_cancelled oauth_refresh_callers consent_callers refresh_usage_cache receipt_type
+    receipt_destructure refresh_drivers refresh_client post_permit permit_mint permit_mint_count daemon_pid_names watch_no_post usage_client_new
+    fake_prefix receipt_check reached_audit codex_no_password_lookup codex_keyring_listing_callers)
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
@@ -760,6 +1589,12 @@ PLANTS=(
     "state_path plant_state_path"
     "marker_mutators plant_marker_mutator_ufcs"
     "codex_flock plant_codex_flock"
+    "fake_prefix plant_fake_prefix"
+    "fake_prefix plant_fake_prefix_cfg_commented"
+    "receipt_check plant_receipt_check"
+    "receipt_check plant_receipt_check_cfg_commented"
+    "reached_audit plant_reached_audit_second_caller"
+    "reached_audit plant_reached_audit_elsewhere"
     "wham_usage plant_wham_usage"
     "codex_usage_url plant_codex_usage_url"
     "codex_timeouts plant_codex_timeouts"
@@ -769,6 +1604,56 @@ PLANTS=(
     "codex_decoded_cap plant_codex_decoded_cap_removed"
     "credits_state plant_credits_state"
     "credits_state plant_credits_state_json_v2"
+    "codex_redirects plant_oauth_redirects_removed"
+    "codex_decoded_cap plant_oauth_decoded_cap_removed"
+    "codex_timeouts plant_oauth_timeouts"
+    "auth_host plant_auth_host"
+    "codex_token_url plant_codex_token_url"
+    "oauth_cancelled plant_oauth_cancelled"
+    "oauth_refresh_callers plant_oauth_refresh_caller"
+    "oauth_refresh_callers plant_oauth_refresh_caller_fmt"
+    "oauth_refresh_callers plant_oauth_refresh_caller_import"
+    "consent_callers plant_consent_caller"
+    "consent_callers plant_reset_consent_caller"
+    "refresh_usage_cache plant_refresh_usage_cache"
+    "receipt_type plant_receipt_type"
+    "receipt_destructure plant_receipt_dotdot"
+    "receipt_destructure plant_receipt_underscore"
+    "receipt_destructure plant_receipt_tuple"
+    "marker_mutators plant_marker_mutator_settle"
+    "refresh_drivers plant_refresh_driver_watch"
+    "refresh_drivers plant_refresh_retry_elsewhere"
+    "refresh_drivers plant_refresh_driver_alias"
+    "refresh_drivers plant_refresh_driver_in_pass"
+    "refresh_client plant_refresh_client_watch"
+    "refresh_client plant_refresh_client_alias"
+    "post_permit plant_post_permit_elsewhere"
+    "post_permit plant_post_permit_alias"
+    "watch_no_post plant_watch_names_permit"
+    "watch_no_post plant_watch_names_post_pass"
+    "watch_no_post plant_refresh_driver_alias"
+    "watch_no_post plant_refresh_driver_in_pass"
+    "watch_no_post plant_pass_names_status"
+    "watch_no_post plant_pass_retry_alias"
+    "watch_no_post plant_watch_reads_owned"
+    "permit_mint plant_permit_mint_in_refresh"
+    "permit_mint plant_permit_mint_in_pass"
+    "permit_mint plant_permit_mint_spaced"
+    "permit_mint plant_permit_impl_elsewhere"
+    "permit_mint plant_permit_alias"
+    "permit_mint plant_permit_type_alias"
+    "permit_mint plant_permit_alias_in_tests"
+    "permit_mint plant_refresh_from_env"
+    "permit_mint_count plant_permit_third_ctor"
+    "permit_mint_count plant_permit_factory_in_refresh"
+    "permit_mint_count plant_permit_wrapped_factory"
+    "permit_mint_count plant_permit_wrapped_self_ctor"
+    "permit_mint_count plant_permit_mint_in_refresh"
+    "daemon_pid_names plant_daemon_pid_name_elsewhere"
+    "daemon_pid_names plant_daemon_pid_legacy_name_elsewhere"
+    "usage_client_new plant_usage_client_new"
+    "codex_no_password_lookup plant_codex_find_generic_password"
+    "codex_keyring_listing_callers plant_codex_keyring_listing_elsewhere"
 )
 
 main() {

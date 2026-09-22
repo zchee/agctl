@@ -1,0 +1,362 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/zchee/agctl/schemas/codex-doctor.v1.json",
+  "title": "agctl codex doctor report, version 1",
+  "description": "What `agctl codex doctor --json` emits (plan section 3.3, AC108). Every string here is an identifier agctl validated, a path agctl derived, a word this build compiled in, or a rendered number: no member name, no configuration value and no line of `config.toml` reaches a field, and no token, key or claim outside the allowlist appears anywhere (invariants I24 and I31).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "home",
+    "store",
+    "environment",
+    "live",
+    "foreign",
+    "namespaces",
+    "orphans",
+    "unnameable_orphans",
+    "audit",
+    "notes"
+  ],
+  "properties": {
+    "version": {
+      "description": "The report version. A consumer must refuse a version it does not know.",
+      "const": 1
+    },
+    "home": { "$ref": "#/$defs/home" },
+    "store": { "$ref": "#/$defs/store" },
+    "environment": {
+      "description": "The Codex variables set in agctl's own process, presence only.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/envVar" }
+    },
+    "live": { "$ref": "#/$defs/live" },
+    "foreign": { "$ref": "#/$defs/foreign" },
+    "namespaces": {
+      "description": "One entry per owned namespace, in registry order.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/namespace" }
+    },
+    "orphans": {
+      "description": "Everything under the Codex tree that no record explains.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/orphan" }
+    },
+    "unnameable_orphans": {
+      "description": "How many further entries under the Codex tree were found under a name agctl would not have written. A COUNT: an entry's name is a directory name read off disk, and anything running as the user can create one (review S35 C3).",
+      "type": "integer",
+      "minimum": 0
+    },
+    "audit": {
+      "description": "The Codex write log's last lines, oldest first.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "notes": {
+      "description": "Sentences about the report as a whole.",
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "home": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "symlink_chain", "error"],
+      "properties": {
+        "path": {
+          "description": "The resolved Codex home; null when it could not be resolved.",
+          "type": ["string", "null"]
+        },
+        "symlink_chain": {
+          "description": "The symbolic links walked to reach it, each as `<link> -> <target>`.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "error": {
+          "description": "Why the home could not be resolved (fact F86).",
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "store": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "read",
+        "coarse_match",
+        "profiles_consulted",
+        "base_url",
+        "config_note"
+      ],
+      "properties": {
+        "mode": {
+          "description": "The configured store mode. `unknown` stands for a value this build does not know: the value itself is file content and is never emitted.",
+          "enum": ["file", "keyring", "auto", "ephemeral", "unknown"]
+        },
+        "read": {
+          "description": "What agctl does about it.",
+          "enum": ["file", "auto (file in effect)", "not read"]
+        },
+        "coarse_match": {
+          "description": "Whether a `Codex Auth` item could only be matched by service name, the keychain listing having no account column.",
+          "type": "boolean"
+        },
+        "profiles_consulted": {
+          "description": "Always false: a profile cannot set the store key (fact F84).",
+          "const": false
+        },
+        "base_url": {
+          "description": "`chatgpt_base_url`, when it is a plain URL carrying no credential.",
+          "type": ["string", "null"]
+        },
+        "config_note": {
+          "description": "What was wrong with `config.toml` — the line NUMBER only, never its text (invariant I31, plan AC116).",
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "envVar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "present"],
+      "properties": {
+        "name": { "type": "string" },
+        "present": {
+          "description": "Whether it is set. The value is never emitted.",
+          "type": "boolean"
+        }
+      }
+    },
+    "live": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "auth_mode",
+        "mode_bits",
+        "mode_warning",
+        "size",
+        "access_expiry",
+        "last_refresh",
+        "matches_namespace",
+        "daemon",
+        "missing_known_members",
+        "unknown_member_count"
+      ],
+      "properties": {
+        "state": {
+          "enum": ["credentials", "absent", "torn", "unusable", "not read", "no home"]
+        },
+        "auth_mode": {
+          "description": "The authentication mode. `unknown` stands for one this build does not know: the spelling is file content.",
+          "type": ["string", "null"],
+          "enum": [
+            "apikey",
+            "chatgpt",
+            "chatgptauthtokens",
+            "headers",
+            "agentidentity",
+            "personalaccesstoken",
+            "bedrockapikey",
+            "bedrockaccesskeys",
+            "unknown",
+            null
+          ]
+        },
+        "mode_bits": {
+          "description": "The file's permission bits as four octal digits.",
+          "type": ["string", "null"],
+          "pattern": "^[0-7]{4}$"
+        },
+        "mode_warning": {
+          "description": "Set when the bits are not 0600.",
+          "type": ["string", "null"]
+        },
+        "size": {
+          "description": "The file's size in bytes.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "access_expiry": {
+          "description": "The access token's expiry as a relative time.",
+          "type": ["string", "null"]
+        },
+        "last_refresh": {
+          "description": "`last_refresh` as a relative time.",
+          "type": ["string", "null"]
+        },
+        "matches_namespace": {
+          "description": "The owned namespace holding the same grant, as `<user>+<acct>`.",
+          "type": ["string", "null"]
+        },
+        "daemon": {
+          "enum": [
+            "none",
+            "a daemon is running",
+            "a recycled process id, not the daemon",
+            "artefacts only",
+            "a daemon record cannot be read"
+          ]
+        },
+        "missing_known_members": {
+          "description": "Members of fact F61's field set the document does not have. The names come from this build's own list.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "unknown_member_count": {
+          "description": "How many members the document has that are not in that set. A COUNT: the names are file content (premortem PM22).",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "foreign": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "multi_auth_present",
+        "switcher_items",
+        "codex_auth_items",
+        "unexplained_removals",
+        "unexplained_items",
+        "unnameable_items"
+      ],
+      "properties": {
+        "multi_auth_present": {
+          "description": "Whether the live home has a `multi-auth/` directory. Its contents are never listed and never read (open question U32).",
+          "type": "boolean"
+        },
+        "switcher_items": {
+          "description": "How many `codex-switcher:` keychain items are listed. A COUNT: an item's account names a person.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "codex_auth_items": {
+          "description": "How many `Codex Auth` keychain items are listed.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "unexplained_removals": {
+          "description": "The manual removal command for each listed `Codex Auth` item that agctl's own write log records a refused login child as having gained, and whose account is spelled `cli|` plus sixteen lowercase hexadecimal digits. Both halves are required: an account is an attribute any application can set, so a command is built only from a string agctl itself could have written (review S35 C1), and an item agctl cannot show it caused is very often another Codex home's working credential, so removing it would be data loss (plan section 3.3).",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^security delete-generic-password -s \"[A-Za-z ]+\" -a \"cli\\|[0-9a-f]{16}\"$"
+          }
+        },
+        "unexplained_items": {
+          "description": "How many further `Codex Auth` items are listed under an account spelled the way Codex spells one that agctl's write log does not explain. A COUNT, and never a command.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "unnameable_items": {
+          "description": "How many further `Codex Auth` items are listed under an account agctl would not have written. A COUNT: the account string is never emitted.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "namespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "user",
+        "acct",
+        "path",
+        "credentials_present",
+        "refresh_policy",
+        "lock",
+        "artefacts",
+        "marker",
+        "notes"
+      ],
+      "properties": {
+        "user": { "type": "string" },
+        "acct": { "type": "string" },
+        "path": {
+          "description": "The namespace directory agctl derives from those two ids.",
+          "type": "string"
+        },
+        "credentials_present": { "type": "boolean" },
+        "refresh_policy": { "enum": ["auto", "never"] },
+        "lock": {
+          "oneOf": [{ "$ref": "#/$defs/lock" }, { "type": "null" }]
+        },
+        "artefacts": {
+          "description": "What else the directory holds, by kind.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "marker": { "$ref": "#/$defs/marker" },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "lock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pid", "acquired_at", "holder"],
+      "properties": {
+        "pid": { "type": "integer", "minimum": 0 },
+        "acquired_at": { "type": "string" },
+        "holder": { "enum": ["held", "dead (holder gone)", "dead (pid recycled)"] }
+      }
+    },
+    "marker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "unavailable",
+        "inflight_digest8",
+        "inflight_age",
+        "class",
+        "floor_min",
+        "did_not_help",
+        "resent",
+        "ambiguous_since",
+        "resend_eligible"
+      ],
+      "properties": {
+        "state": { "enum": ["absent", "present", "unavailable"] },
+        "unavailable": {
+          "description": "Why the marker could not be read, as `<path> (<reason>)`.",
+          "type": ["string", "null"]
+        },
+        "inflight_digest8": {
+          "description": "The digest prefix of the refresh token a send is outstanding for.",
+          "type": ["string", "null"]
+        },
+        "inflight_age": { "type": ["string", "null"] },
+        "class": {
+          "description": "The class of an unknown outcome, including `interrupted`.",
+          "type": ["string", "null"]
+        },
+        "floor_min": { "type": ["integer", "null"], "minimum": 0 },
+        "did_not_help": { "type": ["integer", "null"], "minimum": 0 },
+        "resent": { "type": ["boolean", "null"] },
+        "ambiguous_since": { "type": ["string", "null"] },
+        "resend_eligible": { "type": ["boolean", "null"] }
+      }
+    },
+    "orphan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "subject", "age"],
+      "properties": {
+        "kind": {
+          "enum": ["namespace without record", "record without auth.json", "stale scratch"]
+        },
+        "subject": {
+          "description": "The directory name, or the `<user>+<acct>` pair it concerns — rendered only when it is spelled the way agctl spells one, anything else being counted in `unnameable_orphans` instead (review S35 C3).",
+          "type": "string"
+        },
+        "age": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

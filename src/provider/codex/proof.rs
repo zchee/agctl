@@ -8,9 +8,14 @@
 //!   (plan AC122, `scripts/phase3-structural.sh`). A command can only *receive*
 //!   one, from [`owned`], from the login verification, or from the lock.
 //! - **Inside `provider::codex`** the `pub(super)` constructors are visible to
-//!   every sibling, so which sibling calls each one is pinned by a
-//!   source-reading test instead (plan AC119). That boundary is partial, and
-//!   is stated as such (invariant I22).
+//!   every sibling, and only one of them pins which sibling may call it:
+//!   `scripts/phase3-greps.sh`'s `locked_read` rule holds `from_locked_read`
+//!   to `auth_store.rs` (invariant I26). For `from_verified`,
+//!   `CodexNamespaceGuard::wrap` and `PostExitReport::from_child` the caller
+//!   set is a convention, not a pinned invariant: clauses 1, 5, 7 and 7b of
+//!   `scripts/phase3-structural.sh` prove only that no code outside
+//!   `provider::codex` can build these values, never which sibling inside it
+//!   does. That is what invariant I22 means by a partial boundary.
 //!
 //! What each proof guarantees, and where:
 //!
@@ -36,6 +41,7 @@ use crate::config::codex::RefreshPolicy;
 use crate::config::paths::validate_codex_segment;
 use crate::provider::codex::credentials::CodexIdentity;
 use crate::provider::codex::credentials::Credentials;
+use crate::provider::codex::home::is_home_account;
 use crate::secret::namespace_lock::NamespaceLockGuard;
 
 /// A registry record agctl owns, with ids fit to name a directory.
@@ -155,13 +161,27 @@ impl fmt::Debug for VerifiedLogin {
 }
 
 /// A held Codex namespace lock.
+///
+/// Under the `testing` feature it also carries a
+/// [`HeldCodexGuard`](crate::runtime::lock_order::HeldCodexGuard), so a test
+/// that takes `.config.lock` while one is alive panics (numbered deviation 13).
 #[derive(Debug)]
-pub struct CodexNamespaceGuard(NamespaceLockGuard);
+pub struct CodexNamespaceGuard(
+    NamespaceLockGuard,
+    #[cfg(feature = "testing")] crate::runtime::lock_order::HeldCodexGuard,
+);
 
 impl CodexNamespaceGuard {
     /// Wraps an acquired lock. The only caller is `lock.rs` (plan AC119).
     pub(super) fn wrap(guard: NamespaceLockGuard) -> Self {
-        Self(guard)
+        #[cfg(feature = "testing")]
+        {
+            Self(guard, crate::runtime::lock_order::HeldCodexGuard::take())
+        }
+        #[cfg(not(feature = "testing"))]
+        {
+            Self(guard)
+        }
     }
 
     /// The lock file held.
@@ -170,13 +190,41 @@ impl CodexNamespaceGuard {
     }
 }
 
+/// What the scratch home looked like after the login child exited.
+///
+/// Produced by `login_child::survey` and consumed by
+/// [`PostExitReport::from_child`]. It exists so that the report is built from
+/// one named value rather than from a row of positional `Vec`s and `bool`s
+/// that a caller could silently transpose.
+/// **Deliberately no `Default`, and no `new`/`empty`/`clean` constructor.** A
+/// default survey is the claim "we looked and found nothing", which is the
+/// silent-clean failure `truncated` exists to remove; handing callers a cheap
+/// way to make that claim would put it straight back. The only production
+/// producer is `login_child::survey`, and every value is built by a named
+/// struct literal so a transposed field cannot compile quietly. A test that
+/// wants a clean value builds one in its own `*_tests.rs`.
+///
+/// The fields are `pub(super)`, so `commands/` cannot write the literal
+/// either (E0451) — the same boundary AC122 clause 7 puts around
+/// [`PostExitReport`].
+#[derive(Debug)]
+pub struct ScratchSurvey {
+    /// Whether a Codex daemon directory appeared.
+    pub(super) daemon_dir: bool,
+    /// `*.lock` files something still holds, proved by a non-blocking probe.
+    pub(super) held_locks: Vec<PathBuf>,
+    /// Entries named `*.lock` that are not regular files.
+    pub(super) odd_locks: Vec<PathBuf>,
+    /// Whether a depth or entry bound stopped the walk short.
+    pub(super) truncated: bool,
+}
+
 /// What a login child left behind (plan section 3.3, L2′).
 #[derive(Debug)]
 pub struct PostExitReport {
     gained_codex_auth: Vec<String>,
     survivors: Vec<PathBuf>,
-    daemon_dir: bool,
-    lock_files: Vec<PathBuf>,
+    survey: ScratchSurvey,
     exit: ExitStatus,
 }
 
@@ -186,23 +234,60 @@ impl PostExitReport {
     ///
     /// `gained_codex_auth` holds the `Codex Auth` item accounts present in the
     /// second listing and not the first — `cli|<hash>` names, never emails.
+    ///
+    /// `survivors` is **always empty today**. Plan section 3.3's "refuse if a
+    /// process still holds the scratch" is replaced entirely by the held-lock
+    /// evidence in `survey` (ledger #310, #323, #325): there is no process
+    /// scan in the login path, so a survivor holding an ordinary descriptor,
+    /// rather than a lock, is not detected. That is harmless only because the
+    /// install copies the bytes `verify_login` parsed — nothing a survivor
+    /// writes to the scratch afterwards can reach the namespace. The field
+    /// stays so a future process scan has somewhere to report.
+    ///
+    /// `survey` is what the scratch home looked like: see [`ScratchSurvey`].
+    /// Its `held_locks` are lock files something still **holds**, never lock
+    /// files that merely exist — a normal `codex login` leaves an unheld
+    /// `tmp/arg0/…/.lock` behind (fact F81, measured at S28), so refusing on
+    /// existence would refuse every real login. Its `odd_locks` are entries
+    /// named `*.lock` that are not regular files; S28's residue has none, so
+    /// one is an anomaly, and `flock` is never called on it. Its `truncated`
+    /// says the walk could not look everywhere — a bound, an unreadable
+    /// directory, a lock whose state could not be asked — and a home that was
+    /// not walked completely has not been shown clean.
     pub(super) fn from_child(
         gained_codex_auth: Vec<String>,
         survivors: Vec<PathBuf>,
-        daemon_dir: bool,
-        lock_files: Vec<PathBuf>,
+        survey: ScratchSurvey,
         exit: ExitStatus,
     ) -> Self {
-        Self { gained_codex_auth, survivors, daemon_dir, lock_files, exit }
+        Self { gained_codex_auth, survivors, survey, exit }
+    }
+
+    /// The `Codex Auth` item accounts the second listing gained.
+    ///
+    /// Read-only, and the one reader outside this module is
+    /// `commands::codex::login`, which records them in the write log when the
+    /// login is refused: an item nothing recorded is an item `doctor` can
+    /// never offer to remove, because nothing says agctl caused it.
+    pub fn gained_codex_auth(&self) -> &[String] {
+        &self.gained_codex_auth
     }
 
     /// Whether the child exited successfully and left nothing behind.
     pub(super) fn clean(&self) -> bool {
-        self.exit.success()
-            && self.gained_codex_auth.is_empty()
-            && self.survivors.is_empty()
-            && !self.daemon_dir
-            && self.lock_files.is_empty()
+        // Destructured exhaustively, with no `..`: a field added to either
+        // struct is a compile error here until somebody has decided what it
+        // means for cleanliness. The mutant "add a field, forget `clean()`"
+        // is caught by the compiler rather than by a reviewer's attention.
+        let Self { gained_codex_auth, survivors, survey, exit } = self;
+        let ScratchSurvey { daemon_dir, held_locks, odd_locks, truncated } = survey;
+        exit.success()
+            && gained_codex_auth.is_empty()
+            && survivors.is_empty()
+            && !daemon_dir
+            && held_locks.is_empty()
+            && odd_locks.is_empty()
+            && !truncated
     }
 
     /// The reasons [`PostExitReport::clean`] is false, as refusal fragments.
@@ -212,21 +297,82 @@ impl PostExitReport {
             found.push(format!("the login exited with {}", self.exit));
         }
         if !self.gained_codex_auth.is_empty() {
+            // A keychain `acct` is an attribute any application on this
+            // machine can set, and this sentence is printed to the user's
+            // terminal. So the same rule `doctor` applies before it names one
+            // applies here: a spelling agctl itself could have written is
+            // shown, and anything else is counted (review S37-b1, carry 3).
+            // Without this, a quote, a `$(…)`, a backtick or an escape byte
+            // in that attribute rode into stderr on the refusal path.
+            let (named, unnameable): (Vec<&String>, Vec<&String>) =
+                self.gained_codex_auth.iter().partition(|account| is_home_account(account));
+            let which = if named.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ": {}",
+                    named.iter().map(|account| account.as_str()).collect::<Vec<_>>().join(", ")
+                )
+            };
+            let rest = if unnameable.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({} of them under an account agctl would not have written, so it is not \
+                     printed; look in Keychain Access)",
+                    unnameable.len()
+                )
+            };
             found.push(format!(
-                "the login created {} `Codex Auth` keychain item(s): {}",
-                self.gained_codex_auth.len(),
-                self.gained_codex_auth.join(", ")
+                "the login created {} `Codex Auth` keychain item(s){which}{rest}",
+                self.gained_codex_auth.len()
             ));
         }
         if !self.survivors.is_empty() {
             found.push(format!("{} process(es) still use the scratch home", self.survivors.len()));
         }
-        if self.daemon_dir {
+        if self.survey.daemon_dir {
             found.push("the login started a Codex daemon in the scratch home".to_owned());
         }
-        if !self.lock_files.is_empty() {
+        if !self.survey.odd_locks.is_empty() {
+            // The twin of the keychain join above, and the same rule. These
+            // are names the login CHILD chose inside the scratch home, and
+            // `is_lock_name` is only `ends_with(".lock")`, so a directory it
+            // creates carries whatever bytes it likes into this sentence —
+            // which is printed to the user's terminal (review S37-b1b, F2).
+            // Only the final component is ever shown, and only when it is
+            // spelled the way agctl spells a name: the leading directories
+            // are agctl's own derived path and say nothing a reader needs.
+            let mut named: Vec<&str> = Vec::new();
+            let mut unnameable = 0usize;
+            for path in &self.survey.odd_locks {
+                match path.file_name().and_then(|name| name.to_str()) {
+                    Some(name) if validate_codex_segment(name).is_ok() => named.push(name),
+                    _ => unnameable = unnameable.saturating_add(1),
+                }
+            }
+            let which =
+                if named.is_empty() { String::new() } else { format!(": {}", named.join(", ")) };
+            let rest = if unnameable == 0 {
+                String::new()
+            } else {
+                format!(" ({unnameable} unnameable lock file(s), not printed)")
+            };
+            found.push(format!(
+                "{} entr(y/ies) named `*.lock` in the scratch home are not regular \
+                 files{which}{rest}",
+                self.survey.odd_locks.len()
+            ));
+        }
+        if self.survey.truncated {
             found
-                .push(format!("{} lock file(s) remain in the scratch home", self.lock_files.len()));
+                .push("the scratch home was too large or too deep to survey completely".to_owned());
+        }
+        if !self.survey.held_locks.is_empty() {
+            found.push(format!(
+                "{} lock file(s) are still held in the scratch home",
+                self.survey.held_locks.len()
+            ));
         }
         found
     }

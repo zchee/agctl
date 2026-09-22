@@ -310,6 +310,48 @@ impl<'a> SecretFile<'a> {
         }
     }
 
+    /// Parks `bytes` as pending without trying the target at all.
+    ///
+    /// For a writer that already knows the rename cannot happen: a rotated
+    /// grant whose writes kept failing after the refresh was applied (review
+    /// S30 LOW-1). The target is not examined — a target that is torn, a link,
+    /// or unreadable is exactly why the caller is here — and the temporary is
+    /// staged and parked under [`StopPolicy::Complete`]'s rules: it is not
+    /// registered with cleanup, and a failure to park keeps it, naming it in the
+    /// error, because it may be the only copy of the grant.
+    ///
+    /// # Errors
+    ///
+    /// [`FileStoreError::OutsideNamespaceRoot`] when the root check fails or the
+    /// spec names another target, and [`FileStoreError::Io`] when the temporary
+    /// cannot be written or the pending pair cannot be saved.
+    pub fn park(
+        &self,
+        bytes: &[u8],
+        spec: PendingSpec<'_>,
+        faults: &WriteFaults<'_>,
+    ) -> Result<WriteOutcome, FileStoreError> {
+        self.check()?;
+        let dir_shown = self.shown.parent().unwrap_or(self.shown);
+        pending::check_spec_names(&spec, dir_shown)?;
+        if spec.target_name != self.name {
+            return Err(FileStoreError::OutsideNamespaceRoot(
+                self.shown.with_file_name(spec.target_name),
+            ));
+        }
+        let tmp_name = format!("{}.tmp.{}", self.name, hex8());
+        let tmp = self.shown.with_file_name(&tmp_name);
+        if let Err(err) = create_new_file_at(self.dir, &tmp_name, bytes) {
+            if err.kind() != io::ErrorKind::AlreadyExists {
+                let _ = unlink_at(self.dir, &tmp_name);
+            }
+            return Err(FileStoreError::io(format!("could not write `{}`", tmp.display()), err));
+        }
+        faults.fault.pause_point(faults.before_rename);
+        let cause = io::Error::other("the writes before it failed; parked without a rename");
+        self.save_to_pending(&spec, &tmp_name, &cause, StopPolicy::Complete)
+    }
+
     /// Parks a written temporary file under the spec's pending name.
     ///
     /// The metadata goes first, deliberately. A crash between the two leaves a

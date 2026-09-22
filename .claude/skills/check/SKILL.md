@@ -59,12 +59,10 @@ scripts/release-gate.sh
 It runs `scripts/docs-gate.sh` first (no build needed, so a prose failure is reported in
 seconds), then builds `cargo build --release` (default features, no `--config`, into a scratch
 `--target-dir` that is never `./target` and never the shared `~/.cache/rust/target`) and
-greps the artifact for two lists. The thirteen seam names are one representative name per
-seam-owning module, not the whole test-only surface — `fixtures/fake-security.sh` alone
-defines ten `AGCTL_FAKE_SECURITY_*` names on its own. The fake's **write** knob is the
-one exception to "one per owner": the keychain write path is the only seam that can change
-a keychain, so it is gated by name rather than by family. **Thirteen seam names, every one
-of which must be absent:**
+greps the artifact for two lists. The seam names are the ones in `scripts/release-gate.sh`:
+one representative name per seam-owning module, and only names a `testing` build of the
+binary can carry as a string (the fake stand-ins' knob names and the fake `codex` prefix
+cannot, so they are not listed). **The seam names, every one of which must be absent:**
 
 | name | owner |
 |------|-------|
@@ -76,14 +74,23 @@ of which must be absent:**
 | `AGCTL_CLAUDE_TOKEN_URL` | `src/provider/claude/oauth.rs` |
 | `AGCTL_CLAUDE_AUTHORIZE_URL` | `src/provider/claude/oauth.rs` |
 | `AGCTL_CLAUDE_PROFILE_URL` | `src/provider/claude/oauth.rs` (the live swap's profile GET) |
-| `AGCTL_FAKE_SECURITY_LOG` | `fixtures/fake-security.sh` |
-| `AGCTL_FAKE_SECURITY_WRITE_EXIT` | `fixtures/fake-security.sh` (the `-i` write path) |
 | `AGCTL_NO_BROWSER` | `src/commands/login.rs` |
 | `AGCTL_CODEX_BIN` | `src/provider/codex/login_child.rs` (phase 3; listed from S29b, which introduces the name — the module that reads it lands at S34, and `scripts/phase3-greps.sh` pins it to that one file) |
 | `AGCTL_CODEX_USAGE_URL` | `src/provider/codex/usage.rs` (phase 3, S31; `scripts/phase3-greps.sh` pins it to that one file) |
+| `AGCTL_CODEX_TOKEN_URL` | `src/provider/codex/oauth.rs` (phase 3, S32; `scripts/phase3-greps.sh` pins it to that one file) |
+| `codex_login_before_install` | `src/commands/codex/login.rs` (phase 3, S34: the pause point between `verify_login` and `install`) |
+| `agctl lock order violated: ` | `src/runtime/lock_order.rs` (phase 3, S34: the prefix of the lock-order witness's three messages) |
 
-**Three production names, every one of which must be present:** `AGCTL_CONFIG_DIR`,
-`AGCTL_CLAUDE_USER_AGENT`, `AGCTL_CLAUDE_OAUTH_SCOPES`. (The presence half is there so
+Not in this table: `agctl unaudited write receipt` (S34 C2-a's `UNAUDITED_RECEIPT`, in
+`src/provider/codex/auth_store.rs`). Removed at S37: measured absent from an all-features
+release build, flags cleared and with this project's own build flags applied, 2026-09-22 —
+its absence here proved nothing, since nothing a release build produces was ever shown to
+carry it. The guards that remain: the drop check itself under `cargo nextest
+run --all-features`, and `scripts/phase3-greps.sh`'s `receipt_check`/`reached_audit` rules.
+
+**Four production names, every one of which must be present:** `AGCTL_CONFIG_DIR`,
+`AGCTL_CLAUDE_USER_AGENT`, `AGCTL_CLAUDE_OAUTH_SCOPES`, and — from S33, once
+`agctl codex status` builds the Codex usage client — `AGCTL_CODEX_USER_AGENT`. (The presence half is there so
 a build that somehow embedded no strings at all cannot pass by accident.)
 
 A seam in a release artifact is not a style problem. `AGCTL_CLAUDE_TOKEN_URL` in a
@@ -93,11 +100,24 @@ If the gate fails, the build enabled `testing` — never `cargo build --release
 
 One representative name per seam-owning module: a new seam-owning module adds its
 representative to the `seams` array in `scripts/release-gate.sh` **and** to the table
-above, in the same change that introduces it. Three `AGCTL_*` names in the tree are
-deliberately outside the array — `AGCTL_LOCK_CHILD_ROLE` and `AGCTL_LOCK_CHILD_DIR`, which
-live only in a `#[cfg(test)]` sibling and are covered more strongly by `tests/e2e_lock.rs`,
-and `AGCTL_E2E_MARKER`, which a test sets on a child and the crate never reads. The script
-says so in a comment; do not "tidy" them in.
+above, in the same change that introduces it. Some `AGCTL_*` names in the tree are
+deliberately outside the array, for two different reasons. `AGCTL_LOCK_CHILD_ROLE` and
+`AGCTL_LOCK_CHILD_DIR` live only in a `#[cfg(test)]` sibling and are covered more strongly by
+`tests/e2e_lock.rs`; `AGCTL_E2E_MARKER` is set on a child by a test and the crate never reads
+it — none of the three shows up in a `src`-only sweep at all, since all three live in
+`*_tests.rs` files. Eleven more are dead code in every binary this crate ships (the
+`AGCTL_FAKE_SECURITY_*` family and `AGCTL_FAKE_CODEX_`, added since `e6c00e9`; see below for
+why): `rg -o --no-filename 'AGCTL_[A-Z0-9_]+' src --glob '!*_tests.rs' | sort -u | wc -l`
+finds **27** distinct names outside `*_tests.rs`, of which 4 are the production list above
+and 12 are in the `seams` array, leaving **11** genuinely outside both by that measure. The
+script says so in its own comments; do not "tidy" any of them in.
+
+`AGCTL_FAKE_CODEX_` is outside the array for a different reason: it is only ever a
+`starts_with` argument, so no build carries it as a string at all and an artifact grep
+could not fail for it. `scripts/phase3-greps.sh` guards it with a source rule,
+`fake_prefix`, that pins the single spelling and the `#[cfg(feature = "testing")]`
+directly above it. The drop check's prefix has a second guard of the same shape,
+`receipt_check`, **as well as** its entry in the array above.
 
 ## The documentation gates
 

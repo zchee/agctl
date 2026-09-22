@@ -67,6 +67,7 @@ use std::time::Duration;
 use jiff::Timestamp;
 use rustix::fs::AtFlags;
 use rustix::io::Errno;
+use secrecy::zeroize::Zeroizing;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -123,6 +124,9 @@ pub const DEFAULT_FLOOR_MIN: u32 = 60;
 
 /// The write faults the refresh writer honours.
 const REFRESH_FAULTS: (&str, &str) = ("codex_before_rename", "codex_rename_fail");
+
+/// Writer 1 reports an error after its rename landed.
+const ERROR_AFTER_RENAME_FAULT: &str = "codex_error_after_rename";
 
 /// The write faults the install honours (plan AC126 (d)).
 const INSTALL_FAULTS: (&str, &str) = ("codex_before_rename", "codex_install_rename_fail");
@@ -294,21 +298,121 @@ pub enum WriteKind {
     Delete,
 }
 
+/// A `testing`-only witness that one [`WriteReceipt`] reaches the audit log.
+///
+/// The run-time half of invariant I30. `#[must_use]` makes an ignored receipt
+/// a warning and `scripts/phase3-greps.sh`'s `receipt_destructure` rule reads
+/// the source for receipts bound to `_`, but neither sees one a live path drops
+/// — bound to a name and then let go, moved into a value nobody consumes,
+/// taken out of an `Option` and discarded. This does: every receipt is born
+/// armed, [`append`] disarms it, and a drop while it is still armed panics on
+/// whatever path the test drove.
+///
+/// Compiled only under the `testing` feature, like the lock-order witness it
+/// is modelled on ([`HeldCodexGuard`]). Its one message begins with
+/// [`UNAUDITED_RECEIPT`], spelled once and pinned to that attribute by
+/// `scripts/phase3-greps.sh`.
+///
+/// [`append`]: crate::provider::codex::audit::append
+/// [`HeldCodexGuard`]: crate::runtime::lock_order::HeldCodexGuard
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+pub struct AuditPending {
+    armed: std::cell::Cell<bool>,
+    kind: WriteKind,
+}
+
+/// The prefix of the unaudited-drop panic, spelled once.
+///
+/// `scripts/phase3-greps.sh`'s `receipt_check` rule pins that single spelling
+/// and the `#[cfg]` directly above it, and `tests/common/codex.rs::checked`
+/// fails any e2e run whose binary printed it. `scripts/release-gate.sh`
+/// deliberately does not list it — its comment carries the measurement and the
+/// reason.
+#[cfg(feature = "testing")]
+const UNAUDITED_RECEIPT: &str = "agctl unaudited write receipt";
+
+#[cfg(feature = "testing")]
+impl AuditPending {
+    /// Arms the witness for a receipt of `kind`.
+    fn armed(kind: WriteKind) -> Self {
+        Self { armed: std::cell::Cell::new(true), kind }
+    }
+
+    /// Records that the receipt reached the audit log.
+    fn disarm(&self) {
+        self.armed.set(false);
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Drop for AuditPending {
+    /// Panics when the receipt never reached the audit log.
+    ///
+    /// Silent while the thread is already unwinding: a panic inside a panic
+    /// aborts the process, which would replace the failure the test is about
+    /// to report with this one.
+    fn drop(&mut self) {
+        if self.armed.get() && !std::thread::panicking() {
+            let kind = self.kind;
+            panic!("{UNAUDITED_RECEIPT}: {kind:?} was dropped before codex::audit::append");
+        }
+    }
+}
+
+/// Every witness equals every other: whether a receipt has been audited yet is
+/// not part of what the receipt *says*, and `WriteReceipt` compares by value in
+/// the landed tests.
+#[cfg(feature = "testing")]
+impl PartialEq for AuditPending {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Eq for AuditPending {}
+
 /// The record of one namespace write. Consumed by the Codex audit log and
 /// nothing else (invariant I30, plan AC117).
+///
+/// Neither `Clone` nor `Copy`, so one write is audited once (review S30 LOW-2).
+/// Under the `testing` feature it also carries an [`AuditPending`], so a
+/// receipt any test drives off the audited path fails that test.
 #[must_use = "every Codex namespace write is audited: hand the receipt to the audit log"]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct WriteReceipt {
     kind: WriteKind,
     digest8_before: Option<String>,
     digest8_after: Option<String>,
     ids: (String, String),
+    #[cfg(feature = "testing")]
+    pending_audit: AuditPending,
 }
 
 impl WriteReceipt {
     /// What the write did.
     pub fn kind(&self) -> WriteKind {
         self.kind
+    }
+
+    /// Records that this receipt reached the Codex audit log.
+    ///
+    /// Called by [`append`] before it builds the entry, so a receipt whose log
+    /// line is then refused still counts as audited: that write has landed and
+    /// stands, and the row says `audit log refused` (plan AC117). A no-op
+    /// without the `testing` feature.
+    ///
+    /// A shared borrow, so this is not a way to *consume* a receipt. The one
+    /// function that takes one by value and does not audit it is a helper in
+    /// `auth_store_tests.rs` — outside the source `scripts/phase3-greps.sh`
+    /// scans, and `#[cfg(test)]`, so it reaches no shipped artifact (it does
+    /// live in the unit-test binary, which is where it is meant to run).
+    ///
+    /// [`append`]: crate::provider::codex::audit::append
+    pub(super) fn reached_audit(&self) {
+        #[cfg(feature = "testing")]
+        self.pending_audit.disarm();
     }
 
     /// The refresh digest prefix of the credential before the write.
@@ -360,17 +464,7 @@ impl NamespaceDir {
         acct: &str,
         guard: &CodexNamespaceGuard,
     ) -> Result<Self, FileStoreError> {
-        let expected = paths.codex_lock_path(user, acct).map_err(refused)?;
-        if guard.path() != expected {
-            return Err(FileStoreError::io(
-                format!(
-                    "the lock held is `{}`, not `{}`; refusing to open that namespace",
-                    guard.path().display(),
-                    expected.display()
-                ),
-                io::Error::from(io::ErrorKind::PermissionDenied),
-            ));
-        }
+        check_guard(paths, user, acct, guard)?;
         let root = paths.codex_root();
         let dir_shown = paths.codex_namespace_dir(user, acct).map_err(refused)?;
         let fd = file_store::create_dir_under(&root, &dir_shown)?;
@@ -581,6 +675,8 @@ impl<'g> OwnedNamespace<'g> {
                 digest8_before: digest8_of(write.before.as_ref()),
                 digest8_after: digest8_of(write.pending.as_ref()),
                 ids: self.ns.ids(),
+                #[cfg(feature = "testing")]
+                pending_audit: AuditPending::armed(kind),
             }
         });
         Ok((decision, receipt, evidence))
@@ -650,8 +746,12 @@ impl<'g> OwnedNamespace<'g> {
         };
         let base = credentials.base_digests();
         let after = credentials.credentials().digests();
-        if before.as_ref().and_then(|d| d.refresh_sha256.as_ref())
-            != base.and_then(|d| d.refresh_sha256.as_ref())
+        // A file that is gone is not a newer grant: nothing would be written
+        // over, and the merged response is the only copy of a grant whose old
+        // refresh token is already spent, so it is written (review S30
+        // INFO-2; fact F94: a Codex keychain save can delete `auth.json`).
+        if let Some(current) = &before
+            && current.refresh_sha256.as_ref() != base.and_then(|d| d.refresh_sha256.as_ref())
         {
             return Ok(CodexWrite::ChangedSinceRead {
                 receipt: WriteReceipt {
@@ -659,28 +759,28 @@ impl<'g> OwnedNamespace<'g> {
                     digest8_before: digest8_of(before.as_ref()),
                     digest8_after: digest8_of(after.as_ref()),
                     ids: self.ns.ids(),
+                    #[cfg(feature = "testing")]
+                    pending_audit: AuditPending::armed(WriteKind::DiscardedExternal),
                 },
             });
         }
 
-        let mut bytes = Vec::new();
-        credentials.credentials().write_json_to(&mut bytes).map_err(|err| {
-            FileStoreError::io(format!("could not serialize `{}`", self.ns.shown.display()), err)
-        })?;
-        let spec = PendingSpec {
-            target_name: AUTH_FILE,
-            pending_name: PENDING_FILE,
-            meta_name: PENDING_META,
-            prior: base,
-            expires_at_ms: credentials
-                .credentials()
-                .access_expires_at()
-                .and_then(|exp| exp.checked_mul(1000)),
-        };
+        let bytes = self.serialize(credentials)?;
+        let spec = refresh_spec(credentials);
         let faults =
             WriteFaults { fault, before_rename: REFRESH_FAULTS.0, rename_fail: REFRESH_FAULTS.1 };
         let outcome =
             self.ns.auth_file().write(&bytes, Some(spec), StopPolicy::Complete, &faults)?;
+        if matches!(outcome, WriteOutcome::Written { .. }) && fault.is(ERROR_AFTER_RENAME_FAULT) {
+            // The shape of a post-rename failure `SecretFile::write` can return
+            // (its snapshot of the renamed file fails): the grant is on disk and
+            // no receipt comes back. The refresh driver must re-read rather than
+            // write the same merge again (review S30 INFO-4).
+            return Err(FileStoreError::io(
+                format!("`{}` could not be examined after the rename", self.ns.shown.display()),
+                io::Error::other("error after rename injected by the test fault switch"),
+            ));
+        }
         let kind = match outcome {
             WriteOutcome::Written { .. } => WriteKind::RefreshApplied,
             WriteOutcome::SavedToPending { .. } => WriteKind::RefreshSavedToPending,
@@ -692,8 +792,98 @@ impl<'g> OwnedNamespace<'g> {
                 digest8_before: digest8_of(before.as_ref()),
                 digest8_after: digest8_of(after.as_ref()),
                 ids: self.ns.ids(),
+                #[cfg(feature = "testing")]
+                pending_audit: AuditPending::armed(kind),
             },
         })
+    }
+
+    /// Writer 1's last resort: parks a merged refresh as pending without trying
+    /// `auth.json` (review S30 LOW-1).
+    ///
+    /// For a refresh driver whose writes kept failing after the response was
+    /// applied — `auth.json` unreadable, torn, or the staging failing — and
+    /// which must not drop the only copy of the rotated grant. The pending
+    /// file records the read the merge was built on, so the next pass replays
+    /// it only onto that grant.
+    ///
+    /// # Errors
+    ///
+    /// [`FileStoreError`] for credentials from another namespace and when the
+    /// pending pair cannot be saved; a temporary that could not be parked is
+    /// kept and named in the error.
+    pub fn park(
+        &self,
+        credentials: &LockedCredentials<'g>,
+        fault: &Fault,
+    ) -> Result<CodexWrite, FileStoreError> {
+        check_ids(credentials, &self.ns.user, &self.ns.acct, &self.ns.shown)?;
+        let before = match self.ns.current() {
+            Ok(Current::Present { credentials, .. }) => credentials.digests(),
+            _ => None,
+        };
+        let bytes = self.serialize(credentials)?;
+        let faults =
+            WriteFaults { fault, before_rename: REFRESH_FAULTS.0, rename_fail: REFRESH_FAULTS.1 };
+        let outcome = self.ns.auth_file().park(&bytes, refresh_spec(credentials), &faults)?;
+        Ok(CodexWrite::Landed {
+            outcome,
+            receipt: WriteReceipt {
+                kind: WriteKind::RefreshSavedToPending,
+                digest8_before: digest8_of(before.as_ref()),
+                digest8_after: digest8_of(credentials.credentials().digests().as_ref()),
+                ids: self.ns.ids(),
+                #[cfg(feature = "testing")]
+                pending_audit: AuditPending::armed(WriteKind::RefreshSavedToPending),
+            },
+        })
+    }
+
+    /// The document in Codex's format, in a buffer zeroed on drop (review
+    /// S30 F9).
+    fn serialize(
+        &self,
+        credentials: &LockedCredentials<'g>,
+    ) -> Result<Zeroizing<Vec<u8>>, FileStoreError> {
+        let mut bytes = Zeroizing::new(Vec::new());
+        credentials.credentials().write_json_to(&mut *bytes).map_err(|err| {
+            FileStoreError::io(format!("could not serialize `{}`", self.ns.shown.display()), err)
+        })?;
+        Ok(bytes)
+    }
+
+    /// Whether a staged `auth.json.tmp.<8hex>` is in the namespace: a
+    /// [`StopPolicy::Complete`] write a process exit interrupted, which may
+    /// hold a rotated grant (risk R70). `--resend` is refused while one exists.
+    ///
+    /// # Errors
+    ///
+    /// [`FileStoreError`] when the directory cannot be listed.
+    pub fn has_stray_tmp(&self) -> Result<bool, FileStoreError> {
+        let dir = rustix::fs::Dir::read_from(&self.ns.fd).map_err(|errno| {
+            FileStoreError::errno(
+                format!("could not list `{}`", self.ns.dir_shown.display()),
+                errno,
+            )
+        })?;
+        for entry in dir {
+            let entry = entry.map_err(|errno| {
+                FileStoreError::errno(
+                    format!("could not list `{}`", self.ns.dir_shown.display()),
+                    errno,
+                )
+            })?;
+            let name = entry.file_name().to_string_lossy();
+            if name.starts_with(TMP_PREFIX) && is_named_file(&name) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The Codex daemon evidence in this namespace right now (decision D-032).
+    pub fn daemon_evidence(&self, cancel: &Cancel) -> DaemonEvidence {
+        home::daemon_evidence(&self.ns.dir_shown, cancel)
     }
 
     /// Removes `auth.json`, the pending pair, staged temporaries and the
@@ -781,7 +971,90 @@ impl<'g> OwnedNamespace<'g> {
             digest8_before: digest8_of(before.as_ref()),
             digest8_after: None,
             ids: self.ns.ids(),
+            #[cfg(feature = "testing")]
+            pending_audit: AuditPending::armed(WriteKind::Delete),
         })
+    }
+}
+
+/// Refuses a guard that is not this namespace's lock (review F7, plan AC119).
+///
+/// Shared by every entry point that acts on a namespace, so the rule has one
+/// implementation: a second copy is a second opinion about which lock proves
+/// what.
+fn check_guard(
+    paths: &Paths,
+    user: &str,
+    acct: &str,
+    guard: &CodexNamespaceGuard,
+) -> Result<(), FileStoreError> {
+    let expected = paths.codex_lock_path(user, acct).map_err(refused)?;
+    if guard.path() == expected {
+        return Ok(());
+    }
+    Err(FileStoreError::io(
+        format!(
+            "the lock held is `{}`, not `{}`; refusing to open that namespace",
+            guard.path().display(),
+            expected.display()
+        ),
+        io::Error::from(io::ErrorKind::PermissionDenied),
+    ))
+}
+
+/// Removes the refresh marker of a namespace whose directory is already gone.
+///
+/// # Why this is not `OwnedNamespace::remove_named_files`
+///
+/// [`OwnedNamespace::open`] **creates** the directory it opens, so
+/// `accounts remove --delete-secret` cannot go through it to clean up after a
+/// credential that is no longer there: it would create the namespace in order
+/// to delete it. The marker does not live in the namespace — it is
+/// `codex/.state/<user>+<acct>.refresh` — so it outlived that skip with
+/// nothing left referencing it once the registry row was dropped. This removes
+/// the marker and only the marker: the one directory it opens is
+/// `codex/.state/`, and a missing one means there was no marker.
+///
+/// `Ok(None)` is "there was none": nothing was written, so there is nothing to
+/// audit and no `delete` line is owed (plan AC125). `Ok(Some(receipt))` is a
+/// removal that happened, and the caller audits it like any other write.
+///
+/// # Errors
+///
+/// [`FileStoreError`] when `guard` is not this namespace's lock — the same
+/// check [`OwnedNamespace::open`] makes, because this is the same authority to
+/// write — and when the unlink itself fails.
+pub fn remove_orphaned_refresh_state(
+    paths: &Paths,
+    owned: OwnedRecord<'_>,
+    guard: &CodexNamespaceGuard,
+) -> Result<Option<WriteReceipt>, FileStoreError> {
+    check_guard(paths, owned.user(), owned.acct(), guard)?;
+    let state = RefreshStateFile::new(paths, owned.user(), owned.acct())?;
+    if !state.remove()? {
+        return Ok(None);
+    }
+    Ok(Some(WriteReceipt {
+        kind: WriteKind::Delete,
+        digest8_before: None,
+        digest8_after: None,
+        ids: (owned.user().to_owned(), owned.acct().to_owned()),
+        #[cfg(feature = "testing")]
+        pending_audit: AuditPending::armed(WriteKind::Delete),
+    }))
+}
+
+/// Writer 1's pending spec: what the merge was built on, and its new expiry.
+fn refresh_spec<'a>(credentials: &'a LockedCredentials<'_>) -> PendingSpec<'a> {
+    PendingSpec {
+        target_name: AUTH_FILE,
+        pending_name: PENDING_FILE,
+        meta_name: PENDING_META,
+        prior: credentials.base_digests(),
+        expires_at_ms: credentials
+            .credentials()
+            .access_expires_at()
+            .and_then(|exp| exp.checked_mul(1000)),
     }
 }
 
@@ -865,11 +1138,14 @@ impl<'g> InstallNamespace<'g> {
         if let Err(err) = self.state.reset_for_login() {
             tracing::warn!(error = %err, "the refresh marker could not be reset after a login install");
         }
+        let kind = WriteKind::LoginInstall { overwrote: before.is_some() };
         let receipt = WriteReceipt {
-            kind: WriteKind::LoginInstall { overwrote: before.is_some() },
+            kind,
             digest8_before: before.flatten().as_ref().and_then(|d| digest8_of(Some(d))),
             digest8_after: digest8_of(self.login.doc().digests().as_ref()),
             ids: self.ns.ids(),
+            #[cfg(feature = "testing")]
+            pending_audit: AuditPending::armed(kind),
         };
         Ok((receipt, self.login.identity()))
     }
@@ -889,6 +1165,23 @@ pub enum UnknownClass {
     Interrupted,
     /// A TLS failure during or before the send.
     Tls,
+    /// The response was applied and could be neither written nor parked
+    /// (plan section 3.3, `ambiguous (write_failed)`; ledger #272 ruling 2).
+    WriteFailed,
+}
+
+impl UnknownClass {
+    /// The word a row, an audit line and `doctor` carry.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ambiguous => "ambiguous",
+            Self::ServerError => "server_error",
+            Self::RateLimited => "rate_limited",
+            Self::Interrupted => "interrupted",
+            Self::Tls => "tls",
+            Self::WriteFailed => "write_failed",
+        }
+    }
 }
 
 /// How a sent refresh definitely ended, for clearing its marker.
@@ -945,6 +1238,35 @@ pub struct RefreshState {
     /// When a refresh was last sent, for the floor.
     #[serde(default, with = "ts_opt")]
     pub last_sent_at: Option<Timestamp>,
+    /// The token host's `earliest_refresh_at` for the grant it came with (fact
+    /// F80, ledger 282a): no automatic refresh of that grant before `at`.
+    #[serde(default)]
+    pub earliest_refresh: Option<EarliestRefresh>,
+    /// The refresh digest prefix of a grant the token host called dead. While
+    /// the file still holds it the row is `needs login` and nothing is sent
+    /// again (invariant I26: a dead token is not re-sent pass after pass).
+    #[serde(default)]
+    pub dead_digest8: Option<String>,
+}
+
+/// A server floor on refreshing one grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EarliestRefresh {
+    /// The refresh digest prefix of the grant the floor belongs to.
+    pub grant_digest8: String,
+    /// No automatic refresh before this.
+    #[serde(with = "ts")]
+    pub at: Timestamp,
+}
+
+/// What a definite outcome leaves behind in the marker besides the cleared
+/// send.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Settled {
+    /// The new grant's server floor, when the response carried one.
+    pub earliest_refresh: Option<EarliestRefresh>,
+    /// The grant the server called dead, when it did.
+    pub dead_digest8: Option<String>,
 }
 
 fn default_floor() -> u32 {
@@ -963,6 +1285,8 @@ impl Default for RefreshState {
             resent: false,
             retry_after: None,
             last_sent_at: None,
+            earliest_refresh: None,
+            dead_digest8: None,
         }
     }
 }
@@ -1017,7 +1341,14 @@ pub struct RefreshStateFile {
 
 impl RefreshStateFile {
     /// The marker for one namespace.
-    fn new(paths: &Paths, user: &str, acct: &str) -> Result<Self, FileStoreError> {
+    ///
+    /// `pub(crate)` since S35 (deviation D1): `agctl codex doctor` renders a
+    /// namespace's marker, and every other route to one goes through
+    /// [`OwnedNamespace::open`], which **creates** the namespace directory —
+    /// a read-only command must not. Only the reader widens: every mutator
+    /// below stays `pub(super)`, so nothing outside `provider::codex` can
+    /// write a marker (invariant I26, plan AC122 clause 11).
+    pub(crate) fn new(paths: &Paths, user: &str, acct: &str) -> Result<Self, FileStoreError> {
         let shown = paths.codex_refresh_state_path(user, acct).map_err(refused)?;
         let name = shown
             .file_name()
@@ -1249,6 +1580,54 @@ impl RefreshStateFile {
         state.class = None;
         state.resent = false;
         state.retry_after = None;
+        self.store(&state)
+    }
+
+    /// Clears the in-flight marker after a definite outcome and records what it
+    /// leaves behind, in one durable write: the new grant's server floor, or
+    /// the grant the server called dead.
+    pub(super) fn settle_inflight(
+        &self,
+        _outcome: DefiniteOutcome,
+        settled: Settled,
+    ) -> Result<(), FileStoreError> {
+        let mut state = self.load_for_update()?;
+        state.inflight = None;
+        state.ambiguous_since = None;
+        state.class = None;
+        state.resent = false;
+        state.retry_after = None;
+        state.earliest_refresh = settled.earliest_refresh;
+        state.dead_digest8 = settled.dead_digest8;
+        self.store(&state)
+    }
+
+    /// Restores the unknown marker after a `--resend` that ended without a
+    /// definite answer about the grant (review S32-C2 F1): the in-flight entry
+    /// and its class stay, and `resent` says whether the re-send counts as
+    /// spent. Refuses when there is no classified in-flight send to restore.
+    pub(super) fn restore_unknown(&self, resent: bool) -> Result<(), FileStoreError> {
+        let mut state = self.load_for_update()?;
+        if state.inflight.is_none() || state.class.is_none() {
+            return Err(FileStoreError::Json(format!(
+                "`{}` records no unknown refresh to restore",
+                self.shown.display()
+            )));
+        }
+        state.resent = resent;
+        self.store(&state)
+    }
+
+    /// Counts a sent refresh that a 401 followed: the floor doubles, 60 → 120
+    /// → 240 minutes, and the count saturates (decision D-035).
+    pub(super) fn record_did_not_help(&self) -> Result<(), FileStoreError> {
+        let mut state = self.load_for_update()?;
+        state.did_not_help = state.did_not_help.saturating_add(1);
+        state.floor_min = match state.did_not_help {
+            0 => DEFAULT_FLOOR_MIN,
+            1 => DEFAULT_FLOOR_MIN.saturating_mul(2),
+            _ => DEFAULT_FLOOR_MIN.saturating_mul(4),
+        };
         self.store(&state)
     }
 

@@ -923,6 +923,102 @@ pub(crate) fn read_log_at(
     })
 }
 
+/// [`read_log_at`]'s open, but handing the caller one line at a time instead
+/// of the whole file.
+///
+/// Returns whether a log was there at all: `Ok(false)` for an absent one, the
+/// same as `read_log_at`'s `None`.
+///
+/// # Why a second reader
+///
+/// `read_log_at` answers "show me the tail", which is a bounded question, and
+/// it holds the file in memory to answer it. A caller that must consult
+/// **every** line — `codex doctor` asking which keychain items a refused
+/// login left behind, where the answer can be a thousand writes back — would
+/// turn an append-only log into a whole-file allocation that grows with the
+/// user's history. This reads through a buffer instead, so the memory it
+/// needs is `max_line_bytes` plus the buffer, whatever the log's size.
+///
+/// A line longer than `max_line_bytes`, and a line that is not UTF-8, is
+/// skipped rather than refused: neither is a line agctl wrote, and a reader
+/// asked to find agctl's own entries must not be stopped by somebody else's.
+/// The bound is the caller's, because only the caller knows how long its own
+/// entries are.
+///
+/// # Errors
+///
+/// As [`read_log_at`], apart from the absent case.
+pub(crate) fn for_each_line_at(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    path: &Path,
+    max_line_bytes: usize,
+    mut visit: impl FnMut(&str),
+) -> Result<bool, AppError> {
+    if !is_single_component(name) {
+        return Err(refused(path, "its name is not a single path component"));
+    }
+
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = match rustix::fs::openat(dir, name, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(errno) if errno == Errno::NOENT => return Ok(false),
+        Err(errno) => return Err(refused(path, &why_open_failed(dir, name, errno))),
+    };
+
+    let failed = |err: io::Error| AppError::Io {
+        context: format!("could not read the audit log `{}`", path.display()),
+        source: err,
+    };
+    let mut reader = io::BufReader::new(File::from(fd));
+    let mut line: Vec<u8> = Vec::new();
+    // Set when the current line has already passed the bound: its remaining
+    // bytes are consumed and dropped rather than collected, so one enormous
+    // line costs time and not memory.
+    let mut over_bound = false;
+    loop {
+        let (consumed, complete) = {
+            let available = io::BufRead::fill_buf(&mut reader).map_err(failed)?;
+            if available.is_empty() {
+                break;
+            }
+            match available.iter().position(|&byte| byte == b'\n') {
+                Some(end) => {
+                    over_bound |= line.len().saturating_add(end) > max_line_bytes;
+                    if !over_bound {
+                        line.extend_from_slice(&available[..end]);
+                    }
+                    (end.saturating_add(1), true)
+                }
+                None => {
+                    over_bound |= line.len().saturating_add(available.len()) > max_line_bytes;
+                    if !over_bound {
+                        line.extend_from_slice(available);
+                    }
+                    (available.len(), false)
+                }
+            }
+        };
+        io::BufRead::consume(&mut reader, consumed);
+        if complete {
+            if !over_bound && let Ok(text) = str::from_utf8(&line) {
+                visit(text);
+            }
+            line.clear();
+            over_bound = false;
+        }
+    }
+    // A final line with no terminating newline is still a line: a writer that
+    // was interrupted between the bytes and the `\n` leaves one.
+    if !over_bound
+        && !line.is_empty()
+        && let Ok(text) = str::from_utf8(&line)
+    {
+        visit(text);
+    }
+    Ok(true)
+}
+
 /// The directory the log lives in, opened without following a link.
 ///
 /// Anchored at [`Paths::config_dir`] and walked down to

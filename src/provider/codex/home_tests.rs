@@ -110,6 +110,30 @@ fn base_url_refuses_credentials_in_the_url() {
 }
 
 #[test]
+fn base_url_keeps_the_endpoint_and_drops_everything_after_it() {
+    // Review S35 C4: userinfo was refused, but an endpoint authenticated by a
+    // query parameter walked through — and `doctor` prints this string. The
+    // host and the path are what a reader needs in order to recognise their
+    // own override; nothing after the `?` is.
+    for text in [
+        format!("chatgpt_base_url = 'https://h.invalid/v1?key={}'\n", testkit::AK_SENTINEL),
+        format!("chatgpt_base_url = 'https://h.invalid/v1#{}'\n", testkit::AK_SENTINEL),
+        format!("chatgpt_base_url = 'https://h.invalid/v1?a=1&token={}#f'\n", testkit::RT_SENTINEL),
+    ] {
+        let parsed = parse_config(&text).0.base_url;
+        assert_eq!(parsed.as_deref(), Some("https://h.invalid/v1"), "{text}");
+        testkit::assert_no_needles(&format!("{parsed:?}"), &text);
+    }
+
+    // An empty query is still a query: `?` alone does not survive either, so
+    // the rendered string cannot end in a dangling separator.
+    assert_eq!(
+        parse_config("chatgpt_base_url = 'https://h.invalid/v1?'\n").0.base_url.as_deref(),
+        Some("https://h.invalid/v1")
+    );
+}
+
+#[test]
 fn an_unparseable_config_is_a_line_number_and_nothing_else() {
     // Plan AC116 (unit half), invariant I31: the bad line carries a key
     // sentinel; the note carries a line number, and no rendering of the result
@@ -237,9 +261,14 @@ fn open_readonly_nofollow_flags_cannot_create_or_write() {
 }
 
 fn write_pid_record(home: &Path, pid: u32, mtime: Option<Timestamp>) {
+    write_named_pid_record(home, "app-server.pid", pid, mtime);
+}
+
+/// The same record under either of F83's two names.
+fn write_named_pid_record(home: &Path, name: &str, pid: u32, mtime: Option<Timestamp>) {
     let daemon = home.join("app-server-daemon");
     fs::create_dir_all(&daemon).expect("mkdir");
-    let path = daemon.join("app-server.pid");
+    let path = daemon.join(name);
     let body = format!(
         r#"{{"pid":{pid},"processStartTime":"Wed Sep 16 21:40:50 2026","executableIdentity":{{"digest":"abc"}}}}"#
     );
@@ -296,8 +325,14 @@ fn daemon_evidence_classifies_the_pid_record() {
     fs::write(home.path().join("app-server-daemon/app-server.pid"), b"12").expect("write");
     assert_eq!(
         daemon_evidence(home.path(), &cancel),
-        DaemonEvidence::ArtefactOnly,
-        "not the F83 JSON shape"
+        DaemonEvidence::RecordUnreadable,
+        "not the F83 JSON shape: a record being published blocks a refresh (review S30 F8)"
+    );
+    fs::write(home.path().join("app-server-daemon/app-server.pid"), b"").expect("write");
+    assert_eq!(
+        daemon_evidence(home.path(), &cancel),
+        DaemonEvidence::RecordUnreadable,
+        "an empty, torn record"
     );
 
     // A link at the record is refused by the open, never followed.
@@ -309,7 +344,11 @@ fn daemon_evidence_classifies_the_pid_record() {
         home.path().join("app-server-daemon/app-server.pid"),
     )
     .expect("symlink");
-    assert_eq!(daemon_evidence(home.path(), &cancel), DaemonEvidence::ArtefactOnly);
+    assert_eq!(
+        daemon_evidence(home.path(), &cancel),
+        DaemonEvidence::RecordUnreadable,
+        "a link at the record is refused, and refusing it blocks a refresh"
+    );
 }
 
 #[test]
@@ -343,4 +382,160 @@ fn this_file_names_no_process_environment() {
     let code = source.lines().filter(|line| !line.trim_start().starts_with("//"));
     assert!(code.clone().all(|line| !line.contains(&needle)), "home.rs reads the environment");
     assert_eq!(source.matches(&format!("\"{}\"", CODEX_HOME_ENV)).count(), 1);
+}
+
+// --- F83's second pid-record name (deviation D32) ---------------------------
+
+#[test]
+fn d32_a_live_daemon_is_seen_under_either_pid_record_name() {
+    // At 0.155.0-alpha.12 the name is `app-server.pid` only while the managed
+    // codex binary is under `<CODEX_HOME>/packages/standalone`, and `daemon.pid`
+    // otherwise. Reading one name let a live daemon read as `ArtefactOnly`,
+    // which the refresh gate passes with a note — fail-open.
+    let cancel = Cancel::new();
+    let me = std::process::id();
+    for name in ["app-server.pid", "daemon.pid"] {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_named_pid_record(home.path(), name, me, None);
+        assert_eq!(
+            daemon_evidence(home.path(), &cancel),
+            DaemonEvidence::PidAlive(me),
+            "a live daemon under `{name}` was not seen"
+        );
+    }
+}
+
+#[test]
+fn d32_a_torn_record_under_the_second_name_still_blocks() {
+    let cancel = Cancel::new();
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = home.path().join("app-server-daemon");
+    fs::create_dir_all(&daemon).expect("mkdir");
+    fs::write(daemon.join("daemon.pid"), b"{\"pid\":").expect("a torn record");
+
+    assert_eq!(
+        daemon_evidence(home.path(), &cancel),
+        DaemonEvidence::RecordUnreadable,
+        "a record being published under the new name must still stop a send (review S30 F8)"
+    );
+}
+
+#[test]
+fn d32_when_both_names_exist_the_stronger_evidence_wins() {
+    // A migrated host can hold both: nothing cleans the legacy record up.
+    let cancel = Cancel::new();
+    let me = std::process::id();
+
+    // Live under the new name, dead under the old one.
+    let home = tempfile::tempdir().expect("tempdir");
+    write_named_pid_record(home.path(), "app-server.pid", u32::MAX - 1, None);
+    write_named_pid_record(home.path(), "daemon.pid", me, None);
+    assert_eq!(daemon_evidence(home.path(), &cancel), DaemonEvidence::PidAlive(me));
+
+    // Live under the old name, dead under the new one: the same answer.
+    let home = tempfile::tempdir().expect("tempdir");
+    write_named_pid_record(home.path(), "app-server.pid", me, None);
+    write_named_pid_record(home.path(), "daemon.pid", u32::MAX - 1, None);
+    assert_eq!(daemon_evidence(home.path(), &cancel), DaemonEvidence::PidAlive(me));
+
+    // A torn record outranks a dead one: a daemon may be starting.
+    let home = tempfile::tempdir().expect("tempdir");
+    write_named_pid_record(home.path(), "app-server.pid", u32::MAX - 1, None);
+    fs::write(home.path().join("app-server-daemon/daemon.pid"), b"{").expect("a torn record");
+    assert_eq!(daemon_evidence(home.path(), &cancel), DaemonEvidence::RecordUnreadable);
+
+    // …and a live pid outranks a torn record.
+    write_named_pid_record(home.path(), "app-server.pid", me, None);
+    assert_eq!(daemon_evidence(home.path(), &cancel), DaemonEvidence::PidAlive(me));
+}
+
+#[test]
+fn d32_the_record_tolerates_members_this_crate_does_not_name() {
+    // Upstream added `processIdentity` at alpha.12 (spelled
+    // `linuxProcessIdentity` on Linux) and may add more. `PidRecord` models
+    // none of them and must not have to: `serde` ignores unknown members
+    // unless `deny_unknown_fields` is set, and the unknown-member case below is
+    // what proves this type does not set it. Modelling a member nothing
+    // compares would be dead code pretending to be a pin (review S33-C3b F1).
+    let cancel = Cancel::new();
+    let me = std::process::id();
+    let three =
+        format!(r#"{{"pid":{me},"processStartTime":"x","executableIdentity":{{"digest":"d"}}}}"#);
+    let bodies = [
+        // The shape on disk today, and the shape before `executableIdentity`.
+        format!(r#"{{"pid":{me}}}"#),
+        three.clone(),
+        // The fourth member, under both spellings.
+        format!(
+            r#"{{"pid":{me},"processStartTime":"x","executableIdentity":{{"digest":"d"}},"processIdentity":{{"pidfdInode":7}}}}"#
+        ),
+        format!(
+            r#"{{"pid":{me},"processStartTime":"x","executableIdentity":{{"digest":"d"}},"linuxProcessIdentity":{{"pidfdInode":7}}}}"#
+        ),
+        // A member no version of Codex has ever written: the general case.
+        format!(
+            r#"{{"pid":{me},"processStartTime":"x","executableIdentity":{{"digest":"d"}},"somethingCodexAddsLater":[1,2,3]}}"#
+        ),
+    ];
+
+    let mut home = tempfile::tempdir().expect("tempdir");
+    let daemon = home.path().join("app-server-daemon");
+    fs::create_dir_all(&daemon).expect("mkdir");
+    fs::write(daemon.join("daemon.pid"), &three).expect("write");
+    let baseline = daemon_evidence(home.path(), &cancel);
+    assert_eq!(baseline, DaemonEvidence::PidAlive(me), "the three-member record must parse");
+
+    for body in bodies {
+        home = tempfile::tempdir().expect("tempdir");
+        let daemon = home.path().join("app-server-daemon");
+        fs::create_dir_all(&daemon).expect("mkdir");
+        fs::write(daemon.join("daemon.pid"), &body).expect("write");
+        assert_eq!(
+            daemon_evidence(home.path(), &cancel),
+            baseline,
+            "this record shape did not read the same as the three-member one: {body}"
+        );
+    }
+}
+
+#[test]
+fn f3_two_live_records_report_the_one_written_last() {
+    // A migrated host can hold both names with both processes alive; the
+    // leftover record must not be the one the row names (review S33-C3b F3).
+    // Two *different* live pids are needed for the assertion to distinguish
+    // which record was read, so this test uses its own and its parent's, and
+    // sets both mtimes after this process started so neither is `Recycled`.
+    let cancel = Cancel::new();
+    let me = std::process::id();
+    let parent = std::os::unix::process::parent_id();
+    assert_ne!(me, parent, "this test needs two live pids");
+    let now = Timestamp::now();
+    let later = now + SignedDuration::from_secs(5);
+
+    let home = tempfile::tempdir().expect("tempdir");
+    write_named_pid_record(home.path(), "app-server.pid", me, Some(now));
+    write_named_pid_record(home.path(), "daemon.pid", parent, Some(later));
+    assert_eq!(
+        daemon_evidence(home.path(), &cancel),
+        DaemonEvidence::PidAlive(parent),
+        "the stale legacy record was reported over the current one"
+    );
+
+    // The same the other way round, so the answer is the mtime and not the
+    // order of `DAEMON_PID_FILES`.
+    let home = tempfile::tempdir().expect("tempdir");
+    write_named_pid_record(home.path(), "app-server.pid", me, Some(later));
+    write_named_pid_record(home.path(), "daemon.pid", parent, Some(now));
+    assert_eq!(
+        daemon_evidence(home.path(), &cancel),
+        DaemonEvidence::PidAlive(me),
+        "the tiebreak followed the file name rather than the write time"
+    );
+
+    // The tiebreak never weakens the verdict: a live record still beats a
+    // newer artefact.
+    let home = tempfile::tempdir().expect("tempdir");
+    write_named_pid_record(home.path(), "app-server.pid", me, Some(now));
+    write_named_pid_record(home.path(), "daemon.pid", u32::MAX - 1, Some(later));
+    assert_eq!(daemon_evidence(home.path(), &cancel), DaemonEvidence::PidAlive(me));
 }

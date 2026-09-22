@@ -41,6 +41,7 @@ use serde_json::Value;
 
 use crate::config::paths::FILE_MODE;
 use crate::config::paths::Paths;
+use crate::provider::Provider;
 use crate::secret::file_store::hex8;
 
 /// How long a cached response is served without asking the API again.
@@ -133,8 +134,20 @@ impl CacheEntry {
 /// usage figures. The readable prefix is kept only so a human looking in the
 /// cache directory can tell which file is whose.
 pub fn path(paths: &Paths, acct: &str, org: &str) -> PathBuf {
-    let digest = crate::provider::claude::namespace::sha8(&format!("{acct}/{org}"));
-    paths.cache_dir().join(format!("{}.{}.{digest}.json", file_safe(acct), file_safe(org)))
+    path_for(paths, Provider::Claude, acct, org)
+}
+
+/// [`path`] under one provider's cache directory
+/// ([`Paths::cache_dir_for`]): the same naming rule, so the Codex cache is
+/// keyed by `(chatgpt_user_id, chatgpt_account_id)` the way Claude's is keyed
+/// by `(account, organization)`.
+pub fn path_for(paths: &Paths, provider: Provider, first: &str, second: &str) -> PathBuf {
+    let digest = crate::provider::claude::namespace::sha8(&format!("{first}/{second}"));
+    paths.cache_dir_for(provider).join(format!(
+        "{}.{}.{digest}.json",
+        file_safe(first),
+        file_safe(second)
+    ))
 }
 
 /// The longest run of one identifier that reaches a cache file name.

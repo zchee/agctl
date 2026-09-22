@@ -1,19 +1,21 @@
-# Re-verify after a Claude Code upgrade
+# Re-verify after a Claude Code or Codex CLI upgrade
 
-agctl reads a machine that Claude Code owns. Its behaviour is not derived from a published
-interface but from facts read directly out of Claude Code's shipped binary, and any Claude
-Code release can change them without notice. §1–§4 are the four contracts agctl is built on
-most directly; §5 re-establishes the eighteen further facts (F42–F59) the write path and the
-lock protocol lean on. Work through the whole file after every Claude Code upgrade, and
-before every agctl release.
+agctl reads two machines it does not own. Its behaviour is not derived from a published
+interface but from facts read directly out of each peer's shipped binary, and any release of
+either can change them without notice. §1–§4 are the four Claude Code contracts agctl is
+built on most directly; §5 re-establishes the eighteen further Claude facts (F42–F59) the
+write path and the lock protocol lean on; §6 does the same for the five Codex contracts
+(F61, F62, F65, F67, F90) phase 3 depends on. Work through §1–§5 after every Claude Code
+upgrade, §6 after every Codex CLI upgrade, and all of it before every agctl release.
 
-**Every command here is read-only.** Nothing writes, nothing runs `claude`, nothing touches
-the keychain.
+**Every command here is read-only.** Nothing writes, nothing runs `claude` or `codex`,
+nothing touches the keychain.
 
 Set the version under test once:
 
 ```sh
 CC=~/.local/share/claude/versions/2.1.266     # or whatever `claude --version` reports
+CODEX=$(command -v codex)                     # or whatever `codex --version` reports
 ```
 
 Claude Code ships as a single self-contained Mach-O with the JavaScript bundle embedded, so
@@ -309,12 +311,261 @@ names the pids.
 
 ---
 
+## 6. Codex — the five contracts phase 3 depends on
+
+Phase 3 reads a second peer, the Codex CLI, the same way phases 1 and 2 read Claude Code:
+facts pulled from its shipped binary and source rather than from a published interface. The
+phase-3 plan's fact register (`.omc/plans/agentctl-codex-phase3.md` §0.1–§0.2, evidence
+captured in `.omc/handoffs/p3-codex-facts.md` and `p3-w0-facts.md`) establishes thirty-six
+such facts, F60–F95 with no gaps (14 in "0.1 Register", F60–F73; 22 in "0.2 What W0 must
+establish", F74–F95). §6.1–§6.5 below are the five — F61, F62, F65, F67, F90 — that agctl's
+Codex support actually depends on at runtime, so they are the ones worth re-checking on
+every Codex CLI upgrade; the other thirty-one settled a design decision once (the login
+mechanism, the refresh policy's error classes' host behaviour, the daemon's pid-file shape,
+among others) and are not re-derived here — read the fact register directly if one of them
+is ever in doubt.
+
+Last verified, per fact — not all five at once, and this file does not claim otherwise:
+
+- **F61, F62, F65, F67**: read from source and the installed binary at **codex-cli
+  0.155.0-alpha.4** (upstream `rust-v0.155.0-alpha.4`, commit
+  `66eab8ece44141ff92707868269e1d53b40c4ac5`), 2026-09-16, recorded in
+  `.omc/handoffs/p3-codex-facts.md`. **Not re-checked since.** The later recheck lane
+  (`.omc/handoffs/p3-w0-facts-recheck.md`, 2026-09-19, against the locally installed
+  **0.155.0-alpha.12**) covers a different slice of the register (F74–F77, F83–F86 there)
+  and does not touch any of these four.
+- **F90**: read the same way at alpha.4, 2026-09-16, recorded in
+  `.omc/handoffs/p3-w0-facts.md`, and independently re-checked and confirmed **UNCHANGED**
+  at alpha.12 (`.omc/handoffs/p3-w0-facts-recheck.md`, 2026-09-19): `login/src/auth/
+  storage.rs` is byte-identical at both tags — the cited lines hold verbatim.
+
+Re-run every grep below whenever the installed Codex CLI moves past alpha.12, and treat
+F61/F62/F65/F67 as due for a first re-check regardless of version, since none has been
+looked at again since alpha.4.
+
+### 6.1 F61 — the `auth.json` shape
+
+**What agctl depends on.** `$CODEX_HOME/auth.json` holds a serde struct `AuthDotJson` with
+**8 fields**: `auth_mode` (inferred by `resolved_mode()` when absent), `OPENAI_API_KEY`
+(always serialized, `null` when absent), `tokens` — a `TokenData` with **4 fields**:
+`id_token`, `access_token`, `refresh_token` (opaque, not a JWT) and `account_id` — plus
+`last_refresh`, `agent_identity`, `personal_access_token`, `bedrock_api_key`,
+`bedrock_access_keys`. agctl's own credential type (`Credentials`/`CodexIdentity` in
+`src/provider/codex/credentials.rs`) reads `tokens.account_id` — falling back to the
+id-token claim `chatgpt_account_id` when absent — the three token secrets by path, and
+`last_refresh`, and keeps every other member as an opaque `Value` so an unrecognised one
+round-trips through an agctl-initiated write instead of being dropped (see §6.5). The live
+access token's life is **10 days** — R59, and the reason the phase-3 plan's §9.6 live checks
+and every manual phase-3 command need `codex` to have run recently.
+
+```sh
+rg -a -o 'struct (AuthDotJson|TokenData) with [0-9]+ elements' "$CODEX"
+```
+
+**Expected, 0.155.0-alpha.4:**
+
+```
+struct AuthDotJson with 8 elements
+struct TokenData with 4 elements
+```
+
+**Fails if:** either count changes — a member was added, removed or renamed. Re-read
+`login/src/auth/storage.rs:41-63` and `login/src/token_data.rs:11-41` at the new tag and
+check whether `Credentials::account_id`/`last_refresh`/the three `SecretPath::Token` names in
+`src/provider/codex/credentials.rs` still name real fields.
+
+**Affected agctl code:** `src/provider/codex/credentials.rs`, `src/provider/codex/home.rs`
+(`$CODEX_HOME` resolution).
+
+---
+
+### 6.2 F62 — the store mode and the keychain service name
+
+**What agctl depends on.** The live store mode is **`file`** (`cli_auth_credentials_store`
+defaults to `file`, and this machine's `config.toml` sets it explicitly); under `keyring`,
+Codex's default ("Direct") layout writes one generic-password item, service **`"Codex
+Auth"`**, account **`cli|<first 16 hex of sha256(canonicalized CODEX_HOME)>`**, value = the
+whole `auth.json` document. `agctl codex doctor` and `login` both need that exact service
+name and account-derivation rule to tell an item **agctl's own login child** created from a
+foreign one — `KEYRING_SERVICE` and `keyring_account()` in `src/provider/codex/home.rs`.
+
+```sh
+rg -a -c '"Codex Auth"' "$CODEX"
+```
+
+**Expected, 0.155.0-alpha.4:** at least one hit — the service-name literal is embedded in the
+keyring backend. (Presence is what matters here, not an exact count: the string can legally
+appear more than once, e.g. in an error message that also names it.)
+
+**Fails if:** the string disappears, meaning the service name changed and every `Codex Auth`
+item agctl has ever attributed on this machine is now named after a retired convention.
+Re-read `core/src/config/auth_keyring.rs:85-117` and
+`login/src/auth/storage.rs:235-250,296-306` for the new name and the new
+account-derivation hash width.
+
+**Affected agctl code:** `src/provider/codex/home.rs` (`KEYRING_SERVICE`, `keyring_account`),
+`src/commands/codex/doctor.rs`.
+
+---
+
+### 6.3 F65 — the refresh trigger and request
+
+**What agctl depends on.** Codex refreshes proactively when `access_token.exp <= now + 5
+min` (falling back to `last_refresh < now - 8 days` only when `exp` cannot be parsed), by
+**`POST https://auth.openai.com/oauth/token`**, `Content-Type: application/json`, body
+`{"client_id": "app_EMoamEEZ73f0CkXaXp7hrann", "grant_type": "refresh_token",
+"refresh_token": "<...>"}`. A response is classified **Permanent** — no further automatic
+retry — on 401, on 400 `invalid_grant`, or on a body `error` in
+`{refresh_token_expired, refresh_token_reused, refresh_token_invalidated}` (Codex's own
+`classify_refresh_token_failure`; an earlier plan draft paraphrased the third code as
+`revoked` — the tree follows the source's literal spelling, confirmed at S32 review, ledger
+`p3-s32-review-request.md:438`); anything else is transient. agctl's own D-035 refresh state
+machine (`src/provider/codex/oauth.rs`, `src/provider/codex/refresh.rs`) mirrors this client
+id, this URL and this permanent/transient split, but is stricter than Codex's own client: it
+never re-sends automatically at all — `agctl codex accounts refresh --resend` is the one
+audited, user-issued exception, gated an hour behind an unknown outcome.
+
+```sh
+rg -a -o 'https://auth\.openai\.com[A-Za-z0-9/_.-]*' "$CODEX" | sort -u
+rg -a -c 'app_EMoamEEZ73f0CkXaXp7hrann' "$CODEX"
+rg -a -o 'refresh_token_(expired|reused|invalidated|revoked)' "$CODEX" | sort -u
+```
+
+**Expected, 0.155.0-alpha.4:**
+
+```
+https://auth.openai.com/oauth/authorize
+https://auth.openai.com/oauth/revoke
+https://auth.openai.com/oauth/token
+```
+
+(client-id count: at least 1; the third grep: exactly
+`refresh_token_expired`/`refresh_token_invalidated`/`refresh_token_reused`, never
+`refresh_token_revoked`.)
+
+The `/oauth/authorize` URL above is Codex's own, read from its binary — it is not a seam
+agctl exposes. AC110 originally named a fourth Codex seam, `AGCTL_CODEX_AUTHORIZE_URL`, on
+the assumption agctl would build this URL itself; it does not (D-037's L2' login shells to
+the real `codex login` instead), so no such override exists anywhere in this tree, and AC110
+is amended to the three Codex seams that actually do (S37, lead ruling).
+
+**Fails if:** the token URL or the client id changes, or the third grep's result set changes
+— gaining `refresh_token_revoked` or losing one of the three current codes means
+`src/provider/codex/oauth.rs`'s `classify_refresh_token_failure` match table is stale.
+Re-read `login/src/auth/manager.rs` at the new tag — the line numbers above
+(`191-204,1572-1651,1710-1738`) are alpha.4 anchors, recorded 2026-09-16 and never
+reconfirmed: F65 itself was not part of the one later recheck this repository has done
+(alpha.12, 2026-09-19), and a *different* fact that touches the same file, F93, moved by a
+few lines when that recheck did cover it (`p3-w0-facts-recheck.md`: its `manager.rs:200-202`
+anchor became `208-212`). Treat these line numbers as approximate past alpha.4, and confirm
+them by content (the client id, the URL, the three body-error codes above), not by line
+number alone.
+
+**Affected agctl code:** `src/provider/codex/oauth.rs` (`TOKEN_URL`, `CLIENT_ID`, the
+permanent/transient classification), `src/provider/codex/refresh.rs` (the D-035 send/marker
+state machine).
+
+---
+
+### 6.4 F67 — the usage endpoint
+
+**What agctl depends on.** Codex's own `/status` and TUI rate-limit display read **`GET
+{chatgpt_base_url}/wham/usage`**, default `https://chatgpt.com/backend-api/wham/usage`, with
+`Authorization: Bearer <access_token>`, **`ChatGPT-Account-Id: <tokens.account_id>`**, and
+`X-OpenAI-Fedramp: true` when the account is fedramp. `src/provider/codex/usage.rs` reads the
+same endpoint and the same two identifying headers, and parses `rate_limit.{primary,secondary}`
+windows (`used_percent`, `limit_window_seconds`, `reset_after_seconds`, `reset_at`) plus
+`credits` the same way the TUI's mapped `RateLimitSnapshot` does.
+
+```sh
+rg -a -c '/wham/usage' "$CODEX"
+rg -a -o 'chatgpt_base_url = "[^"]*"' "$CODEX"
+rg -a -c 'ChatGPT-Account-Id' "$CODEX"
+```
+
+**Expected, 0.155.0-alpha.4:**
+
+```
+chatgpt_base_url = "https://chatgpt.com/backend-api/"
+```
+
+(both count greps: at least 1 each.)
+
+**Fails if:** the base URL, the path, or either identifying header's name changes, or the
+window shape (`used_percent`/`limit_window_seconds`/`reset_after_seconds`/`reset_at`) gains
+or loses a member in a way the current parse would reject. Re-read
+`backend-client/src/client/rate_limit_resets.rs:23-80` and the
+`RateLimitWindowSnapshot` model at the new tag.
+
+**Affected agctl code:** `src/provider/codex/usage.rs`.
+
+---
+
+### 6.5 F90 — the `auth.json` serializer
+
+**What agctl depends on.** Codex writes `auth.json` with `serde_json::to_string_pretty`
+(2-space indent, `": "` separators, **no trailing newline**), through
+`OpenOptions::truncate(true).write(true).create(true)` with `mode(0o600)` applied only on
+**create** — an existing file keeps whatever mode it already had. `AuthDotJson` has **no**
+`#[serde(flatten)]` catch-all, so **Codex's own next save silently drops any member it does
+not recognise**, including one agctl might have added. agctl's write path
+(`Credentials::write`, `src/provider/codex/credentials.rs`) uses `serde_json::to_writer_pretty`
+over the whole parsed `Value` rather than a fixed struct, specifically so an unrecognised
+member survives an agctl-initiated write; it cannot make Codex preserve one on Codex's own
+next save, which is why AC87 is relaxed to parse-equal plus key order plus "unknown members
+verbatim *on agctl's side*" rather than a byte-identical round trip.
+
+```sh
+rg -a -o 'struct AuthDotJson with [0-9]+ elements' "$CODEX"
+rg -a -c 'truncate(true)' "$CODEX"
+```
+
+**Expected, 0.155.0-alpha.4:** `struct AuthDotJson with 8 elements` (same grep and count as
+§6.1 — F61 and F90 share the struct declaration); the second grep: at least 1 (Rust debug
+symbols for `OpenOptions` builder calls are not guaranteed to survive optimization, so treat
+a 0 here as inconclusive rather than a failure, and fall back to reading
+`login/src/auth/storage.rs:206-223` directly).
+
+**Fails if:** Codex switches to a writer that fsyncs or renames (making the torn-read window
+F66 assumes narrower or gone), or `AuthDotJson` gains a flatten catch-all (which would change
+what "Codex drops unknown members" means for AC87). Re-read
+`login/src/auth/storage.rs:206-223` at the new tag.
+
+**Affected agctl code:** `src/provider/codex/credentials.rs` (`Credentials::write`), and
+every AC87 test fixture under `fixtures/codex/`.
+
+**A residual this section does not cover.** Two properties are held inside agctl rather than by
+any Codex-binary fact, so no Codex CLI upgrade touches them — and neither is held the way a
+reader might assume. They are stated separately here because one sentence used to claim both.
+
+*That no Codex command asks the keychain for one account's password* is held first by
+`tests/common/codex.rs`'s `checked`, which fails any e2e run whose fake `security` log records a
+`find-generic-password`, and second by `scripts/phase3-greps.sh`'s `codex_no_password_lookup`
+rule over the source. The grep is the second line of defence, not the first.
+
+*That every write receipt reaches the audit log* is held at run time by
+`src/provider/codex/auth_store.rs`'s `UNAUDITED_RECEIPT` panic-on-drop guard, which every receipt
+is born armed with — and by essentially nothing else. `phase3-greps.sh`'s `receipt_type`,
+`receipt_destructure`, `receipt_check` and `reached_audit` rules pin the type, three syntactic
+shapes, the guard's one spelling and its one disarmer; none of them follows a receipt from its
+binding to its audit, and an unaudited receipt planted at a real production site leaves them all
+green. **The guard therefore fires only on a path a test actually drives, and nothing in the tree
+requires a newly added receipt site to be driven by one.** The static AC119 source-reading family
+that used to state this here was **dropped from the phase-3 plan by user decision, 2026-09-22
+(ledger #460)** and its files are gone. None of this proves anything about the coverage of code
+added after it: do not read a green run as a substitute for a security review of new
+Codex-touching code.
+
+---
+
 ## After the checklist
 
 1. Record the version you checked and the date at the top of this file.
 2. Run the gate: `cargo fmt --check`, then `cargo clippy --all-targets --all-features
    -- -D warnings` and `cargo nextest run --all-features`.
-3. Run `scripts/release-gate.sh`.
+3. Run `scripts/release-gate.sh` — it also proves the three Codex seams (its own `seams`
+   array, mirrored in `.claude/skills/check/SKILL.md`'s table) absent from the release
+   artifact and `AGCTL_CODEX_USER_AGENT` present.
 4. If any contract moved, fix the affected code **and** the fixtures under
-   `fixtures/claude/` before releasing. A contract that changed silently is exactly the
-   failure mode this file exists to prevent.
+   `fixtures/claude/` or `fixtures/codex/` before releasing. A contract that changed silently
+   is exactly the failure mode this file exists to prevent.

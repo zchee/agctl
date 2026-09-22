@@ -128,6 +128,66 @@ mod against_the_fake_script {
         Harness { dir: plain.dir, reader: SecurityCli::new(wrapper, "example".to_owned(), ctx) }
     }
 
+    /// A `dump-keychain` listing in `security(1)`'s own format, one record per
+    /// `(service, account)`.
+    fn dump_text(records: &[(&str, &str)]) -> String {
+        let mut text = String::from(
+            "keychain: \"/Users/example/Library/Keychains/login.keychain-db\"\nversion: 512\n",
+        );
+        for (service, account) in records {
+            text.push_str("class: \"genp\"\nattributes:\n");
+            text.push_str(&format!("    0x00000007 <blob>=\"{service}\"\n"));
+            text.push_str(&format!("    \"acct\"<blob>=\"{account}\"\n"));
+            text.push_str(&format!("    \"svce\"<blob>=\"{service}\"\n"));
+        }
+        text
+    }
+
+    #[test]
+    fn list_services_uncached_takes_a_second_dump_and_returns_what_it_says() {
+        // Order A3 (i). `login` compares a listing taken before its child with
+        // one taken after; if the second were served from the first's memo, a
+        // `Codex Auth` item the child created would be invisible and the F95
+        // backstop would pass everything. Mutant: drop the memo clear.
+        let dir = TempDir::new().expect("tempdir");
+        let dump = dir.path().join("dump.txt");
+        let log = dir.path().join("argv.log");
+        std::fs::write(&dump, dump_text(&[("Claude Code-credentials", "example")]))
+            .expect("dump #1");
+        let harness = wired(&[
+            ("AGCTL_FAKE_SECURITY_DUMP", dump.display().to_string()),
+            ("AGCTL_FAKE_SECURITY_LOG", log.display().to_string()),
+        ]);
+
+        let first = harness.reader.list_services("Codex Auth").expect("listing #1");
+        assert!(first.is_empty(), "no Codex item before the login: {first:?}");
+
+        // The child "creates" a keychain item between the two listings.
+        std::fs::write(
+            &dump,
+            dump_text(&[
+                ("Claude Code-credentials", "example"),
+                ("Codex Auth", "cli|0123456789abcdef"),
+            ]),
+        )
+        .expect("dump #2");
+
+        let second = harness.reader.list_services_uncached("Codex Auth").expect("listing #2");
+        let accounts: Vec<Option<String>> = second.into_iter().map(|entry| entry.account).collect();
+        assert_eq!(
+            accounts,
+            [Some("cli|0123456789abcdef".to_owned())],
+            "listing #2 is the second dump"
+        );
+
+        let dumps = std::fs::read_to_string(&log)
+            .expect("the fake logged its argv")
+            .lines()
+            .filter(|line| line.starts_with("dump-keychain"))
+            .count();
+        assert_eq!(dumps, 2, "two `dump-keychain` invocations, not one and a memo");
+    }
+
     #[test]
     fn a_default_preflight_is_unlocked() {
         let harness = harness();

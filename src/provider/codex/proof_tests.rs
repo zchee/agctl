@@ -45,8 +45,7 @@ fn a_verified_login_proves_itself_as_an_unregistered_owned_record() {
     let report = PostExitReport::from_child(
         Vec::new(),
         Vec::new(),
-        false,
-        Vec::new(),
+        testkit::clean_survey(),
         testkit::exit_status(0),
     );
     let login = auth_store::verify_login(scratch.path(), &report).expect("verifies");
@@ -64,20 +63,21 @@ fn a_verified_login_proves_itself_as_an_unregistered_owned_record() {
 #[test]
 fn a_post_exit_report_is_clean_only_when_nothing_was_left_behind() {
     let ok = testkit::exit_status(0);
-    assert!(PostExitReport::from_child(Vec::new(), Vec::new(), false, Vec::new(), ok).clean());
     assert!(
-        PostExitReport::from_child(Vec::new(), Vec::new(), false, Vec::new(), ok)
+        PostExitReport::from_child(Vec::new(), Vec::new(), testkit::clean_survey(), ok).clean()
+    );
+    assert!(
+        PostExitReport::from_child(Vec::new(), Vec::new(), testkit::clean_survey(), ok)
             .anomalies()
             .is_empty()
     );
-    let cases: [(&str, PostExitReport); 5] = [
+    let cases: [(&str, PostExitReport); 7] = [
         (
             "exit",
             PostExitReport::from_child(
                 Vec::new(),
                 Vec::new(),
-                false,
-                Vec::new(),
+                testkit::clean_survey(),
                 testkit::exit_status(2),
             ),
         ),
@@ -86,8 +86,7 @@ fn a_post_exit_report_is_clean_only_when_nothing_was_left_behind() {
             PostExitReport::from_child(
                 vec!["cli|0000".to_owned()],
                 Vec::new(),
-                false,
-                Vec::new(),
+                testkit::clean_survey(),
                 ok,
             ),
         ),
@@ -96,19 +95,51 @@ fn a_post_exit_report_is_clean_only_when_nothing_was_left_behind() {
             PostExitReport::from_child(
                 Vec::new(),
                 vec![PathBuf::from("/x")],
-                false,
-                Vec::new(),
+                testkit::clean_survey(),
                 ok,
             ),
         ),
-        ("daemon", PostExitReport::from_child(Vec::new(), Vec::new(), true, Vec::new(), ok)),
+        (
+            "daemon",
+            PostExitReport::from_child(
+                Vec::new(),
+                Vec::new(),
+                testkit::survey_where(|s| {
+                    s.daemon_dir = true;
+                }),
+                ok,
+            ),
+        ),
         (
             "lock",
             PostExitReport::from_child(
                 Vec::new(),
                 Vec::new(),
-                false,
-                vec![PathBuf::from("a.lock")],
+                testkit::survey_where(|s| {
+                    s.held_locks = vec![PathBuf::from("a.lock")];
+                }),
+                ok,
+            ),
+        ),
+        (
+            "odd lock",
+            PostExitReport::from_child(
+                Vec::new(),
+                Vec::new(),
+                testkit::survey_where(|s| {
+                    s.odd_locks = vec![PathBuf::from("wedge.lock")];
+                }),
+                ok,
+            ),
+        ),
+        (
+            "truncated survey",
+            PostExitReport::from_child(
+                Vec::new(),
+                Vec::new(),
+                testkit::survey_where(|s| {
+                    s.truncated = true;
+                }),
                 ok,
             ),
         ),
@@ -124,4 +155,35 @@ fn the_guard_reports_the_lock_it_holds() {
     let (_dir, paths) = testkit::store();
     let guard = testkit::lock_for(&paths, &testkit::owned_record(testkit::USER, testkit::ACCT));
     assert_eq!(guard.path(), paths.codex_lock_path(testkit::USER, testkit::ACCT).expect("path"));
+}
+
+#[test]
+fn an_odd_lock_is_named_only_by_a_final_component_agctl_would_have_written() {
+    // Review S37-b1b F2, the unit half. `anomalies()` is printed to the
+    // user's terminal, and these paths carry a name the login CHILD chose:
+    // `is_lock_name` is only `ends_with(".lock")`.
+    let mut survey = testkit::clean_survey();
+    survey.odd_locks = vec![
+        // Hostile: an escape byte, a command substitution and a needle, under
+        // a directory whose own path must not be printed either.
+        PathBuf::from("/tmp/scratch-0001")
+            .join(format!("a\u{1b}]0;pwned\u{7}$(id){}.lock", testkit::AK_SENTINEL)),
+        // Well spelled: still named, so the guard is a filter, not a switch.
+        PathBuf::from("/tmp/scratch-0001").join("codex.lock"),
+    ];
+    let report =
+        PostExitReport::from_child(Vec::new(), Vec::new(), survey, testkit::exit_status(0));
+
+    let text = report.anomalies().join("\n");
+
+    // Each value guard runs BEFORE the shape assertions, whose failure would
+    // print the text.
+    for shape in ["\u{1b}]0;", "$(id)", testkit::AK_SENTINEL, "/tmp/scratch-0001"] {
+        assert!(!text.contains(shape), "an odd-lock name or path reached the refusal");
+    }
+    testkit::assert_no_needles(&text, "the refusal");
+    assert!(text.contains("are not regular files"), "{text}");
+    assert!(text.contains("codex.lock"), "a name agctl would write is still shown: {text}");
+    assert!(text.contains("1 unnameable lock file(s)"), "the other is counted: {text}");
+    assert!(text.contains("2 entr(y/ies)"), "and the total is still the truth: {text}");
 }

@@ -51,6 +51,8 @@
 //! "something went wrong". The em dash says the figure is unavailable, which
 //! is the only true statement available.
 
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use tabled::builder::Builder;
 use tabled::settings::Style;
 
@@ -108,14 +110,6 @@ pub const CODEX_HEADINGS: [&str; 9] =
     ["Account", "Plan", "Kind", "5h", "Weekly", "Credits", "5h reset", "Weekly reset", "State"];
 
 /// Which provider's columns a table has.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "`Codex` is selected by the Codex table renderer (S33); `headings` passes \
-                  `Claude` for every table this build prints"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
     /// Claude's ten columns, plus `Kind` under `--by-identity`.
@@ -129,9 +123,8 @@ pub enum Layout {
 
 /// The headings one layout prints, in order.
 ///
-/// The Codex arm has no production caller until S33 builds that table; the
-/// Claude arm is what every table this build prints goes through, via
-/// [`headings`].
+/// The Claude arm is what every Claude table goes through, via [`headings`];
+/// the Codex arm is [`render_codex`]'s.
 pub fn headings_for(layout: Layout) -> Vec<&'static str> {
     match layout {
         Layout::Claude { by_identity } => {
@@ -153,6 +146,133 @@ pub fn headings_for(layout: Layout) -> Vec<&'static str> {
 /// of it is rendering a Claude table and should not have to say so.
 pub fn headings(by_identity: bool) -> Vec<&'static str> {
     headings_for(Layout::Claude { by_identity })
+}
+
+/// Where `5h reset` sits in a Codex record.
+const CODEX_SESSION_RESET_INDEX: usize = 6;
+
+/// Where `Weekly reset` sits in a Codex record.
+const CODEX_WEEKLY_RESET_INDEX: usize = 7;
+
+/// One Codex account, ready to render (plan AC103).
+///
+/// The Codex twin of [`StatusRow`], and for the same reason a separate type:
+/// the renderer is handed finished cells and windows, never a provider state,
+/// so it cannot decide what to hide. The windows are the shared
+/// [`LimitWindow`] vocabulary, already sorted into the two columns and the
+/// continuation rows by the row that built this.
+#[derive(Debug, Clone)]
+pub struct CodexTableRow {
+    /// The first column: the email when known, else the display id.
+    pub account: String,
+    /// The plan, or empty when unknown.
+    pub plan: String,
+    /// Where the credential lives: `live`, `home_read_only` or `owned`.
+    pub kind: &'static str,
+    /// The five-hour window, when the response described one.
+    pub session: Option<LimitWindow>,
+    /// The weekly window, when the response described one.
+    pub weekly: Option<LimitWindow>,
+    /// Every other window, one continuation row each.
+    pub extra: Vec<LimitWindow>,
+    /// The finished credits cell.
+    pub credits: String,
+    /// The finished state cell, notes included.
+    pub state: String,
+    /// Whether the row appears without `--all`.
+    pub visible_by_default: bool,
+}
+
+/// A whole Codex pass, ready to render.
+#[derive(Debug, Clone)]
+pub struct CodexReport {
+    /// Every row the pass produced, hidden ones included.
+    pub rows: Vec<CodexTableRow>,
+    /// The moment every countdown is relative to.
+    pub now: Timestamp,
+    /// The zone the reset columns are printed in.
+    pub tz: TimeZone,
+    /// Whether `--all` was given.
+    pub show_all: bool,
+}
+
+impl CodexReport {
+    /// How many rows `--all` would add.
+    pub fn hidden_count(&self) -> usize {
+        if self.show_all {
+            return 0;
+        }
+        self.rows.iter().filter(|row| !row.visible_by_default).count()
+    }
+}
+
+/// Renders a Codex report: [`CODEX_HEADINGS`], one row per account with its
+/// continuation rows under it, then the hidden-row footer.
+///
+/// The same two-pass layout as [`render`], so the two reset columns justify
+/// the same way in both tables.
+pub fn render_codex(report: &CodexReport) -> String {
+    let mut builder = Builder::default();
+    builder.push_record(headings_for(Layout::Codex));
+
+    let mut records: Vec<[String; 9]> = Vec::new();
+    let mut session_column: Vec<ResetSlot> = Vec::new();
+    let mut weekly_column: Vec<ResetSlot> = Vec::new();
+
+    let shown = report.rows.iter().filter(|row| report.show_all || row.visible_by_default);
+    for row in shown {
+        session_column.push(reset_slot_at(row.session.as_ref(), report.now, &report.tz));
+        weekly_column.push(reset_slot_at(row.weekly.as_ref(), report.now, &report.tz));
+        records.push([
+            row.account.clone(),
+            or_empty(&row.plan),
+            row.kind.to_owned(),
+            percent_cell(row.session.as_ref()),
+            percent_cell(row.weekly.as_ref()),
+            or_empty(&row.credits),
+            String::new(),
+            String::new(),
+            row.state.clone(),
+        ]);
+        for window in &row.extra {
+            session_column.push(ResetSlot::Final(String::new()));
+            weekly_column.push(reset_slot_at(Some(window), report.now, &report.tz));
+            records.push([
+                format!("  {CONTINUATION_MARKER} {}", window.label()),
+                String::new(),
+                String::new(),
+                String::new(),
+                percent_cell(Some(window)),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ]);
+        }
+    }
+
+    let session_width = column_width(&session_column);
+    let weekly_width = column_width(&weekly_column);
+    for ((record, session), weekly) in
+        records.iter_mut().zip(session_column.iter()).zip(weekly_column.iter())
+    {
+        record[CODEX_SESSION_RESET_INDEX] = session.finalize(session_width);
+        record[CODEX_WEEKLY_RESET_INDEX] = weekly.finalize(weekly_width);
+    }
+    for record in records {
+        builder.push_record(record);
+    }
+
+    let mut table = builder.build();
+    table.with(Style::psql());
+
+    let mut out = table.to_string();
+    let hidden = report.hidden_count();
+    if hidden > 0 {
+        out.push('\n');
+        out.push_str(&footer(hidden));
+    }
+    out
 }
 
 /// Renders a whole report: the table, then the hidden-row footer.
@@ -367,9 +487,15 @@ impl ResetSlot {
 /// The reset slot for one window: a pair to justify when it has a
 /// `resets_at`, an em dash otherwise.
 fn reset_slot(window: Option<&LimitWindow>, report: &Report) -> ResetSlot {
+    reset_slot_at(window, report.now, &report.tz)
+}
+
+/// [`reset_slot`] against an explicit clock and zone, for a report that is
+/// not a Claude [`Report`].
+fn reset_slot_at(window: Option<&LimitWindow>, now: Timestamp, tz: &TimeZone) -> ResetSlot {
     match window.and_then(|window| window.resets_at) {
         Some(resets_at) => {
-            let (countdown, absolute) = reset::parts(report.now, resets_at, &report.tz);
+            let (countdown, absolute) = reset::parts(now, resets_at, tz);
             ResetSlot::Pair(countdown, absolute)
         }
         None => ResetSlot::Final(empty()),

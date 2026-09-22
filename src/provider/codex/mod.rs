@@ -35,17 +35,23 @@
 )]
 
 pub mod account;
+pub mod audit;
 pub mod auth_store;
 pub mod claims;
 pub mod credentials;
+pub mod discovery;
 pub mod home;
 pub mod lock;
+pub mod login_child;
+pub mod oauth;
+pub mod permit;
 pub mod proof;
+pub mod refresh;
 pub mod usage;
 
 #[cfg(test)]
 #[path = "testkit_tests.rs"]
-mod testkit;
+pub(crate) mod testkit;
 
 /// The environment variable that replaces
 /// [`USER_AGENT_DEFAULT`](crate::provider::USER_AGENT_DEFAULT) for Codex.

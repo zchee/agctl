@@ -12,6 +12,7 @@
 //! that some state or other should be hidden. Visibility and the exit status
 //! are settled before a row is built.
 
+pub mod codex_doctor;
 pub mod json;
 pub mod json_v2;
 pub mod reset;

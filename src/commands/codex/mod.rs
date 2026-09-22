@@ -1,10 +1,12 @@
-//! `agctl codex` — the dispatch table, and the stubs behind it.
+//! `agctl codex` — the dispatch table, the stubs behind it, and the one
+//! constructor that reads the Codex home from the process.
 //!
 //! The command line for the whole Codex surface is parsed from S29b
 //! (`cli::CodexCommand`), and the commands behind it land wave by wave: the
-//! usage pass at S33, login, import and accounts at S34, doctor at S35. Until
-//! each one exists its arm is a stub, and a stub does exactly one thing —
-//! it says so and exits non-zero.
+//! usage pass ([`status`], [`watch`]) at S33, login, import and accounts at
+//! S34, doctor at S35. Every arm of this table now runs; the two `accounts`
+//! subcommands that send a POST — `set` and `refresh` — are the last stubs,
+//! and they refuse inside [`accounts`] rather than here.
 //!
 //! # Why the flags exist before the commands do
 //!
@@ -24,53 +26,60 @@
 //! anything would be a write nobody asked for, on a path the reviewer of the
 //! real command has not seen yet.
 
+pub mod accounts;
+pub mod accounts_refresh;
+pub mod doctor;
+pub mod import;
+pub mod login;
+pub mod pass;
+pub mod status;
+pub mod watch;
+
+use std::path::PathBuf;
+
 use crate::cli::Cli;
-use crate::cli::CodexAccountsCommand;
 use crate::cli::CodexCommand;
 use crate::error::AppError;
+use crate::provider::codex::home;
+use crate::provider::codex::home::CodexEnv;
 use crate::runtime::coordinator::Cancel;
 
 /// Routes a parsed `agctl codex` subcommand.
 ///
-/// `cancel` and the store are untouched for now: every arm below refuses
-/// before it could use either.
+/// Every arm runs. The refusals that are left belong to `accounts set` and
+/// `accounts refresh`, and are made inside [`accounts`].
 ///
 /// # Errors
 ///
-/// Returns [`AppError::Config`] naming the command, for every subcommand
-/// until its wave lands.
-pub fn run(_cli: &Cli, command: &CodexCommand, _cancel: &Cancel) -> Result<i32, AppError> {
-    Err(AppError::not_implemented(&name(command)))
-}
-
-/// What to call one subcommand in the refusal.
-///
-/// The user's own spelling, so the message names the thing they typed rather
-/// than an internal variant.
-fn name(command: &CodexCommand) -> String {
-    let tail = match command {
-        CodexCommand::Status(_) => "status".to_owned(),
-        CodexCommand::Watch(_) => "watch".to_owned(),
-        CodexCommand::Login(_) => "login".to_owned(),
-        CodexCommand::Import(_) => "import".to_owned(),
-        CodexCommand::Doctor(_) => "doctor".to_owned(),
-        CodexCommand::Accounts { command } => format!("accounts {}", accounts_name(command)),
-    };
-    format!("agctl codex {tail}")
-}
-
-/// The `accounts` subcommand's own name.
-fn accounts_name(command: &CodexAccountsCommand) -> &'static str {
+/// Whatever the command returns.
+pub fn run(cli: &Cli, command: &CodexCommand, cancel: &Cancel) -> Result<i32, AppError> {
     match command {
-        CodexAccountsCommand::List { .. } => "list",
-        CodexAccountsCommand::Show { .. } => "show",
-        CodexAccountsCommand::Remove { .. } => "remove",
-        CodexAccountsCommand::Forget { .. } => "forget",
-        CodexAccountsCommand::Unforget { .. } => "unforget",
-        CodexAccountsCommand::Set { .. } => "set",
-        CodexAccountsCommand::Refresh { .. } => "refresh",
+        CodexCommand::Status(args) => status::run(cli, args, cancel).map(|()| 0),
+        CodexCommand::Watch(args) => watch::run(cli, args, cancel).map(|()| 0),
+        CodexCommand::Login(args) => login::run(cli, args, cancel).map(|()| 0),
+        CodexCommand::Import(args) => import::run(cli, args, cancel).map(|()| 0),
+        CodexCommand::Accounts { command } => accounts::run(cli, command, cancel).map(|()| 0),
+        CodexCommand::Doctor(args) => doctor::run(cli, args, cancel).map(|()| 0),
     }
 }
+
+/// The Codex home inputs, read from this process (plan section 3.1,
+/// invariant I25).
+///
+/// The one constructor that reads the process environment for a
+/// [`CodexEnv`]: `provider::codex::home` never names the environment module,
+/// so every resolution rule there is tested with values a test chose. Called
+/// only by command code, never by a test.
+pub fn codex_env_from_process() -> CodexEnv {
+    CodexEnv::new(
+        std::env::var_os(home::CODEX_HOME_ENV),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+#[cfg(test)]
+#[path = "testkit_tests.rs"]
+pub(crate) mod testkit;
 
 #[cfg(test)]
 #[path = "mod_tests.rs"]

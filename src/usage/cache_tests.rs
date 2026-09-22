@@ -185,3 +185,24 @@ fn a_stale_entry_still_loads_so_it_can_be_rendered_stale() {
     assert!(!loaded.is_fresh(i64::from(u32::MAX), TTL));
     assert_eq!(loaded.body, body());
 }
+
+#[test]
+fn d30_a_codex_cache_entry_is_keyed_by_user_and_account() {
+    // Two Codex rows share a cache entry exactly when they share BOTH ids: the
+    // live home and an owned namespace holding one grant are one account read
+    // twice, and serving the second from the first's entry is right. Two
+    // accounts under one user id are not, and must not share (review S33-C3a
+    // F1, where an e2e asserted a GET count that this rule decides).
+    let (_dir, paths) = crate::provider::codex::testkit::store();
+    let key = |user: &str, acct: &str| path_for(&paths, Provider::Codex, user, acct);
+
+    assert_eq!(key("user-a", "acct-1"), key("user-a", "acct-1"), "one identity, one entry");
+    assert_ne!(key("user-a", "acct-1"), key("user-a", "acct-2"), "one user, two accounts");
+    assert_ne!(key("user-a", "acct-1"), key("user-b", "acct-1"), "two users, one account");
+    // And the provider is part of the path, so Claude and Codex never collide.
+    assert_ne!(
+        key("user-a", "acct-1"),
+        path_for(&paths, Provider::Claude, "user-a", "acct-1"),
+        "two providers, one identity"
+    );
+}

@@ -74,6 +74,12 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(TerminalAwareWriter)
+        // A log line that cannot be delivered is dropped, never a panic. The
+        // default reports a failed write with `eprintln!` on the same broken
+        // stderr, which panics, and under `panic = "abort"` a panic skips every
+        // destructor — including the one that removes a login's scratch
+        // credential (`codex login` with a closed stderr, plan AC105).
+        .log_internal_errors(false)
         .try_init();
 }
 
@@ -97,11 +103,18 @@ fn dispatch(cli: &Cli, cancel: &Cancel) -> Result<i32, AppError> {
 
 /// Routes a parsed `agctl codex` subcommand.
 ///
-/// One arm, because every Codex command is a stub until its wave lands and
-/// each one refuses the same way (`commands::codex`). It fans out into a
-/// table of its own as those commands arrive.
+/// One arm per command that has landed; the rest still refuse through
+/// `commands::codex::run` until their wave arrives.
 fn dispatch_codex(cli: &Cli, command: &CodexCommand, cancel: &Cancel) -> Result<i32, AppError> {
-    commands::codex::run(cli, command, cancel)
+    match command {
+        CodexCommand::Status(args) => {
+            commands::codex::status::run(cli, args, cancel).map(|()| EXIT_OK)
+        }
+        CodexCommand::Watch(args) => {
+            commands::codex::watch::run(cli, args, cancel).map(|()| EXIT_OK)
+        }
+        other => commands::codex::run(cli, other, cancel),
+    }
 }
 
 /// Routes a parsed `agctl claude` subcommand.

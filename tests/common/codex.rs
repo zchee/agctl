@@ -42,8 +42,12 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Output;
 
 use assert_cmd::Command;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde_json::Value;
 
 use crate::common::Fixture;
 
@@ -123,6 +127,44 @@ impl CodexFixture {
         dir
     }
 
+    /// Wires the fake `security` into every spawn, the way the Claude suite
+    /// does, so a Codex login takes real keychain listings instead of the
+    /// empty ones a disabled backend returns.
+    ///
+    /// `Fixture::new` disables the keychain for every test; a login test that
+    /// does not call this runs keychain-less, and says so.
+    pub fn with_keychain(&mut self) -> &mut Self {
+        self.inner.with_keychain();
+        self
+    }
+
+    /// The fake `security`'s `dump-keychain` output, once [`Self::with_keychain`]
+    /// has run.
+    ///
+    /// `Fixture::dump_path` is private to the phase-2 harness, so the path is
+    /// derived here the same way and asserted to exist: a rename there fails
+    /// loudly here instead of pointing a test at a file nobody reads.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the keychain is not wired.
+    #[must_use]
+    pub fn keychain_dump_path(&self) -> PathBuf {
+        let path = self.root().join("keychain-dump.txt");
+        assert!(
+            path.exists(),
+            "call `with_keychain` first; there is no dump at {}",
+            path.display()
+        );
+        path
+    }
+
+    /// The fake `security`'s argv log, once [`Self::with_keychain`] has run.
+    #[must_use]
+    pub fn security_log_path(&self) -> PathBuf {
+        self.inner.security_log_path()
+    }
+
     /// Where the fake `codex` was written.
     #[must_use]
     pub fn codex_bin(&self) -> &Path {
@@ -163,7 +205,25 @@ impl CodexFixture {
     #[must_use]
     pub fn cmd(&self) -> Command {
         let command = self.inner.cmd();
-        self.assert_isolated(&command);
+        self.assert_isolated(command.get_envs());
+        command
+    }
+
+    /// A `std::process::Command` to the binary, for the few tests that must
+    /// control a stream `assert_cmd` cannot (a stdout whose reader is closed).
+    ///
+    /// Never call `self.inner().raw()` bare: that keeps phase 2's isolation but
+    /// skips this fixture's own [`Self::assert_isolated`]. This runs the same
+    /// check [`Self::cmd`] runs, over the same environment.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Codex home variable reached the child's environment,
+    /// or when `HOME` is not inside the fixture.
+    #[must_use]
+    pub fn raw(&self) -> std::process::Command {
+        let command = self.inner.raw();
+        self.assert_isolated(command.get_envs());
         command
     }
 
@@ -214,9 +274,14 @@ impl CodexFixture {
     ///
     /// Panics when the Codex home variable is set in the child's environment,
     /// or when `HOME` is not the fixture's.
-    fn assert_isolated(&self, command: &Command) {
+    fn assert_isolated<'a>(
+        &self,
+        envs: impl Iterator<Item = (&'a std::ffi::OsStr, Option<&'a std::ffi::OsStr>)>,
+    ) {
         let home = self.inner.home();
-        for (key, value) in command.get_envs() {
+        let mut security_bin: Option<PathBuf> = None;
+        let mut backend_none = false;
+        for (key, value) in envs {
             if key == CODEX_HOME_ENV {
                 assert!(
                     value.is_none(),
@@ -231,6 +296,36 @@ impl CodexFixture {
                     "HOME must point inside the fixture"
                 );
             }
+            if key == "AGCTL_SECURITY_BIN" {
+                security_bin = value.map(PathBuf::from);
+            }
+            if key == "AGCTL_KEYCHAIN_BACKEND" {
+                backend_none = value == Some(std::ffi::OsStr::new("none"));
+            }
+        }
+        // AC109's anti-vacuity arm (fix loop 1, F2): a log check alone is
+        // vacuous for a fixture that never calls `with_keychain()` — no fake
+        // `security` runs, so no log is ever written, and "zero
+        // `find-generic-password` lines" would be trivially true. This proves
+        // the OTHER half instead, on the same route every `cmd()`/`raw()`
+        // already takes: every launch either wires a fake `security` INSIDE
+        // the fixture root (so `checked`'s log check means something) or has
+        // the keychain backend disabled outright, which fails closed before
+        // any keychain call (`secret::default_reader`) — never neither, which
+        // would leave a real `security(1)` reachable.
+        match (backend_none, &security_bin) {
+            (true, None) => {}
+            (false, Some(bin)) => assert!(
+                bin.starts_with(self.root()),
+                "AGCTL_SECURITY_BIN ({}) is not inside the fixture root ({})",
+                bin.display(),
+                self.root().display()
+            ),
+            _ => panic!(
+                "this fixture wires neither the fake `security` (`AGCTL_SECURITY_BIN`) nor the \
+                 disabled backend (`AGCTL_KEYCHAIN_BACKEND=none`), so a keychain call here could \
+                 reach the real one; call `with_keychain()` if the test needs a keychain"
+            ),
         }
     }
 }
@@ -239,4 +334,202 @@ impl Default for CodexFixture {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A string a test's output must not carry: the NAME a failure reports, and
+/// the value searched for. A hit reports the name and the byte offset only —
+/// never the value, and never the text around it, because a value may be a
+/// credential and the text a stream that holds one.
+pub type Needle = (&'static str, &'static str);
+
+/// A captured stream that [`checked`] copies to `AGCTL_E2E_TRACE_DIR`.
+#[derive(Clone, Copy)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
+/// The first needle `text` carries, as its name and byte offset.
+pub fn find_needle(text: &[u8], needles: &[Needle]) -> Option<(&'static str, usize)> {
+    needles.iter().find_map(|(name, value)| {
+        text.windows(value.len())
+            .position(|window| window == value.as_bytes())
+            .map(|at| (*name, at))
+    })
+}
+
+/// Panics if `text` carries a needle, naming `test`, `what` was searched, the
+/// needle's name and its byte offset.
+pub fn assert_no_needle(test: &str, what: &str, text: &[u8], needles: &[Needle]) {
+    if let Some((name, at)) = find_needle(text, needles) {
+        panic!("{test}: {what} carries the needle `{name}` at byte {at}");
+    }
+}
+
+/// The unaudited-receipt drop check's panic prefix, as the binary prints it.
+///
+/// Spelled here a second time on purpose: `tests/` is not compiled into the
+/// crate, so it cannot reach `UNAUDITED_RECEIPT` in `auth_store.rs`. The two
+/// spellings are held together by `scripts/release-gate.sh`, whose absent-seam
+/// entry is this same string — a drift in the source spelling makes the gate
+/// look for a string no build carries, and the gate's own plant-and-prove
+/// half reports it.
+const UNAUDITED_RECEIPT: &str = "agctl unaudited write receipt";
+
+/// Panics if `stderr` carries the unaudited-receipt line.
+///
+/// The dev profile is `panic = "abort"`, so a receipt the real binary drops
+/// before `codex::audit::append` shows up as this line plus exit 134. A test
+/// asserting a successful run already fails on the status; one asserting a
+/// refusal would not, and would report a wrong exit code rather than the
+/// invariant that broke. This names it instead.
+///
+/// [`checked`] calls it, and so must every Codex e2e launch that does not go
+/// through `checked` — a test that reads only an exit status would otherwise
+/// be a hole in the one guard this invariant has left. The C2-a request
+/// carries the table of every launch and which of the two routes it takes.
+pub fn assert_receipts_were_audited(test: &str, stderr: &[u8]) {
+    let hit = stderr
+        .windows(UNAUDITED_RECEIPT.len())
+        .position(|window| window == UNAUDITED_RECEIPT.as_bytes());
+    if let Some(at) = hit {
+        let tail = String::from_utf8_lossy(&stderr[at..]);
+        let line = tail.lines().next().unwrap_or_default();
+        panic!("{test}: the binary dropped a Codex write receipt before the audit log: {line}");
+    }
+}
+
+/// Plan AC109's per-account lookup clause, enforced on the fake `security`
+/// log itself rather than on the Rust source (fix loop 1, F1): a Codex
+/// command never needs one account's password, only a listing
+/// (`dump-keychain`), and a source-string grep cannot see a call that
+/// reaches `KeychainReader::read` (`src/secret/mod.rs:130`) without spelling
+/// `find-generic-password` anywhere in Codex's own modules — as a planted
+/// `reader.read(KEYRING_SERVICE)` in `login.rs`/`pass.rs` proved.
+///
+/// Non-vacuous by construction, not by assumption: every fixture is in
+/// exactly one of two states — the fake `security` wired
+/// (`CodexFixture::with_keychain`), whose log this reads, or the keychain
+/// backend disabled outright (`Fixture::new`'s default), which fails closed
+/// before any lookup could happen (`secret::default_reader`,
+/// `keychain_write::security_bin`) and asserted on every launch by
+/// `Fixture::assert_keychain_seam` (`cmd()`/`raw()`, `tests/common/mod.rs:815,839`).
+/// So a missing log is never "the check didn't run" — it is either "the
+/// keychain is off" (proven elsewhere) or "this launch never touched a fake
+/// `security` that exists" (nothing to find). A `with_keychain()` fixture's
+/// own `dumps == N` assertions (`e2e_codex_login.rs`,
+/// `e2e_codex_import.rs`) already prove the log is live when one is wired.
+fn assert_no_keychain_lookup(test: &str, security_log: Option<&Path>) {
+    let Some(path) = security_log else { return };
+    let Ok(text) = fs::read_to_string(path) else { return };
+    let lookups: Vec<&str> =
+        text.lines().filter(|line| line.starts_with("find-generic-password")).collect();
+    assert!(
+        lookups.is_empty(),
+        "{test}: a Codex launch issued a per-account keychain lookup, which no Codex command \
+         needs:\n{}",
+        lookups.join("\n")
+    );
+}
+
+/// Asserts neither stream of `output` carries a needle, that the fake
+/// `security` log — when `security_log` names one that exists — carries no
+/// per-account lookup, then copies the `keep` streams to
+/// `AGCTL_E2E_TRACE_DIR/<prefix>-<test>.<stream>` when that directory is
+/// named. Every e2e crate's `checked` is this one: the one route every
+/// Codex launch already goes through.
+pub fn checked(
+    prefix: &str,
+    test: &str,
+    output: Output,
+    needles: &[Needle],
+    keep: &[Stream],
+    security_log: Option<&Path>,
+) -> Output {
+    assert_no_needle(test, "stdout", &output.stdout, needles);
+    assert_no_needle(test, "stderr", &output.stderr, needles);
+    assert_receipts_were_audited(test, &output.stderr);
+    assert_no_keychain_lookup(test, security_log);
+    if let Some(dir) = std::env::var_os("AGCTL_E2E_TRACE_DIR") {
+        let dir = PathBuf::from(dir);
+        for stream in keep {
+            let (suffix, bytes) = match stream {
+                Stream::Stdout => ("stdout", &output.stdout),
+                Stream::Stderr => ("stderr", &output.stderr),
+            };
+            fs::write(dir.join(format!("{prefix}-{test}.{suffix}")), bytes)
+                .expect("the trace directory is writable");
+        }
+    }
+    output
+}
+
+// ---------------------------------------------------------------------------
+// Helpers each `e2e_codex*.rs` used to define for itself. Every one below had
+// an identical body in two or more of them. A helper whose body read a
+// per-file constant (`USER`, `ACCT`, `JWT_SIGNATURE` — all different per file)
+// takes that value as an argument here, and the caller keeps a one-line
+// binding rather than a copy of the body.
+// ---------------------------------------------------------------------------
+
+/// The current second.
+pub fn now_s() -> i64 {
+    jiff::Timestamp::now().as_second()
+}
+
+/// A JWT with the usual header, `payload` as its body and `signature` verbatim.
+pub fn jwt(payload: &Value, signature: &str) -> String {
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).expect("serializes"));
+    format!("{header}.{body}.{signature}")
+}
+
+/// Writes `bytes` to `path`, creating its parent, at mode 0600.
+pub fn write_0600(path: &Path, bytes: &[u8]) {
+    fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+    fs::write(path, bytes).expect("write");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod");
+}
+
+/// A run's stdout, lossily decoded.
+pub fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// A run's stderr, lossily decoded.
+pub fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// The Codex write log, `<store>/codex/writes.jsonl` (`audit::LOG_FILE`).
+pub fn audit_log(fixture: &CodexFixture) -> PathBuf {
+    fixture.inner().config_dir().join("codex").join("writes.jsonl")
+}
+
+/// The `outcome` of every line in the Codex audit log, oldest first.
+pub fn audit_outcomes(fixture: &CodexFixture) -> Vec<String> {
+    let log = audit_log(fixture);
+    let Ok(text) = fs::read_to_string(&log) else { return Vec::new() };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|value| value.get("outcome")?.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The keychain account name agctl derives for the Codex home at `home`.
+pub fn keyring_account(home: &Path) -> String {
+    let canonical = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let digest =
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(canonical.to_string_lossy().as_bytes()));
+    format!("cli|{}", &digest[..16])
+}
+
+/// The namespace directory `<store>/codex/<user>/<acct>`.
+pub fn namespace(fixture: &CodexFixture, user: &str, acct: &str) -> PathBuf {
+    fixture.inner().config_dir().join("codex").join(user).join(acct)
+}
+
+/// The refresh marker for `<user>/<acct>`.
+pub fn marker_path(fixture: &CodexFixture, user: &str, acct: &str) -> PathBuf {
+    fixture.inner().config_dir().join("codex").join(".state").join(format!("{user}+{acct}.refresh"))
 }

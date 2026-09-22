@@ -28,6 +28,7 @@
 //!   codex/                              0700   codex_root()
 //!     .locks/                           0700   codex_locks_dir()
 //!       <user>+<acct>.lock              0600, never unlinked
+//!       scratch.lock                    0600   codex_scratch_lock()
 //!     .state/                           0700   codex_state_dir()
 //!       <user>+<acct>.refresh           0600   codex_refresh_state_path()
 //!     .scratch/                         0700   codex_scratch_root()
@@ -354,6 +355,19 @@ impl Paths {
         self.codex_root().join(".scratch")
     }
 
+    /// The lock that serialises the whole `login` lifecycle (plan section
+    /// 3.3): scratch home, child, verification, install and sweep.
+    ///
+    /// **Not a namespace lock.** A namespace lock is named
+    /// `<user>+<acct>.lock` and always contains `+`, which
+    /// [`validate_codex_segment`] forbids inside either id — so no namespace
+    /// can ever derive this name. It shares the directory and nothing else:
+    /// holding it says a login is in progress, never that any namespace may
+    /// be written.
+    pub fn codex_scratch_lock(&self) -> PathBuf {
+        self.codex_locks_dir().join("scratch.lock")
+    }
+
     /// Where the per-namespace refresh markers live.
     pub fn codex_state_dir(&self) -> PathBuf {
         self.codex_root().join(".state")
@@ -505,10 +519,6 @@ pub fn validate_segment(s: &str) -> Result<(), AppError> {
 /// # Errors
 ///
 /// Returns [`AppError::Config`] describing which rule the value broke.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the Codex paths are consumed from S30 (provider::codex) onward")
-)]
 pub fn validate_codex_segment(s: &str) -> Result<(), AppError> {
     validate_segment(s)?;
     if s.starts_with('.') {

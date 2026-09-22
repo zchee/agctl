@@ -12,6 +12,8 @@
 pub mod cleanup;
 pub mod coordinator;
 pub mod fault;
+#[cfg(feature = "testing")]
+pub mod lock_order;
 pub mod log_writer;
 pub mod proc;
 pub mod signals;

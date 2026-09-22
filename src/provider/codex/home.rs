@@ -24,7 +24,7 @@
 //!
 //! [`daemon_evidence`] looks for Codex's shared app-server daemon in a home
 //! (facts F72, F83) without taking part in any of its locks: it never opens
-//! `daemon.lock`, and reads `app-server.pid` through
+//! `daemon.lock`, and reads both spellings of the pid record through
 //! [`open_readonly_nofollow`], whose flags cannot create or write.
 
 use std::ffi::OsString;
@@ -58,8 +58,19 @@ const CONFIG_FILE: &str = "config.toml";
 /// The daemon directory inside a Codex home (fact F83).
 const DAEMON_DIR: &str = "app-server-daemon";
 
-/// The daemon's pid record (fact F83).
-const DAEMON_PID_FILE: &str = "app-server.pid";
+/// The daemon's pid record, under either of the two names Codex gives it
+/// (fact F83, re-checked at 0.155.0-alpha.12).
+///
+/// The name is conditional upstream: `app-server.pid` while the managed codex
+/// binary lives under `<CODEX_HOME>/packages/standalone`, and `daemon.pid`
+/// otherwise (`app-server-daemon/src/lib.rs:43-49`, selected at `:316-330` and
+/// `:354-356`). agctl cannot see which branch a host is on without reading the
+/// daemon's own state, and it does not need to: it reads both and takes the
+/// strongest evidence, so a live daemon stops a refresh under either name.
+/// Reading one name only was a **fail-open** gap — a live daemon writing the
+/// other name read as `ArtefactOnly`, which the refresh gate passes with a note
+/// (deviation D32).
+const DAEMON_PID_FILES: [&str; 2] = ["app-server.pid", "daemon.pid"];
 
 /// The largest `config.toml` this module will parse.
 const MAX_CONFIG_BYTES: u64 = 1 << 20;
@@ -285,13 +296,31 @@ fn mode_from(value: &str) -> StoreMode {
     }
 }
 
-/// `value` when it is an `http(s)` URL without credentials in it.
+/// `value` as scheme, host, port and path, when it is an `http(s)` URL that
+/// carries no credential.
+///
+/// # Why the query and the fragment are dropped rather than inspected
+///
+/// The value is `chatgpt_base_url` out of a `config.toml` this process only
+/// reads, and `doctor` prints it. Refusing userinfo keeps a
+/// `https://user:token@host` spelling out of the report, but an endpoint is
+/// just as often authenticated by a query parameter — `?key=…`, `?token=…`,
+/// `?sig=…` — and that spelling walked straight through the check (review
+/// S35 C4). There is no list of parameter names a credential may not use, so
+/// there is no inspection to do: what a reader needs in order to recognise
+/// their own override is the host and the path, and everything from the `?`
+/// on is dropped.
 fn plain_url(value: &str) -> Option<String> {
-    let url = url::Url::parse(value).ok()?;
-    let plain = matches!(url.scheme(), "https" | "http")
-        && url.username().is_empty()
-        && url.password().is_none();
-    plain.then(|| url.as_str().to_owned())
+    let mut url = url::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "https" | "http")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.as_str().to_owned())
 }
 
 /// The 1-based line containing byte `offset` of `text`.
@@ -325,6 +354,10 @@ fn read_config(path: &Path) -> Result<Option<String>, ConfigNote> {
     String::from_utf8(bytes).map(Some).map_err(|_| ConfigNote::Unparseable { line: None })
 }
 
+/// The keychain item service Codex stores a home's credentials under (fact
+/// F94). Compared against a read-only listing, never passed to a writer.
+pub const KEYRING_SERVICE: &str = "Codex Auth";
+
 /// The keychain item account Codex uses for a home (fact F94):
 /// `cli|<first 16 hex digits of sha256(canonical home)>`.
 ///
@@ -335,6 +368,30 @@ pub fn keyring_account(home: &Path) -> String {
     let canonical = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
     let digest = hex::encode(Sha256::digest(canonical.to_string_lossy().as_bytes()));
     format!("cli|{}", &digest[..16])
+}
+
+/// Whether `account` is spelled the way [`keyring_account`] spells one (fact
+/// F94): `cli|` and exactly sixteen lowercase hexadecimal digits.
+///
+/// # Why anything else is only ever counted
+///
+/// The account is an attribute of a keychain item, and **any** application on
+/// this machine can create a `Codex Auth` item with any account string it
+/// likes. `doctor` offers a removal command for an item agctl's own login
+/// child left behind, and a command is something a reader pastes into a
+/// shell: a quote, a `$(…)`, a backtick or an escape byte in that string
+/// would ride into their shell and into `--json` (review S35 C1). So a
+/// command — and the audit line that explains one — is built only from a
+/// string this predicate accepted, whose every byte is then one agctl itself
+/// would have written; anything else is counted, and the reader is sent to
+/// the keychain to look at it themselves.
+///
+/// The check is on the value, not on its source: it holds however the string
+/// was obtained, and it does not depend on a keychain listing, a log line or
+/// a test fake being well behaved.
+pub fn is_home_account(account: &str) -> bool {
+    let Some(digest) = account.strip_prefix("cli|") else { return false };
+    digest.len() == 16 && digest.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// What the read-only keychain listing said about a home's item.
@@ -410,37 +467,33 @@ pub enum DaemonEvidence {
     Recycled(u32),
     /// A daemon directory, lock or record, with no live process behind it.
     ArtefactOnly,
+    /// A pid record exists in the daemon directory and cannot be read, is not
+    /// a regular file, or does not parse. Codex publishes the record under its
+    /// own reservation lock (fact F83), so this is "a daemon may be starting",
+    /// not "no daemon": a refresh sends nothing this pass (review S30 F8).
+    RecordUnreadable,
 }
 
-/// Codex's `app-server.pid` (fact F83).
+/// Codex's daemon pid record (fact F83), under either spelling.
 ///
-/// Only `pid` decides anything. The start time Codex recorded is compared by
-/// `mtime` instead, because its spelling is not settled (fact F83, open row);
-/// the executable digest is not needed once a recycled id is caught by time.
+/// **Only `pid` is read.** Every other member is ignored, `serde` tolerates
+/// unknown members by default, and no field is declared for one this crate
+/// does not compare: a field that exists only to be parsed is dead code
+/// pretending to be a pin, which review S33-C3b F1 demonstrated by deleting
+/// one with the suite still green. What is pinned instead is the property that
+/// has to hold as the vendor adds members —
+/// `d32_the_record_tolerates_members_this_crate_does_not_name`.
+///
+/// So `processStartTime` and `executableIdentity` are gone too. The recycled-id
+/// rule the plan states (D-032, AC93) compares agctl's **own**
+/// `proc::start_timestamp(pid)` against the **record's mtime**, not anything
+/// inside the record, and `processStartTime` is a raw `ps -o lstart=` string
+/// rather than a machine timestamp (fact F83), so parsing it would buy a second
+/// ground the plan never asked for at the cost of a locale-dependent parse.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PidRecord {
     pid: u32,
-    #[cfg_attr(
-        test,
-        expect(dead_code, reason = "parsed to pin the record's shape (F83); never compared")
-    )]
-    process_start_time: Option<serde_json::Value>,
-    #[cfg_attr(
-        test,
-        expect(dead_code, reason = "parsed to pin the record's shape (F83); never compared")
-    )]
-    executable_identity: Option<ExecutableIdentity>,
-}
-
-/// The executable fingerprint inside a [`PidRecord`].
-#[derive(Debug, Deserialize)]
-struct ExecutableIdentity {
-    #[cfg_attr(
-        test,
-        expect(dead_code, reason = "parsed to pin the record's shape (F83); never compared")
-    )]
-    digest: String,
 }
 
 /// Looks for Codex's daemon in the home at `dir`, without contending for any
@@ -452,9 +505,10 @@ struct ExecutableIdentity {
 /// alive and started more than a second after the record was last modified is
 /// [`DaemonEvidence::Recycled`]; alive otherwise is
 /// [`DaemonEvidence::PidAlive`]. A process whose start time cannot be read
-/// counts as alive — the conservative answer, since it stops a refresh.
-/// Everything else inside the daemon directory, including an unreadable
-/// record, is [`DaemonEvidence::ArtefactOnly`].
+/// counts as alive — the conservative answer, since it stops a refresh. A
+/// record that is there and cannot be used is
+/// [`DaemonEvidence::RecordUnreadable`]; a dead process, or a daemon directory
+/// with no record at all, is [`DaemonEvidence::ArtefactOnly`].
 pub fn daemon_evidence(dir: &Path, cancel: &Cancel) -> DaemonEvidence {
     let daemon = dir.join(DAEMON_DIR);
     match std::fs::symlink_metadata(&daemon) {
@@ -462,15 +516,60 @@ pub fn daemon_evidence(dir: &Path, cancel: &Cancel) -> DaemonEvidence {
         Ok(_) => return DaemonEvidence::ArtefactOnly,
         Err(_) => return DaemonEvidence::None,
     }
-    let Some((pid, written)) = read_pid_record(&daemon.join(DAEMON_PID_FILE)) else {
-        // `daemon.lock` alone, or an unreadable record: only an artefact. The
-        // lock itself is never opened, so it is never named here either.
-        return DaemonEvidence::ArtefactOnly;
+    DAEMON_PID_FILES
+        .iter()
+        .map(|name| one_record(&daemon.join(name), cancel))
+        .reduce(stronger)
+        .map_or(DaemonEvidence::ArtefactOnly, |(evidence, _)| evidence)
+}
+
+/// What one pid record says, whichever name it is under, and when that record
+/// was last written — the tiebreak when both names name a live process.
+fn one_record(record: &Path, cancel: &Cancel) -> (DaemonEvidence, Option<Timestamp>) {
+    let Some((pid, written)) = read_pid_record(record) else {
+        // `daemon.lock` alone is only an artefact; the lock itself is never
+        // opened, so it is never named here either. A record that is there
+        // and cannot be used may be one being published (review S30 F8).
+        let evidence = match std::fs::symlink_metadata(record) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => DaemonEvidence::ArtefactOnly,
+            _ => DaemonEvidence::RecordUnreadable,
+        };
+        return (evidence, None);
     };
     if pid == 0 || !proc::exists(pid) {
-        return DaemonEvidence::ArtefactOnly;
+        return (DaemonEvidence::ArtefactOnly, Some(written));
     }
-    classify_live(pid, proc::start_timestamp(pid, cancel), written)
+    (classify_live(pid, proc::start_timestamp(pid, cancel), written), Some(written))
+}
+
+/// The evidence that stops more: a live daemon outranks a record that cannot
+/// be read, which outranks a recycled id, which outranks a bare artefact.
+///
+/// Both names can exist at once — an upgrade migrates a host from one to the
+/// other (`migration.rs:35,85,140`), and nothing cleans the old record up — so
+/// two answers have to become one, and the safe direction is the one that
+/// sends less. **Equal verdicts are broken toward the record written last**,
+/// so a migrated host naming two live pids reports the daemon whose record is
+/// current rather than the leftover one (review S33-C3b F3). The array order
+/// is not a tiebreak: which name is current depends on the host, and the mtime
+/// does not.
+fn stronger(
+    left: (DaemonEvidence, Option<Timestamp>),
+    right: (DaemonEvidence, Option<Timestamp>),
+) -> (DaemonEvidence, Option<Timestamp>) {
+    let rank = |evidence: &DaemonEvidence| match evidence {
+        DaemonEvidence::PidAlive(_) => 4,
+        DaemonEvidence::RecordUnreadable => 3,
+        DaemonEvidence::Recycled(_) => 2,
+        DaemonEvidence::ArtefactOnly => 1,
+        DaemonEvidence::None => 0,
+    };
+    match rank(&right.0).cmp(&rank(&left.0)) {
+        std::cmp::Ordering::Greater => right,
+        std::cmp::Ordering::Less => left,
+        std::cmp::Ordering::Equal if right.1 > left.1 => right,
+        std::cmp::Ordering::Equal => left,
+    }
 }
 
 /// Alive or recycled, from the process's start and the record's `mtime`.

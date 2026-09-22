@@ -38,7 +38,7 @@
 //! [`exposed`], with a private constructor; the only way to obtain one is
 //! [`LockedCredentials::from_locked_read`], which borrows the lock proof for
 //! the value's whole life, and whose callers `auth_store.rs` alone may be
-//! (plan AC119's source test).
+//! (`scripts/phase3-greps.sh`'s `locked_read` rule).
 
 use std::fmt;
 use std::io;
@@ -93,6 +93,22 @@ const TOP_LEVEL_SECRETS: [&str; 5] = [
 
 /// Members of `tokens` that hold a credential.
 const TOKEN_SECRETS: [&str; 3] = ["id_token", "access_token", "refresh_token"];
+
+/// Every top-level member fact F61 names, in the order the fact lists them.
+///
+/// The one list `doctor`'s field-set comparison (premortem PM22) reports
+/// against. It is compiled in, so the names it prints came from this crate and
+/// never from the file on disk.
+pub const KNOWN_MEMBERS: [&str; 8] = [
+    "auth_mode",
+    "OPENAI_API_KEY",
+    "tokens",
+    "last_refresh",
+    "agent_identity",
+    "personal_access_token",
+    "bedrock_api_key",
+    "bedrock_access_keys",
+];
 
 /// Where a secret sits in the document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,6 +410,23 @@ impl Credentials {
         self.view.access_exp
     }
 
+    /// The members of [`KNOWN_MEMBERS`] this document does not have.
+    ///
+    /// Static strings: a name here came from this crate's list, never from the
+    /// file (premortem PM22, the S35 lead ruling of 2026-09-22).
+    pub fn missing_known_members(&self) -> Vec<&'static str> {
+        KNOWN_MEMBERS.iter().filter(|name| !self.doc.contains_key(**name)).copied().collect()
+    }
+
+    /// How many members the document has that [`KNOWN_MEMBERS`] does not name.
+    ///
+    /// A count and never the names: a member name is file content, and a
+    /// credential pasted as a key would otherwise be echoed to the terminal
+    /// and into `--json` (invariant I24).
+    pub fn unknown_member_count(&self) -> usize {
+        self.doc.keys().filter(|name| !KNOWN_MEMBERS.contains(&name.as_str())).count()
+    }
+
     /// The secret at `path`, when the document has one.
     fn secret(&self, path: SecretPath) -> Option<&Secret> {
         self.secrets.iter().find(|secret| secret.path == path)
@@ -504,6 +537,7 @@ pub struct RefreshResponse {
     id_token: Option<SecretString>,
     access_token: Option<SecretString>,
     refresh_token: Option<SecretString>,
+    earliest_refresh_at: Option<Timestamp>,
 }
 
 impl RefreshResponse {
@@ -528,11 +562,31 @@ impl RefreshResponse {
             Some(Value::String(token)) => Ok(Some(SecretString::from(token))),
             Some(_) => Err(CredentialsError::WrongType(name)),
         };
-        Ok(Self {
-            id_token: take("id_token")?,
-            access_token: take("access_token")?,
-            refresh_token: take("refresh_token")?,
-        })
+        let id_token = take("id_token")?;
+        let access_token = take("access_token")?;
+        let refresh_token = take("refresh_token")?;
+        // Fact F80 / ledger 282a: a server hint, read only when it is a whole
+        // number of seconds that names a representable time. Anything else is
+        // ignored rather than refused — the grant in the rest of the body is
+        // what matters. Every other member (`oai_is`, `scope`, …) is dropped
+        // here, unread and never persisted.
+        let earliest_refresh_at = body
+            .get("earliest_refresh_at")
+            .and_then(Value::as_i64)
+            .and_then(|seconds| Timestamp::from_second(seconds).ok());
+        Ok(Self { id_token, access_token, refresh_token, earliest_refresh_at })
+    }
+
+    /// Whether the response carries an access token: a 2xx without one is not
+    /// a usable grant (decision D-035's class table).
+    pub fn has_access_token(&self) -> bool {
+        self.access_token.is_some()
+    }
+
+    /// The server's `earliest_refresh_at`, when it sent a usable one (fact
+    /// F80, ledger 282a).
+    pub fn earliest_refresh_at(&self) -> Option<Timestamp> {
+        self.earliest_refresh_at
     }
 }
 
@@ -543,6 +597,7 @@ impl fmt::Debug for RefreshResponse {
             .field("id_token", &self.id_token.is_some())
             .field("access_token", &self.access_token.is_some())
             .field("refresh_token", &self.refresh_token.is_some())
+            .field("earliest_refresh_at", &self.earliest_refresh_at)
             .finish()
     }
 }
@@ -588,9 +643,10 @@ impl<'g> LockedCredentials<'g> {
     /// was held, recording the digests the file had at that read.
     ///
     /// The borrow is the point: the value cannot outlive the lock. Callers are
-    /// pinned to `auth_store.rs` by plan AC119's source test — a sibling
-    /// module could call this with a guard for the right namespace and bytes
-    /// it did not read under it, which privacy alone cannot stop.
+    /// pinned to `auth_store.rs` by `scripts/phase3-greps.sh`'s `locked_read`
+    /// rule — a sibling module could call this with a guard for the right
+    /// namespace and bytes it did not read under it, which privacy alone
+    /// cannot stop.
     pub(super) fn from_locked_read(
         inner: Credentials,
         ids: (&str, &str),
@@ -615,6 +671,20 @@ impl<'g> LockedCredentials<'g> {
     /// The credentials.
     pub fn credentials(&self) -> &Credentials {
         &self.inner
+    }
+
+    /// The credentials, no longer bound to the lock they were read under.
+    ///
+    /// For a usage GET, which reads a token and writes nothing: holding the
+    /// namespace lock for the length of a request would make every other
+    /// agctl process's refresh of this namespace `busy` meanwhile. What an
+    /// unbound value cannot do is the point of the type — build a refresh
+    /// body ([`LockedCredentials::write_refresh_body_to`]) or be written
+    /// (`OwnedNamespace::write` takes `&LockedCredentials`) — so unbinding
+    /// gives up exactly the capabilities a read-only caller does not need
+    /// (invariant I26).
+    pub fn into_credentials(self) -> Credentials {
+        self.inner
     }
 
     /// The first eight hex digits of the refresh token's digest.
@@ -673,7 +743,7 @@ impl<'g> LockedCredentials<'g> {
         }
         let before_refresh = inner.refresh_digest8();
         let before_user = inner.view.claims.as_ref().and_then(|c| c.chatgpt_user_id.clone());
-        let RefreshResponse { id_token, access_token, refresh_token } = response;
+        let RefreshResponse { id_token, access_token, refresh_token, .. } = response;
         // Review S30 F3: an id token whose claims do not decode is not merged,
         // so the view below cannot fail on it and the rest of the grant lands.
         let mut id_token_unreadable = false;
