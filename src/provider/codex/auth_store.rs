@@ -301,8 +301,8 @@ pub enum WriteKind {
 /// A `testing`-only witness that one [`WriteReceipt`] reaches the audit log.
 ///
 /// The run-time half of invariant I30. `#[must_use]` makes an ignored receipt
-/// a warning and the static AC119 rule reads the source for receipts that are
-/// taken and never audited, but neither sees a receipt that a live path drops
+/// a warning and `scripts/phase3-greps.sh`'s `receipt_destructure` rule reads
+/// the source for receipts bound to `_`, but neither sees one a live path drops
 /// — bound to a name and then let go, moved into a value nobody consumes,
 /// taken out of an `Option` and discarded. This does: every receipt is born
 /// armed, [`append`] disarms it, and a drop while it is still armed panics on
@@ -405,8 +405,9 @@ impl WriteReceipt {
     ///
     /// A shared borrow, so this is not a way to *consume* a receipt. The one
     /// function that takes one by value and does not audit it is a helper in
-    /// `auth_store_tests.rs` — outside the source the AC119 rule reads, and
-    /// outside every binary.
+    /// `auth_store_tests.rs` — outside the source `scripts/phase3-greps.sh`
+    /// scans, and `#[cfg(test)]`, so it reaches no shipped artifact (it does
+    /// live in the unit-test binary, which is where it is meant to run).
     ///
     /// [`append`]: crate::provider::codex::audit::append
     pub(super) fn reached_audit(&self) {

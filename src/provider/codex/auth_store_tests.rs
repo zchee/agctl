@@ -26,8 +26,8 @@ const OTHER_ACCT: &str = "99999999-2222-4333-8444-555555555555";
 /// A unit test that asserts on the write itself and stops there is not that
 /// bug, so it says so once, here, rather than letting each site trip the
 /// check. It lives in this file, not in `auth_store.rs`: nothing that takes a
-/// receipt by value and does not audit it belongs in a file the AC119 source
-/// rule reads, or in any binary.
+/// receipt by value and does not audit it belongs in a file
+/// `scripts/phase3-greps.sh` scans, or in any shipped artifact.
 fn discarded_by_this_test(receipt: WriteReceipt) {
     receipt.reached_audit();
 }
@@ -629,8 +629,8 @@ fn an_unreadable_marker_fails_closed() {
 #[cfg(feature = "testing")]
 fn a_receipt_dropped_before_the_audit_log_fails_the_test_that_drops_it() {
     // The run-time half of invariant I30 (user decision, ledger #454). The
-    // static AC119 rule reads the source and cannot see a receipt that a live
-    // path lets go; this fires on whatever path a test actually drives, and
+    // source-scanning rules in `scripts/phase3-greps.sh` cannot see a receipt
+    // that a live path lets go; this fires on the path a test drives, and
     // here is the proof that it fires at all — a check never seen to fail
     // proves nothing.
     let (_dir, paths) = testkit::store();

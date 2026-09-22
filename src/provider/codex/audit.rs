@@ -2,9 +2,10 @@
 //!
 //! Every Codex namespace write returns a [`WriteReceipt`], and [`append`] is
 //! the one function that consumes one: it takes the receipt by value, so a
-//! write that is audited cannot be audited twice, and the source test in
-//! `mod_tests.rs` pins that no other module takes a receipt apart (plan
-//! AC117/AC119, review S30 LOW-2). A refresh outcome that changes no
+//! write that is audited cannot be audited twice, and
+//! `scripts/phase3-greps.sh`'s `receipt_type` rule holds `WriteReceipt` to
+//! `auth_store.rs` and this file, so no other module takes a receipt apart
+//! (plan AC117, review S30 LOW-2). A refresh outcome that changes no
 //! credential file — an adopted external grant, a dead grant, an ambiguous
 //! send, a user's re-send, a floor reset — is recorded through
 //! [`append_event`].

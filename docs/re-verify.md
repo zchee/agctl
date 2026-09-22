@@ -534,15 +534,27 @@ what "Codex drops unknown members" means for AC87). Re-read
 **Affected agctl code:** `src/provider/codex/credentials.rs` (`Credentials::write`), and
 every AC87 test fixture under `fixtures/codex/`.
 
-**A residual this section does not cover.** `src/provider/codex/ac119_receipts_tests.rs`
-carries the AC119 source-reading test family — a static analysis of agctl's own tree, not a
-Codex-binary fact, and so untouched by a Codex CLI upgrade. Static AC119 analysis was
-**dropped from the phase-3 plan by user decision, 2026-09-22 (ledger #460)**; what remains in
-that file proves one narrower thing — that no Codex command can ask the keychain for one
-password without going through the drop-checked write-receipt path (`src/provider/codex/
-auth_store.rs`'s `UNAUDITED_RECEIPT` panic-on-drop guard) — and proves nothing about the
-coverage of code added after it. Do not read a green run of that file as a substitute for a
-security review of new Codex-touching code.
+**A residual this section does not cover.** Two properties are held inside agctl rather than by
+any Codex-binary fact, so no Codex CLI upgrade touches them — and neither is held the way a
+reader might assume. They are stated separately here because one sentence used to claim both.
+
+*That no Codex command asks the keychain for one account's password* is held first by
+`tests/common/codex.rs`'s `checked`, which fails any e2e run whose fake `security` log records a
+`find-generic-password`, and second by `scripts/phase3-greps.sh`'s `codex_no_password_lookup`
+rule over the source. The grep is the second line of defence, not the first.
+
+*That every write receipt reaches the audit log* is held at run time by
+`src/provider/codex/auth_store.rs`'s `UNAUDITED_RECEIPT` panic-on-drop guard, which every receipt
+is born armed with — and by essentially nothing else. `phase3-greps.sh`'s `receipt_type`,
+`receipt_destructure`, `receipt_check` and `reached_audit` rules pin the type, three syntactic
+shapes, the guard's one spelling and its one disarmer; none of them follows a receipt from its
+binding to its audit, and an unaudited receipt planted at a real production site leaves them all
+green. **The guard therefore fires only on a path a test actually drives, and nothing in the tree
+requires a newly added receipt site to be driven by one.** The static AC119 source-reading family
+that used to state this here was **dropped from the phase-3 plan by user decision, 2026-09-22
+(ledger #460)** and its files are gone. None of this proves anything about the coverage of code
+added after it: do not read a green run as a substitute for a security review of new
+Codex-touching code.
 
 ---
 

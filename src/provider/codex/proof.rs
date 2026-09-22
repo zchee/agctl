@@ -8,9 +8,14 @@
 //!   (plan AC122, `scripts/phase3-structural.sh`). A command can only *receive*
 //!   one, from [`owned`], from the login verification, or from the lock.
 //! - **Inside `provider::codex`** the `pub(super)` constructors are visible to
-//!   every sibling, so which sibling calls each one is pinned by a
-//!   source-reading test instead (plan AC119). That boundary is partial, and
-//!   is stated as such (invariant I22).
+//!   every sibling, and only one of them pins which sibling may call it:
+//!   `scripts/phase3-greps.sh`'s `locked_read` rule holds `from_locked_read`
+//!   to `auth_store.rs` (invariant I26). For `from_verified`,
+//!   `CodexNamespaceGuard::wrap` and `PostExitReport::from_child` the caller
+//!   set is a convention, not a pinned invariant: clauses 1, 5, 7 and 7b of
+//!   `scripts/phase3-structural.sh` prove only that no code outside
+//!   `provider::codex` can build these values, never which sibling inside it
+//!   does. That is what invariant I22 means by a partial boundary.
 //!
 //! What each proof guarantees, and where:
 //!

@@ -38,7 +38,7 @@
 //! [`exposed`], with a private constructor; the only way to obtain one is
 //! [`LockedCredentials::from_locked_read`], which borrows the lock proof for
 //! the value's whole life, and whose callers `auth_store.rs` alone may be
-//! (plan AC119's source test).
+//! (`scripts/phase3-greps.sh`'s `locked_read` rule).
 
 use std::fmt;
 use std::io;
@@ -643,9 +643,10 @@ impl<'g> LockedCredentials<'g> {
     /// was held, recording the digests the file had at that read.
     ///
     /// The borrow is the point: the value cannot outlive the lock. Callers are
-    /// pinned to `auth_store.rs` by plan AC119's source test — a sibling
-    /// module could call this with a guard for the right namespace and bytes
-    /// it did not read under it, which privacy alone cannot stop.
+    /// pinned to `auth_store.rs` by `scripts/phase3-greps.sh`'s `locked_read`
+    /// rule — a sibling module could call this with a guard for the right
+    /// namespace and bytes it did not read under it, which privacy alone
+    /// cannot stop.
     pub(super) fn from_locked_read(
         inner: Credentials,
         ids: (&str, &str),

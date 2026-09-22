@@ -54,14 +54,9 @@ httpmock = "0.8"
 insta = "1"
 jsonschema = "0.56"
 predicates = "3.1.4"
-# AC119's receipt rule parses the source tree (numbered deviation 14). `syn` 3
-# is the major serde, clap and thiserror 2 already build, so the tests add no
-# third copy; `span-locations` lets a violation name its line.
-proc-macro2 = { version = "1.0.107", default-features = false, features = ["span-locations"] }
 # The Codex refresh client's self-signed TLS test generates its certificate at
 # test time, so no key material is committed.
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
-syn = { version = "3.0.5", default-features = false, features = ["clone-impls", "full", "parsing", "visit"] }
 tempfile = "3.27.0"
 
 [profile.release]

@@ -4,8 +4,8 @@
 //! Nothing here reads a credential. A source says where a row's credentials
 //! are and, for an owned namespace, what the daemon evidence is; the read
 //! itself happens in `auth_store` — under the namespace lock for an owned row
-//! — so `LockedCredentials` is never built here (plan AC119: a planted
-//! `from_locked_read` in this file fails the source test).
+//! — so `LockedCredentials` is never built here (a planted `from_locked_read`
+//! in this file fails `scripts/phase3-greps.sh`'s `locked_read` rule).
 
 use std::fs;
 use std::io;

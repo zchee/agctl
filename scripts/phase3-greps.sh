@@ -1055,11 +1055,14 @@ check_receipt_destructure() {
             # file that takes receipts calls audit::append( somewhere". A
             # second, unaudited receipt in a file that audits a first one
             # passed it, and no line-oriented grep can follow a receipt from
-            # its binding to its audit. The per-binding rule R6c in
-            # src/provider/codex/ac119_receipts_tests.rs (a `syn` walk over a
-            # vocabulary derived from signatures) replaces it; one strong pin
-            # rather than a strong one and a weak twin. The three clauses
-            # above stay: each is a per-pattern check a grep does hold.
+            # its binding to its audit. Following one is a RUN-TIME job now:
+            # every receipt is born armed and panics if it is dropped before
+            # `audit::append` disarms it, and `check_receipt_check` and
+            # `check_reached_audit` below prove that guard is present and has
+            # exactly one disarmer. (The static per-binding rule that held
+            # this from S34 until 2026-09-22 went with plan item AC119,
+            # ledger #460.) The three clauses above stay: each is a
+            # per-pattern check a grep does hold.
         done < <(cd "$root" && rg --files --glob '*.rs' --glob '!*_tests.rs' "$dir" | LC_ALL=C sort)
     done
     return "$bad"
@@ -1522,8 +1525,9 @@ plant_receipt_tuple() {
 }
 # plant_receipt_unaudited is RETIRED with the clause it proved (S34 C1b-1,
 # bead agctl-meqv): see check_receipt_destructure. Its shape — a receipt
-# dropped in `watch.rs` — is now R6c's plant in mod_tests.rs, beside the shape
-# the clause could not see: a second receipt dropped in the real `login.rs`.
+# dropped in `watch.rs` — is caught at run time instead, by the panic-on-drop
+# guard that `check_receipt_check` and `check_reached_audit` below prove is
+# present and has exactly one disarmer.
 plant_marker_mutator_settle() {
     plant_line "$1" 'fn _phase3_plant(s: &RefreshStateFile) { let _ = s.settle_inflight(DefiniteOutcome::Applied, Settled::default()); }' src/provider/codex/discovery.rs
 }
