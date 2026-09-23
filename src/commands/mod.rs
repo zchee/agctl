@@ -39,6 +39,11 @@ pub trait Prompt {
     /// Writes a line the user is meant to read.
     fn tell(&mut self, message: &str);
 
+    /// Whether a person can be asked, for question details restricted to a terminal.
+    fn can_ask(&self) -> bool {
+        true
+    }
+
     /// Asks a yes/no question that must be answered by a person.
     ///
     /// # Errors
@@ -56,6 +61,10 @@ pub struct Tty;
 impl Prompt for Tty {
     fn tell(&mut self, message: &str) {
         println!("{message}");
+    }
+
+    fn can_ask(&self) -> bool {
+        std::io::stdin().is_terminal()
     }
 
     fn confirm(&mut self, question: &str) -> Result<bool, AppError> {

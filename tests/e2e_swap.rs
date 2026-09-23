@@ -4507,6 +4507,423 @@ fn live_item(fixture: &Fixture) -> Option<String> {
     fs::read_to_string(fixture.keychain_item_path(LIVE_SERVICE)).ok()
 }
 
+#[test]
+fn ac142_expired_live_pass_refuses_f_at_adoption_in_both_directions() {
+    for reverse in [false, true] {
+        for expired in [true, false] {
+            let server = MockServer::start();
+            let (p_profile, t_profile) = live_profiles(&server);
+            let refreshed_profile =
+                common::mock_profile(&server, "sk-ant-oat01-incoming-refreshed", (ACCT_T, ORG_T));
+            let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+            if reverse {
+                let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+                assert_eq!(code, 0, "control forward: {stdout}{stderr}");
+                assert_eq!(outcome_doc(&stdout)["outcome"], "applied");
+                // Device alpha: a real token rotation forces ThirdStore on undo.
+                let refreshed = claude_code_blob(
+                    "sk-ant-oat01-incoming-refreshed",
+                    "sk-ant-ort01-incoming-refreshed",
+                    common::fresh_at() + 3_600_000,
+                );
+                fixture.keychain_item(LIVE_SERVICE, &refreshed);
+            }
+            let item_before = fs::read(fixture.keychain_item_path(LIVE_SERVICE)).expect("item");
+            let t_before = fs::read(fixture.credentials_path(ACCT_T, ORG_T)).expect("T store");
+            let profile_before = if reverse { p_profile.calls() } else { t_profile.calls() };
+            let config_before = config_steps(&fixture).len();
+            let mut command = fixture.cmd();
+            command.args(["claude", "use", "--yes", "--json"]);
+            if reverse {
+                command.arg("--undo");
+            } else {
+                command.args(["--live", EMAIL_T]);
+            }
+            command.env_remove("AGCTL_SWAP_DEADLINE_MS");
+            if expired {
+                command.env("AGCTL_SWAP_DEADLINE_MS", "0");
+            }
+            let output = command.output().expect("deadline pass");
+            let stdout = String::from_utf8(output.stdout).expect("stdout");
+            let stderr = String::from_utf8(output.stderr).expect("stderr");
+            let doc = outcome_doc(&stdout);
+            assert_eq!(
+                if reverse { p_profile.calls() } else { t_profile.calls() },
+                profile_before + 1,
+                "Phase B reached, reverse={reverse}: {stdout}{stderr}",
+            );
+            live_artefacts_released(&fixture, &resolved);
+            artefacts_released(&fixture);
+            for (acct, org) in [(ACCT, ORG), (ACCT_T, ORG_T)] {
+                assert!(
+                    !common::lock_is_held(&fixture.lock_path(acct, org)),
+                    "namespace lock released"
+                );
+            }
+            let namespace = if reverse { (ACCT_T, ORG_T) } else { (ACCT, ORG) };
+            assert!(
+                fixture
+                    .namespace_entries(namespace.0, namespace.1)
+                    .iter()
+                    .all(|name| !name.contains(".tmp.")),
+                "no staged temporary survives"
+            );
+            if expired {
+                assert_eq!(doc["refusal"], "F", "step 15 specifically: {stdout}{stderr}");
+                assert_eq!(doc["outcome"], "refused");
+                assert_eq!(output.status.code(), Some(14));
+                assert_eq!(
+                    fs::read(fixture.keychain_item_path(LIVE_SERVICE)).expect("item"),
+                    item_before
+                );
+                assert_eq!(config_steps(&fixture).len(), config_before, "no config_write");
+                if reverse {
+                    assert_eq!(
+                        fs::read(fixture.credentials_path(ACCT_T, ORG_T)).expect("T store"),
+                        t_before
+                    );
+                    assert_eq!(refreshed_profile.calls(), 1, "rotated T identified in Phase A");
+                } else {
+                    assert!(!adopted_path(&fixture, ACCT, ORG).exists(), "no adopted copy");
+                }
+            } else {
+                assert_eq!(output.status.code(), Some(0), "default deadline: {stdout}{stderr}");
+                assert_eq!(doc["outcome"], "applied", "control must apply: {doc}");
+                assert_eq!(config_steps(&fixture).len(), config_before + 1);
+            }
+        }
+    }
+}
+
+/// Every registry object, including its metadata and content digest (AC138).
+#[derive(Debug, PartialEq, Eq)]
+struct SessionSnapshot {
+    size: u64,
+    mode: u32,
+    modified: std::time::SystemTime,
+    sha256: String,
+}
+
+fn session_tree(root: &Path) -> BTreeMap<std::path::PathBuf, SessionSnapshot> {
+    use std::os::unix::fs::PermissionsExt;
+
+    use sha2::Digest;
+    use sha2::Sha256;
+
+    fn visit(root: &Path, path: &Path, result: &mut BTreeMap<std::path::PathBuf, SessionSnapshot>) {
+        let metadata = fs::symlink_metadata(path).expect("registry metadata");
+        let mode = metadata.permissions().mode();
+        let bytes = if metadata.is_file() {
+            fs::read(path).expect("registry bytes")
+        } else if metadata.is_symlink() {
+            fs::read_link(path).expect("registry symlink").as_os_str().as_encoded_bytes().to_vec()
+        } else {
+            Vec::new()
+        };
+        result.insert(
+            path.strip_prefix(root).expect("relative registry path").to_path_buf(),
+            SessionSnapshot {
+                size: metadata.len(),
+                mode,
+                modified: metadata.modified().expect("mtime"),
+                sha256: hex::encode(Sha256::digest(&bytes)),
+            },
+        );
+        if metadata.is_dir() {
+            // Only the test's snapshot temporarily grants access; agctl runs
+            // with the original mode. chmod does not change the checked mtime.
+            if mode & 0o700 == 0 {
+                fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700))
+                    .expect("snapshot access");
+            }
+            for entry in fs::read_dir(path).expect("registry entries") {
+                visit(root, &entry.expect("registry entry").path(), result);
+            }
+            if mode & 0o700 == 0 {
+                fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                    .expect("restore registry mode");
+            }
+        }
+    }
+    let mut result = BTreeMap::new();
+    if root.exists() {
+        visit(root, root, &mut result);
+    }
+    result
+}
+
+fn remote_registry(fixture: &Fixture, remote_on: bool) -> std::path::PathBuf {
+    let dir = fixture.home().join(".claude/sessions");
+    fs::create_dir_all(&dir).expect("session registry");
+    fs::write(
+        dir.join("4242.json"),
+        json!({
+            "pid": std::process::id(), "name": "rc-e2e", "cwd": "/tmp/secret-cwd",
+            "tmux": "x:@1.%1", "sessionId": "local-secret-id",
+            "bridgeSessionId": if remote_on { Some("session_01TESTSECRET") } else { None },
+        })
+        .to_string(),
+    )
+    .expect("live session");
+    fs::write(dir.join("session.key"), b"untouched registry sibling").expect("key fixture");
+    fs::create_dir(dir.join("nested")).expect("nested registry directory");
+    fs::write(dir.join("nested/unchanged"), b"nested bytes").expect("nested file");
+    std::os::unix::fs::symlink("4242.json", dir.join("alias.json")).expect("registry symlink");
+    dir
+}
+
+/// Every S3 command checks the complete registry tree before and after it runs.
+fn remote_run(fixture: &Fixture, args: &[&str]) -> (i32, String, String) {
+    let dir = fixture.home().join(".claude/sessions");
+    let before = session_tree(&dir);
+    let output =
+        fixture.cmd().args(args).env_remove("AGCTL_SWAP_DEADLINE_MS").output().expect("hint pass");
+    assert_eq!(
+        session_tree(&dir),
+        before,
+        "agctl must leave the entire registry unchanged: {args:?}"
+    );
+    (
+        output.status.code().expect("normal exit"),
+        String::from_utf8(output.stdout).expect("stdout"),
+        common::strip_ansi(&String::from_utf8(output.stderr).expect("stderr")),
+    )
+}
+
+const REMOTE_COUNTS_WARNING: &str = "1 Claude Code session had Remote Control on when this swap started, and agctl cannot tell which of them use this store. In each one that does, Remote Control stops (now, or on its next account check): run `/remote-control` there to start it again. Its earlier conversation reaches claude.ai only if Remote Control was disconnected there before the swap";
+const REMOTE_UNREADABLE_NOTE: &str = "agctl could not read Claude Code's session registry (permission denied), so it cannot say whether a running session has Remote Control on. A session that does keeps its claude.ai history only if Remote Control is disconnected there before the swap: decline this swap (answer n, or run without `--yes`), disconnect it there, and run this command again";
+
+fn assert_remote_warning(stdout: &str, stderr: &str, json: bool) {
+    let named = REMOTE_COUNTS_WARNING.replacen("session had", "session (`rc-e2e`) had", 1);
+    assert_eq!(stderr.matches(&format!("warning: {named}")).count(), 1, "{stderr}");
+    if json {
+        let docs = json_docs(stdout);
+        assert!(!docs.is_empty(), "JSON documents, not prose");
+        let doc = docs.last().expect("outcome");
+        assert!(
+            doc["warnings"].as_array().expect("warnings").contains(&json!(REMOTE_COUNTS_WARNING)),
+            "{doc}"
+        );
+        assert!(!stdout.contains("rc-e2e"), "names never reach any JSON document: {stdout}");
+    }
+    for forbidden in
+        ["4242.json", "/tmp/secret-cwd", "x:@1.%1", "local-secret-id", "session_01TESTSECRET"]
+    {
+        assert!(
+            !stdout.contains(forbidden) && !stderr.contains(forbidden),
+            "registry field leaked: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn remote_control_applied_forward_and_undo_warn_on_stderr_and_json_counts_only() {
+    for json in [false, true] {
+        for config_present in [false, true] {
+            let server = MockServer::start();
+            let profiles = live_profiles(&server);
+            let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+            if config_present {
+                fixture.live_claude_json_js(&common::live_config_document());
+            }
+            remote_registry(&fixture, true);
+            let mut args = vec!["claude", "use", "--live", EMAIL_T, "--yes"];
+            if json {
+                args.push("--json");
+            }
+            let (code, stdout, stderr) = remote_run(&fixture, &args);
+            assert_eq!(code, 0, "{stdout}{stderr}");
+            assert_remote_warning(&stdout, &stderr, json);
+            if json {
+                let doc = outcome_doc(&stdout);
+                assert_eq!(doc["outcome"], "applied");
+                if !config_present {
+                    assert_config(&doc, "skipped", Some("absent"));
+                }
+            }
+            let mut args = vec!["claude", "use", "--undo", "--yes"];
+            if json {
+                args.push("--json");
+            }
+            let (code, stdout, stderr) = remote_run(&fixture, &args);
+            assert_eq!(code, 0, "undo: {stdout}{stderr}");
+            assert_remote_warning(&stdout, &stderr, json);
+            if json {
+                assert_eq!(outcome_doc(&stdout)["outcome"], "applied");
+            }
+            live_artefacts_released(&fixture, &resolved);
+            assert_eq!((profiles.0.calls(), profiles.1.calls()), (2, 2));
+        }
+    }
+}
+
+#[test]
+fn remote_control_completion_is_silent_without_an_applied_change() {
+    let cases = [
+        ("absent registry", "applied", 0),
+        ("remote off", "applied", 0),
+        ("env refusal", "refused", 11),
+        ("cancelled", "cancelled", 20),
+        ("unknown", "unknown", 18),
+        ("already current", "already_active", 0),
+    ];
+    for (case, expected, expected_code) in cases {
+        let server = MockServer::start();
+        let profiles = live_profiles(&server);
+        let (mut fixture, resolved) = live_accounts(&server, common::fresh_at());
+        fixture.live_claude_json_js(&common::live_config_document());
+        if case != "absent registry" {
+            remote_registry(&fixture, case != "remote off");
+        }
+        if case == "env refusal" {
+            fixture.set("CLAUDE_CODE_OAUTH_TOKEN", "fixture-env-override");
+        }
+        if case == "unknown" {
+            fixture.fault("keychain_write_hang");
+        }
+        let mut args = vec!["claude", "use", "--live", EMAIL_T, "--json"];
+        if case != "cancelled" {
+            args.push("--yes");
+        }
+        if case == "already current" {
+            let (code, stdout, stderr) = remote_run(&fixture, &args);
+            assert_eq!(code, 0, "setup: {stdout}{stderr}");
+            assert_remote_warning(&stdout, &stderr, true);
+        }
+        let (code, stdout, stderr) = remote_run(&fixture, &args);
+        let doc = outcome_doc(&stdout);
+        assert_eq!(doc["outcome"], expected, "{case}: {stdout}{stderr}");
+        assert_eq!(code, expected_code, "{case}: {stdout}{stderr}");
+        assert!(!stderr.contains("had Remote Control on"), "{case}: {stderr}");
+        assert!(!doc["warnings"].to_string().contains("Remote Control"), "{case}: {doc}");
+        if case == "cancelled" {
+            assert!(!stdout.contains("rc-e2e"), "names never reach JSON notes: {stdout}");
+            for undo in [false, true] {
+                if undo {
+                    let (code, stdout, stderr) = remote_run(
+                        &fixture,
+                        &["claude", "use", "--live", EMAIL_T, "--yes", "--json"],
+                    );
+                    assert_eq!(code, 0, "undo setup: {stdout}{stderr}");
+                    assert_eq!(outcome_doc(&stdout)["outcome"], "applied");
+                }
+                for json in [false, true] {
+                    let mut args = if undo {
+                        vec!["claude", "use", "--undo"]
+                    } else {
+                        vec!["claude", "use", "--live", EMAIL_T]
+                    };
+                    if json {
+                        args.push("--json");
+                    }
+                    let (code, stdout, stderr) = remote_run(&fixture, &args);
+                    assert_eq!(code, 20, "undo={undo}, json={json}: {stdout}{stderr}");
+                    assert!(!stdout.contains("rc-e2e"), "names never reach stdout: {stdout}");
+                    assert!(!stderr.contains("rc-e2e"), "no prompt was printed: {stderr}");
+                    assert!(!stderr.contains("had Remote Control on"), "{stderr}");
+                    if json {
+                        let doc = outcome_doc(&stdout);
+                        assert_eq!(doc["outcome"], "cancelled", "{doc}");
+                        assert!(!doc["warnings"].to_string().contains("Remote Control"), "{doc}");
+                    }
+                }
+            }
+        }
+        if case == "already current" {
+            assert_config(&doc, "skipped", Some("already_current"));
+        }
+        live_artefacts_released(&fixture, &resolved);
+        let _ = profiles;
+    }
+}
+
+#[test]
+fn remote_control_catch_up_warns_only_when_the_config_is_updated() {
+    let server = MockServer::start();
+    let profiles = live_profiles(&server);
+    let (fixture, _) = live_accounts(&server, common::fresh_at());
+    remote_registry(&fixture, true);
+    let args = ["claude", "use", "--live", EMAIL_T, "--yes", "--json"];
+    let (code, stdout, stderr) = remote_run(&fixture, &args);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert_remote_warning(&stdout, &stderr, true);
+    assert_config(&outcome_doc(&stdout), "skipped", Some("absent"));
+    fixture.live_claude_json_js(&common::live_config_document());
+    let (code, stdout, stderr) = remote_run(&fixture, &args);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], "already_active");
+    assert_config(&doc, "applied", None);
+    assert_remote_warning(&stdout, &stderr, true);
+    let (code, stdout, stderr) = remote_run(&fixture, &args);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert_config(&outcome_doc(&stdout), "skipped", Some("already_current"));
+    assert!(!stderr.contains("had Remote Control on"));
+    assert!(!outcome_doc(&stdout)["warnings"].to_string().contains("Remote Control"));
+    let _ = profiles;
+}
+
+#[test]
+fn remote_control_unreadable_registry_is_a_note_only_for_live_passes_after_env_gate() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (case, unreadable, namespace, env_refusal) in [
+        ("absent control", false, false, false),
+        ("live unreadable", true, false, false),
+        ("namespace unreadable", true, true, false),
+        ("env refusal before scan", true, false, true),
+    ] {
+        let server = MockServer::start();
+        let profiles = live_profiles(&server);
+        let (mut fixture, _) = if namespace {
+            let (fixture, _) = two_accounts(&server, common::fresh_at());
+            (fixture, std::path::PathBuf::new())
+        } else {
+            live_accounts(&server, common::fresh_at())
+        };
+        if env_refusal {
+            fixture.set("CLAUDE_CODE_OAUTH_TOKEN", "fixture-env-override");
+        }
+        let dir = fixture.home().join(".claude/sessions");
+        if unreadable {
+            remote_registry(&fixture, true);
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o000))
+                .expect("deny registry access");
+        }
+        let (code, stdout, stderr) =
+            remote_run(&fixture, &["claude", "use", "--live", EMAIL_T, "--yes", "--json"]);
+        if unreadable {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("cleanup access");
+        }
+        assert_eq!(code, if env_refusal { 11 } else { 0 }, "{case}: {stdout}{stderr}");
+        let doc = outcome_doc(&stdout);
+        if unreadable && !namespace && !env_refusal {
+            assert_eq!(
+                stderr.matches(&format!("note: {REMOTE_UNREADABLE_NOTE}")).count(),
+                1,
+                "{stderr}"
+            );
+            assert_eq!(
+                doc["warnings"]
+                    .as_array()
+                    .expect("warnings")
+                    .iter()
+                    .filter(|value| **value == json!(REMOTE_UNREADABLE_NOTE))
+                    .count(),
+                1,
+                "{doc}"
+            );
+        } else {
+            assert!(
+                !stderr.contains("session registry") && !stdout.contains("session registry"),
+                "{case}: {stdout}{stderr}"
+            );
+        }
+        assert!(!stderr.contains("had Remote Control on"));
+        let _ = profiles;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // S24 — whose credential the live item holds, as the profile says
 // ---------------------------------------------------------------------------

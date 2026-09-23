@@ -284,6 +284,11 @@ pub fn backups_dir(env: &EnvView) -> PathBuf {
     config_home(env).join("backups")
 }
 
+/// The read-only session registry under this environment's configuration home.
+pub fn sessions_dir(env: &EnvView) -> PathBuf {
+    config_home(env).join("sessions")
+}
+
 /// The name of the configuration lock directory for `config_path`:
 /// `<file name>.lock`, beside the **literal** path (drift 1).
 ///

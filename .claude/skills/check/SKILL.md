@@ -75,6 +75,7 @@ cannot, so they are not listed). **The seam names, every one of which must be ab
 | `AGCTL_CLAUDE_AUTHORIZE_URL` | `src/provider/claude/oauth.rs` |
 | `AGCTL_CLAUDE_PROFILE_URL` | `src/provider/claude/oauth.rs` (the live swap's profile GET) |
 | `AGCTL_NO_BROWSER` | `src/commands/login.rs` |
+| `AGCTL_SWAP_DEADLINE_MS` | `src/commands/use.rs` (Remote Control hint S2b: expired-pass regression seam) |
 | `AGCTL_CODEX_BIN` | `src/provider/codex/login_child.rs` (phase 3; listed from S29b, which introduces the name — the module that reads it lands at S34, and `scripts/phase3-greps.sh` pins it to that one file) |
 | `AGCTL_CODEX_USAGE_URL` | `src/provider/codex/usage.rs` (phase 3, S31; `scripts/phase3-greps.sh` pins it to that one file) |
 | `AGCTL_CODEX_TOKEN_URL` | `src/provider/codex/oauth.rs` (phase 3, S32; `scripts/phase3-greps.sh` pins it to that one file) |
@@ -108,8 +109,8 @@ it — none of the three shows up in a `src`-only sweep at all, since all three 
 `*_tests.rs` files. Eleven more are dead code in every binary this crate ships (the
 `AGCTL_FAKE_SECURITY_*` family and `AGCTL_FAKE_CODEX_`, added since `e6c00e9`; see below for
 why): `rg -o --no-filename 'AGCTL_[A-Z0-9_]+' src --glob '!*_tests.rs' | sort -u | wc -l`
-finds **27** distinct names outside `*_tests.rs`, of which 4 are the production list above
-and 12 are in the `seams` array, leaving **11** genuinely outside both by that measure. The
+finds **28** distinct names outside `*_tests.rs`, of which 4 are the production list above
+and 13 are in the `seams` array, leaving **11** genuinely outside both by that measure. The
 script says so in its own comments; do not "tidy" any of them in.
 
 `AGCTL_FAKE_CODEX_` is outside the array for a different reason: it is only ever a

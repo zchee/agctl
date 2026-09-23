@@ -431,6 +431,15 @@ the displaced credential was parked and the audit id. `--json` does not imply `-
 prints a `"kind": "plan"` document before the prompt and a `"kind": "outcome"` document at
 the end, so read the last document rather than the second.
 
+**Remote Control.** A live swap stops Remote Control in sessions using that store; the
+local conversation survives, but reconnecting afterwards does not carry its earlier
+conversation to claude.ai unless Remote Control was disconnected before the swap. When
+Claude Code's session registry reports Remote Control on, agctl adds a consent hint and
+an applied-swap warning (`--json` carries counts only). The hint cannot tell which session
+uses this store. To keep a session's claude.ai history, answer `n`, run `/remote-control`
+in that session and disconnect, then re-run the swap and run `/remote-control` afterwards.
+Do not leave the question open while disconnecting: it counts against the swap's limit.
+
 **When `~/.claude.json` was not rewritten.** The config step never changes the swap's
 outcome. If it does not land — Claude Code held its config lock, the file changed under
 agctl's lock, the profile request failed — the swap still exits 0, `--json` reports the
