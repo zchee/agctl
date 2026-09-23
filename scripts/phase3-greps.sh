@@ -1246,6 +1246,34 @@ check_codex_keyring_listing_callers() {
     return "$bad"
 }
 
+# Remote Control hint (S4): the registry is read-only and its bridge ids
+# never escape the parser. These checks exclude sibling tests like all AC120 pins.
+check_live_sessions_readonly() {
+    local hits
+    hits=$(scoped_code_hits "$1" 'fs::write|OpenOptions|create_dir|remove_|rename\(|set_permissions|File::create|fs::copy|hard_link|symlink\(|Command::new' \
+        src/provider/claude/live_sessions.rs) || scan_failed check_live_sessions_readonly
+    [[ -z $hits ]] && return 0
+    printf '  the session registry reader writes or spawns a command:\n%s' "$hits"
+    return 1
+}
+
+check_sessions_key() {
+    local hits
+    hits=$(scoped_code_hits "$1" '\.key"' src/provider/claude/live_sessions.rs) || scan_failed check_sessions_key
+    [[ -z $hits ]] && return 0
+    printf '  the session registry reader names a key file:\n%s' "$hits"
+    return 1
+}
+
+check_sessions_dir_callers() {
+    check_helper_callers "$1" 'sessions_dir\(' 'sessions_dir' \
+        src/provider/claude/namespace.rs src/provider/claude/live_sessions.rs src/commands/use.rs
+}
+
+check_bridge_id_escape() {
+    check_helper_callers "$1" 'bridge_session_id' 'the private bridge id' src/provider/claude/live_sessions.rs
+}
+
 # Each plant_<name> <root> adds exactly one violation of its check.
 PLANT_FILE=src/main.rs
 # plant_line <root> <line> [file]: appends one line to <file> (default the
@@ -1546,12 +1574,22 @@ plant_codex_home_fmt() { plant_line "$1" $'const _PHASE3_PLANT: [&str; 1] = [\n 
 plant_unlink_helper_fmt() { plant_line "$1" $'fn _phase3_plant(d: BorrowedFd<\'_>) {\n    unlink_at(d, "x");\n}'; }
 plant_remove_dir_under_fmt() { plant_line "$1" $'fn _phase3_plant(a: &Path, p: &Path) {\n    remove_dir_under(\n        a, p,\n    );\n}'; }
 
+plant_live_sessions_write() { plant_line "$1" 'fn _rc_plant() { fs::write("x", "x"); }' src/provider/claude/live_sessions.rs; }
+plant_live_sessions_command() { plant_line "$1" $'fn _rc_plant() {\n    Command::new("x");\n}' src/provider/claude/live_sessions.rs; }
+plant_sessions_key() { plant_line "$1" 'const _RC_PLANT: &str = "secret.key";' src/provider/claude/live_sessions.rs; }
+plant_sessions_key_fmt() { plant_line "$1" $'const _RC_PLANT: [&str; 1] = [\n    "secret.key",\n];' src/provider/claude/live_sessions.rs; }
+plant_sessions_dir_caller() { plant_line "$1" 'fn _rc_plant(e: &EnvView) { namespace::sessions_dir(e); }'; }
+plant_sessions_dir_caller_fmt() { plant_line "$1" $'fn _rc_plant(e: &EnvView) {\n    sessions_dir(e);\n}'; }
+plant_bridge_id_escape() { plant_line "$1" 'fn _rc_plant(e: Entry) { tracing::debug!(id = e.bridge_session_id); }'; }
+plant_bridge_id_escape_fmt() { plant_line "$1" $'struct RcPlant {\n    bridge_session_id: String,\n}'; }
+
 CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers exposed codex_bin codex_env
     exposure_count auth_json account_header toml locked_read marker_mutators stop_policy
     codex_debug_assert state_path codex_flock wham_usage codex_usage_url codex_timeouts codex_redirects codex_decoded_cap credits_state
     auth_host codex_token_url oauth_cancelled oauth_refresh_callers consent_callers refresh_usage_cache receipt_type
     receipt_destructure refresh_drivers refresh_client post_permit permit_mint permit_mint_count daemon_pid_names watch_no_post usage_client_new
-    fake_prefix receipt_check reached_audit codex_no_password_lookup codex_keyring_listing_callers)
+    fake_prefix receipt_check reached_audit codex_no_password_lookup codex_keyring_listing_callers
+    live_sessions_readonly sessions_key sessions_dir_callers bridge_id_escape)
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
@@ -1654,6 +1692,14 @@ PLANTS=(
     "usage_client_new plant_usage_client_new"
     "codex_no_password_lookup plant_codex_find_generic_password"
     "codex_keyring_listing_callers plant_codex_keyring_listing_elsewhere"
+    "live_sessions_readonly plant_live_sessions_write"
+    "live_sessions_readonly plant_live_sessions_command"
+    "sessions_key plant_sessions_key"
+    "sessions_key plant_sessions_key_fmt"
+    "sessions_dir_callers plant_sessions_dir_caller"
+    "sessions_dir_callers plant_sessions_dir_caller_fmt"
+    "bridge_id_escape plant_bridge_id_escape"
+    "bridge_id_escape plant_bridge_id_escape_fmt"
 )
 
 main() {

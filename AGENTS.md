@@ -39,6 +39,8 @@ the planted file and line), and `scripts/phase3-version-gate.sh` (AC99 — build
 writing nothing, while still reading a version-1 one; it builds no Codex binary and reads no
 installed `codex`).
 
+On each Claude Code version bump, re-run the route-A′ checklist `.omc/handoffs/rc-hint-a-prime-check.md`: the session registry schema and bridge behaviour are Claude Code internals, and the Remote Control hint degrades silently if they change.
+
 ## Run cargo through direnv
 
 ```sh
