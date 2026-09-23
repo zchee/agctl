@@ -24,6 +24,7 @@ pub mod adopt;
 pub mod claude_json;
 pub mod credentials;
 pub mod discovery;
+pub mod live_sessions;
 pub mod namespace;
 pub mod oauth;
 pub mod swap;

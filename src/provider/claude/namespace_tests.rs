@@ -267,6 +267,18 @@ fn backups_dir_is_under_the_config_home_not_beside_the_config_file() {
 }
 
 #[test]
+fn sessions_dir_follows_the_config_home_not_the_credential_store() {
+    let tests = [
+        ("set", Some("/config"), "/config/sessions"),
+        ("empty", Some(""), "/Users/zchee/.claude/sessions"),
+        ("unset", None, "/Users/zchee/.claude/sessions"),
+    ];
+    for (name, config, expected) in tests {
+        assert_eq!(sessions_dir(&env(Some("/store"), config)), PathBuf::from(expected), "{name}");
+    }
+}
+
+#[test]
 fn export_spelling_trims_one_trailing_slash_and_normalizes() {
     assert_eq!(export_spelling(std::path::Path::new("/a/b/")), "/a/b");
     assert_eq!(export_spelling(std::path::Path::new("/a/b")), "/a/b");
