@@ -122,6 +122,7 @@ use crate::provider::claude::credentials::Digests;
 use crate::provider::claude::credentials::Identity;
 use crate::provider::claude::credentials::KeychainStdinLine;
 use crate::provider::claude::credentials::REFRESH_MARGIN_MS;
+use crate::provider::claude::live_sessions;
 use crate::provider::claude::namespace;
 use crate::provider::claude::namespace::EnvView;
 use crate::provider::claude::oauth::OauthError;
@@ -136,6 +137,7 @@ use crate::provider::claude::usage::RefreshError;
 use crate::runtime::coordinator::Cancel;
 use crate::runtime::coordinator::PassCtx;
 use crate::runtime::fault::Fault;
+use crate::runtime::proc;
 use crate::secret::KeychainReader;
 use crate::secret::audit;
 use crate::secret::audit::AuditEntry;
@@ -424,7 +426,7 @@ fn run_live(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
         None => (Which::Live, String::new(), None),
     };
 
-    let ctx = PassCtx::standalone(cancel.clone(), Instant::now() + SWAP_DEADLINE);
+    let ctx = PassCtx::standalone(cancel.clone(), Instant::now() + swap_deadline());
     let fault = fault_from_env();
     let swap = Swap {
         paths: &paths,
@@ -643,6 +645,21 @@ fn fault_from_env() -> Fault {
     }
 }
 
+/// The pass deadline override exists only in test artifacts (AC142).
+#[cfg(feature = "testing")]
+fn swap_deadline() -> Duration {
+    std::env::var("AGCTL_SWAP_DEADLINE_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(SWAP_DEADLINE)
+}
+
+#[cfg(not(feature = "testing"))]
+fn swap_deadline() -> Duration {
+    SWAP_DEADLINE
+}
+
 /// The spelling an `Owned` record recorded for its namespace.
 ///
 /// The empty string for every other kind, which no derived directory can
@@ -749,6 +766,17 @@ fn swap_phases(
     // whole purpose is being parsed.
     pass.warnings.push(BACKEND_NOTE.to_owned());
     eprintln!("note: {BACKEND_NOTE}");
+    let remote = if which == Which::Live {
+        live_sessions::scan(&namespace::sessions_dir(env), |pid| {
+            proc::holder(pid, ctx.cancel()) != proc::Holder::Dead
+        })
+    } else {
+        live_sessions::Scan::NoRegistry
+    };
+    if let Some(text) = live_sessions::unreadable_note(&remote) {
+        eprintln!("note: {text}");
+        pass.warnings.push(text);
+    }
 
     let reader = default_reader(ctx);
 
@@ -852,6 +880,7 @@ fn swap_phases(
         record: incoming.record,
         direction,
         item_profile: item_profile.as_ref(),
+        remote: &remote,
     };
 
     // A live reversal's three arms (§D1), from the identity just resolved:
@@ -1175,6 +1204,7 @@ fn swap_phases(
             &service,
             direction,
             config_path.as_deref().map(|path| claude_json::shown_path(path, &env.home)).as_deref(),
+            live_sessions::consent_clause(&remote, SWAP_DEADLINE.as_secs()).as_deref(),
         )
     {
         return report;
@@ -1430,6 +1460,7 @@ fn swap_phases(
             Direction::Reverse => Recovery::Live { id },
         };
         tell_config(pass, env, config, recovery);
+        tell_remote_control(pass, &remote, &report.outcome);
     }
     report
 }
@@ -1451,6 +1482,19 @@ fn tell_config(pass: &mut Pass, env: &EnvView, config: &ConfigReport, recovery: 
     }
 }
 
+/// Names stay on stderr; the report carries the counts-only warning (D-041).
+fn tell_remote_control(pass: &mut Pass, scan: &live_sessions::Scan, outcome: &Outcome) {
+    if *outcome != Outcome::Applied {
+        return;
+    }
+    if let Some(text) = live_sessions::completion_warning(scan, true) {
+        eprintln!("warning: {text}");
+    }
+    if let Some(text) = live_sessions::completion_warning(scan, false) {
+        pass.warnings.push(text);
+    }
+}
+
 /// What the `already_active` catch-up needs from the pass (S24b-2).
 struct CatchUp<'a> {
     paths: &'a Paths,
@@ -1464,6 +1508,7 @@ struct CatchUp<'a> {
     /// Phase A's profile of the item, or `None` when agctl's own write named
     /// it (an expired or revoked token).
     item_profile: Option<&'a Profile>,
+    remote: &'a live_sessions::Scan,
 }
 
 /// The catch-up at a live `already_active` return (S24b-2, ruling G4): the
@@ -1491,7 +1536,13 @@ fn catch_up(c: &CatchUp<'_>, pass: &mut Pass, mut report: Report) -> Report {
                 emit_config_plan(&shown, profile);
             }
         },
-        || Tty.confirm(&claude_json::catch_up_question(who, &shown)).unwrap_or(false),
+        || {
+            let mut question = claude_json::catch_up_question(who, &shown);
+            if let Some(clause) = live_sessions::consent_clause(c.remote, SWAP_DEADLINE.as_secs()) {
+                question.push_str(&clause);
+            }
+            Tty.confirm(&question).unwrap_or(false)
+        },
         |check, profile| claude_json::catch_up_write(check, c.env, profile, c.ctx),
     );
     if let Some(log) = &log {
@@ -1515,6 +1566,9 @@ fn catch_up(c: &CatchUp<'_>, pass: &mut Pass, mut report: Report) -> Report {
         (Some(_), Direction::Reverse) => Recovery::Live { id },
     };
     tell_config(pass, c.env, &config, recovery);
+    if config.not_updated().is_none() {
+        tell_remote_control(pass, c.remote, &Outcome::Applied);
+    }
     report.config = Some(config);
     report
 }
@@ -2962,7 +3016,7 @@ fn emit_plan(
 #[expect(
     clippy::too_many_arguments,
     reason = "the question names every fact the operator is consenting to, and the live \
-              target's configuration file is the eighth"
+              target's configuration file is the eighth and its Remote Control hint the ninth"
 )]
 fn confirm(
     prompt: &mut dyn Prompt,
@@ -2973,6 +3027,7 @@ fn confirm(
     service: &str,
     direction: Direction,
     config_shown: Option<&str>,
+    remote: Option<&str>,
 ) -> Option<Report> {
     let verb = match direction {
         Direction::Forward => "replace",
@@ -2980,12 +3035,13 @@ fn confirm(
     };
     let question = format!(
         "{verb} the credential in `{}` (digest {}) with `{}`'s (digest {}){}? It takes effect on \
-         your next message, within 30 s; run `/model` once afterwards to refresh model access",
+         your next message, within 30 s; run `/model` once afterwards to refresh model access{}",
         store_dir.display(),
         from_digest8.as_deref().unwrap_or("none"),
         incoming.email.as_deref().unwrap_or(&incoming.account_uuid),
         to_digest8,
         config_shown.map(claude_json::plan_line).unwrap_or_default(),
+        remote.unwrap_or_default(),
     );
     match prompt.confirm(&question) {
         Ok(true) => None,
@@ -4037,7 +4093,7 @@ fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
     };
 
     let env = EnvView::from_process();
-    let ctx = PassCtx::standalone(cancel.clone(), Instant::now() + SWAP_DEADLINE);
+    let ctx = PassCtx::standalone(cancel.clone(), Instant::now() + swap_deadline());
     let fault = fault_from_env();
     let swap = Swap {
         paths: &paths,

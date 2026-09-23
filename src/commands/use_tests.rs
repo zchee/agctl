@@ -462,7 +462,59 @@ fn confirm_with(answer: Result<bool, ()>) -> Option<Report> {
         "Claude Code-credentials-cafebabe",
         Direction::Forward,
         None,
+        None,
     )
+}
+
+#[test]
+fn remote_control_consent_preserves_both_questions_without_live_entries() {
+    struct Question(String);
+    impl Prompt for Question {
+        fn tell(&mut self, _message: &str) {}
+        fn confirm(&mut self, question: &str) -> Result<bool, AppError> {
+            self.0 = question.to_owned();
+            Ok(true)
+        }
+    }
+    let scans = [
+        live_sessions::Scan::NoRegistry,
+        live_sessions::Scan::Read { remote: vec![], skipped: 1 },
+        live_sessions::Scan::Read {
+            remote: vec![live_sessions::RemoteSession { name: Some("rc-review".into()) }],
+            skipped: 0,
+        },
+    ];
+    for (direction, verb) in [(Direction::Forward, "replace"), (Direction::Reverse, "put back")] {
+        for scan in &scans {
+            let mut prompt = Question(String::new());
+            let clause = live_sessions::consent_clause(scan, SWAP_DEADLINE.as_secs());
+            assert!(
+                confirm(
+                    &mut prompt,
+                    Path::new("/tmp/store"),
+                    &keyed("99999999", "bbbb"),
+                    &Some("aaaaaaaa".to_owned()),
+                    "bbbbbbbb",
+                    "Claude Code-credentials-cafebabe",
+                    direction,
+                    None,
+                    clause.as_deref(),
+                )
+                .is_none()
+            );
+            let baseline = format!(
+                "{verb} the credential in `/tmp/store` (digest aaaaaaaa) with `99999999`'s (digest bbbbbbbb)? It takes effect on your next message, within 30 s; run `/model` once afterwards to refresh model access"
+            );
+            assert_eq!(prompt.0, format!("{baseline}{}", clause.as_deref().unwrap_or_default()));
+            if clause.is_some() {
+                assert!(prompt.0.contains("answer n"));
+                assert!(prompt.0.contains("120-second limit"));
+                assert!(prompt.0.contains("rc-review"));
+            } else {
+                assert_eq!(prompt.0, baseline, "no new bytes without live Remote Control");
+            }
+        }
+    }
 }
 
 #[test]
