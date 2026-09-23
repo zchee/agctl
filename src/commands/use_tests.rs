@@ -518,6 +518,46 @@ fn remote_control_consent_preserves_both_questions_without_live_entries() {
 }
 
 #[test]
+fn remote_control_consent_is_absent_from_a_non_terminal_cancellation_note() {
+    struct NoTerminal;
+    impl Prompt for NoTerminal {
+        fn tell(&mut self, _message: &str) {}
+        fn can_ask(&self) -> bool {
+            false
+        }
+        fn confirm(&mut self, question: &str) -> Result<bool, AppError> {
+            Err(AppError::Refused { reason: question.to_owned() })
+        }
+    }
+    let scan = live_sessions::Scan::Read {
+        remote: vec![live_sessions::RemoteSession { name: Some("rc-review".into()) }],
+        skipped: 0,
+    };
+    let clause = live_sessions::consent_clause(&scan, SWAP_DEADLINE.as_secs())
+        .expect("a live Remote Control session adds a consent clause");
+    for direction in [Direction::Forward, Direction::Reverse] {
+        let report = confirm(
+            &mut NoTerminal,
+            Path::new("/tmp/store"),
+            &keyed("99999999", "bbbb"),
+            &Some("aaaaaaaa".to_owned()),
+            "bbbbbbbb",
+            "Claude Code-credentials-cafebabe",
+            direction,
+            None,
+            Some(&clause),
+        )
+        .expect("an unaskable prompt reports");
+        assert_eq!(report.outcome, Outcome::Cancelled);
+        let note = report.note.expect("the cancellation keeps its reason");
+        assert!(note.contains("/tmp/store"), "the base question remains: {note}");
+        assert!(!note.contains(&clause), "no terminal-only clause: {note}");
+        assert!(!note.contains("Remote Control"), "no partial clause: {note}");
+        assert!(!note.contains("rc-review"), "no session name: {note}");
+    }
+}
+
+#[test]
 fn a_declined_confirmation_is_cancelled_and_not_refusal_f() {
     // Refusal **F** is `CannotAdopt`: *the outgoing credential cannot be
     // adopted, so the swap would lose it* — a fact about the store that no

@@ -3041,7 +3041,7 @@ fn confirm(
         incoming.email.as_deref().unwrap_or(&incoming.account_uuid),
         to_digest8,
         config_shown.map(claude_json::plan_line).unwrap_or_default(),
-        remote.unwrap_or_default(),
+        if prompt.can_ask() { remote.unwrap_or_default() } else { "" },
     );
     match prompt.confirm(&question) {
         Ok(true) => None,

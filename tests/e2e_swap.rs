@@ -4796,6 +4796,39 @@ fn remote_control_completion_is_silent_without_an_applied_change() {
         assert_eq!(code, expected_code, "{case}: {stdout}{stderr}");
         assert!(!stderr.contains("had Remote Control on"), "{case}: {stderr}");
         assert!(!doc["warnings"].to_string().contains("Remote Control"), "{case}: {doc}");
+        if case == "cancelled" {
+            assert!(!stdout.contains("rc-e2e"), "names never reach JSON notes: {stdout}");
+            for undo in [false, true] {
+                if undo {
+                    let (code, stdout, stderr) = remote_run(
+                        &fixture,
+                        &["claude", "use", "--live", EMAIL_T, "--yes", "--json"],
+                    );
+                    assert_eq!(code, 0, "undo setup: {stdout}{stderr}");
+                    assert_eq!(outcome_doc(&stdout)["outcome"], "applied");
+                }
+                for json in [false, true] {
+                    let mut args = if undo {
+                        vec!["claude", "use", "--undo"]
+                    } else {
+                        vec!["claude", "use", "--live", EMAIL_T]
+                    };
+                    if json {
+                        args.push("--json");
+                    }
+                    let (code, stdout, stderr) = remote_run(&fixture, &args);
+                    assert_eq!(code, 20, "undo={undo}, json={json}: {stdout}{stderr}");
+                    assert!(!stdout.contains("rc-e2e"), "names never reach stdout: {stdout}");
+                    assert!(!stderr.contains("rc-e2e"), "no prompt was printed: {stderr}");
+                    assert!(!stderr.contains("had Remote Control on"), "{stderr}");
+                    if json {
+                        let doc = outcome_doc(&stdout);
+                        assert_eq!(doc["outcome"], "cancelled", "{doc}");
+                        assert!(!doc["warnings"].to_string().contains("Remote Control"), "{doc}");
+                    }
+                }
+            }
+        }
         if case == "already current" {
             assert_config(&doc, "skipped", Some("already_current"));
         }
