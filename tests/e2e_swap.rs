@@ -6583,6 +6583,213 @@ fn ac81_a_live_swap_touches_nothing_outside_the_namespace_root_but_the_three_art
 }
 
 #[test]
+fn a_live_swap_after_undo_accepts_equal_and_refreshed_copies() {
+    for scenario in [
+        "equal",
+        "incoming refreshed before undo",
+        "outgoing refreshed after undo",
+        "unrecorded duplicate",
+    ] {
+        let server = MockServer::start();
+        let (_p_asked, _t_asked) = live_profiles(&server);
+        let _p_refreshed = common::mock_profile(&server, "sk-ant-oat01-p-refreshed", (ACCT, ORG));
+        let _t_refreshed =
+            common::mock_profile(&server, "sk-ant-oat01-t-refreshed", (ACCT_T, ORG_T));
+        let expiry = common::fresh_at();
+        let (fixture, resolved) = live_accounts(&server, expiry);
+        let p_original = live_item(&fixture).expect("original live credential");
+        if scenario == "unrecorded duplicate" {
+            fixture.write_credentials(ACCT, ORG, &p_original);
+            fs::write(adopted_path(&fixture, ACCT, ORG), &p_original)
+                .expect("duplicate adopted copy");
+        } else {
+            let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+            assert_eq!(code, 0, "{scenario}: initial swap: {stdout}{stderr}");
+            if scenario == "incoming refreshed before undo" {
+                fixture.keychain_item(
+                    LIVE_SERVICE,
+                    &claude_code_blob(
+                        "sk-ant-oat01-t-refreshed",
+                        "sk-ant-ort01-t-refreshed",
+                        expiry + 3_600_000,
+                    ),
+                );
+            }
+            let (code, stdout, stderr) = undo_json(&fixture);
+            assert_eq!(code, 0, "{scenario}: undo: {stdout}{stderr}");
+            assert!(
+                !fixture.credentials_path(ACCT, ORG).exists(),
+                "undo retained only the adopted P copy"
+            );
+            assert_eq!(
+                fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("parked P"),
+                live_item(&fixture).expect("restored P")
+            );
+        }
+        if matches!(scenario, "outgoing refreshed after undo" | "unrecorded duplicate") {
+            fixture.keychain_item(
+                LIVE_SERVICE,
+                &claude_code_blob(
+                    "sk-ant-oat01-p-refreshed",
+                    "sk-ant-ort01-p-refreshed",
+                    expiry + 3_600_000,
+                ),
+            );
+        }
+        let p_own = fixture.credentials_path(ACCT, ORG);
+        let p_adopted = adopted_path(&fixture, ACCT, ORG);
+        let t_own = fixture.credentials_path(ACCT_T, ORG_T);
+        let t_adopted = adopted_path(&fixture, ACCT_T, ORG_T);
+        assert!(!t_adopted.exists(), "no scenario parked A beside its own store");
+        let t_before = fs::read_to_string(&t_own).expect("A own store");
+        let t_value: Value = serde_json::from_str(&t_before).expect("A credential JSON");
+        assert_eq!(
+            t_value["claudeAiOauth"]["accessToken"],
+            if scenario == "incoming refreshed before undo" {
+                "sk-ant-oat01-t-refreshed"
+            } else {
+                "sk-ant-oat01-incoming"
+            }
+        );
+        let live_before = live_item(&fixture).expect("live P before forward swap");
+        let adopted_before = fs::read_to_string(&p_adopted).expect("P adopted copy");
+        if scenario == "unrecorded duplicate" {
+            assert_eq!(fs::read_to_string(&p_own).expect("P own store"), adopted_before);
+            assert_ne!(adopted_before, live_before, "the duplicate is older, not equal to live");
+        }
+        let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+        let doc = outcome_doc(&stdout);
+        if scenario == "unrecorded duplicate" {
+            assert_eq!(code, 14, "{scenario}: {stdout}{stderr}");
+            assert_eq!(doc["refusal"], "F");
+            let note = doc["note"].as_str().expect("refusal message");
+            assert!(note.contains("was not parked by a live swap agctl recorded"), "{note}");
+            assert!(note.contains("move the file aside"), "{note}");
+            assert!(
+                note.contains(&p_adopted.display().to_string()),
+                "the exact file is named: {note}"
+            );
+            let (code, stdout, stderr) = swap(&fixture, &[]);
+            assert_eq!(code, 14, "plain output: {stdout}{stderr}");
+            assert!(
+                format!("{stdout}{stderr}").contains(note),
+                "plain output retains the JSON refusal message"
+            );
+            assert_eq!(fs::read_to_string(&p_own).expect("P own store"), adopted_before);
+            assert_eq!(fs::read_to_string(&p_adopted).expect("P adopted copy"), adopted_before);
+            assert_eq!(live_item(&fixture).expect("live P"), live_before);
+            assert!(writes(&fixture).is_empty(), "the refusal writes no keychain item");
+        } else {
+            assert_eq!(code, 0, "{scenario}: {stdout}{stderr}");
+            assert_eq!(doc["outcome"], "applied", "{scenario}: {stdout}{stderr}");
+            assert!(doc["refusal"].is_null() && doc["note"].is_null());
+            assert_eq!(fs::read_to_string(&p_adopted).expect("P parked again"), live_before);
+            assert!(!p_own.exists(), "the sole-copy path does not create an own store");
+            assert_eq!(writes(&fixture).len(), 3, "swap, undo, swap all write");
+        }
+        assert_eq!(fs::read_to_string(t_own).expect("A own store"), t_before);
+        live_artefacts_released(&fixture, &resolved);
+    }
+}
+
+#[test]
+fn a_live_swap_after_undo_reuses_or_supersedes_a_recorded_sole_adopted_copy() {
+    for (refresh_after_undo, duplicate_own_store) in [(false, false), (true, false), (true, true)] {
+        let server = MockServer::start();
+        let (_p_asked, _t_asked) = live_profiles(&server);
+        let _p1_asked = common::mock_profile(&server, "sk-ant-oat01-p-first-refresh", (ACCT, ORG));
+        let _p2_asked = common::mock_profile(&server, "sk-ant-oat01-p-second-refresh", (ACCT, ORG));
+        let expiry = common::fresh_at();
+        let (fixture, resolved) = live_accounts(&server, expiry);
+        let p0 = live_item(&fixture).expect("L0");
+        let own = fixture.write_credentials(ACCT, ORG, &p0);
+        let p1 = claude_code_blob(
+            "sk-ant-oat01-p-first-refresh",
+            "sk-ant-ort01-p-first-refresh",
+            expiry + 3_600_000,
+        );
+        fixture.keychain_item(LIVE_SERVICE, &p1);
+        let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+        assert_eq!(code, 0, "L1 -> A: {stdout}{stderr}");
+        let adopted = adopted_path(&fixture, ACCT, ORG);
+        assert_eq!(fs::read_to_string(&adopted).expect("L1 parked"), p1);
+        assert_eq!(
+            write_entries(&fixture)[0]["from_digest8"],
+            common::sha8("sk-ant-oat01-p-first-refresh")
+        );
+
+        let (code, stdout, stderr) = undo_json(&fixture);
+        assert_eq!(code, 0, "restore L1: {stdout}{stderr}");
+        assert_eq!(live_item(&fixture).expect("restored L1"), p1);
+        assert_eq!(fs::read_to_string(&own).expect("independent L0 own store"), p0);
+        assert_eq!(fs::read_to_string(&adopted).expect("sole L1 candidate retained"), p1);
+        assert!(!adopted_path(&fixture, ACCT_T, ORG_T).exists());
+        let a_before = fs::read(fixture.credentials_path(ACCT_T, ORG_T)).expect("A own store");
+        if duplicate_own_store {
+            // Undo-of-undo records the live L1 -> own-store write. Restoring
+            // L with a forward swap retains that recorded duplicate.
+            let (code, stdout, stderr) = undo_json(&fixture);
+            assert_eq!(code, 0, "record L1 in its own store: {stdout}{stderr}");
+            assert_eq!(fs::read_to_string(&own).expect("recorded own L1"), p1);
+            assert_eq!(fs::read_to_string(&adopted).expect("retained adopted L1"), p1);
+            let (code, stdout, stderr) = swap_to(&fixture, ACCT, &["--json"]);
+            assert_eq!(code, 0, "restore L1 with a forward swap: {stdout}{stderr}");
+            assert_eq!(live_item(&fixture).expect("live L1"), p1);
+            assert_eq!(fs::read_to_string(&own).expect("own L1"), p1);
+            assert_eq!(fs::read_to_string(&adopted).expect("adopted L1"), p1);
+        }
+        let own_before = fs::read(&own).expect("own store before final swap");
+
+        let outgoing = if refresh_after_undo {
+            claude_code_blob(
+                "sk-ant-oat01-p-second-refresh",
+                "sk-ant-ort01-p-second-refresh",
+                expiry + 7_200_000,
+            )
+        } else {
+            p1
+        };
+        fixture.keychain_item(LIVE_SERVICE, &outgoing);
+        let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+        let doc = outcome_doc(&stdout);
+        assert_eq!(code, 0, "refresh_after_undo={refresh_after_undo}: {stdout}{stderr}");
+        assert_eq!(doc["outcome"], "applied");
+        assert!(doc["refusal"].is_null() && doc["note"].is_null(), "{doc}");
+        assert_eq!(
+            doc["adopted_to"],
+            if refresh_after_undo { json!(ADOPTED) } else { Value::Null }
+        );
+        assert_eq!(fs::read_to_string(adopted).expect("latest parked copy"), outgoing);
+        assert_eq!(fs::read(own).expect("own store unchanged"), own_before);
+        assert_eq!(
+            fs::read(fixture.credentials_path(ACCT_T, ORG_T)).expect("A unchanged"),
+            a_before
+        );
+        assert_eq!(writes(&fixture).len(), if duplicate_own_store { 5 } else { 3 });
+        live_artefacts_released(&fixture, &resolved);
+    }
+}
+
+#[test]
+fn a_live_equal_adopted_copy_needs_no_recorded_parking() {
+    let server = MockServer::start();
+    let (_p_asked, _t_asked) = live_profiles(&server);
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+    let outgoing = live_item(&fixture).expect("live credential");
+    fs::create_dir_all(fixture.ns_dir(ACCT, ORG)).expect("namespace");
+    let adopted = adopted_path(&fixture, ACCT, ORG);
+    fs::write(&adopted, &outgoing).expect("unrecorded equal parked copy");
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+    assert_eq!(code, 0, "equal parked copy is already adopted: {stdout}{stderr}");
+    let doc = outcome_doc(&stdout);
+    assert_eq!(doc["outcome"], "applied");
+    assert!(doc["adopted_to"].is_null() && doc["refusal"].is_null());
+    assert_eq!(fs::read_to_string(adopted).expect("parked copy unchanged"), outgoing);
+    assert!(!fixture.credentials_path(ACCT, ORG).exists());
+    live_artefacts_released(&fixture, &resolved);
+}
+
+#[test]
 fn a_live_undo_resolves_identical_own_and_adopted_copies() {
     let server = MockServer::start();
     let token = token_ok(&server);

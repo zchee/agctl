@@ -3502,13 +3502,13 @@ fn decide_adoption(
                             Refusal::CannotAdopt(adopt::Refusal::OccupiedByAnother),
                             service,
                             format!(
-                                "the outgoing credential cannot be adopted: the adopted copy in \
+                                "the outgoing credential cannot be adopted: the adopted copy \
                                  `{}` was not parked by a live swap agctl recorded — a namespace \
                                  swap's undo source, or a copy a live undo refreshed and wrote \
                                  back but never recorded because it then ended busy, discarded or \
                                  refused; undo that namespace swap, or move the file aside, then \
                                  run this again",
-                                dir.display()
+                                dir.join(file_store::ADOPTED_FILE).display()
                             ),
                         )));
                     }
