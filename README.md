@@ -401,9 +401,12 @@ agctl reports what the item holds; it cannot see a session switch.
 Both accounts must be ones agctl owns: `<id>`, and the account whose credential the item
 holds now. That credential is not thrown away, unless it is an older copy of `<id>`'s own
 credential, which the incoming one supersedes. It is **parked** in its own account's
-namespace as `.credentials.adopted.json`, and `use --undo` puts it back from there. When no
-account agctl owns is the live one, the swap refuses (exit 14) and says to
-`agctl claude login` that account first.
+namespace as `.credentials.adopted.json`, and `use --undo` puts it back from there. A copy
+already parked there that no recorded live swap left — the source of a namespace swap's
+undo, or one a live undo wrote back but never recorded — blocks the swap (exit 14) unless
+it holds the same credential; the message names the file and says to undo that swap or
+move the file aside. When no account agctl owns is the live one, the swap refuses (exit
+14) and says to `agctl claude login` that account first.
 
 Before the prompt, agctl changes no credential: it reads its registry, its environment and
 the live item once, and asks `GET /api/oauth/profile` with that item's own access token —
@@ -455,11 +458,16 @@ account the undo put back. A missing `~/.claude.json` is only a `note:`: Claude 
 **`--undo`.** `use --undo` reverses the most recent `--live` swap: the parked credential
 goes back into the item, the credential it displaces goes back to its own account's
 namespace, and `~/.claude.json` is rewritten for the account restored — the same prompt,
-locks, audit lines and exit codes. After an applied undo, a second `--undo` reverses that
-undo and swaps forward again. If the item changed hands after the swap — a `/login` inside
-Claude Code, another switcher — `--undo` does not guess: it answers `already_active` when
-the item already holds the account it would restore, and refuses (exit 27) when it holds
-anyone else.
+locks, audit lines and exit codes. When the parked copy and that account's own store hold
+the same credential — the same access and refresh tokens, whatever the formatting — they
+count as one: the undo restores from the parked copy, then removes it once the item holds
+the credential and both files still match. A removal that fails leaves the undo applied and
+names the file left behind. Two copies whose refresh tokens differ are not one credential:
+`--undo` refuses and names both files rather than guess. After an applied undo, a second
+`--undo` reverses that undo and swaps forward again. If the item changed hands after the
+swap — a `/login` inside Claude Code, another switcher — `--undo` does not guess: it answers
+`already_active` when the item already holds the account it would restore, and refuses (exit
+27) when it holds anyone else.
 
 **From an isolated session's shell.** When `CLAUDE_SECURESTORAGE_CONFIG_DIR` is set and not
 empty — as `use`, `exec` and `env` set it — `use --live <id>` swaps the keychain item of the
@@ -583,7 +591,8 @@ counted; `--all` shows them.
   namespace as `.credentials.adopted.json`, at 0600 — a name Claude Code's credential read,
   its deletion and `/logout` never visit, so a keychain hiccup cannot make a session fall
   back to the account you swapped away from. `doctor` lists each such copy, `use --undo`
-  restores it, and `accounts remove --delete-secret` clears it.
+  restores it — and removes it when the account's own store already holds the same
+  credential — and `accounts remove --delete-secret` clears it.
 - **Refresh tokens sit at rest in 0600 files** —
   `~/.config/agctl/claude/<acct>/<org>/.credentials.json`, in a directory tree created
   at 0700. This is the same posture as Claude Code's own plaintext fallback store, which
@@ -750,7 +759,7 @@ carries one of the two, never both.
 | `11` | `refusal: "C"` | `CLAUDE_CODE_OAUTH_TOKEN` is set in agctl's own environment |
 | `12` | `refusal: "D"` | the credential does not fit the 4 032-byte keychain line |
 | `13` | `refusal: "E"` | `--undo` of a live swap, from a shell that names a namespace |
-| `14` | `refusal: "F"` | a credential cannot be parked or read; the message says which |
+| `14` | `refusal: "F"` | a credential cannot be parked or read; the message names the file, and the way out |
 | `15` | `reason: "not_owned"` | `CLAUDE_SECURESTORAGE_CONFIG_DIR` names no namespace agctl owns |
 | `16` | `busy` | another process holds the store's Claude Code locks |
 | `17` | `discarded` | the item changed, or the hold ran out of time; nothing was written |
