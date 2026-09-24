@@ -1,25 +1,7 @@
 # agctl
 
-`agctl` shows the subscription rate-limit utilization of **several Claude accounts at
-once** — the 5-hour window, the weekly window, the weekly per-model window (Fable), and
-usage credits — in one table or one terminal UI, without running `claude` and without
-disturbing a Claude Code session that is already running.
-
-It also switches which account Claude Code uses, among the accounts agctl owns — the ones
-`agctl claude login` created. `use <id>`, `exec` and `env` prepare an isolated Claude Code
-session for one account — `use` starts `claude` in it, `exec` runs one command in it, `env`
-points your shell at it — and leave the account your running Claude Code uses alone.
-`use --live <id>` hot-swaps the credential your running Claude Code reads, without running
-`claude`, and `use --undo` puts the previous one back.
-
-The same table exists for **Codex (ChatGPT) accounts** under `agctl codex`: `status` and
-`watch` show each account's rate-limit windows, and `login`, `accounts`, `import` and
-`doctor` manage the accounts agctl owns, with `accounts set --refresh` and
-`accounts refresh` deciding when agctl may send a refresh token — see [Codex](#codex).
-
-agctl is **macOS only**. Switching accounts is **Claude only**: `agctl codex` tracks and
-refreshes Codex accounts but does not switch which account the `codex` CLI uses; see
-[Scope](#scope).
+Subscription usage for several Claude and Codex accounts in one table, and account
+switching for Claude Code.
 
 ```
  Account           | Org  | Plan | 5h  | Weekly | Fable (weekly) | Credits                 | 5h reset        | Weekly reset         | State
@@ -28,82 +10,93 @@ refreshes Codex accounts but does not switch which account the `codex` CLI uses;
  bob@example.com   | Acme | max  | 4%  | 12%    | 30%            | $219.56 / $5000.00 (4%) | 2h13m (5:16 PM) | 2d22h (Sun 02:00 PM) | ok
 ```
 
-The `Credits` cell reads `n/a` when the account has no usage credits, `off` when they are
-disabled, `<used> / <limit> (<pct>%)` when capped, and `<used> / Unlimited` when not.
+- **`agctl claude status`** shows the Claude accounts agctl knows (rows hidden by default
+  need `--all`): the 5-hour window, the weekly window, the weekly per-model window (Fable)
+  and usage credits. It never runs `claude` and never disturbs a Claude Code session that
+  is already running.
+- **`agctl codex status`** does the same for Codex (ChatGPT) accounts.
+- **`watch`** keeps either table on screen and refreshes it.
+- **`use <id>`, `exec` and `env`** prepare an isolated Claude Code session for one
+  account: `use` starts `claude` in it, `exec` runs one command in it, `env` points your
+  shell at it. All three leave your running session alone.
+- **`use --live <id>`** hot-swaps the credential your running Claude Code reads, with no
+  restart. **`use --undo`** puts the previous one back.
 
-The two reset columns say **when** each window rolls over as well as how long is left: the
-5-hour window in `5h reset`, the seven-day all-models window in `Weekly reset`. Each cell
-leads with the countdown and follows it with the absolute local time in parentheses, and
-within a column every countdown lines up flush left and every closing parenthesis lines up
-flush right, so `2d22h` and a shorter countdown in the same column still end at the same
-right edge. The absolute time carries as much of the date as it takes to name the day —
-nothing for a reset later today (`4:15 PM`), the weekday for another day this week
-(`Sun 02:00 PM`), the date from a week out (`Sep 16 02:00 PM`) — and the hour is zero-padded
-once a weekday or a date joins it, so every absolute time inside one of those two shapes is
-the same width; today's bare clock time keeps the un-padded hour. A reset that has already
-passed reads `now (11:59 PM)`, and a window agctl has no reset for is an em dash. A per-model
-weekly window other than Fable gets a continuation row of its own, and its reset appears in
-`Weekly reset`.
+agctl is **macOS only**. Codex accounts are tracked and refreshed but not switched: there is
+no `agctl codex use`.
 
-## Build
+**Contents:** [Install](#install) · [Quick start](#quick-start) ·
+[Claude commands](#claude-commands) · [Codex commands](#codex-commands) ·
+[How it works](#how-it-works) · [Reference](#reference) · [Development](#development)
 
-macOS only: account discovery reads the login keychain through `security(1)`.
+## Install
 
-```sh
-cargo build --release
-./target/release/agctl claude status
-./target/release/agctl codex status
-```
-
-There is no published crate and no installer yet. If you install by hand, install the
-**default-feature** binary:
+macOS only: account discovery reads the login keychain through `security(1)`. There is no
+published crate and no installer. Build the **default-feature** binary and copy it:
 
 ```sh
-# correct
 cargo build --release
 install -m 0755 target/release/agctl ~/.local/bin/agctl
 ```
 
-> **Never build or install with `--all-features`.**
-> The `testing` feature compiles the test seams into the artifact, including overrides for
-> the OAuth **token endpoint** and the **profile endpoint**. A production binary that
-> honours `AGCTL_CLAUDE_TOKEN_URL` would send your refresh token wherever an environment
-> variable pointed it, and one that honours `AGCTL_CLAUDE_PROFILE_URL` would do the same
-> with the live item's access token. `cargo install --all-features` and
-> `cargo build --release --all-features` are both wrong for anything you intend to run.
-> `scripts/release-gate.sh` builds the release artifact the correct way and proves it
-> carries none of those seams.
+> **Never build or install with `--all-features`.** The `testing` feature compiles the
+> test seams into the binary, including overrides for the OAuth **token endpoint** and the
+> **profile endpoint**. A binary that honours `AGCTL_CLAUDE_TOKEN_URL` sends your refresh
+> token wherever an environment variable points it, and one that honours
+> `AGCTL_CLAUDE_PROFILE_URL` does the same with the live access token.
+> `cargo install --all-features` and `cargo build --release --all-features` are both wrong
+> for anything you intend to run. `scripts/release-gate.sh` builds the release artifact the
+> right way and proves it carries none of those seams.
 
 ### Shell completions
 
 ```sh
-# zsh — add to ~/.zshrc, after compinit (the script calls compdef, which
+# zsh — in ~/.zshrc, after compinit (the script calls compdef, which
 # only exists once the completion system is loaded)
 autoload -Uz compinit && compinit
 eval "$(agctl completions zsh)"
-# or install the file once into a directory you own and put on fpath:
+
+# or install the file once into a directory on fpath:
 mkdir -p ~/.zfunc && agctl completions zsh > ~/.zfunc/_agctl
 fpath=(~/.zfunc $fpath)   # before compinit in ~/.zshrc
-# bash — add to ~/.bashrc
+
+# bash — in ~/.bashrc
 eval "$(agctl completions bash)"
+
 # fish
 agctl completions fish > ~/.config/fish/completions/agctl.fish
 ```
 
-`elvish` and `powershell` are also accepted. The script is generated from the same
-`clap` definition the binary parses, so it never drifts from the real flag set. On
-bash older than 4.4 (macOS ships 3.2) the candidates come back sorted alphabetically
-rather than in the order the help text lists them; everything else is the same.
+`elvish` and `powershell` are also accepted. The script is generated from the same `clap`
+definition the binary parses, so it never drifts from the real flag set. On bash older
+than 4.4 (macOS ships 3.2) the candidates come back sorted alphabetically instead of in
+help order; everything else is the same.
 
-## Commands
+## Quick start
 
-Every provider command lives under `agctl claude` or `agctl codex` — the Codex commands are
-documented in [Codex](#codex), below; the rest of this section is Claude's. The one
-non-provider top-level command is `agctl completions`, above. `--config-dir DIR` is global
-and names *agctl's* store; it is accepted before or after the subcommand, for either
-provider.
+```sh
+agctl claude login --label work     # mint a credential agctl owns
+agctl claude status                 # one row per account
+agctl claude watch --interval 10m   # the same table, live
+agctl claude use --live work        # point your running Claude Code at it
+agctl claude use --undo             # and back
+agctl codex login && agctl codex status
+```
 
-### `status` — the table
+Every provider command lives under `agctl claude` or `agctl codex`. The one top-level
+command is `agctl completions`. `--config-dir DIR` (or `AGCTL_CONFIG_DIR`) names *agctl's
+own* store, `~/.config/agctl` by default; it is accepted before or after the subcommand,
+for either provider.
+
+**Naming an account.** For Claude, `<ID>` is the account UUID when that is unambiguous,
+`<account-uuid>/<organization-uuid>` when it is not, and the email address when that is
+unique. A keychain item with no identity is addressed by its service name. For Codex,
+`<id>` is the account id, email or label; the canonical spelling `list` and `show` print is
+`<user-id>/<account-id>`, the registry's key (two rows can share one email).
+
+## Claude commands
+
+### `status`
 
 ```sh
 agctl claude status
@@ -123,55 +116,65 @@ agctl claude status --all --refresh --timeout 30s
 | `--account <ID>` | limit the report to one account; repeat for several |
 | `--timeout <DUR>` | per-HTTP-request timeout, default `10s` (`10s`, `5m`, `2h`, or a bare number of seconds) |
 
-`<ID>` is the account UUID when that is unambiguous, `<account-uuid>/<organization-uuid>`
-when it is not, and the email address when that is unique. A keychain item with no
-identity is addressed by its service name.
+**Reading the table.** The `Credits` cell reads `n/a` when the account has no usage
+credits, `off` when they are disabled, `<used> / <limit> (<pct>%)` when capped, and
+`<used> / Unlimited` when not. The two reset columns say when each window rolls over and
+how long is left: the 5-hour window in `5h reset`, the seven-day all-models window in
+`Weekly reset`. Each cell leads with the countdown and follows it with the absolute local
+time in parentheses; within a column every countdown lines up flush left and every closing
+parenthesis flush right, so `2d22h` and a shorter countdown in the same column still end at
+the same right edge. The absolute time carries as much of the date as it takes to name
+the day: nothing for a reset later today (`4:15 PM`), the weekday for another day this week
+(`Sun 02:00 PM`), the date from a week out (`Sep 16 02:00 PM`). The hour is zero-padded
+once a weekday or a date joins it; today's bare clock time keeps the un-padded hour. A reset
+that has already passed reads `now (11:59 PM)`; a window agctl has no reset for is an em
+dash. A per-model weekly window other than Fable gets a continuation row of its own, and
+its reset appears in `Weekly reset`.
 
-One address can legitimately appear on two rows — a credential agctl owns and the one
-Claude Code is signed in as can be the same account with two independent token pairs. The
-owned row says so, with `same identity as live` in its `State` column and
-`"same_identity_as": "live"` in `--json`; the rows stay separate, because each pair
-expires, refreshes and can be revoked on its own.
+**One account on two rows.** A credential agctl owns and the one Claude Code is signed in
+as can be the same account with two independent token pairs. The owned row says so, with
+`same identity as live` in `State` and `"same_identity_as": "live"` in `--json`. The rows
+stay separate, because each pair expires, refreshes and can be revoked on its own.
+`--by-identity` collapses the pair into one table row with a `Kind` column reading
+`live+owned`; the owned row survives, because it is the one agctl can refresh, relocate or
+forget. It is a table flag: `--json` still emits one object per credential source, so the
+two row counts differ under it, and a live row in a failing state is never folded away.
 
-`--by-identity` collapses that pair into one table row instead, with a `Kind` column
-reading `live+owned`. The owned row is the one that survives, because it is the one
-agctl can refresh, relocate or forget. It is a table flag: `--json` still emits one
-object per credential source, so the two row counts differ under it, and a live row in a
-failing state is never folded away.
+**The `Plan` column.** For an account agctl owns it comes from `GET /api/oauth/profile`,
+asked at two points only: at `login`, and when `status` or `watch` next refreshes a
+credential that has no plan recorded, which they do only once it has expired, `--refresh`
+included. Once the plan and the rate-limit tier are both recorded, the question is not
+asked again, so a plan that changes later shows after the next `agctl claude login`. The
+cell is Claude Code's own word: `max`, `pro`, `team` or `enterprise`. An organization type
+Claude Code does not map leaves it `—`, and agctl asks again at each refresh. A pass with
+too little time left, such as one under a very short `--timeout`, skips the question for
+that refresh rather than delay saving the credential.
 
-For an account agctl owns, the `Plan` column comes from `GET /api/oauth/profile`, and it is
-filled at two points only: at `login`, and when `status` or `watch` next refreshes a
-credential that has none — which they do only once it has expired, `--refresh` included.
-Once the plan and the rate-limit tier are both recorded, it is not asked again, so a plan
-that changes later shows after the next `agctl claude login`. The cell is Claude Code's own
-word — `max`, `pro`, `team` or `enterprise`. An organization type Claude Code does not map
-leaves it `—`, and agctl asks again at each refresh. A pass with too little time left, such
-as one under a very short `--timeout`, skips the question for that refresh rather than delay
-saving the credential.
-
-### `watch` — the same table, live
+### `watch`
 
 ```sh
 agctl claude watch
 agctl claude watch --interval 10m
 ```
 
-`--interval` defaults to `300s` and **will not go below 60s** — agctl declines to poll
-an undocumented endpoint faster than that. Keys: `q`, `Esc`, `Ctrl-C` or `Ctrl-D` quit;
-`r` refreshes now; arrows or `j`/`k` move the selection. (`Ctrl-C` is bound explicitly
-because raw mode swallows the terminal's own interrupt.)
+`--interval` defaults to `300s` and **will not go below 60s**: agctl declines to poll an
+undocumented endpoint faster than that.
 
-Three things about `watch` that are not visible from the flags:
+Keys: `q`, `Esc`, `Ctrl-C` or `Ctrl-D` quit; `r` refreshes now; arrows or `j`/`k` move the
+selection. `Ctrl-C` is bound explicitly because raw mode swallows the terminal's own
+interrupt.
+
+Three things the flags do not show:
 
 - A **scheduled** pass may be served from the 300 s usage cache and make no request at
   all. `r` always goes to the wire.
 - `watch` has no `--timeout`; every request in a pass uses the 10 s `status` default. An
-  `--interval` so large that the schedule arithmetic overflows simply schedules nothing,
-  and only `r` fetches.
+  `--interval` so large that the schedule arithmetic overflows schedules nothing, and only
+  `r` fetches.
 - `watch` has no `--all`. The footer counts the hidden rows and points at
-  `agctl claude status --all` to see them.
+  `agctl claude status --all`.
 
-### `login` — mint a credential agctl owns
+### `login`
 
 ```sh
 agctl claude login --label work
@@ -179,14 +182,13 @@ agctl claude login --manual          # paste `code#state` instead of using the l
 agctl claude login --no-duplicate    # refuse if this account is already the live one
 ```
 
-The browser goes to Anthropic's authorize page; the code comes back either to a loopback
-listener on `127.0.0.1` or, with `--manual`, by paste. Only after the exchange returns —
-so only once the account and organization are known — does anything reach disk, and it
-reaches `<config-dir>/claude/<account-uuid>/<organization-uuid>/.credentials.json` under
-that namespace's lock. A mismatched `state` fails before the exchange and leaves nothing
-behind at all.
+The browser goes to Anthropic's authorize page; the code comes back to a loopback listener
+on `127.0.0.1` or, with `--manual`, by paste. Nothing reaches disk until the exchange
+returns and the account and organization are known. Then the credential is written to
+`<config-dir>/claude/<account-uuid>/<organization-uuid>/.credentials.json` under that
+namespace's lock. A mismatched `state` fails before the exchange and leaves nothing behind.
 
-After the exchange, `login` asks `GET /api/oauth/profile` once, with the new access token,
+After the exchange, `login` asks `GET /api/oauth/profile` once with the new access token
 and stores the account's plan and rate-limit tier with the credential; that is what fills
 the `Plan` column. The profile never changes which account or organization the exchange
 named, and a tier that is not in Claude Code's own shape is not recorded. When the request
@@ -195,16 +197,16 @@ refresh asks again.
 
 Logging the same `(account, organization)` in twice overwrites, and only after an
 interactive confirmation. There is no `--yes` on `login`, so a non-interactive re-login
-refuses rather than replacing a credential another process may be refreshing.
+refuses rather than replace a credential another process may be refreshing.
 
-Logging in as the account Claude Code is *already* signed in as is allowed, and prints a
+Logging in as the account Claude Code is *already* signed in as is allowed. It prints a
 one-line notice on standard error saying both sessions stay valid: two independent token
 pairs for one account is a supported setup. `--no-duplicate` refuses that case instead,
 exits 1 and writes nothing; its message names the `.claude.json` the claim came from, so a
-stale one can be checked. To change which account Claude Code itself uses, that is
+stale one can be checked. To change which account Claude Code itself uses, run
 `agctl claude use --live <id>`, not a second login.
 
-### `accounts` — inspect and edit what agctl knows
+### `accounts`
 
 ```sh
 agctl claude accounts list [--all]
@@ -215,183 +217,180 @@ agctl claude accounts forget <keychain-service>
 agctl claude accounts unforget <keychain-service>
 ```
 
-`remove` and `relocate` mutate a namespace and therefore wait for that namespace's lock
-before touching anything; both refuse a row agctl does not own. `forget` and
-`unforget` flip one flag in agctl's own registry — the keychain item they hide is
-never read, never written and never removed. `relocate` moves a namespace that was
-created as `_unknown-org` into its real organization directory once the organization is
-known.
+- `remove` and `relocate` mutate a namespace, so they wait for that namespace's lock before
+  touching anything; both refuse a row agctl does not own.
+- `relocate` moves a namespace that was created as `_unknown-org` into its real
+  organization directory once the organization is known.
+- `forget` and `unforget` flip one flag in agctl's own registry. The keychain item they
+  hide is never read, written or removed.
 
-### `import --from keychain` — record what another config directory already has
+### `import --from keychain`
 
 ```sh
 agctl claude import --from keychain --dry-run
 agctl claude import --from keychain --claude-config-dir ~/work/.claude
 ```
 
-An import **records what is already true and changes nothing else**: it reads Claude Code
-credential items belonging to other configuration directories, once, to learn who they
-belong to, and files them in agctl's registry as read-only rows. No credential is
-written, moved or deleted; an account already in the registry is reported and left alone,
-so a second import is a no-op. `--dry-run` prints the plan and writes nothing at all.
+An import **records what is already true and changes nothing else**. It reads the Claude
+Code credential items that belong to other configuration directories, once, to learn who
+they belong to, and files them in agctl's registry as read-only rows. No credential is
+written, moved or deleted. An account already in the registry is reported and left alone,
+so a second import is a no-op. `--dry-run` prints the plan and writes nothing.
 
 `--claude-config-dir` names a *Claude Code* configuration directory to scan; repeat it for
 several. It is deliberately spelled differently from the global `--config-dir`, which
 always means agctl's own store.
 
-### `doctor` — what is actually on this machine
+### `doctor`
 
 ```sh
 agctl claude doctor
 agctl claude doctor --remove-stale ~/.config/agctl/claude/<acct>/<org>/.oauth_refresh.lock --yes
 ```
 
-The report covers the keychain preflight, every discovered row with its token expiries,
-credentials on this machine that belong to something else and are never read, the
-namespace locks and who holds them, the Claude Code locks agctl is holding itself, the
-artefacts a Claude Code session leaves behind, the files a failed write leaves behind, the
-credential a `use --live` parked in a namespace, every isolated session directory with the
-state of its links and the keys it was seeded with, and the four situations that are not
-failures but are worth knowing about: a stale sibling, a forgotten service, two rows holding
-the same credential, and a namespace still called `_unknown-org`.
+The report covers:
+
+- the keychain preflight and every discovered row with its token expiries;
+- credentials on this machine that belong to something else and are never read;
+- the namespace locks and who holds them, and the Claude Code locks agctl is holding;
+- the artefacts a Claude Code session leaves behind, and the files a failed write leaves;
+- the credential a `use --live` parked in a namespace;
+- every isolated session directory, with the state of its links and the keys it was seeded
+  with;
+- four situations that are not failures but are worth knowing about: a stale sibling, a
+  forgotten service, two rows holding the same credential, and a namespace still called
+  `_unknown-org`.
 
 Its `store` block names the audit log and whether agctl can append to it, and has one
 `claude config` row: the configuration file `use --live` rewrites and the lock beside it,
-both as literal paths, then what the newest config write recorded:
+both as literal paths, then what the newest config write recorded. That is one of:
 
 - `no config write recorded`;
-- `the newest live write (<audit id>) has no config write after it`, which is what a
-  crash between a swap and its config step leaves;
+- `the newest live write (<audit id>) has no config write after it`, which is what a crash
+  between a swap and its config step leaves;
 - `last config write …` with its outcome, reason and audit ids, then whether its account
   `agrees with the file`, `differs from the file`, or cannot be compared with it.
 
 The row prints audit ids, outcome words and those fixed phrases, never an account id or an
 email.
 
-**`--remove-stale` is the only thing in agctl that deletes anything Claude Code
-created, and deleting a lock that is not actually stale can corrupt a running Claude Code
-session's credential store.** It is fenced accordingly. The path must:
+#### `--remove-stale`
+
+**This is the only thing in agctl that deletes anything Claude Code created, and deleting a
+lock that is not actually stale can corrupt a running Claude Code session's credential
+store.** It is fenced accordingly. The path must:
 
 1. spell a location under `<config-dir>/claude/`, or be named by a held-lock record whose
-   process is gone — see below;
-2. not be in `.locks/` — those are agctl's own locks, which nothing ever unlinks;
+   process is gone (the one exception, below);
+2. not be in `.locks/`: those are agctl's own locks, which nothing ever unlinks;
 3. be named `.oauth_refresh.lock`, `.storage-write`, or a legacy `<namespace>.lock`;
-4. be a **directory**, reached without following a symbolic link: Claude Code takes every
+4. be a **directory**, reached without following a symbolic link. Claude Code takes every
    one of its locks with `mkdir` and releases it with `rmdir`, so a directory is the only
    shape a lapsed lock has. A regular file at one of those names was written by something
    else; the report calls it anomalous and nothing removes it;
 5. be older than 60 s;
-6. show the **same modification time in two samples 12 s apart** — Claude Code's lock
-   holders heartbeat every five seconds and derive "the holder is alive" from exactly that
+6. show the **same modification time in two samples 12 s apart**. Claude Code's lock
+   holders heartbeat every five seconds and decide "the holder is alive" from exactly that
    comparison, so an unchanged mtime across twelve seconds is the evidence that nobody is
    holding it;
-7. and be confirmed with `--yes`, after the risk has been printed.
+7. be confirmed with `--yes`, after the risk has been printed.
 
 Anything else is refused, including a path that satisfies six of the seven. The command
 takes about twelve seconds because of step 6.
 
-Step 1 has one exception, and it is the only way `--remove-stale` reaches outside
-`<config-dir>/claude/`. When agctl takes Claude Code's locks itself it records what it
-took before taking it, and a crash leaves that record naming directories nothing else will
-ever remove. So a path outside the store is accepted when a record in
-`<config-dir>/claude/held-locks/` names **that exact path** and the process that wrote it
-is gone. A live process, a record naming some other path, and no record at all are each
-refused. `doctor` lists those records, and prints the removal command for the ones that
-leaked. A `use --live` killed while it held the live store's three locks leaves exactly
-such a record, and this is how those lock artefacts are removed.
+The exception to step 1 is the only way `--remove-stale` reaches outside
+`<config-dir>/claude/`. When agctl takes Claude Code's locks itself, it records what it is
+about to take in `<config-dir>/claude/held-locks/`; a crash leaves that record naming
+directories nothing else will ever remove. So a path outside the store is accepted when a
+record there names **that exact path** and the process that wrote it is gone. A live
+process, a record naming some other path, and no record at all are each refused. `doctor`
+lists those records and prints the removal command for the ones that leaked. A `use --live`
+killed while it held the live store's three locks leaves exactly such a record.
 
-### `use` — an isolated Claude Code session for one account
+### `use`, `exec`, `env`: isolated sessions
 
 ```sh
 agctl claude use bob@example.com
 agctl claude use bob@example.com --fresh-context --no-mcp
 agctl claude use bob@example.com --json
 agctl claude use --forget bob@example.com
+
+agctl claude exec bob@example.com -- claude
+agctl claude exec bob@example.com -- env
+
+eval "$(agctl claude env bob@example.com)"               # zsh or bash
+agctl claude env bob@example.com --shell fish | source   # fish
 ```
 
 `use <id>` starts `claude` from your `PATH` as that account, in a Claude Code configuration
 directory of its own, and exits with `claude`'s exit code. It does not change which account
 the Claude Code you already run is using: the session has its own credential store, named
 by the environment below. Only an account agctl owns can be isolated. `--new-only` is
-accepted as another name for this default.
+another name for this default.
 
-The session directory is `<config-dir>/claude-sessions/<account-uuid>/<organization-uuid>/`,
+`exec <id> -- <command>` prepares the same session directory and runs the command directly,
+with no shell, then exits with that command's exit code (`128 + n` when signal `n` killed
+it). `--mcp-config` is added only when the command's name is exactly `claude`, because any
+other program would not understand it. `use <id>` is `exec <id> -- claude`.
+
+`env <id>` prepares the session directory and prints the commands that point the current
+shell at it. They are an `export` of the two variables (`set -gx` in fish), an `unset` of
+`CLAUDE_CODE_OAUTH_TOKEN` with a comment saying why (`set -e`), and, unless `--no-mcp`, an
+alias `claude` that adds `--mcp-config` (a function in fish). Every value is single-quoted.
+An alias reaches only an interactive shell; a script started from that shell does not see
+it. `--shell` is `zsh` (the default), `bash` or `fish`.
+
+**The session directory** is `<config-dir>/claude-sessions/<account-uuid>/<organization-uuid>/`,
 created at 0700. Each run places what is missing and leaves what is already correct alone:
 
-- **Tier 1** — `settings.json`, `CLAUDE.md` and `skills` are symbolic links into your live
+- **Tier 1**: `settings.json`, `CLAUDE.md` and `skills` are symbolic links into your live
   Claude Code configuration directory (`~/.claude`, or `CLAUDE_CONFIG_DIR`), so the session
   behaves the way your own does.
-- **Tier 2** — `projects`, `shell-snapshots`, `file-history`, `sessions` and `session-env`
+- **Tier 2**: `projects`, `shell-snapshots`, `file-history`, `sessions` and `session-env`
   are directory links too, so the session can resume your work. `--fresh-context` leaves
   them out.
 - **`mcp.json`** links to the live `~/.claude.json`, and `claude` is started with
   `--mcp-config` pointing at it, so the session has your MCP servers. `--no-mcp` leaves out
   the link and the flag.
 - **`.claude.json`** is the session's own Claude Code configuration, seeded once at 0600
-  with your onboarding and editor preferences from the live file — `theme`, `editorMode`,
-  `autoUpdates` and a dozen more — and never an account, cache, project or MCP key. agctl
+  with your onboarding and editor preferences from the live file (`theme`, `editorMode`,
+  `autoUpdates` and a dozen more) and never an account, cache, project or MCP key. agctl
   never rewrites it after the first run.
 
 `history.jsonl` is never linked, because it has a lock of its own. An entry your live
 directory does not have is skipped. Anything agctl did not put at one of these names is
 refused, naming the path, and nothing after it is touched. The seed is read from the live
-file under Claude Code's own config lock when that lock is free — one read; agctl never
-waits on that lock and never breaks it — and otherwise read twice and compared, up to four
-times, so a file Claude Code is halfway through writing is never copied.
+file under Claude Code's own config lock when that lock is free, in one read; agctl never
+waits on that lock and never breaks it. Otherwise the file is read twice and compared, up
+to four times, so a file Claude Code is halfway through writing is never copied.
 
-`claude` gets your environment with three changes: `CLAUDE_SECURESTORAGE_CONFIG_DIR` names
-the account's namespace, whose spelling Claude Code hashes into the name of the keychain
-item it uses; `CLAUDE_CONFIG_DIR` names the session directory; and `CLAUDE_CODE_OAUTH_TOKEN`
-is removed, because it would bypass the stored credential.
+**The environment** `claude` gets is yours with three changes:
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` names the account's namespace, whose spelling Claude Code
+hashes into the name of the keychain item it uses; `CLAUDE_CONFIG_DIR` names the session
+directory; and `CLAUDE_CODE_OAUTH_TOKEN` is removed, because it would bypass the stored
+credential.
 
 | flag | effect |
 |------|--------|
 | `--claude-config-dir <PATH>` | use this session directory instead of the generated one |
 | `--fresh-context` | leave out the tier 2 links |
 | `--no-mcp` | leave out the MCP link and the `--mcp-config` flag |
-| `--json` | print the session's paths as JSON before `claude` starts |
-| `--forget <ID>` | remove that account's session directory instead of starting one |
-| `--yes` | do not ask before `--forget` removes anything |
+| `--json` | `use` only: print the session's paths as JSON before `claude` starts |
+| `--forget <ID>` | `use` only: remove that account's session directory instead of starting one |
+| `--yes` | `use` only: do not ask before `--forget` removes anything |
+| `--shell <SHELL>` | `env` only: `zsh` (default), `bash` or `fish` |
 
-A `--claude-config-dir` path must be absolute, with no `.` or `..` in it, and may not be the
-live Claude Code configuration directory itself. `--json` prints `securestorage_dir`,
+A `--claude-config-dir` path must be absolute, with no `.` or `..` in it, and may not be
+the live Claude Code configuration directory itself. `--json` prints `securestorage_dir`,
 `config_dir`, `session_path` and `mcp_config`.
 
-`use --forget <id>` removes the generated session directory and everything in it — its
-links (never their targets), its seed, and whatever Claude Code wrote there, such as the
-session's own `history.jsonl` and, for a `--fresh-context` session, its transcripts — after
-a confirmation. The account's credentials and its namespace are left alone, and a
+`use --forget <id>` removes the generated session directory and everything in it, after a
+confirmation: its links (never their targets), its seed, and whatever Claude Code wrote
+there, such as the session's own `history.jsonl` and, for a `--fresh-context` session, its
+transcripts. The account's credentials and its namespace are left alone, and a
 `--claude-config-dir` directory is not removed.
 
-### `exec` — one command as an account
-
-```sh
-agctl claude exec bob@example.com -- claude
-agctl claude exec bob@example.com -- env
-```
-
-`exec` prepares the same session directory as `use` and runs the command directly — no
-shell — with the same three changes to your environment, then exits with that command's
-exit code (`128 + n` when signal `n` killed it). `--mcp-config` is added only when the
-command's name is exactly `claude`, because any other program would not understand it.
-`use <id>` is `exec <id> -- claude`. `--claude-config-dir`, `--fresh-context` and
-`--no-mcp` mean what they mean for `use`.
-
-### `env` — the same session, in your shell
-
-```sh
-eval "$(agctl claude env bob@example.com)"               # zsh or bash
-agctl claude env bob@example.com --shell fish | source   # fish
-```
-
-`env` prepares the session directory and prints the commands that point the current shell
-at it: an `export` of the two variables (`set -gx` in fish), an `unset` of
-`CLAUDE_CODE_OAUTH_TOKEN` with a comment saying why (`set -e`), and, unless `--no-mcp`, an
-alias `claude` that adds `--mcp-config` (a function in fish). Every value is single-quoted.
-An alias reaches only an interactive shell; a script started from that shell does not see
-it. `--shell` is `zsh` (the default), `bash` or `fish`.
-
-### `use --live` — hot-swap the account Claude Code is using
+### `use --live`, `use --undo`: hot-swapping the live account
 
 ```sh
 agctl claude use --live bob@example.com
@@ -400,8 +399,8 @@ agctl claude use --undo
 ```
 
 `use --live <id>` writes `<id>`'s credential into the keychain item your running Claude
-Code reads — `Claude Code-credentials` in the default layout — so every session using the
-live store runs as that account from its next message, within 30 s, with no restart and
+Code reads (`Claude Code-credentials` in the default layout). Every session using the live
+store then runs as that account from its next message, within 30 s, with no restart and
 without running `claude`. It is opt-in: without `--live`, `use` starts an isolated session.
 agctl reports what the item holds; it cannot see a session switch.
 
@@ -409,85 +408,89 @@ Both accounts must be ones agctl owns: `<id>`, and the account whose credential 
 holds now. That credential is not thrown away, unless it is an older copy of `<id>`'s own
 credential, which the incoming one supersedes. It is **parked** in its own account's
 namespace as `.credentials.adopted.json`, and `use --undo` puts it back from there. A copy
-already parked there that no recorded live swap left — the source of a namespace swap's
-undo, or one a live undo wrote back but never recorded — blocks the swap (exit 14) unless
-it holds the same credential; the message names the file and says to undo that swap or
-move the file aside. When no account agctl owns is the live one, the swap refuses (exit
-14) and says to `agctl claude login` that account first.
+already parked there that no recorded live swap left blocks the swap (exit 14) unless it
+holds the same credential. Such a copy is the source of a namespace swap's undo, or one a
+live undo wrote back but never recorded; the message names the file and says to undo that
+swap or move the file aside. When no account agctl owns is the live one, the swap refuses
+(exit 14) and says to `agctl claude login` that account first.
 
-Before the prompt, agctl changes no credential: it reads its registry, its environment and
-the live item once, and asks `GET /api/oauth/profile` with that item's own access token —
-which is how it learns whose credential the item holds. Then it asks once, naming the store,
-the incoming account and both credentials' digest prefixes, and that one answer covers
-every write below. `--yes` answers it; with no terminal and no `--yes` the swap is
+**Before the prompt, agctl changes no credential.** It reads its registry, its environment
+and the live item once, and asks `GET /api/oauth/profile` with that item's own access
+token, which is how it learns whose credential the item holds. Then it asks once, naming
+the store, the incoming account and both credentials' digest prefixes, and that one answer
+covers every write below. `--yes` answers it; with no terminal and no `--yes` the swap is
 `cancelled` (exit 20). After the answer, one swap:
 
 1. refreshes `<id>`'s credential if it has expired, and saves the new pair to `<id>`'s own
    store;
 2. parks the displaced credential, under agctl's own namespace locks;
-3. writes the item — one `add-generic-password -U`, over a pipe — under Claude Code's three
+3. writes the item, one `add-generic-password -U` over a pipe, under Claude Code's three
    credential-store locks, starting no write that cannot finish inside their 3 s budget;
 4. releases those locks and appends the write to the audit log, then rewrites
    `~/.claude.json` under Claude Code's config lock: `oauthAccount` becomes `<id>`'s, from
-   its profile, and five stale caches are deleted (see [Security posture](#security-posture));
-   this step gets an audit line of its own. Running Claude Code sessions watch that file
-   once a second, which is what the completion sentence's "within a second" rests on.
+   its profile, and five stale caches are deleted (see
+   [What agctl writes](#what-agctl-writes-and-what-it-never-does)). This step gets an audit
+   line of its own. Running Claude Code sessions watch that file
+   once a second, which is what "within a second" below rests on.
 
-On success it prints `swapped:` with the item and the new credential's digest prefix, says
-the swap takes effect on your next message, within 30 s — and, when `~/.claude.json` was
-rewritten, adds that running sessions show the new account within a second — and asks you
-to run `/model` once in a running session to refresh its model access. It then names where
-the displaced credential was parked and the audit id. `--json` does not imply `--yes`: it
+**On success** it prints `swapped:` with the item and the new credential's digest prefix,
+and says the swap takes effect on your next message, within 30 s. When `~/.claude.json` was
+rewritten it adds that running sessions show the new account within a second. It asks you
+to run `/model` once in a running session to refresh its model access, then names where the
+displaced credential was parked and the audit id. `--json` does not imply `--yes`: it
 prints a `"kind": "plan"` document before the prompt and a `"kind": "outcome"` document at
 the end, so read the last document rather than the second.
 
-**Remote Control.** A live swap stops Remote Control in sessions using that store; the
+**Remote Control.** A live swap stops Remote Control in sessions using that store. The
 local conversation survives, but reconnecting afterwards does not carry its earlier
 conversation to claude.ai unless Remote Control was disconnected before the swap. When
-Claude Code's session registry reports Remote Control on, agctl adds a consent hint and
-an applied-swap warning (`--json` carries counts only). The hint cannot tell which session
-uses this store. To keep a session's claude.ai history, answer `n`, run `/remote-control`
-in that session and disconnect, then re-run the swap and run `/remote-control` afterwards.
-Do not leave the question open while disconnecting: it counts against the swap's limit.
+Claude Code's session registry reports Remote Control on, agctl adds a consent hint and an
+applied-swap warning (`--json` carries counts only). The hint cannot tell which session
+uses this store. To keep a session's claude.ai history: answer `n`, run `/remote-control`
+in that session and disconnect, re-run the swap, then run `/remote-control` again. Do not
+leave the question open while disconnecting: it counts against the swap's limit.
 
 **When `~/.claude.json` was not rewritten.** The config step never changes the swap's
-outcome. If it does not land — Claude Code held its config lock, the file changed under
-agctl's lock, the profile request failed — the swap still exits 0, `--json` reports the
-step in `config` (`outcome`, `reason`, `backup`, `hold_ms`, `budget_ms`) and in `warnings`,
-and stderr says the file was not updated and why, that running sessions keep showing the
+outcome. If it does not land (Claude Code held its config lock, the file changed under
+agctl's lock, the profile request failed) the swap still exits 0. `--json` reports the step
+in `config` (`outcome`, `reason`, `backup`, `hold_ms`, `budget_ms`) and in `warnings`.
+stderr says the file was not updated and why, that running sessions keep showing the
 previous account, and to run the same `agctl claude use --live <id>` again. That re-run is
 the fix: when the item still holds the account, the swap answers `already_active` (exit 0)
-and offers to rewrite the file on its own — a prompt of its own, which `--yes` also answers
-and which writes nothing when declined. After `--undo`, the sentence names `use --live` with the
-account the undo put back. A missing `~/.claude.json` is only a `note:`: Claude Code writes
-`oauthAccount` itself at its next start.
+and offers to rewrite the file on its own, a prompt of its own that `--yes` also answers
+and that writes nothing when declined. After `--undo`, the sentence names `use --live` with
+the account the undo put back. A missing `~/.claude.json` is only a `note:`; Claude Code
+writes `oauthAccount` itself at its next start.
 
-**`--undo`.** `use --undo` reverses the most recent `--live` swap: the parked credential
-goes back into the item, the credential it displaces goes back to its own account's
-namespace, and `~/.claude.json` is rewritten for the account restored — the same prompt,
-locks, audit lines and exit codes. When the parked copy and that account's own store hold
-the same credential — the same access and refresh tokens, whatever the formatting — they
-count as one: the undo restores from the parked copy, then removes it once the item holds
-the credential and both files still match. A removal that fails leaves the undo applied and
-names the file left behind. Two copies whose refresh tokens differ are not one credential:
-`--undo` refuses and names both files rather than guess. After an applied undo, a second
-`--undo` reverses that undo and swaps forward again. If the item changed hands after the
-swap — a `/login` inside Claude Code, another switcher — `--undo` does not guess: it answers
-`already_active` when the item already holds the account it would restore, and refuses (exit
-27) when it holds anyone else.
+**`--undo`** reverses the most recent `--live` swap: the parked credential goes back into
+the item, the credential it displaces goes back to its own account's namespace, and
+`~/.claude.json` is rewritten for the account restored, with the same prompt, locks, audit
+lines and exit codes. When the parked copy and that account's own store hold the same
+credential (the same access and refresh tokens, whatever the formatting) they count as one.
+The undo restores from the parked copy, then removes it once the item holds the credential
+and both files still match. A removal that fails leaves the undo applied and names the file
+left behind. Two copies whose refresh tokens differ are not one credential: `--undo`
+refuses and names both files rather than guess. After an applied undo, a second `--undo`
+reverses that undo and swaps forward again. If the item changed hands after the swap (a
+`/login` inside Claude Code, another switcher) `--undo` does not guess: it answers
+`already_active` when the item already holds the account it would restore, and refuses
+(exit 27) when it holds anyone else.
 
 **From an isolated session's shell.** When `CLAUDE_SECURESTORAGE_CONFIG_DIR` is set and not
-empty — as `use`, `exec` and `env` set it — `use --live <id>` swaps the keychain item of the
+empty, as `use`, `exec` and `env` set it, `use --live <id>` swaps the keychain item of the
 namespace it names instead of the live one, and leaves `~/.claude.json` alone. The variable
 must spell a namespace agctl owns, byte for byte, or the swap refuses (exit 15). A
 `use --undo` of a live swap run from such a shell refuses (exit 13) rather than lock one
 store and write another; run it without the variable.
 
 **What it will not do.** It never refreshes the live credential; Claude Code does that. It
-refuses while `CLAUDE_CODE_OAUTH_TOKEN` is set in its own environment (exit 11), against a
-live store whose credential has not moved into the keychain yet (exit 24: run `claude`
-once), and for an incoming account whose credential lives only in its namespace's keychain
-item, which cannot be swapped in yet (exit 14).
+refuses:
+
+- while `CLAUDE_CODE_OAUTH_TOKEN` is set in its own environment (exit 11);
+- against a live store whose credential has not moved into the keychain yet (exit 24: run
+  `claude` once);
+- for an incoming account whose credential lives only in its namespace's keychain item,
+  which cannot be swapped in yet (exit 14).
 
 **Known limitation: one grant, two copies.** After a live swap, the incoming account's token
 pair is in two places: the live item and that account's own agctl store. Anthropic rotates
@@ -495,182 +498,371 @@ a refresh token when it is used, so whichever side refreshes first leaves the ot
 a dead one. A `status` refresh of that account can cost the live session its next refresh,
 and the session's own refresh can leave agctl's copy needing a new `login`.
 
-## How accounts are discovered
+## Codex commands
 
-Three sources, and what separates them is who is allowed to write the credential:
+`agctl codex` shows subscription usage for Codex (ChatGPT) accounts the way `agctl claude`
+does for Claude: one table, `--json`, a `watch` UI, no keychain writes for reading. What
+each command writes, and which ones touch the network in a way that changes a credential,
+is stated in that command's section. There is no Codex equivalent of `use`, `exec`, `env`
+or `use --live`: agctl tracks and refreshes the Codex accounts it owns and does not switch
+which account the `codex` CLI uses.
 
-1. **The live keychain item** — the credentials the `claude` you run right now is using.
+agctl does not implement Codex's OAuth flow itself. `agctl codex login` runs the real
+`codex login` against a scratch home agctl owns, verifies what that run left behind, and
+copies the verified bytes into agctl's own store. Codex's browser flow is never
+reimplemented, and no credential is trusted before it is checked.
+
+### `status`
+
+```sh
+agctl codex status
+agctl codex status --json | jq '.rows[] | {id, state, windows}'
+agctl codex status --account 8ff4… --account someone@example.com
+agctl codex status --all --refresh --timeout 30s
+```
+
+| flag | effect |
+|------|--------|
+| `--json` | the report as JSON instead of a table; the shape is fixed by `schemas/status.v2.json` |
+| `--raw` | include the untouched upstream response body under `raw` |
+| `--refresh` | refresh expired credentials even when a cached value would do |
+| `--no-cache` | bypass the usage cache without forcing a token refresh |
+| `--all` | also show rows hidden by default, such as stale siblings |
+| `--account <ID>` | limit the report to one account; repeat for several |
+| `--timeout <DUR>` | per-request HTTP timeout, default `10s` |
+
+`status` is where an owned account's refresh happens. When a due row's policy is `auto`
+(the default; see `accounts set`) `status` runs the refresh as a sequential pre-pass on the
+command thread, one namespace at a time, before the usage requests are coordinated, and
+only then reads that account's usage. `watch` never does this. One usage request can spend
+`4 × min(--timeout, 5s) + 2 × --timeout`, 40 s at the default, and that is the whole pass
+when no selected owned account has refresh policy `auto`. A refresh POST has its own budget
+and is never cut short, so a pass with an owned `auto` account can take up to
+`1s + 19s + 1s + 2 × (4 × min(--timeout, 5s) + 2 × --timeout)`, 101 s at the default,
+whether or not that account is due: a 401 can call for a refresh that was not scheduled.
+
+**The live access token lasts 10 days** from Codex's own last login or refresh. A row past
+that window shows `expired (run codex to refresh)` rather than being fetched; `status` and
+`watch` never send a request for a token they already know is dead. Running `codex` (or
+`agctl codex login`) at least that often is what keeps a Codex row alive without a manual
+refresh.
+
+### `watch`
+
+```sh
+agctl codex watch
+agctl codex watch --interval 10m
+```
+
+`--interval` defaults to `300s` and will not go below `60s`, the same floor as
+`agctl claude watch`. Unlike `status`, **`watch` never sends a refresh token**: a due owned
+row shows `expired (run agctl codex status)` instead of being refreshed from an unattended
+loop. An unattended background process is exactly where a refresh defect is most expensive,
+so refreshing is kept to the commands a person runs and reads the result of.
+
+### `login`
+
+```sh
+agctl codex login
+agctl codex login --label work
+agctl codex login --no-refresh
+```
+
+Runs the real `codex login` (from `PATH`; never overridden by an environment variable in a
+release build, see [Install](#install)) against a scratch `CODEX_HOME` agctl creates and
+removes. It reads what that run wrote and, only after the read is verified, copies the
+credential into `<config-dir>/codex/<user-id>/<account-id>/auth.json` under that namespace's
+lock. Nothing reaches agctl's own store before the child's output is parsed and checked; a
+mismatched or unreadable result leaves nothing behind. `--label` gives the resulting account
+a human-readable name. `--no-refresh` records it with `accounts set --refresh never` already
+applied, so agctl never sends its refresh token unless you opt back in.
+
+### `accounts`
+
+```sh
+agctl codex accounts list [--all]
+agctl codex accounts show <id>
+agctl codex accounts remove <id> [--delete-secret] [--yes]
+agctl codex accounts forget <id>
+agctl codex accounts unforget <id>
+agctl codex accounts set <id> --refresh auto|never
+agctl codex accounts refresh <id> --resend [--yes]
+agctl codex accounts refresh <id> --reset-floor [--yes]
+```
+
+`set --refresh` changes only agctl's own registry, under its own config lock. It never
+opens the namespace, never takes its lock, never reads `auth.json`. `--refresh never` is
+what `login --no-refresh` applies at login time: the next `status` pass makes zero refresh
+requests for that account and the row goes `expired (run agctl codex login)` once its
+access token runs out. `--refresh auto` restores the default.
+
+`refresh --resend` and `refresh --reset-floor` act on a row `status`'s own refresh pre-pass
+already touched:
+
+- **`--resend`** is the one deliberate exception to "agctl never re-sends a refresh token
+  automatically". It applies only to a row whose last refresh outcome is *unknown* (an
+  ambiguous network failure, not a rejection), only once that state is **at least an hour
+  old**, and only **once per such state**. A second `--resend` against the same unresolved
+  send is refused, and so is one while a pending write from an earlier attempt is still
+  waiting to be replayed. A pending write that was already *discarded*, superseded by a
+  newer successful write, does not block a `--resend`. Without a terminal, `--resend`
+  refuses even with `--yes`: a second send of a token the server may already have consumed
+  is a cost a person takes deliberately, never something a script or a cron job can
+  schedule on agctl's behalf.
+- **`--reset-floor`** lifts the terminal state a Codex row reaches after three refreshes in
+  a row that were sent but did not clear a 401: `unauthorized (refresh did not help)`.
+  Nothing else lifts it, not `--refresh` on `status` and not `watch`'s periodic pass; only
+  `agctl codex login` (which replaces the credential outright) or this flag (which keeps it
+  and gives the next due refresh another chance).
+
+`remove --delete-secret` also deletes the credential file agctl wrote for that account, not
+just the registry row; without it, the row is dropped but the file (and any parked residue
+under it) stays on disk. `forget` and `unforget` only flip whether a foreign Codex keychain
+item is hidden from `doctor`'s report; nothing is read, written or removed by either.
+
+### `import --from codex-home`
+
+```sh
+agctl codex import --from codex-home
+agctl codex import --from codex-home --codex-home ~/work/.codex --dry-run
+```
+
+Reads another `CODEX_HOME`'s `auth.json` **read-only** (never a byte written, moved or
+removed under it) and files what its claims say (account id, email, plan) as a read-only
+row in agctl's registry. An account already known is reported and left alone, so a second
+import is a no-op. `--codex-home` names the directory to read instead of the one this
+environment names; `--dry-run` prints the plan and writes nothing.
+
+### `doctor`
+
+```sh
+agctl codex doctor
+agctl codex doctor --json
+```
+
+The report covers:
+
+- the resolved Codex home and the links walked to reach it;
+- the store mode (`file` or `keyring`) and whether agctl can read it;
+- the four `AGCTL_CODEX_*` variables this process carries;
+- the live credential's shape and its refresh-floor state, and daemon evidence;
+- every owned namespace with its lock and its refresh marker;
+- the write-receipt audit log's health.
+
+There is no `--remove-stale` here: no Codex lock is agctl's to break, so `doctor` has no
+write path and creates nothing. Running it on a machine that has never seen
+`agctl codex login` leaves that machine exactly as it was.
+
+`doctor` never hands you a removal command for a foreign `Codex Auth` keychain item on its
+own say-so: a pasted removal of another Codex home's legitimate credential is data loss,
+not a fix. A refused login that gained a `Codex Auth` item writes one audit line for it
+(`login_keychain_gained`, its account guarded to the `cli|` + 16 hex shape), and a removal
+command (`security delete-generic-password …`) is offered **only** for an item that audit
+line names. Every other foreign `Codex Auth` item, one `import` never claimed or one
+belonging to a different `CODEX_HOME` entirely, is reported as a count, with no command and
+no account attached. agctl itself still deletes no keychain item: the command is printed
+for you to run, never run on your behalf. The same caution applies to `orphans`: a subject
+that does not have the shape agctl's own writes leave becomes a count, not a named row.
+`store.base_url` is printed without its query string, for the same reason doctor prints no
+email or account id anywhere in its report.
+
+## How it works
+
+### Where accounts come from
+
+Three sources, separated by who is allowed to write the credential:
+
+1. **The live keychain item**: the credentials the `claude` you run right now is using.
    agctl reads it and never refreshes it; only `use --live` and `use --undo` write it. In
    the table, identity comes from the blob's own `tokenAccount`, or from `.claude.json` for
    this row only. `use --live` trusts neither: Claude Code writes the item with no
-   `tokenAccount`, and a `.claude.json` a swap could not rewrite still names the account the
-   swap displaced. So it asks `GET /api/oauth/profile` with the item's own access token, and
-   refuses (exit 29) when nothing can say whose credential the item holds.
-2. **Per-configuration-directory keychain items** — a Claude Code credential item named
+   `tokenAccount`, and a `.claude.json` a swap could not rewrite still names the account
+   the swap displaced. So it asks `GET /api/oauth/profile` with the item's own access
+   token, and refuses (exit 29) when nothing can say whose credential the item holds.
+2. **Per-configuration-directory keychain items**: a Claude Code credential item named
    after some *other* config directory, recorded by `import --from keychain`. Read once,
    read-only forever.
-3. **agctl-owned namespaces** — `<config-dir>/claude/<account-uuid>/<organization-uuid>/.credentials.json`,
-   created by `login`. These are the only credentials agctl will ever refresh, and apart
+3. **agctl-owned namespaces**: `<config-dir>/claude/<account-uuid>/<organization-uuid>/.credentials.json`,
+   created by `login`. These are the only credentials agctl will ever refresh and, apart
    from the live item `use --live` replaces, the only ones it writes.
 
 A keychain item is named after a *directory spelling*, not after an account, so the same
 account can appear under several names and two names can point at one directory. agctl
-therefore folds two entries into one row only when their token digests match, never by
-path. Two items naming one physical directory but holding different credentials are a
-**stale sibling of live**: real, not actionable, hidden by default and counted in the
-footer. A blob that names nobody is `identity unknown` and stays visible, because logging
-in fixes it. An unrecognised Claude Code item is `unclaimed` and shown; `accounts forget`
-hides it.
+folds two entries into one row only when their token digests match, never by path. Two
+items naming one physical directory but holding different credentials are a **stale
+sibling of live**: real, not actionable, hidden by default and counted in the footer. A
+blob that names nobody is `identity unknown` and stays visible, because logging in fixes
+it. An unrecognised Claude Code item is `unclaimed` and shown; `accounts forget` hides it.
 
 By default the table shows Live, Owned, `unclaimed` and `identity unknown` rows. Stale
 siblings, third-party (`claude-switcher:*`) items and forgotten services are hidden and
 counted; `--all` shows them.
 
-## Security posture
+### What agctl writes, and what it never does
 
-- **agctl writes two classes of keychain item, and deletes none.** The `security(1)`
-  subcommands it issues are `show-keychain-info`, `find-generic-password` and
-  `dump-keychain` — all reads — plus `add-generic-password -U`, on standard input, for two
-  cases. Those two cases are the two constructors of one type — `WriteTarget::migrated` and
-  `WriteTarget::live`, in `src/secret/keychain_write.rs` — which has no other constructor,
-  no public fields and none taking a service name as a string, so the set of items agctl
-  can write is exactly the set those two can name. The first is the item of a namespace
-  agctl created, whose name `WriteTarget::migrated` derives from the account registry:
-  `status` refreshes it in place once a Claude Code session has migrated that namespace into
-  the keychain, and `use --live` from that session's shell swaps it. The second is the live
-  item — `Claude Code-credentials`, or `Claude Code-credentials-<sha8>` under a non-empty
-  `CLAUDE_CONFIG_DIR` — which `WriteTarget::live` derives from the environment the way
-  Claude Code derives it, and which only `use --live` and `use --undo` write, once per run
-  and only after you confirm or pass `--yes`. Both are written under Claude Code's own lock
-  protocol, and no other item is nameable as a target. There is no `delete-generic-password`
-  code path at all, and no secret ever appears in a command line: the credential goes to
-  `security -i` over a pipe. Every write is appended to `~/.config/agctl/claude/keychain-writes.jsonl`,
-  which records digest prefixes and never token material; the entry is written after the
-  write, and a failure to append is reported rather than rolling the write back, so a
-  process killed between the two leaves a write the log does not name. The `~/.claude.json`
-  step after a swap or undo is appended there too, and a catch-up's once it has read the
-  file, unless you decline it. Each is a `config_write` line with its outcome and reason,
-  the account ids, the backup's file name and digest prefixes of the file.
-- **A live swap refuses to run without an appendable audit log.** Against the live item,
-  `use --live` and `use --undo` open the audit log before they touch the live store or park
-  anything, and append through that open file. If it cannot be appended to — a symbolic
-  link at its name, a mode `append` refuses — the swap refuses (exit 22), and `doctor`'s
-  `audit log` row says why. A namespace swap keeps the older rule: a refused log is reported
-  and the swap goes on.
-- **Nothing irreversible happens before you confirm.** Until the prompt, a live swap reads
-  the registry, the environment and the live item once, and sends one
-  `GET /api/oauth/profile`, which rotates nothing; beyond that it only takes agctl's own
-  locks and opens its audit log. The refresh POST, the parking and both writes follow the
-  answer. Neither Claude Code's credential-store locks nor its config lock is ever held
-  across a network request or a prompt, and the two are never held together.
-- **Outside its own configuration directory, agctl writes only for `use --live` and
-  `use --undo`, one lock when an isolated session is seeded, and the session directory you
-  name with `--claude-config-dir`.** Against the live store (`~/.claude`, or
-  `CLAUDE_CONFIG_DIR`) a live swap creates and removes Claude Code's three credential-store
-  lock artefacts — `.oauth_refresh.lock` and `.storage-write` inside the resolved store, and
-  the legacy `<store>.lock` beside it — and writes the keychain item; it never writes or
-  removes a credential file there. Its config step then writes exactly three things: the
-  lock beside the configuration file (`~/.claude.json.lock`), a backup in Claude Code's
-  `backups/` directory (`~/.claude/backups/` by default, created at 0700 when absent), and
-  the file itself, through a temporary file beside the link's target and a rename. Seeding
-  an isolated session takes that same lock for one read, only when it is free. Everything
-  else agctl creates is under its own configuration directory.
-- **`~/.claude.json` changes by one key and five deletions, as a peer of Claude Code's own
-  config lock.** After an applied live swap or undo, or on the re-run that catches the file
-  up, agctl replaces `oauthAccount` with the object Claude Code builds from
-  `/api/oauth/profile`, deletes five caches every reader treats as "fetch again"
-  (`modelAccessCache`, `orgModelDefaultCache`, `cachedExtraUsageDisabledReason`,
-  `cachedUsageUtilization`, `passesEligibilityCache`), and changes nothing else. It takes
-  Claude Code's lock beside the link, never beside its target, and waits for a busy one only
-  with nothing of Claude Code's held. It writes the backup first, in Claude Code's own
-  `.claude.json.backup.<epoch ms>` format at 0600, and never prunes one; Claude Code's next
-  save does. It refuses unless re-serialising the unmodified file reproduces its bytes
-  exactly, and re-reads the file before the rename and aborts if it changed. The new
-  contents go to a temporary file beside the symlink's target, with the target's mode, and
-  that file is renamed over the target; the link itself is never touched. It starts no step
-  that cannot finish inside the lock's 1.2 s budget, and never breaks Claude Code's config
-  lock: a stale one skips the rewrite, and one agctl leaves behind by being killed is Claude
-  Code's to reclaim after 10 s. When `~/.claude/.config.json` exists, Claude Code uses that
-  file instead, and so does agctl.
-- **A displaced credential is parked, and never where Claude Code reads.** The one exception
-  is an older copy of the incoming account's own credential, which the incoming one
-  supersedes. A live swap files the credential it displaces in that account's own
-  namespace as `.credentials.adopted.json`, at 0600 — a name Claude Code's credential read,
-  its deletion and `/logout` never visit, so a keychain hiccup cannot make a session fall
-  back to the account you swapped away from. `doctor` lists each such copy, `use --undo`
-  restores it — and removes it when the account's own store already holds the same
-  credential — and `accounts remove --delete-secret` clears it.
-- **Refresh tokens sit at rest in 0600 files** —
-  `~/.config/agctl/claude/<acct>/<org>/.credentials.json`, in a directory tree created
-  at 0700. This is the same posture as Claude Code's own plaintext fallback store, which
-  holds the same material in the same shape at the same mode. It is not the keychain, and
-  it is not encrypted: anything running as your user can read it.
-- **The namespace lock lives outside the namespace** —
-  `~/.config/agctl/claude/.locks/<acct>.<org>.lock` — is created once, and is never
-  unlinked, not even by the command that deletes the namespace it protects. `flock` locks
-  an inode, so a lock file that can be deleted and recreated is a lock two processes can
-  hold at the same time.
-- **Claude Code activity in a namespace is detected and the refresh is refused.** Before a
-  refresh POST, agctl checks the write target, takes the lock, re-checks for a Claude
-  Code session under the lock, and re-checks once more immediately before the rename. Any
-  surprise at any of those points ends in a refusal. There is no flag that overrides it: a
-  row reading `claude session detected — refresh refused` is the system working. A
-  namespace a session has *migrated* into the keychain is the one activity that is not a
-  refusal: agctl refreshes that item instead of the file, and refuses again if the item
-  changes while the refresh is in flight.
-- **A row agctl does not own is never refreshed and, when expired, is not even
-  fetched.** Its owner refreshes it; agctl reports.
-- **agctl removes a lock artefact it did not create in exactly three circumstances.**
-  `doctor --remove-stale`, fenced by the seven conditions — and the one record-attested
-  exception to the first of them — listed under
-  [`doctor`](#doctor--what-is-actually-on-this-machine); and, as a protocol peer taking
-  Claude Code's credential-store locks itself, a stale one of those locks **inside agctl's
-  own directory tree** while refreshing a migrated namespace's keychain item or swapping a
-  namespace's item, and **in the live store** while `use --live` or `use --undo` writes the
-  live item. Those two take twelve seconds of modification-time sampling before they remove
-  anything, remove at most one lock per attempt, stand down if any `claude` process is
-  stopped, and append the whole decision to the audit log whether they broke the lock or
-  abandoned the attempt. The config lock beside `~/.claude.json` is never removed.
+**Two classes of keychain item, and no deletions.** The `security(1)` subcommands agctl
+issues are `show-keychain-info`, `find-generic-password` and `dump-keychain`, all reads,
+plus `add-generic-password -U` on standard input for two cases. Those two cases are the two
+constructors of one type, `WriteTarget::migrated` and `WriteTarget::live` in
+`src/secret/keychain_write.rs`. The type has no other constructor, no public fields and
+none taking a service name as a string, so the set of items agctl can write is exactly the
+set those two can name.
 
-## The usage endpoint
+- `WriteTarget::migrated` derives the item of a namespace agctl created from the account
+  registry. `status` refreshes it in place once a Claude Code session has migrated that
+  namespace into the keychain, and `use --live` from that session's shell swaps it.
+- `WriteTarget::live` derives the live item (`Claude Code-credentials`, or
+  `Claude Code-credentials-<sha8>` under a non-empty `CLAUDE_CONFIG_DIR`) from the
+  environment the way Claude Code derives it. Only `use --live` and `use --undo` write it,
+  once per run and only after you confirm or pass `--yes`.
 
-The numbers come from `GET https://api.anthropic.com/api/oauth/usage`, the endpoint
-Claude Code's own `/usage` command reads. **It is undocumented.** It is not part of
-Anthropic's published API, it carries no compatibility promise, and it may change shape or
-disappear in any Claude Code release — which is what
-[`docs/re-verify.md`](docs/re-verify.md) is for.
+Both are written under Claude Code's own lock protocol, and no other item is nameable as a
+target. There is no `delete-generic-password` code path at all, and no secret ever appears
+in a command line: the credential goes to `security -i` over a pipe.
 
-agctl sends an honest `User-Agent`: `agctl/<version>`. It does not pretend to be
-Claude Code. A client that lies about who it is cannot be rate-limited, deprecated or
-excluded separately from the product it is impersonating, which is bad for both sides. If
-Anthropic ever starts refusing the honest agent, `AGCTL_CLAUDE_USER_AGENT` replaces the
-string without waiting for a release.
+**Every keychain write is audited.** Each write is appended to
+`~/.config/agctl/claude/keychain-writes.jsonl`, which records digest prefixes and never
+token material. The entry is written after the write, and a failure to append is reported
+rather than rolling the write back, so a process killed between the two leaves a write the
+log does not name. The `~/.claude.json` step after a swap or undo is appended there too,
+and a catch-up's once it has read the file, unless you decline it. Each is a `config_write`
+line with its outcome and reason, the account ids, the backup's file name and digest
+prefixes of the file.
+
+**A live swap refuses to run without an appendable audit log.** Against the live item,
+`use --live` and `use --undo` open the audit log before they touch the live store or park
+anything, and append through that open file. If it cannot be appended to (a symbolic link
+at its name, a mode `append` refuses) the swap refuses (exit 22), and `doctor`'s
+`audit log` row says why. A namespace swap keeps the older rule: a refused log is reported
+and the swap goes on.
+
+**Nothing irreversible happens before you confirm.** Until the prompt, a live swap reads
+the registry, the environment and the live item once, and sends one
+`GET /api/oauth/profile`, which rotates nothing; beyond that it only takes agctl's own
+locks and opens its audit log. The refresh POST, the parking and both writes follow the
+answer. Neither Claude Code's credential-store locks nor its config lock is ever held
+across a network request or a prompt, and the two are never held together.
+
+**Outside its own configuration directory, agctl writes only for `use --live` and
+`use --undo`, one lock when an isolated session is seeded, and the session directory you
+name with `--claude-config-dir`.** Against the live store (`~/.claude`, or
+`CLAUDE_CONFIG_DIR`) a live swap creates and removes Claude Code's three credential-store
+lock artefacts (`.oauth_refresh.lock` and `.storage-write` inside the resolved store, and
+the legacy `<store>.lock` beside it) and writes the keychain item. It never writes or
+removes a credential file there. Its config step then writes exactly three things: the
+lock beside the configuration file (`~/.claude.json.lock`), a backup in Claude Code's
+`backups/` directory (`~/.claude/backups/` by default, created at 0700 when absent), and
+the file itself, through a temporary file beside the link's target and a rename. Seeding
+an isolated session takes that same lock for one read, only when it is free. Everything
+else agctl creates is under its own configuration directory.
+
+**`~/.claude.json` changes by one key and five deletions, as a peer of Claude Code's own
+config lock.** After an applied live swap or undo, or on the re-run that catches the file
+up, agctl replaces `oauthAccount` with the object Claude Code builds from
+`/api/oauth/profile`, deletes five caches every reader treats as "fetch again"
+(`modelAccessCache`, `orgModelDefaultCache`, `cachedExtraUsageDisabledReason`,
+`cachedUsageUtilization`, `passesEligibilityCache`), and changes nothing else. It takes
+Claude Code's lock beside the link, never beside its target, and waits for a busy one only
+with nothing of Claude Code's held. It writes the backup first, in Claude Code's own
+`.claude.json.backup.<epoch ms>` format at 0600, and never prunes one; Claude Code's next
+save does. It refuses unless re-serialising the unmodified file reproduces its bytes
+exactly, and re-reads the file before the rename and aborts if it changed. The new contents
+go to a temporary file beside the symlink's target, with the target's mode, and that file
+is renamed over the target; the link itself is never touched. It starts no step that cannot
+finish inside the lock's 1.2 s budget, and never breaks Claude Code's config lock: a stale
+one skips the rewrite, and one agctl leaves behind by being killed is Claude Code's to
+reclaim after 10 s. When `~/.claude/.config.json` exists, Claude Code uses that file
+instead, and so does agctl.
+
+**A displaced credential is parked, and never where Claude Code reads.** The one exception
+is an older copy of the incoming account's own credential, which the incoming one
+supersedes. A live swap files the credential it displaces in that account's own namespace
+as `.credentials.adopted.json`, at 0600. Claude Code's credential read, its deletion and
+`/logout` never visit that name, so a keychain hiccup cannot make a session fall back to
+the account you swapped away from. `doctor` lists each such copy, `use --undo` restores it (and
+removes it when the account's own store already holds the same credential), and
+`accounts remove --delete-secret` clears it.
+
+**Refresh tokens sit at rest in 0600 files**,
+`~/.config/agctl/claude/<acct>/<org>/.credentials.json`, in a directory tree created at
+0700. This is the same posture as Claude Code's own plaintext fallback store, which holds
+the same material in the same shape at the same mode. It is not the keychain, and it is not
+encrypted: anything running as your user can read it.
+
+**The namespace lock lives outside the namespace**,
+`~/.config/agctl/claude/.locks/<acct>.<org>.lock`. It is created once and never unlinked,
+not even by the command that deletes the namespace it protects. `flock` locks an inode, so
+a lock file that can be deleted and recreated is a lock two processes can hold at the same
+time.
+
+**Claude Code activity in a namespace is detected and the refresh is refused.** Before a
+refresh POST, agctl checks the write target, takes the lock, re-checks for a Claude Code
+session under the lock, and re-checks once more immediately before the rename. Any surprise
+at any of those points ends in a refusal. There is no flag that overrides it: a row
+reading `claude session detected — refresh refused` is the system working. A namespace a
+session has *migrated* into the keychain is the one activity that is not a refusal: agctl
+refreshes that item instead of the file, and refuses again if the item changes while the
+refresh is in flight.
+
+**A row agctl does not own is never refreshed and, when expired, is not even fetched.** Its
+owner refreshes it; agctl reports.
+
+**agctl removes a lock artefact it did not create in exactly three circumstances.**
+
+1. `doctor --remove-stale`, fenced by the seven conditions and the one record-attested
+   exception listed under [`--remove-stale`](#--remove-stale).
+2. As a protocol peer taking Claude Code's credential-store locks itself, a stale one of
+   those locks **inside agctl's own directory tree**, while refreshing a migrated
+   namespace's keychain item or swapping a namespace's item.
+3. The same, **in the live store**, while `use --live` or `use --undo` writes the live
+   item.
+
+The last two take twelve seconds of modification-time sampling before they remove
+anything, remove at most one lock per attempt, stand down if any `claude` process is
+stopped, and append the whole decision to the audit log whether they broke the lock or
+abandoned the attempt. The config lock beside `~/.claude.json` is never removed.
+
+### The usage endpoint
+
+The numbers come from `GET https://api.anthropic.com/api/oauth/usage`, the endpoint Claude
+Code's own `/usage` command reads. **It is undocumented.** It is not part of Anthropic's
+published API, it carries no compatibility promise, and it may change shape or disappear in
+any Claude Code release, which is what [`docs/re-verify.md`](docs/re-verify.md) is for.
+
+agctl sends an honest `User-Agent`, `agctl/<version>`, and does not pretend to be Claude
+Code. A client that lies about who it is cannot be rate-limited, deprecated or excluded
+separately from the product it is impersonating, which is bad for both sides. If Anthropic
+ever starts refusing the honest agent, `AGCTL_CLAUDE_USER_AGENT` replaces the string
+without waiting for a release.
 
 Reading your own subscription usage with your own credentials is the same operation
 `/usage` performs, but you are responsible for your own use of Anthropic's services under
-their terms. agctl reads usage figures and refreshes tokens it owns; it sends no
-inference requests and consumes no quota. It also reads `GET /api/oauth/profile`, the
-request Claude Code makes for the same facts: at `login`, at `accounts relocate` when the
-stored credential names no organization, at a refresh of a credential whose plan or
-rate-limit tier is not recorded, and at most twice per `use --live` or `use --undo`, to
-learn whose credential the live item holds and to build the `oauthAccount` it writes.
+their terms. agctl reads usage figures and refreshes tokens it owns; it sends no inference
+requests and consumes no quota. It also reads `GET /api/oauth/profile`, the request Claude
+Code makes for the same facts, at four points:
+
+- at `login`;
+- at `accounts relocate`, when the stored credential names no organization;
+- at a refresh of a credential whose plan or rate-limit tier is not recorded;
+- at most twice per `use --live` or `use --undo`, to learn whose credential the live item
+  holds and to build the `oauthAccount` it writes.
 
 **Caching and polling.** A usage response is cached for **300 s** per account, at
 `<config-dir>/cache/claude/<acct>.<org>.<sha8>.json`. Inside that window a repeated
 `status` answers from disk and makes no request. `--refresh` and `--no-cache` bypass it.
-`watch --interval` will not go below **60 s**. When a fetch fails — a 429, a dead network,
-a keychain that went away — the last good numbers are shown with the row marked `stale` or
+`watch --interval` will not go below **60 s**. When a fetch fails (a 429, a dead network, a
+keychain that went away) the last good numbers are shown with the row marked `stale` or
 `rate-limited`, rather than a blank cell.
 
-## One switcher at a time
+### One switcher at a time
 
 agctl coexists with Claude Code. It does **not** coexist with another tool that rewrites
 the same credentials.
 
 - A third-party menu-bar account switcher (for example `claude-account-switcher`) works by
-  deleting and recreating the live keychain item on every switch. agctl lists those
-  tools' `claude-switcher:*` items and never reads or writes them, but it cannot stop the
-  live item from being replaced underneath it. Run one switcher, not two.
+  deleting and recreating the live keychain item on every switch. agctl lists those tools'
+  `claude-switcher:*` items and never reads or writes them, but it cannot stop the live
+  item from being replaced underneath it. Run one switcher, not two.
 - While a live swap is outstanding, go back with `agctl claude use --undo`, not with
   `/login` inside Claude Code, and run no third-party switcher until you have. Either one
   replaces the live item behind agctl's back. `--undo` then answers `already_active` when
@@ -678,25 +870,25 @@ the same credentials.
   `agctl claude status` names who is live now, and `use --live` can switch from there. If
   that login's token has expired by then, agctl cannot tell whose it is (exit 29) until one
   message in Claude Code refreshes it.
-- `/logout` inside a Claude Code session that is pointed at an agctl namespace — an
-  isolated session from `use`, `exec` or `env` is one — **deletes that namespace's
-  credential store**. Claude Code's logout clears both the
-  keychain item and the plaintext file. Nothing is corrupted, but that account needs a new
-  `agctl claude login`.
+- `/logout` inside a Claude Code session that is pointed at an agctl namespace (an isolated
+  session from `use`, `exec` or `env` is one) **deletes that namespace's credential
+  store**. Claude Code's logout clears both the keychain item and the plaintext file.
+  Nothing is corrupted, but that account needs a new `agctl claude login`.
 - Two agctl stores with different `--config-dir` values have independent locks. Logging
   the same account into both makes two independent holders of one refresh chain, and each
   will eventually invalidate the other's token. Use one store per account.
 
-**Codex is different here, because phase 3 has no live-swap equivalent yet.** `agctl codex
-login` never touches the live `CODEX_HOME`'s own credential at all — it runs the real `codex
-login` against a scratch home agctl creates and removes, and pins that scratch child to
-file-mode storage (`cli_auth_credentials_store="file"`) regardless of what the live machine's
-own `config.toml` says, so agctl's own login never contends with a keyring-based Codex
+**Codex is different here, because there is no live-swap equivalent.** `agctl codex login`
+never touches the live `CODEX_HOME`'s own credential at all. It runs the real `codex login`
+against a scratch home agctl creates and removes, and pins that scratch child to file-mode
+storage (`cli_auth_credentials_store="file"`) regardless of what the live machine's own
+`config.toml` says, so agctl's own login never contends with a keyring-based Codex
 switcher. Running `codex login` directly, outside agctl, still replaces whatever the live
-`CODEX_HOME` holds — the same read-only relationship `agctl codex import`/`doctor` have with
-it that phase 1 originally had with Claude, before `use --live` gave phase 2 a write path.
+`CODEX_HOME` holds; `agctl codex import` and `doctor` only read it.
 
-## Environment variables
+## Reference
+
+### Environment variables
 
 | variable | meaning |
 |----------|---------|
@@ -705,29 +897,26 @@ it that phase 1 originally had with Claude, before `use --live` gave phase 2 a w
 | `AGCTL_CLAUDE_OAUTH_SCOPES` | replaces the space-separated scope set requested at login. A diagnostic: the server grants the same five scopes whatever is asked for |
 | `AGCTL_CODEX_USER_AGENT` | replaces `agctl/<version>` as the `User-Agent` of every Codex usage request |
 | `RUST_LOG` | tracing filter for the diagnostics on stderr. Unset or unparseable means `warn`. `RUST_LOG=agctl=trace` is the useful setting; no token material is ever logged at any level |
-| `TZ` | selects the zone the `5h reset` and `Weekly reset` columns are printed in. Unset — or set to something unrecognised — means the system zone (`/etc/localtime`), and UTC when even that cannot be determined |
+| `TZ` | selects the zone the `5h reset` and `Weekly reset` columns are printed in. Unset, or set to something unrecognised, means the system zone (`/etc/localtime`), and UTC when even that cannot be determined |
 
-The four `AGCTL_*` names above are the whole `AGCTL_*` surface agctl defines —
-`RUST_LOG` and `TZ` it only reads. Every other `AGCTL_*`
-name you may find in the source is a test seam compiled only under the `testing` feature
-and absent from a release build — see [Build](#build) and `scripts/release-gate.sh`. The
-gate's seam list checks twelve such names (four shared between both providers, five
-Claude's, three Codex's) plus two more `testing`-only message prefixes that are not
-`AGCTL_*` names at all: a Codex-only login pause-point marker, and a lock-order witness
-shared by both providers (`src/config/mod.rs` and `src/commands/use.rs` use it too, not only
-Codex's own command modules). `AGCTL_CLAUDE_PROFILE_URL` is one of Claude's: it redirects
-the profile request, and with it the access token that request carries;
-`AGCTL_CODEX_TOKEN_URL` is its Codex counterpart, redirecting the refresh request and the
-refresh token it carries.
+The four `AGCTL_*` names above are the whole `AGCTL_*` surface agctl defines; `RUST_LOG`
+and `TZ` it only reads. Every other `AGCTL_*` name you may find in the source is a test
+seam compiled only under the `testing` feature and absent from a release build; see
+[Install](#install) and `scripts/release-gate.sh`. The gate's seam list checks thirteen
+such names: four shared between both providers, six Claude's, three Codex's. It also checks
+two `testing`-only message prefixes that are not `AGCTL_*` names at all: a Codex-only login
+pause-point marker, and a lock-order witness shared by both providers (`src/config/mod.rs`
+and `src/commands/use.rs` use it too, not only Codex's own command modules).
+`AGCTL_CLAUDE_PROFILE_URL` is one of Claude's: it redirects the profile request, and with
+it the access token that request carries. `AGCTL_CODEX_TOKEN_URL` is its Codex
+counterpart, redirecting the refresh request and the refresh token it carries.
 
-### Read, but owned by Claude Code
-
-agctl also reads a handful of variables it does not define, because they decide what
-Claude Code itself would do:
+**Read, but owned by Claude Code.** agctl also reads a handful of variables it does not
+define, because they decide what Claude Code itself would do:
 
 | variable | meaning |
 |----------|---------|
-| `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR` | read on every run by `EnvView::from_process` in `src/provider/claude/namespace.rs`; together they decide which keychain service name agctl rebuilds — see [docs/re-verify.md](docs/re-verify.md) section 1 |
+| `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR` | read on every run by `EnvView::from_process` in `src/provider/claude/namespace.rs`; together they decide which keychain service name agctl rebuilds. See [docs/re-verify.md](docs/re-verify.md) section 1 |
 | `CLAUDE_CODE_OAUTH_TOKEN` | short-circuits Claude Code's own credential lookup; agctl reports that row read-only and never refreshes it |
 | `HOME` | locates the live store |
 | `USER`, `LOGNAME` | the `acct` attribute every `find-generic-password` is keyed on (`src/secret/mod.rs`); an unexpected value finds nothing rather than erroring |
@@ -739,20 +928,20 @@ owns, and unset or empty means the live store, whose configuration file is
 set both for the session they prepare and remove `CLAUDE_CODE_OAUTH_TOKEN` from it; set in
 agctl's own environment, that variable makes `use --live` refuse (exit 11).
 
-## Exit codes
+### Exit codes
 
 | code | meaning |
 |------|---------|
 | `0` | the run produced a complete, healthy result |
-| `1` | the run failed outright and produced nothing useful — a bad configuration, an I/O failure, a refused command |
+| `1` | the run failed outright and produced nothing useful: a bad configuration, an I/O failure, a refused command |
 | `2` | the run produced output, but at least one **shown** row is degraded: expired, `needs login`, rate-limited, stale, keychain-locked, busy, or refused |
 
 Exit 2 is about rows you can see. A row hidden by default cannot change the exit status,
 because you did not ask about it. A pending credential that was replayed successfully is
 not a degraded row and exits 0.
 
-`exec` and bare `use <id>` exit with the child's own code instead — `128 + n` when signal
-`n` killed it — so a script sees `claude`'s status, not agctl's.
+`exec` and bare `use <id>` exit with the child's own code instead (`128 + n` when signal
+`n` killed it), so a script sees `claude`'s status, not agctl's.
 
 `use --live` and `use --undo` give each outcome its own code, so a script can act on one
 without parsing English. `--json` names the same outcome in its last document. Every row
@@ -782,186 +971,25 @@ carries one of the two, never both.
 | `29` | `reason: "live_token_expired"` | the live token expired; send Claude Code one message |
 
 An applied swap or undo whose `~/.claude.json` rewrite did not land still exits `0`: the
-swap applied, `config` says what did not, and `warnings` too unless the file is missing.
-On `18` the rewrite is not attempted, and `config` says so with the reason `swap_unknown`.
-The line about a secure-storage backend in agctl's own environment is a warning, not a
-refusal, and exits `0` too.
+swap applied, `config` says what did not, and `warnings` too unless the file is missing. On
+`18` the rewrite is not attempted, and `config` says so with the reason `swap_unknown`. The
+line about a secure-storage backend in agctl's own environment is a warning, not a refusal,
+and exits `0` too.
 
-## Codex
+### JSON schemas
 
-`agctl codex` shows subscription usage for Codex (ChatGPT) accounts the same way `agctl
-claude` does for Claude: one table, `--json`, a `watch` UI, no keychain writes for reading.
-Which commands write agctl's own registry, and which ever touch the network in a way that
-changes a credential, is stated in each command's own section below — a one-line summary
-here would only have to be re-read against them, so this file does not restate it. There is
-no Codex equivalent of `use`, `exec`, `env` or `use --live` yet — phase 3 does not switch
-which account the `codex` CLI uses, only tracks and refreshes the accounts agctl owns.
-
-agctl does not implement Codex's OAuth flow itself. `agctl codex login` runs the real `codex
-login` against a scratch home agctl owns, verifies what that run left behind, and copies the
-verified bytes into agctl's own store — never Codex's own browser flow reimplemented, and
-never a credential trusted before it is checked.
-
-### `status` — the table
-
-```sh
-agctl codex status
-agctl codex status --json | jq '.rows[] | {id, state, windows}'
-agctl codex status --account 8ff4… --account someone@example.com
-agctl codex status --all --refresh --timeout 30s
-```
-
-| flag | effect |
-|------|--------|
-| `--json` | the report as JSON instead of a table |
-| `--raw` | include the untouched upstream response body under `raw` |
-| `--refresh` | refresh expired credentials even when a cached value would do |
-| `--no-cache` | bypass the usage cache without forcing a token refresh |
-| `--all` | also show rows hidden by default, such as stale siblings |
-| `--account <ID>` | limit the report to one account; repeat for several |
-| `--timeout <DUR>` | per-request HTTP timeout, default `10s` |
-
-`status` is also where an owned account's refresh happens: when a due row's policy is
-`auto` (the default — see `accounts set`, below), `status` runs the refresh as a sequential
-pre-pass on the command thread, one namespace at a time, before the usage requests are
-coordinated, and only then reads that account's usage. `watch` never does this — see below.
-Because a refresh POST has its own budget and is never cut short, one `status` run can take
-up to `1s + 19s + 1s + 2 ×` `--timeout` (101s at the default `--timeout`) when an owned
-account is due, against `4 × min(--timeout, 5s) + 2 × --timeout` (40s at the default) when
-none is.
-
-**The live access token this depends on lasts 10 days** from Codex's own last login or
-refresh. A row past that window shows `expired (run codex to refresh)` rather than being
-fetched — `status`/`watch` never send a request for a token they already know is dead — so
-running `codex` (or `agctl codex login`) at least that often is what keeps a Codex row alive
-without a manual refresh.
-
-### `watch` — the same table, live
-
-```sh
-agctl codex watch
-agctl codex watch --interval 10m
-```
-
-`--interval` defaults to `300s` and will not go below `60s`, the same floor `agctl claude
-watch` uses. Unlike `status`, **`watch` never sends a refresh token** — a due owned row shows
-`expired (run agctl codex status)` instead of being refreshed from an unattended loop, by
-design: an unattended background process is exactly where a refresh defect is most expensive
-to have, so refreshing is kept to the commands a person runs and reads the result of.
-
-### `login` — mint a credential agctl owns
-
-```sh
-agctl codex login
-agctl codex login --label work
-agctl codex login --no-refresh
-```
-
-Runs the real `codex login` (from `PATH`; never overridden by an environment variable in a
-release build — see [Build](#build)) against a scratch `CODEX_HOME` agctl creates and
-removes, reads what it wrote, and — only after that read is verified — copies the credential
-into `<config-dir>/codex/<user-id>/<account-id>/auth.json` under that namespace's lock.
-Nothing reaches agctl's own store before the child's output is parsed and checked; a
-mismatched or unreadable result leaves nothing behind. `--label` gives the resulting account
-a human-readable name; `--no-refresh` records it with `accounts set --refresh never` already
-applied, so agctl never sends its refresh token unless you opt back in.
-
-### `accounts` — inspect and edit what agctl knows
-
-```sh
-agctl codex accounts list [--all]
-agctl codex accounts show <id>
-agctl codex accounts remove <id> [--delete-secret] [--yes]
-agctl codex accounts forget <id>
-agctl codex accounts unforget <id>
-agctl codex accounts set <id> --refresh auto|never
-agctl codex accounts refresh <id> --resend [--yes]
-agctl codex accounts refresh <id> --reset-floor [--yes]
-```
-
-`<id>` is the account id, email or label; the canonical spelling `list` and `show` print is
-`<user-id>/<account-id>`, the registry's key (two rows can share one email).
-
-`set --refresh` changes only agctl's own registry, under its own config lock — it never opens
-the namespace, never takes its lock, never reads `auth.json`. `--refresh never` is what
-`login --no-refresh` applies at login time; the next `status` pass makes zero refresh
-requests for that account and the row goes `expired (run agctl codex login)` once its access
-token runs out. `--refresh auto` restores the default.
-
-`refresh --resend` and `refresh --reset-floor` act on a row `status`'s own refresh pre-pass
-already touched:
-
-- **`--resend`** is the one deliberate exception to "agctl never re-sends a refresh token
-  automatically." It only applies to a row whose last refresh outcome is *unknown* — an
-  ambiguous network failure, not a rejection — and only once that state is **at least an
-  hour old**, and only **once per such state**: a second `--resend` against the same
-  unresolved send is refused, and so is one while a pending write from an earlier attempt is
-  still waiting to be replayed. (A pending write that was already *discarded* — superseded by
-  a newer, successful write — does not block a `--resend`; only one still waiting to be
-  replayed does.) Without a terminal, `--resend` refuses even with `--yes`: a second send of a
-  token the server may already have consumed is a cost a person takes deliberately, never
-  something a script or a cron job can schedule on agctl's behalf.
-- **`--reset-floor`** lifts the terminal state a Codex row reaches after three refreshes in a
-  row that were sent but did not clear a 401 — `unauthorized (refresh did not help)`. Nothing
-  else does: not `--refresh` on `status`, not `watch`'s periodic pass, only `agctl codex
-  login` (which replaces the credential outright) or this flag (which keeps it and gives the
-  next due refresh another chance).
-
-`remove --delete-secret` also deletes the credential file agctl wrote for that account, not
-just the registry row; without it, the row is dropped but the file (and any parked residue
-under it) stays on disk. `forget`/`unforget` only flip whether a foreign Codex keychain item
-is hidden from `doctor`'s report — nothing is read, written or removed by either.
-
-### `import --from codex-home` — record what another Codex home already has
-
-```sh
-agctl codex import --from codex-home
-agctl codex import --from codex-home --codex-home ~/work/.codex --dry-run
-```
-
-Reads another `CODEX_HOME`'s `auth.json` **read-only** — never a byte written, moved or
-removed under it — and files what its claims say (account id, email, plan) as a read-only
-row in agctl's registry; an account already known is reported and left alone, so a second
-import is a no-op. `--codex-home` names the directory to read instead of the one this
-environment names; `--dry-run` prints the plan and writes nothing.
-
-### `doctor` — what is actually on this machine, for Codex
-
-```sh
-agctl codex doctor
-agctl codex doctor --json
-```
-
-Reports the resolved Codex home and the links walked to reach it, the store mode (`file` or
-`keyring`) and whether agctl can read it, the four `AGCTL_CODEX_*` variables this process
-carries, the live credential's shape and its refresh-floor state, daemon evidence, every
-owned namespace with its lock and its refresh marker, and the write-receipt audit log's
-health. There is no `--remove-stale` here: no Codex lock is agctl's to break, so `doctor` has
-no write path and creates nothing — running it on a machine that has never seen `agctl codex
-login` leaves that machine exactly as it was.
-
-<!-- ## depends on S37-b: the two sentences below describe doctor's foreign-item handling
-     and orphan/base_url wording the way S37-b's landed commit leaves it, not the way it
-     read at base 0304a40. -->
-`doctor` never hands you a removal command for a foreign `Codex Auth` keychain item on its
-own say-so: a pasted removal of another Codex home's legitimate credential is data loss, not
-a fix. A refused login that gained a `Codex Auth` item writes one audit line for it
-(`login_keychain_gained`, its account guarded to the `cli|` + 16 hex shape) — a removal
-command (`security delete-generic-password …`) is offered **only** for an item that audit
-line names; every other foreign `Codex Auth` item — one `import` never claimed, one
-belonging to a different `CODEX_HOME` entirely — is reported as a count, with no command and
-no account attached. agctl itself still deletes no keychain item: the command is printed for
-you to run, never run on your behalf. The same caution applies to `orphans`: a subject that
-does not have the shape agctl's own writes leave becomes a count, not a named row.
-`store.base_url` is printed without its query string, for the same reason doctor prints
-no email or account id anywhere in its report.
-
----
+`schemas/` holds JSON Schemas for four reports: `status.v1.json` for
+`agctl claude status --json`, `status.v2.json` for `agctl codex status --json`,
+`codex-doctor.v1.json` for `agctl codex doctor --json`, and `doctor.v1.json` for the
+isolation half of `agctl claude doctor`'s report, which no flag emits yet. The test suite
+validates the emitted documents against them. Each of those reports carries a `version`,
+and a consumer must refuse a version it does not know. The `use --json` documents (the
+session paths, and a live swap's `plan` and `outcome`) have no schema and no version.
 
 ## Development
 
-The gate is three commands, and `--all-features` is not optional for the last two — the
-test suite fails to compile without it, on purpose:
+The gate is three commands, and `--all-features` is not optional for the last two: the test
+suite fails to compile without it, on purpose.
 
 ```sh
 cargo fmt --check
@@ -969,8 +997,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run --all-features
 ```
 
-See `.claude/skills/check/SKILL.md` for what each one is guarding and how to read a
-failure, and `AGENTS.md` for the build environment (the whole crate builds with
+See `.claude/skills/check/SKILL.md` for what each one guards and how to read a failure,
+and `AGENTS.md` for the build environment (the whole crate builds with
 `-C debug-assertions=off -C overflow-checks=off`, so `debug_assert!` is inert and integer
 overflow wraps silently).
 
@@ -986,22 +1014,9 @@ a local mock.
 Before releasing an artifact, run `scripts/release-gate.sh`: it builds a default-feature
 release into a scratch directory and proves the binary contains no test seam.
 
-After a Claude Code upgrade, work through
-[**docs/re-verify.md**](docs/re-verify.md) — agctl's correctness depends on four
-contracts read out of Claude Code's own binary, and an upgrade can change any of them.
-
-## Scope
-
-| phase | scope |
-|-------|-------|
-| 1 | `status`, `watch`, `login`, `accounts`, `import` (read-only), `doctor` (Claude) |
-| 2 | switching the account Claude Code uses: `use`, `exec`, `env`, `use --live` (Claude) |
-| 3 (this) | a second provider, Codex: `status`, `watch`, `login`, `accounts` (incl. `set`, `refresh --resend`/`--reset-floor`), `import`, `doctor` — see [Codex](#codex) |
-| 4+ | further providers: Cursor, Copilot, and the rest; a Codex `use`/`use --live` equivalent, if one is ever wanted |
-
-Phases 1–3 have landed, and all three are macOS only. Phase 3 adds a second provider but not
-a second platform, and it adds no Codex equivalent of phase 2's account-switching commands —
-see [Codex](#codex) and [One switcher at a time](#one-switcher-at-a-time).
+After a Claude Code upgrade, work through [`docs/re-verify.md`](docs/re-verify.md): agctl's
+correctness depends on four contracts read out of Claude Code's own binary, and an upgrade
+can change any of them.
 
 ## License
 
