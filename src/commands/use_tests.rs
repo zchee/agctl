@@ -2835,20 +2835,80 @@ fn a_live_undo_refuses_a_digest_that_matches_in_two_accounts_namespaces() {
 }
 
 #[test]
-fn a_live_undo_refuses_to_guess_between_two_homes_of_one_credential() {
-    // Exactly one match or refuse. Two copies carrying the digest the entry
-    // names are two candidates for the live item, and nothing in the entry says
-    // which one the swap being undone produced.
+fn a_live_undo_prefers_the_adopted_copy_when_both_homes_have_equal_digests() {
+    for reformatted in [false, true] {
+        let (_dir, paths, config) = reversal_store();
+        let p = owned_by("sk-ant-oat01-p", P.0, P.1);
+        let adopted = if reformatted {
+            let parsed: serde_json::Value = serde_json::from_str(&p).expect("fixture JSON");
+            serde_json::to_string_pretty(&parsed).expect("formatted JSON")
+        } else {
+            p.clone()
+        };
+        park(&paths, P, file_store::CREDENTIALS_FILE, &p);
+        park(&paths, P, file_store::ADOPTED_FILE, &adopted);
+
+        let found = resolves(&paths, &config, &recorded(&p));
+        assert_eq!(found.owner.account_uuid, P.0);
+        assert!(
+            matches!(found.source, Source::AdoptedCopy(dir) if dir == paths.namespace_dir(P.0, P.1)),
+            "the adopted copy wins, including when only the serialization differs"
+        );
+        let restored = Credentials::parse_blob(p.as_bytes()).expect("credential").digests();
+        let dir = paths.namespace_dir(P.0, P.1);
+        assert!(remove_duplicate_adopted(&paths, &dir, &restored).expect("cleanup succeeds"));
+        assert!(!dir.join(file_store::ADOPTED_FILE).exists(), "duplicate removed");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(file_store::CREDENTIALS_FILE)).expect("own store"),
+            p
+        );
+    }
+}
+
+#[test]
+fn a_live_undo_keeps_an_adopted_copy_without_a_matching_own_store() {
+    for own in [None, Some("sk-ant-oat01-different")] {
+        let (_dir, paths, _config) = reversal_store();
+        let p = owned_by("sk-ant-oat01-p", P.0, P.1);
+        park(&paths, P, file_store::ADOPTED_FILE, &p);
+        if let Some(access) = own {
+            park(&paths, P, file_store::CREDENTIALS_FILE, &owned_by(access, P.0, P.1));
+        }
+        let restored = Credentials::parse_blob(p.as_bytes()).expect("credential").digests();
+        let dir = paths.namespace_dir(P.0, P.1);
+        assert!(!remove_duplicate_adopted(&paths, &dir, &restored).expect("no cleanup needed"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(file_store::ADOPTED_FILE))
+                .expect("parked copy retained"),
+            p
+        );
+    }
+}
+
+#[test]
+fn a_live_undo_refuses_same_access_with_different_refresh_tokens_in_one_namespace() {
     let (_dir, paths, config) = reversal_store();
     let p = owned_by("sk-ant-oat01-p", P.0, P.1);
+    let different = p.replace("sk-ant-ort01-reversal", "sk-ant-ort01-rotated");
     park(&paths, P, file_store::CREDENTIALS_FILE, &p);
-    park(&paths, P, file_store::ADOPTED_FILE, &p);
+    park(&paths, P, file_store::ADOPTED_FILE, &different);
 
     let said = refuses(&paths, &config, Some(&recorded(&p)));
     assert!(said.contains("in both"), "it names the ambiguity: {said}");
     assert!(
         said.contains(file_store::CREDENTIALS_FILE) && said.contains(file_store::ADOPTED_FILE),
         "and both places: {said}"
+    );
+    let dir = paths.namespace_dir(P.0, P.1);
+    assert_eq!(
+        std::fs::read_to_string(dir.join(file_store::CREDENTIALS_FILE))
+            .expect("own store unchanged"),
+        p
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join(file_store::ADOPTED_FILE))
+            .expect("adopted copy unchanged"),
+        different
     );
 }
 
