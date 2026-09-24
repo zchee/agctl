@@ -12,8 +12,14 @@ points your shell at it — and leave the account your running Claude Code uses 
 `use --live <id>` hot-swaps the credential your running Claude Code reads, without running
 `claude`, and `use --undo` puts the previous one back.
 
-Phases 1 and 2 are **Claude only** and **macOS only**. Later phases add other providers;
-see [Scope](#scope).
+The same table exists for **Codex (ChatGPT) accounts** under `agctl codex`: `status` and
+`watch` show each account's rate-limit windows, and `login`, `accounts`, `import` and
+`doctor` manage the accounts agctl owns, with `accounts set --refresh` and
+`accounts refresh` deciding when agctl may send a refresh token — see [Codex](#codex).
+
+agctl is **macOS only**. Switching accounts is **Claude only**: `agctl codex` tracks and
+refreshes Codex accounts but does not switch which account the `codex` CLI uses; see
+[Scope](#scope).
 
 ```
  Account           | Org  | Plan | 5h  | Weekly | Fable (weekly) | Credits                 | 5h reset        | Weekly reset         | State
@@ -46,6 +52,7 @@ macOS only: account discovery reads the login keychain through `security(1)`.
 ```sh
 cargo build --release
 ./target/release/agctl claude status
+./target/release/agctl codex status
 ```
 
 There is no published crate and no installer yet. If you install by hand, install the
