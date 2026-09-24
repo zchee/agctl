@@ -1425,6 +1425,10 @@ fn swap_phases(
             // live store is ever written or removed" structural rather than a
             // promise.
             shadowing_store: !item_present && displaced.is_some(),
+            restored_adopted: match (&incoming.source, which, direction) {
+                (Source::AdoptedCopy(dir), Which::Live, Direction::Reverse) => Some(dir),
+                _ => None,
+            },
             // Every live write records the account it installed, forward and
             // undo alike (§D7): an undo of an undo reads it back, and so does
             // a later swap whose item token has expired.
@@ -2197,6 +2201,8 @@ struct PhaseC<'a> {
     /// from (finding N-2), which is the exposure decision D-024 exists to
     /// prevent.
     shadowing_store: bool,
+    /// A live undo's adopted source, removed only if its own store duplicates it.
+    restored_adopted: Option<&'a Path>,
     /// On a live pass, forward or undo, the account being installed, by id
     /// alone — the entry's `incoming_identity`, which `use --undo` and an
     /// expired-token swap read back (decision D-027, §D7). `None` for a
@@ -2582,6 +2588,20 @@ fn phase_c(
             });
         }
     }
+    if applied
+        && let Some(dir) = c.restored_adopted
+        && let Err(err) = remove_duplicate_adopted(paths, dir, c.after)
+    {
+        tracing::error!(error = %err, "the restored credential's duplicate copy could not be removed");
+        let sentence = format!(
+            "the swap applied, but the duplicate adopted copy `{}` could not be removed ({err})",
+            dir.join(file_store::ADOPTED_FILE).display()
+        );
+        note = Some(match note {
+            Some(existing) => format!("{existing}. {sentence}"),
+            None => sentence,
+        });
+    }
     if note.is_none() && !applied {
         note = Some("the write could not be confirmed; re-run `agctl claude status`".to_owned());
     }
@@ -2868,6 +2888,22 @@ fn guarded_write_back(
         )),
         Err(err) => Err(err.to_string()),
     }
+}
+
+/// Removes only a duplicate of the credential a live undo confirmed in the item.
+/// Both files are re-read under the namespace lock: a refresh or a changed own
+/// store must not turn cleanup into deletion of the only parked copy.
+fn remove_duplicate_adopted(
+    paths: &Paths,
+    dir: &Path,
+    restored: &Digests,
+) -> Result<bool, file_store::FileStoreError> {
+    if !matches!(location::from_file(dir), Resolved::Credentials(home) if home.digests() == *restored)
+        || !matches!(location::from_adopted(dir), Resolved::Credentials(parked) if parked.digests() == *restored)
+    {
+        return Ok(false);
+    }
+    file_store::remove_adopted_file(paths, dir)
 }
 
 /// Whether a live reversal's adopted copy can take the refreshed pair: the
@@ -4326,19 +4362,29 @@ fn live_reversal(
         }
         let ns_dir = paths.namespace_dir(&record.account_uuid, &record.organization_uuid);
         let candidates = [
-            (location::from_file(&ns_dir), Source::OwnStore, file_store::CREDENTIALS_FILE),
             (
                 location::from_adopted(&ns_dir),
                 Source::AdoptedCopy(ns_dir.clone()),
                 file_store::ADOPTED_FILE,
             ),
+            (location::from_file(&ns_dir), Source::OwnStore, file_store::CREDENTIALS_FILE),
         ];
+        let mut adopted_digests = None;
         for (read, source, name) in candidates {
             let Resolved::Credentials(credentials) = read else { continue };
-            let digest8 = audit::digest8(&credentials.digests().access_sha256);
+            let digests = credentials.digests();
+            let digest8 = audit::digest8(&digests.access_sha256);
             // Its own account's namespace and only that — see above.
             if digest8.as_deref() == Some(from_digest8) && swap::same_identity(&credentials, record)
             {
+                // Prefer the parked copy when both secrets agree. A shared
+                // access prefix alone cannot distinguish rotated refresh tokens.
+                if adopted_digests.as_ref() == Some(&digests) {
+                    continue;
+                }
+                if matches!(source, Source::AdoptedCopy(_)) {
+                    adopted_digests = Some(digests);
+                }
                 found.push((record.clone(), source, ns_dir.join(name)));
             }
         }

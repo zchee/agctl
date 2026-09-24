@@ -765,13 +765,30 @@ pub fn commit_staged(
 /// way, and [`FileStoreError::Io`] when the unlink fails for any reason other
 /// than the file not being there.
 pub fn remove_credentials_file(paths: &Paths, ns_dir: &Path) -> Result<bool, FileStoreError> {
-    let target = ns_dir.join(CREDENTIALS_FILE);
+    remove_store_file(paths, ns_dir, CREDENTIALS_FILE)
+}
+
+/// Removes the redundant adopted copy after a confirmed live undo.
+///
+/// Returns whether the file existed. The caller must hold the namespace lock
+/// and verify that its own store still holds the same credential.
+///
+/// # Errors
+///
+/// Returns the same containment, directory-walk and unlink errors as
+/// [`remove_credentials_file`].
+pub fn remove_adopted_file(paths: &Paths, ns_dir: &Path) -> Result<bool, FileStoreError> {
+    remove_store_file(paths, ns_dir, ADOPTED_FILE)
+}
+
+fn remove_store_file(paths: &Paths, ns_dir: &Path, name: &str) -> Result<bool, FileStoreError> {
+    let target = ns_dir.join(name);
     if !paths.is_under_namespace_root(&target) {
         return Err(FileStoreError::OutsideNamespaceRoot(target));
     }
 
     let dir = open_namespace_dir(paths, ns_dir)?;
-    match rustix::fs::unlinkat(dir.as_fd(), CREDENTIALS_FILE, AtFlags::empty()) {
+    match rustix::fs::unlinkat(dir.as_fd(), name, AtFlags::empty()) {
         Ok(()) => Ok(true),
         Err(errno) if errno == Errno::NOENT => Ok(false),
         Err(errno) => {

@@ -5581,9 +5581,8 @@ fn two_live_swaps_in_a_row_then_undo_then_undo_of_undo_all_apply() {
 fn a_live_undo_of_an_undo_puts_back_what_that_undo_displaced() {
     // The lift of 26 on one pair of accounts. P → T, undo (P back), undo again
     // (T back): the second undo reverses the first like any other write, because
-    // the first names the account it put back. A third `--undo` then refuses —
-    // P's credential is now at home in both of P's files — and that is a
-    // recorded residual, fail-closed, not a guard.
+    // the first names the account it put back. A third `--undo` resolves P's
+    // identical copies and removes the redundant adopted copy after success.
     let server = MockServer::start();
     let (p_asked, t_asked) = live_profiles(&server);
     let (fixture, resolved) = live_accounts(&server, common::fresh_at());
@@ -5628,14 +5627,15 @@ fn a_live_undo_of_an_undo_puts_back_what_that_undo_displaced() {
         &[("find-generic-password", 11), ("-i", 3), ("add-generic-password", 3)],
     );
 
-    // Residual: P's credential is now in P's adopted copy (step 1) and in P's
-    // store (step 3's reversal files into `.credentials.json`), so the undo that
-    // would reverse step 3 finds two homes and refuses, naming both.
-    let (code, _stdout, stderr) = undo(&fixture);
-    assert_eq!(code, 1, "two homes of one credential refuse rather than guess: {stderr}");
-    assert!(stderr.contains("in both"), "{stderr}");
-    assert_eq!(writes(&fixture).len(), 3, "and nothing was written");
-    assert_eq!(config_steps(&fixture).len(), 3, "and no config step was recorded for it");
+    // P is in its adopted copy (step 1) and own store (step 3). Equal copies
+    // are one candidate, and the successful undo removes only the adopted one.
+    let (code, stdout, stderr) = undo(&fixture);
+    assert_eq!(code, 0, "two equal homes must not refuse: {stdout}{stderr}");
+    assert_eq!(live_item(&fixture).as_deref(), Some(p_back.as_str()), "P is restored again");
+    assert_eq!(fs::read_to_string(fixture.credentials_path(ACCT, ORG)).expect("own store"), p_back);
+    assert!(!adopted_path(&fixture, ACCT, ORG).exists(), "duplicate adopted copy removed");
+    assert_eq!(writes(&fixture).len(), 4, "the third undo wrote the live item");
+    assert_eq!(config_steps(&fixture).len(), 4, "and recorded its config step");
     live_artefacts_released(&fixture, &resolved);
     audit_carries_no_token(&fixture);
 }
@@ -6583,6 +6583,28 @@ fn ac81_a_live_swap_touches_nothing_outside_the_namespace_root_but_the_three_art
 }
 
 #[test]
+fn a_live_undo_resolves_identical_own_and_adopted_copies() {
+    let server = MockServer::start();
+    let token = token_ok(&server);
+    let (_p_asked, _t_asked) = live_profiles(&server);
+    let (fixture, resolved) = live_accounts(&server, common::fresh_at());
+    let (code, stdout, stderr) = swap(&fixture, &["--json"]);
+    assert_eq!(code, 0, "forward swap: {stdout}{stderr}");
+    let parked_path = adopted_path(&fixture, ACCT, ORG);
+    let parked = fs::read_to_string(&parked_path).expect("the forward swap parked P");
+    let own_path = fixture.write_credentials(ACCT, ORG, &parked);
+
+    let (code, stdout, stderr) = undo_json(&fixture);
+    assert_eq!(code, 0, "equal copies must not make undo ambiguous: {stdout}{stderr}");
+    assert_eq!(outcome_doc(&stdout)["outcome"], "applied");
+    assert_eq!(live_item(&fixture).expect("restored live item"), parked);
+    assert_eq!(fs::read_to_string(own_path).expect("own store stays"), parked);
+    assert!(!parked_path.exists(), "the redundant adopted copy is removed after success");
+    assert_eq!(token.calls(), 0, "no refresh is needed");
+    live_artefacts_released(&fixture, &resolved);
+}
+
+#[test]
 fn ac76_a_live_swap_is_reversed_by_undo_and_the_item_holds_p_again() {
     // AC76's half that can run under the fake `security`: the swap applies, the
     // reversal puts P back **byte-identically**, and both audit entries name
@@ -6639,6 +6661,11 @@ fn ac76_a_live_swap_is_reversed_by_undo_and_the_item_holds_p_again() {
     // equal what was parked, byte for byte, and what was parked must be P.
     let back = live_item(&fixture).expect("the live item is readable");
     assert_eq!(back, parked, "the live item holds P again, byte-identical to the parked copy");
+    assert_eq!(
+        fs::read_to_string(adopted_path(&fixture, ACCT, ORG)).expect("sole parked copy retained"),
+        parked,
+        "undo retains an adopted copy when the own store is absent"
+    );
     for field in ["sk-ant-oat01-outgoing", "sk-ant-ort01-outgoing", ACCT, ORG] {
         assert!(back.contains(field), "and that copy is P (`{field}`): {back}");
     }
