@@ -577,7 +577,7 @@ fn a_subcommand_is_required() {
 }
 
 #[test]
-fn the_swap_exit_table_has_seventeen_unique_codes_and_retires_25_26_and_28() {
+fn the_swap_exit_table_has_eighteen_unique_codes_and_retires_25_26_and_28() {
     // S24 lifted S23b's temporary refusals. Their numbers are retired rather
     // than reused: a script that learned "25 means undo first" must never see
     // 25 come back meaning something else, so the table holds none of the three
@@ -586,7 +586,7 @@ fn the_swap_exit_table_has_seventeen_unique_codes_and_retires_25_26_and_28() {
     use crate::provider::claude::swap::DECISION_ORDER;
 
     let codes: Vec<i32> = swap_exit::ALL.iter().map(|(_, code)| *code).collect();
-    assert_eq!(codes.len(), 17, "the table's size: {codes:?}");
+    assert_eq!(codes.len(), 18, "the table's size: {codes:?}");
     let mut unique = codes.clone();
     unique.sort_unstable();
     unique.dedup();
@@ -600,4 +600,30 @@ fn the_swap_exit_table_has_seventeen_unique_codes_and_retires_25_26_and_28() {
         );
     }
     assert_eq!(swap_exit::IDENTITY_UNAVAILABLE, 29, "the fresh code S24 added");
+    assert_eq!(swap_exit::RC_NOT_DISCONNECTED, 30);
+    assert!(include_str!("cli.rs").contains("/// | 30 | --restart-remote-control"));
+}
+
+#[test]
+fn remote_control_requires_a_live_pass_and_fresh_operator_consent() {
+    let cases: std::collections::BTreeMap<&str, (&[&str], bool)> = [
+        ("live", (&["--live", "--restart-remote-control"][..], true)),
+        ("live id", (&["--live", "account", "--restart-remote-control"][..], true)),
+        ("undo", (&["--undo", "--restart-remote-control"][..], true)),
+        ("alone", (&["--restart-remote-control"][..], false)),
+        ("isolated", (&["account", "--restart-remote-control"][..], false)),
+        ("forget", (&["--forget", "account", "--restart-remote-control"][..], false)),
+        ("live yes", (&["--live", "--yes", "--restart-remote-control"][..], false)),
+        ("undo yes", (&["--undo", "--yes", "--restart-remote-control"][..], false)),
+        ("unchanged live yes", (&["--live", "--yes"][..], true)),
+    ]
+    .into();
+    for (name, (flags, accepted)) in cases {
+        let argv = ["agctl", "claude", "use"].into_iter().chain(flags.iter().copied());
+        let result = Cli::try_parse_from(argv);
+        assert_eq!(result.is_ok(), accepted, "{name}: {result:?}");
+        if let Err(error) = result {
+            assert_eq!(error.exit_code(), 2, "{name}");
+        }
+    }
 }
