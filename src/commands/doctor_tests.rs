@@ -18,6 +18,10 @@
 
 use std::fs;
 use std::sync::Mutex;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::AtomicBool;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rustix::fs::AtFlags;
@@ -41,6 +45,13 @@ const LIVE_SERVICE: &str = "Claude Code-credentials";
 /// Short enough that the tests are instant, long enough that a rewrite between
 /// the samples has time to land.
 const TEST_INTERVAL: Duration = Duration::from_millis(120);
+
+/// The interval for the one test whose rewrite comes from another thread.
+/// Wider than [`TEST_INTERVAL`] because that thread has to be scheduled
+/// inside the window, and a loaded CI runner has been seen to delay it by
+/// most of 120ms.
+#[cfg(target_os = "macos")]
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -66,12 +77,11 @@ fn store() -> Store {
 
 impl Store {
     fn doctor(&self) -> Doctor<'_> {
-        Doctor {
-            paths: &self.paths,
-            env: &self.env,
-            cancel: &self.cancel,
-            sample_interval: TEST_INTERVAL,
-        }
+        self.doctor_with(TEST_INTERVAL)
+    }
+
+    fn doctor_with(&self, sample_interval: Duration) -> Doctor<'_> {
+        Doctor { paths: &self.paths, env: &self.env, cancel: &self.cancel, sample_interval }
     }
 
     fn ctx(&self) -> PassCtx {
@@ -115,6 +125,26 @@ impl Prompt for Recorder {
     fn tell(&mut self, message: &str) {
         if let Ok(mut lines) = self.lines.lock() {
             lines.push(message.to_owned());
+        }
+    }
+
+    fn confirm(&mut self, _question: &str) -> Result<bool, AppError> {
+        panic!("`doctor` gates on `--yes`, never on a prompt");
+    }
+}
+
+/// A `Prompt` that reports the moment `remove_stale` has taken its first
+/// sample: the "checking for a heartbeat" line is printed right after it.
+#[cfg(target_os = "macos")]
+struct SampledSignal<'a> {
+    sampled: &'a AtomicBool,
+}
+
+#[cfg(target_os = "macos")]
+impl Prompt for SampledSignal<'_> {
+    fn tell(&mut self, message: &str) {
+        if message.contains("Checking for a heartbeat") {
+            self.sampled.store(true, Ordering::Release);
         }
     }
 
@@ -483,18 +513,33 @@ fn remove_stale_refuses_an_artefact_whose_holder_is_still_beating() {
     record_owned(&store, ORG, None);
     let artefact = plant_artefact(&store, ORG, REFRESH_LOCK, Duration::from_secs(120));
 
+    // Not one beat at a chosen moment: on a loaded runner that beat landed
+    // after the second sample, and the artefact was removed under it. The
+    // beating starts once the first sample is taken — any earlier and the
+    // artefact is too young to be examined — and keeps going until
+    // `remove_stale` has decided, the way a live holder's does.
     let beating = artefact.clone();
+    let sampled = AtomicBool::new(false);
+    let decided = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        scope.spawn(move || {
-            std::thread::sleep(TEST_INTERVAL / 3);
-            // Claude Code's heartbeat is `utimes` on the lock directory (fact
-            // F45), so the fixture beats the same way rather than writing a
-            // file into it.
-            beat(&beating);
+        scope.spawn(|| {
+            // `decided` as well, so a refusal before the first sample fails the
+            // assertion below instead of leaving this thread waiting forever.
+            while !sampled.load(Ordering::Acquire) && !decided.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            while !decided.load(Ordering::Acquire) {
+                // Claude Code's heartbeat is `utimes` on the lock directory
+                // (fact F45), so the fixture beats the same way rather than
+                // writing a file into it.
+                beat(&beating);
+                std::thread::sleep(HEARTBEAT_INTERVAL / 10);
+            }
         });
-        let mut io = Recorder::default();
-        let err = remove_stale(&store.doctor(), &artefact, true, &mut io)
-            .expect_err("a beating holder is refused");
+        let mut io = SampledSignal { sampled: &sampled };
+        let result = remove_stale(&store.doctor_with(HEARTBEAT_INTERVAL), &artefact, true, &mut io);
+        decided.store(true, Ordering::Release);
+        let err = result.expect_err("a beating holder is refused");
         assert!(err.to_string().contains("rewritten between the two samples"), "{err}");
     });
 
