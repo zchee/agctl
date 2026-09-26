@@ -111,6 +111,9 @@ fn no_production_source_names_a_process_argument_or_environment_api() {
     let tokens = ["environ", "environb"];
     for path in production_sources() {
         let source = std::fs::read_to_string(&path).expect("a readable source file");
+        // tmux's -E is the capture viewport end, not the retired process-lister
+        // environment flag. Exempt only this one exact closed argv, never a module.
+        let source = without_tmux_viewport_argv(&path, &source);
         for needle in literals {
             assert!(
                 !source.contains(needle),
@@ -126,6 +129,31 @@ fn no_production_source_names_a_process_argument_or_environment_api() {
             );
         }
     }
+}
+
+const TMUX_VIEWPORT_ARGV: &str =
+    "&[\"capture-pane\", \"-p\", \"-t\", pane.as_str(), \"-S\", \"0\", \"-E\", \"-\"]";
+
+fn without_tmux_viewport_argv(path: &Path, source: &str) -> String {
+    if path.ends_with("src/runtime/tmux.rs") {
+        source.replacen(TMUX_VIEWPORT_ARGV, "", 1)
+    } else {
+        source.to_owned()
+    }
+}
+
+#[test]
+fn viewport_exception_cannot_hide_another_environment_flag() {
+    let tmux = Path::new("src/runtime/tmux.rs");
+    assert!(!without_tmux_viewport_argv(tmux, TMUX_VIEWPORT_ARGV).contains("\"-E\""));
+    let extra = format!("{TMUX_VIEWPORT_ARGV}\nlet forbidden = \"-E\";");
+    assert!(without_tmux_viewport_argv(tmux, &extra).contains("\"-E\""));
+    assert!(
+        without_tmux_viewport_argv(Path::new("src/other.rs"), TMUX_VIEWPORT_ARGV)
+            .contains("\"-E\"")
+    );
+    let doubled = format!("{TMUX_VIEWPORT_ARGV}\n{TMUX_VIEWPORT_ARGV}");
+    assert!(without_tmux_viewport_argv(tmux, &doubled).contains("\"-E\""));
 }
 
 #[test]

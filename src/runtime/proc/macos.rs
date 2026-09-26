@@ -54,6 +54,7 @@ use super::CLAUDE_PROCESS_NAME;
 use super::Holder;
 use super::ProcError;
 use super::Seen;
+use super::TtyForeground;
 use super::sweep;
 
 /// Retains macOS's no-follow directory-mode reset for scratch cleanup.
@@ -109,6 +110,38 @@ pub(in crate::runtime::proc) fn holder_from_status(status: u32) -> Holder {
         libc::SZOMB => Holder::Dead,
         _ => Holder::Alive,
     }
+}
+
+/// Observes status, process group and terminal from the same kernel snapshot.
+#[cfg_attr(not(test), expect(dead_code, reason = "Remote Control stage wiring lands in S10"))]
+pub(super) fn tty_foreground(pid: u32) -> Option<TtyForeground> {
+    let info = ffi::bsd_info(pid).ok()?;
+    Some(TtyForeground {
+        holder: holder_from_status(info.pbi_status),
+        pgid: info.pbi_pgid,
+        tpgid: info.e_tpgid,
+        tdev: info.e_tdev,
+    })
+}
+
+/// Walks at most 64 parents; an unreadable or cyclic walk is not permission to type.
+#[cfg_attr(not(test), expect(dead_code, reason = "Remote Control stage wiring lands in S10"))]
+pub(super) fn ancestor_of_self(pid: u32) -> bool {
+    let mut current = std::process::id();
+    for _ in 0..64 {
+        if current == pid {
+            return true;
+        }
+        if current <= 1 {
+            return false;
+        }
+        let Ok(info) = ffi::bsd_info(current) else { return true };
+        if info.pbi_ppid == current {
+            return true;
+        }
+        current = info.pbi_ppid;
+    }
+    true
 }
 
 /// When a process started, to microsecond resolution.

@@ -16,6 +16,22 @@ use std::time::Instant;
 
 use super::*;
 
+#[test]
+fn remote_control_foreground_snapshot_and_ancestor_walk() {
+    let observed = tty_foreground(std::process::id()).expect("own kernel BSD info");
+    assert_eq!(observed.holder, Holder::Alive);
+    assert_eq!(observed.pgid, rustix::process::getpgrp().as_raw_nonzero().get() as u32);
+    assert!(ancestor_of_self(std::process::id()));
+    assert!(ancestor_of_self(
+        rustix::process::getppid().expect("parent").as_raw_nonzero().get() as u32
+    ));
+    let mut child = Command::new("sleep").arg("0").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    assert!(!ancestor_of_self(pid));
+    assert!(tty_foreground(IMPOSSIBLE_PID).is_none());
+}
+
 /// A process id no running process can have.
 ///
 /// `kill(0, 0)` addresses the caller's whole process group and `kill(-n, …)`

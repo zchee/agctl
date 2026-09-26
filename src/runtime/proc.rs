@@ -49,6 +49,32 @@ impl Holder {
     }
 }
 
+/// One kernel observation of a process and its controlling terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "Remote Control stage wiring lands in S10"))]
+pub struct TtyForeground {
+    /// Runnable, stopped, or dead at the time of the observation.
+    pub holder: Holder,
+    /// The process's group.
+    pub pgid: u32,
+    /// Its controlling terminal's foreground group.
+    pub tpgid: u32,
+    /// The terminal's device number, retaining the kernel's full width.
+    pub tdev: u32,
+}
+
+/// Reads a process's foreground-terminal identity; unknown is not permission to type.
+#[cfg_attr(not(test), expect(dead_code, reason = "Remote Control stage wiring lands in S10"))]
+pub fn tty_foreground(pid: u32) -> Option<TtyForeground> {
+    platform::tty_foreground(pid)
+}
+
+/// Whether `pid` is an ancestor of this process; an unreadable walk fails closed.
+#[cfg_attr(not(test), expect(dead_code, reason = "Remote Control stage wiring lands in S10"))]
+pub fn ancestor_of_self(pid: u32) -> bool {
+    platform::ancestor_of_self(pid)
+}
+
 /// Why the process table could not be read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProcError {

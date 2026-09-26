@@ -25,7 +25,7 @@ libc = "0.2"
 open = "5.4.3"
 rand = "0.10.2"
 ratatui = "0.30"
-rustix = { version = "1", features = ["fs", "param", "process"] }
+rustix = { version = "1", features = ["event", "fs", "param", "process", "termios"] }
 # Named only so a TLS failure inside an `io::Error` can be recognised by type
 # (provider/codex/oauth.rs); the same crate `ureq` already links, no new code.
 rustls = { version = "0.23.45", default-features = false }
@@ -51,6 +51,7 @@ url = "2"
 procfs-core = { version = "0.18", default-features = false }
 
 [dev-dependencies]
+rustix = { version = "1", features = ["pty"] }
 assert_cmd = "2.2.2"
 flate2 = "1.1.10"
 httpmock = "0.8"
