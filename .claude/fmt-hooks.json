@@ -1,7 +1,9 @@
 {
   "rs": [
-    "rustfmt",
-    "--edition",
-    "2024"
+    "direnv",
+    "exec",
+    ".",
+    "cargo",
+    "fmt"
   ]
 }
