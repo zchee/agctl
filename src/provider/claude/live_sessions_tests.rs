@@ -119,8 +119,26 @@ fn detailed_scan_preserves_bad_candidates_and_bounded_file_guards() {
     assert_eq!(detailed.sessions.len(), 1, "bad detailed schema cannot silently authorize a swap");
     assert!(detailed.sessions[0].state.is_none());
     assert_eq!(reread(root.path(), &detailed.sessions[0].key), Reread::Unrecognized);
-    fs::write(&path, " ".repeat(MAX_BYTES as usize)).unwrap();
-    assert!(scan_detailed(root.path(), |_| true).sessions.is_empty());
+    let valid = detailed_entry().to_string();
+    fs::write(&path, &valid).unwrap();
+    let baseline = scan_detailed(root.path(), |_| true);
+    let session = &baseline.sessions[0];
+    for (size, accepted) in [(MAX_BYTES - 1, true), (MAX_BYTES, false), (MAX_BYTES + 1, false)] {
+        let mut bytes = valid.as_bytes().to_vec();
+        bytes.resize(size as usize, b' ');
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            scan_detailed(root.path(), |_| true).sessions.len(),
+            usize::from(accepted),
+            "scan at {size} bytes"
+        );
+        let expected = if accepted {
+            Reread::State(session.state.clone().unwrap())
+        } else {
+            Reread::Unrecognized
+        };
+        assert_eq!(reread(root.path(), &session.key), expected, "reread at {size} bytes");
+    }
     fs::remove_file(&path).unwrap();
     let target = root.path().join("target");
     fs::write(&target, detailed_entry().to_string()).unwrap();

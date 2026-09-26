@@ -240,6 +240,34 @@ fn fake_transport_pins_argv_and_closed_capture_failures() {
 }
 
 #[test]
+fn send_nonzero_exit_is_reported_without_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let panes = dir.path().join("panes");
+    let log = dir.path().join("log");
+    fs::write(&panes, "%7 123 /dev/tty 0 0 0\n").unwrap();
+    let bin = fake(
+        dir.path(),
+        &[
+            ("AGCTL_FAKE_TMUX_PANES", panes.display().to_string()),
+            ("AGCTL_FAKE_TMUX_LOG", log.display().to_string()),
+            ("AGCTL_FAKE_TMUX_EXIT", "9".to_owned()),
+        ],
+    );
+    let pane = Pane::parse("%7").unwrap();
+    let ctx = context();
+    for keys in [Keys::RemoteControl, Keys::Disconnect] {
+        fs::write(&log, "").unwrap();
+        assert_eq!(send(&bin, &pane, keys, &ctx, ctx.deadline()), Err(Failure::Nonzero));
+        let logged = fs::read_to_string(&log).unwrap();
+        assert_eq!(logged.matches("arg send-keys\n").count(), 1, "{keys:?}: no retry");
+        assert!(logged.contains(&format!(
+            "arg send-keys\narg -t\narg %7\narg {}\n",
+            keys.argv().join("\narg ")
+        )));
+    }
+}
+
+#[test]
 fn child_timeout_kills_and_reaps_even_after_the_pass_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("pid");

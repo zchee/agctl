@@ -48,6 +48,7 @@ fn ac147_restart_is_opt_in_and_bulk_yes_is_a_parser_error() {
     let session = Session::new(&fixture, 7);
     setup(&mut fixture, &[&session], &resolved);
     let before = fixture.keychain_items();
+    let credentials = credential_files(&fixture);
     let config = fs::read(fixture.home().join(".claude.json")).unwrap();
     for mode in ["--live", "--undo"] {
         let output = fixture
@@ -57,7 +58,7 @@ fn ac147_restart_is_opt_in_and_bulk_yes_is_a_parser_error() {
             .unwrap();
         assert_eq!(output.status.code(), Some(2));
         assert!(calls(&fixture).is_empty());
-        assert_unchanged(&fixture, &before, &config);
+        assert_unchanged(&fixture, &before, &config, &credentials);
     }
     let output = fixture
         .raw()
@@ -87,6 +88,83 @@ fn ac147_restart_namespace_undo_types_nothing() {
     assert!(result.output.stderr.contains("does not act on a namespace target"));
     assert!(calls(&fixture).is_empty());
     assert_counts(&doc(&result));
+}
+
+#[test]
+fn restart_expired_owned_credentials_refresh_only_after_disconnect() {
+    for decline in [Some(1), Some(2), None] {
+        let server = MockServer::start();
+        let (_p, incoming) = live_profiles(&server);
+        let token = token_ok(&server);
+        let refreshed = common::mock_profile(&server, "sk-ant-oat01-rotated", (ACCT_T, ORG_T));
+        let (mut fixture, resolved) = live_accounts(&server, common::expired_at());
+        fixture.live_claude_json_js(&normal_config());
+        let session = Session::new(&fixture, 7);
+        setup(&mut fixture, &[&session], &resolved);
+        let before = fixture.keychain_items();
+        let credentials = credential_files(&fixture);
+        let config = fs::read(fixture.home().join(".claude.json")).unwrap();
+        let result = run(&fixture, &forward(), |index, _| {
+            if index <= 2 {
+                assert_eq!(token.calls(), 0, "no refresh before disconnect attestation");
+            }
+            if decline == Some(index) { Reply::No } else { Reply::Yes }
+        });
+        let outcome = doc(&result);
+        assert_eq!(incoming.calls(), 0, "only a refreshed incoming token may be profiled");
+        if let Some(group) = decline {
+            assert_eq!(
+                result.output.code(),
+                30,
+                "{}{}",
+                result.output.stdout,
+                result.output.stderr
+            );
+            assert_eq!(outcome["reason"], "remote_control_not_disconnected");
+            assert_eq!(outcome["remote_control"]["attestation_declined"], 1);
+            assert_eq!(sends(&fixture), group - 1);
+            assert_eq!(token.calls(), 0);
+            assert_eq!(refreshed.calls(), 0);
+            assert_unchanged(&fixture, &before, &config, &credentials);
+        } else {
+            assert_eq!(result.output.code(), 0, "{}{}", result.output.stdout, result.output.stderr);
+            assert_eq!(outcome["outcome"], "applied");
+            assert_eq!(outcome["remote_control"]["disconnected"], 1);
+            assert_eq!(outcome["remote_control"]["reconnected"], 1);
+            assert_eq!(token.calls(), 1);
+            assert_eq!(refreshed.calls(), 1);
+            let path = fixture.credentials_path(ACCT_T, ORG_T);
+            assert_ne!(fs::read(&path).unwrap(), *credentials[&path].as_ref().unwrap());
+        }
+        assert_released(&fixture, &resolved);
+    }
+}
+
+#[test]
+fn restart_unknown_write_requires_status_without_reconnecting() {
+    let server = MockServer::start();
+    let (_p, _t) = live_profiles(&server);
+    let (mut fixture, resolved) = live_accounts(&server, common::fresh_at());
+    fixture.live_claude_json_js(&normal_config());
+    let session = Session::new(&fixture, 7);
+    setup(&mut fixture, &[&session], &resolved);
+    fixture.fault("keychain_write_hang");
+    let result = run(&fixture, &forward(), |_, _| Reply::Yes);
+    assert_eq!(result.output.code(), 18, "{}{}", result.output.stdout, result.output.stderr);
+    let outcome = doc(&result);
+    assert_eq!(outcome["outcome"], "unknown");
+    assert_config(&outcome, "not_attempted", Some("swap_unknown"));
+    assert_eq!(outcome["remote_control"]["disconnected"], 1);
+    assert_eq!(outcome["remote_control"]["not_confirmed"], 1);
+    assert_eq!(outcome["remote_control"]["reconnected"], 0);
+    assert_eq!(outcome["remote_control"]["restored"], 0);
+    assert_eq!(result.questions.len(), 3, "no recovery attestation after an unknown write");
+    assert_eq!(sends(&fixture), 2, "only opening and disconnect may send");
+    assert_eq!(calls(&fixture).len(), 7, "status recovery makes no further tmux calls");
+    assert!(outcome["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning == "Run agctl claude status, then /remote-control in 1 session(s)."
+    }));
+    assert_released(&fixture, &resolved);
 }
 
 #[test]
@@ -210,6 +288,7 @@ fn ac154_restart_timeout_restores_only_the_disconnected_session() {
     fixture.set("AGCTL_FAKE_TMUX_NULL_AFTER_MS", delays.to_str().unwrap());
     fixture.set("AGCTL_RC_BUDGET_MS", "30000");
     let before = fixture.keychain_items();
+    let credentials = credential_files(&fixture);
     let config = fs::read(fixture.home().join(".claude.json")).unwrap();
     let result = run(&fixture, &forward(), |_, _| Reply::Yes);
     assert_eq!(result.output.code(), 30, "{}{}", result.output.stdout, result.output.stderr);
@@ -218,7 +297,7 @@ fn ac154_restart_timeout_restores_only_the_disconnected_session() {
     assert_eq!(counts["not_disconnected"], 1);
     assert_eq!(counts["restored"], 1);
     assert_eq!(sends(&fixture), 5);
-    assert_unchanged(&fixture, &before, &config);
+    assert_unchanged(&fixture, &before, &config, &credentials);
     assert_released(&fixture, &resolved);
     assert_eq!(p.calls(), 1);
     assert_eq!(t.calls(), 0);
@@ -703,6 +782,7 @@ fn ac152_restart_required_field_loss_after_discovery_refuses_before_input() {
             let session = Session::new(&fixture, 7);
             setup(&mut fixture, &[&session], &resolved);
             let before = fixture.keychain_items();
+            let credentials = credential_files(&fixture);
             let config = fs::read(fixture.home().join(".claude.json")).unwrap();
             let result = run(&fixture, &forward(), |index, _| {
                 assert_eq!(index, 0);
@@ -723,7 +803,7 @@ fn ac152_restart_required_field_loss_after_discovery_refuses_before_input() {
                 result.output.stderr
             );
             assert_eq!(sends(&fixture), 0);
-            assert_unchanged(&fixture, &before, &config);
+            assert_unchanged(&fixture, &before, &config, &credentials);
             assert_eq!(t.calls(), 0);
             assert_eq!(token.calls(), 0);
         }

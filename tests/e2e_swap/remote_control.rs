@@ -484,13 +484,50 @@ fn forbidden_output(fixture: &Fixture, tree: &BTreeMap<PathBuf, SessionSnapshot>
 fn log_events(run: &Run) -> String {
     common::strip_ansi(&run.output.stderr)
         .lines()
-        // Echo is disabled; strip only the human TTY prefix, never log fields.
+        // Strip the human [y/N] prefix and tracing timestamp, never the
+        // level, target, message or fields. Echo is disabled.
         .map(|line| line.rsplit("[y/N] ").next().unwrap_or(line))
+        .map(|line| match line.split_once(' ') {
+            Some((stamp, rest))
+                if stamp.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                    && stamp.ends_with('Z') =>
+            {
+                rest
+            }
+            _ => line,
+        })
         .filter(|line| {
             ["DEBUG", "INFO", "WARN", "ERROR", "TRACE"].iter().any(|level| line.contains(level))
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn restart_log_hygiene_keeps_identity_fields_but_not_timestamps() {
+    let stamp = "2026-09-26T22:39:14.317280Z";
+    let fixture = Fixture::new();
+    let clean = Run {
+        output: common::Output {
+            code: Some(0),
+            stdout: String::new(),
+            stderr: format!("question [y/N] {stamp} DEBUG agctl::runtime::tmux: tmux call\n"),
+        },
+        questions: Vec::new(),
+    };
+    assert_eq!(log_events(&clean), "DEBUG agctl::runtime::tmux: tmux call");
+    assert_output_hygiene(&fixture, &clean, &["3172".to_owned()]);
+    for prefix in [format!("{stamp} "), String::new()] {
+        let with_identity = Run {
+            output: common::Output {
+                code: Some(0),
+                stdout: String::new(),
+                stderr: format!("{prefix}WARN agctl::runtime::tmux: pid=3172\n"),
+            },
+            questions: Vec::new(),
+        };
+        assert_eq!(log_events(&with_identity), "WARN agctl::runtime::tmux: pid=3172");
+    }
 }
 
 fn assert_output_hygiene(fixture: &Fixture, run: &Run, forbidden: &[String]) {
@@ -576,7 +613,30 @@ fn assert_counts(doc: &Value) {
         assert!(counts[name].is_u64(), "integer {name}: {doc}");
     }
 }
-fn assert_unchanged(fixture: &Fixture, before: &[(String, Vec<u8>)], config: &[u8]) {
+fn credential_files(fixture: &Fixture) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    [(ACCT, ORG), (ACCT_T, ORG_T)]
+        .into_iter()
+        .flat_map(|(acct, org)| {
+            [fixture.credentials_path(acct, org), adopted_path(fixture, acct, org)]
+        })
+        .map(|path| {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("snapshot {}: {error}", path.display()),
+            };
+            (path, bytes)
+        })
+        .collect()
+}
+
+fn assert_unchanged(
+    fixture: &Fixture,
+    before: &[(String, Vec<u8>)],
+    config: &[u8],
+    credentials: &BTreeMap<PathBuf, Option<Vec<u8>>>,
+) {
+    assert_eq!(&credential_files(fixture), credentials, "namespace credential presence and bytes");
     assert_eq!(fixture.keychain_items(), before);
     assert_eq!(fs::read(fixture.home().join(".claude.json")).unwrap(), config);
     assert!(config_steps(fixture).is_empty());
@@ -601,6 +661,7 @@ fn ac169_restart_preflight_requires_both_ttys_before_any_io() {
         let session = Session::new(&fixture, 7);
         setup(&mut fixture, &[&session], &resolved);
         let before = fixture.keychain_items();
+        let credentials = credential_files(&fixture);
         let config = fs::read(fixture.home().join(".claude.json")).unwrap();
         let (_master, slave, _) = pty();
         let mut command = fixture.raw();
@@ -619,7 +680,7 @@ fn ac169_restart_preflight_requires_both_ttys_before_any_io() {
         assert!(doc["remote_control"].as_object().unwrap().values().all(|v| v == 0));
         assert!(calls(&fixture).is_empty());
         assert!(!fixture.security_log_path().exists());
-        assert_unchanged(&fixture, &before, &config);
+        assert_unchanged(&fixture, &before, &config, &credentials);
     }
     assert_eq!(p.calls(), 0);
     assert_eq!(t.calls(), 0);
@@ -754,6 +815,7 @@ fn ac170_restart_declines_eof_partial_and_deadlines_at_each_input_group() {
             setup(&mut fixture, &[&session], &resolved);
             fixture.set("AGCTL_RC_BUDGET_MS", "6000");
             let before = fixture.keychain_items();
+            let credentials = credential_files(&fixture);
             let config = fs::read(fixture.home().join(".claude.json")).unwrap();
             let run = run(
                 &fixture,
@@ -773,7 +835,7 @@ fn ac170_restart_declines_eof_partial_and_deadlines_at_each_input_group() {
             assert_eq!(outcome["remote_control"][field], 1);
             assert_eq!(outcome["remote_control"]["not_disconnected"], 1);
             assert_eq!(sends(&fixture), group - 1);
-            assert_unchanged(&fixture, &before, &config);
+            assert_unchanged(&fixture, &before, &config, &credentials);
             assert_eq!(token.calls(), 0);
             assert_eq!(t.calls(), 0);
             assert_released(&fixture, &resolved);
@@ -804,6 +866,7 @@ fn ac152_restart_schema_versions_and_preflight_fail_before_input_or_post() {
         document[field] = value.clone();
         session.save(&document);
         let before = fixture.keychain_items();
+        let credentials = credential_files(&fixture);
         let config = fs::read(fixture.home().join(".claude.json")).unwrap();
         let run = run(&fixture, &forward(), |_, _| Reply::Yes);
         assert_eq!(
@@ -815,7 +878,7 @@ fn ac152_restart_schema_versions_and_preflight_fail_before_input_or_post() {
         );
         assert_eq!(doc(&run)["remote_control"]["skipped"], 1);
         assert_eq!(sends(&fixture), 0);
-        assert_unchanged(&fixture, &before, &config);
+        assert_unchanged(&fixture, &before, &config, &credentials);
         assert_eq!(token.calls(), 0);
         assert_eq!(t.calls(), 0);
     }
@@ -867,11 +930,12 @@ fn ac155_restart_insufficient_stage_reserve_never_calls_tmux() {
     setup(&mut fixture, &[&session], &resolved);
     fixture.set("AGCTL_SWAP_DEADLINE_MS", "55000");
     let before = fixture.keychain_items();
+    let credentials = credential_files(&fixture);
     let config = fs::read(fixture.home().join(".claude.json")).unwrap();
     let run = run(&fixture, &forward(), |_, _| Reply::Yes);
     assert_eq!(run.output.code(), 30);
     assert!(calls(&fixture).is_empty());
-    assert_unchanged(&fixture, &before, &config);
+    assert_unchanged(&fixture, &before, &config, &credentials);
 }
 
 #[test]
@@ -884,6 +948,7 @@ fn ac164_restart_sigint_in_disconnect_poll_exits_130_with_counts_notice() {
     setup(&mut fixture, &[&session], &resolved);
     fixture.set("AGCTL_FAKE_TMUX_NULL_AFTER_MS", "never");
     let before = fixture.keychain_items();
+    let credentials = credential_files(&fixture);
     let config = fs::read(fixture.home().join(".claude.json")).unwrap();
     let run = run(
         &fixture,
@@ -898,6 +963,6 @@ fn ac164_restart_sigint_in_disconnect_poll_exits_130_with_counts_notice() {
         .map(Result::unwrap)
         .collect();
     assert!(documents.iter().all(|value| value["kind"] != "outcome"));
-    assert_unchanged(&fixture, &before, &config);
+    assert_unchanged(&fixture, &before, &config, &credentials);
     assert_released(&fixture, &resolved);
 }

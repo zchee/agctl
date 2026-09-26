@@ -438,7 +438,27 @@ mod stage_tests {
     #[test]
     fn remote_control_each_group_rejects_config_capture_schema_and_stale_answers() {
         for group in [Group::Opening, Group::Disconnect, Group::Reconnect, Group::Restore] {
-            for failure in ["config", "capture", "schema", "stale", "decline", "eof", "cancel"] {
+            let cases: BTreeMap<_, _> = [
+                ("config", (GroupResult::Skipped("config_mode_rejected"), 0)),
+                (
+                    "capture",
+                    (
+                        GroupResult::Skipped(if group == Group::Disconnect {
+                            "dialog_conflict"
+                        } else {
+                            "draft_visible"
+                        }),
+                        0,
+                    ),
+                ),
+                ("schema", (GroupResult::Skipped("registry_unrecognized"), 0)),
+                ("stale", (GroupResult::Skipped("attestation_stale"), 1)),
+                ("decline", (GroupResult::Unattested(Attestation::Declined), 1)),
+                ("eof", (GroupResult::Unattested(Attestation::NotObtained), 1)),
+                ("cancel", (GroupResult::Unattested(Attestation::NotObtained), 1)),
+            ]
+            .into();
+            for (failure, (expected, questions)) in cases {
                 let fixture = Fixture::new();
                 let ctx = context();
                 let rc = fixture.plan(&ctx);
@@ -489,10 +509,127 @@ mod stage_tests {
                     notice: &cleanup::register_exit_notice(0, not_confirmed_warning),
                 };
                 let result = stage.group(session, group, &mut prompt);
-                assert_ne!(result, GroupResult::Sent, "{group:?} {failure}");
+                assert_eq!(result, expected, "{group:?} {failure}");
+                assert_eq!(prompt.questions.len(), questions, "{group:?} {failure}");
                 assert!(!fixture.log().contains("arg send-keys"), "{group:?} {failure}");
             }
         }
+    }
+
+    #[test]
+    fn remote_control_each_group_reports_send_failure_without_retry() {
+        for group in [Group::Opening, Group::Disconnect, Group::Reconnect, Group::Restore] {
+            let fixture = Fixture::new();
+            let ctx = context();
+            let rc = fixture.plan(&ctx);
+            let mut document = fixture.document.clone();
+            if group == Group::Disconnect {
+                document["status"] = json!("waiting");
+                document["waitingFor"] = json!("dialog open");
+            } else if group.connecting() {
+                document["bridgeSessionId"] = serde_json::Value::Null;
+            }
+            fixture.save(&document);
+            let script = fs::read_to_string(&fixture.bin).unwrap().replacen(
+                "#!/bin/sh\n",
+                "#!/bin/sh\nexport AGCTL_FAKE_TMUX_EXIT=9\n",
+                1,
+            );
+            fs::write(&fixture.bin, script).unwrap();
+            let mut prompt = Script::yes(1);
+            let stage = Stage {
+                dir: &fixture.dir,
+                config: &fixture.config,
+                bin: &fixture.bin,
+                ctx: &ctx,
+                end: ctx.deadline(),
+                notice: &cleanup::register_exit_notice(0, not_confirmed_warning),
+            };
+            assert_eq!(
+                stage.group(&rc.sessions[0].session, group, &mut prompt),
+                GroupResult::Skipped("send_failed"),
+                "{group:?}"
+            );
+            assert_eq!(prompt.questions.len(), 1, "{group:?}");
+            let log = fixture.log();
+            assert_eq!(log.matches("arg send-keys\n").count(), 1, "{group:?}: no retry");
+            let keys = if group == Group::Disconnect {
+                "arg Up\narg Up\narg Enter\n"
+            } else {
+                "arg /remote-control\narg Enter\n"
+            };
+            assert!(log.contains(&format!("arg send-keys\narg -t\narg %7\n{keys}")), "{group:?}");
+        }
+    }
+
+    #[test]
+    fn remote_control_send_failure_preserves_later_groups_and_counts() {
+        for (group, attempt) in [
+            (Group::Opening, 1),
+            (Group::Disconnect, 2),
+            (Group::Reconnect, 3),
+            (Group::Restore, 3),
+        ] {
+            let fixture = Fixture::new();
+            let ctx = context();
+            let mut rc = fixture.plan(&ctx);
+            let mut prompt = Script::yes(4);
+            let bin = fixture.bin.clone();
+            let mut question = 0;
+            prompt.change = Some(Box::new(move || {
+                question += 1;
+                if question == attempt {
+                    let script = fs::read_to_string(&bin).unwrap().replacen(
+                        "#!/bin/sh\n",
+                        "#!/bin/sh\nexport AGCTL_FAKE_TMUX_EXIT=9\n",
+                        1,
+                    );
+                    fs::write(&bin, script).unwrap();
+                }
+            }));
+            assert_eq!(rc.disconnect(&ctx, &mut prompt), group.connecting(), "{group:?}");
+            let action =
+                if group == Group::Reconnect { Action::Reconnect } else { Action::Restore };
+            rc.finish(&ctx, &mut prompt, action);
+            assert_eq!(
+                rc.counts,
+                Counts {
+                    eligible: 1,
+                    skipped: 1,
+                    disconnected: usize::from(group.connecting()),
+                    not_disconnected: usize::from(!group.connecting()),
+                    not_confirmed: usize::from(group.connecting()),
+                    ..Counts::default()
+                },
+                "{group:?}"
+            );
+            assert_eq!(prompt.questions.len(), attempt, "{group:?}: no later question");
+            assert_eq!(fixture.log().matches("arg send-keys\n").count(), attempt, "{group:?}");
+            assert_eq!(prompt.notes, ["Remote Control input skipped: send_failed."]);
+        }
+    }
+
+    #[test]
+    fn remote_control_status_recovery_never_reconnects_a_disconnected_session() {
+        let fixture = Fixture::new();
+        let ctx = context();
+        let mut rc = fixture.plan(&ctx);
+        let mut prompt = Script::yes(3);
+        assert!(rc.disconnect(&ctx, &mut prompt));
+        assert_eq!(rc.counts.disconnected, 1);
+        let before = fixture.log();
+        let questions = prompt.questions.clone();
+        rc.finish(&ctx, &mut prompt, Action::StatusRecovery);
+        assert_eq!(fixture.log(), before, "status recovery must not call tmux");
+        assert_eq!(prompt.questions, questions, "status recovery must not request attestation");
+        assert_eq!(rc.counts.not_confirmed, rc.counts.disconnected);
+        assert_eq!(
+            warnings(&rc.counts, Action::StatusRecovery),
+            [
+                not_confirmed_warning(1),
+                "Run agctl claude status, then /remote-control in 1 session(s).".to_owned(),
+            ]
+        );
     }
 
     fn dynamic_group_failures(group: Group) {

@@ -110,7 +110,17 @@ fn remote_control_attestation_observes_cancel_within_one_poll() {
 
 #[test]
 fn remote_control_attestation_rejects_non_tty_and_expired_channels_without_printing() {
-    let (master, slave) = pty();
+    let (mut master, slave) = pty();
+    rustix::fs::fcntl_setfl(&master, rustix::fs::OFlags::NONBLOCK).unwrap();
+    let mut assert_silent = || {
+        let mut bytes = [0; 256];
+        let count = match master.read(&mut bytes) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Err(error) => panic!("read refused question output: {error}"),
+        };
+        assert_eq!(count, 0, "refusal printed {:?}", &bytes[..count]);
+    };
     let mut output = slave.try_clone().unwrap();
     let input = tempfile::tempfile().unwrap();
     assert_eq!(
@@ -123,6 +133,7 @@ fn remote_control_attestation_rejects_non_tty_and_expired_channels_without_print
         ),
         Attestation::NotObtained
     );
+    assert_silent();
     let mut file = tempfile::tempfile().unwrap();
     assert_eq!(
         attest_terminal(
@@ -135,10 +146,12 @@ fn remote_control_attestation_rejects_non_tty_and_expired_channels_without_print
         Attestation::NotObtained
     );
     assert_eq!(file.metadata().unwrap().len(), 0);
+    assert_silent();
     assert_eq!(
         attest_terminal(&slave, &mut output, "must not print", Instant::now(), &Cancel::new()),
         Attestation::NotObtained
     );
+    assert_silent();
     drop(master);
     assert_eq!(
         attest_terminal(
