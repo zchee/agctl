@@ -469,7 +469,6 @@ impl Stage<'_> {
 struct Progress {
     session: DetailedSession,
     opened: bool,
-    sent: bool,
     disconnected: bool,
     gone: bool,
 }
@@ -503,13 +502,7 @@ impl RemoteControl {
             .sessions
             .into_iter()
             .filter(|session| session.pane.is_some())
-            .map(|session| Progress {
-                session,
-                opened: false,
-                sent: false,
-                disconnected: false,
-                gone: false,
-            })
+            .map(|session| Progress { session, opened: false, disconnected: false, gone: false })
             .collect();
         Self {
             counts: Counts { eligible: sessions.len(), ..Counts::default() },
@@ -682,7 +675,7 @@ impl RemoteControl {
                 break;
             }
             match stage.group(&item.session, Group::Disconnect, prompt) {
-                GroupResult::Sent => item.sent = true,
+                GroupResult::Sent => {}
                 GroupResult::Disconnected => {
                     item.disconnected = true;
                     self.counts.disconnected += 1;

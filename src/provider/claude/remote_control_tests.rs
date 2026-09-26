@@ -667,7 +667,6 @@ mod stage_tests {
         rc.sessions.push(Progress {
             session: duplicate,
             opened: false,
-            sent: false,
             disconnected: false,
             gone: false,
         });
