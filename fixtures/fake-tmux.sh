@@ -14,10 +14,22 @@
 # Each delay can also name a file of pid/value rows for multi-session scenarios.
 # AGCTL_FAKE_TMUX_SCREEN: file of synthetic screen bytes (absent means zero bytes).
 # AGCTL_FAKE_TMUX_CAPTURE_EXIT: capture-only exit status.
-# AGCTL_FAKE_TMUX_CAPTURE_BYTES: fixed ASCII fixture byte count.
+# AGCTL_FAKE_TMUX_CAPTURE_BYTES: fixed ASCII fixture byte count, including a screen sentinel.
+# fixture-state pid state: synchronous test-owned invalidation, using the same logged atomic move.
 # AGCTL_FAKE_TMUX_EXIT: send-only exit status.
 # AGCTL_FAKE_TMUX_SLEEP: seconds to pause before answering.
 umask 077
+
+move_state() {
+    copy="$AGCTL_FAKE_TMUX_REGISTRY/.$1.$$.json"
+    cp "$AGCTL_FAKE_TMUX_STATES/$1.$2.json" "$copy" && mv "$copy" "$AGCTL_FAKE_TMUX_REGISTRY/$1.json" || return 5
+    [ -z "${AGCTL_FAKE_TMUX_LOG:-}" ] || printf 'move %s %s\n' "$1" "$2" >> "$AGCTL_FAKE_TMUX_LOG"
+}
+
+if [ "${1:-}" = fixture-state ]; then
+    move_state "$2" "$3"
+    exit $?
+fi
 
 if [ -n "${AGCTL_FAKE_TMUX_LOG:-}" ]; then
     {
@@ -63,7 +75,7 @@ row=$(awk -v pane="$pane" '$1 == pane { print; exit }' "${AGCTL_FAKE_TMUX_PANES:
 if [ "$command" = capture-pane ]; then
     [ "${AGCTL_FAKE_TMUX_CAPTURE_EXIT:-0}" = 0 ] || exit "$AGCTL_FAKE_TMUX_CAPTURE_EXIT"
     if [ -n "${AGCTL_FAKE_TMUX_CAPTURE_BYTES:-}" ]; then
-        perl -e 'print "x" x $ARGV[0]' "$AGCTL_FAKE_TMUX_CAPTURE_BYTES"
+        perl -e 'my $s = "RC_SCREEN_SENTINEL "; print substr($s x (1 + $ARGV[0] / length($s)), 0, $ARGV[0])' "$AGCTL_FAKE_TMUX_CAPTURE_BYTES"
     elif [ -n "${AGCTL_FAKE_TMUX_SCREEN:-}" ]; then
         cat "$AGCTL_FAKE_TMUX_SCREEN"
     fi
@@ -96,18 +108,14 @@ if [ -f "$delay" ]; then delay=$(awk -v pid="$pid" '$1 == pid {print $2; exit}' 
 # The detached fixture writer owns no transport pipe, so completion stays bounded.
 (
     perl -e 'select undef, undef, undef, $ARGV[0] / 1000' "${delay:-0}"
-    copy="$registry/.$pid.$$.json"
-    cp "$states/$pid.$state.json" "$copy" && mv "$copy" "$registry/$pid.json" || exit 5
-    [ -z "${AGCTL_FAKE_TMUX_LOG:-}" ] || printf 'move %s %s\n' "$pid" "$state" >> "$AGCTL_FAKE_TMUX_LOG"
+    move_state "$pid" "$state" || exit 5
     if [ "$state" = disconnected ] && [ -n "${AGCTL_FAKE_TMUX_REBRIDGE_AFTER_MS:-}" ]; then
         perl -e 'select undef, undef, undef, $ARGV[0] / 1000' "$AGCTL_FAKE_TMUX_REBRIDGE_AFTER_MS"
-        cp "$states/$pid.reconnected.json" "$copy" && mv "$copy" "$registry/$pid.json" || exit 5
-        [ -z "${AGCTL_FAKE_TMUX_LOG:-}" ] || printf 'move %s reconnected\n' "$pid" >> "$AGCTL_FAKE_TMUX_LOG"
+        move_state "$pid" reconnected || exit 5
     fi
     if [ "$state" = reconnected ] && [ -n "${AGCTL_FAKE_TMUX_DROP_AFTER_MS:-}" ]; then
         perl -e 'select undef, undef, undef, $ARGV[0] / 1000' "$AGCTL_FAKE_TMUX_DROP_AFTER_MS"
-        cp "$states/$pid.disconnected.json" "$copy" && mv "$copy" "$registry/$pid.json" || exit 5
-        [ -z "${AGCTL_FAKE_TMUX_LOG:-}" ] || printf 'move %s disconnected\n' "$pid" >> "$AGCTL_FAKE_TMUX_LOG"
+        move_state "$pid" disconnected || exit 5
     fi
 ) </dev/null >/dev/null 2>&1 &
 exit 0

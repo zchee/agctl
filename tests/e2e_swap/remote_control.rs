@@ -50,7 +50,7 @@ struct Session {
     _master: File,
     tty: PathBuf,
     path: PathBuf,
-    key: PathBuf,
+    root: PathBuf,
     document: Value,
 }
 impl Drop for Session {
@@ -136,14 +136,40 @@ impl Session {
             "bridgeSessionId":format!("session_private_bridge_{pane}"), "tmux":format!("private-name:@0.%{pane}"), "cwd":fixture.home().join("private-cwd"),
             "version":"2.1.281", "status":"idle", "statusUpdatedAt":1});
         fs::write(&path, document.to_string()).unwrap();
-        Self { child, foreground, _master: master, tty, path, key, document }
+        Self { child, foreground, _master: master, tty, path, root: fixture.scratch(""), document }
     }
     fn save(&self, document: &Value) {
-        fs::write(&self.path, document.to_string()).unwrap();
+        let states = self.root.join("tmux-states");
+        fs::create_dir_all(&states).unwrap();
+        let bytes = document.to_string();
+        let source = states.join(format!("{}.fixture.json", self.child.id()));
+        fs::write(&source, &bytes).unwrap();
+        let state = format!("fixture-{}", file_hash(&source));
+        fs::rename(&source, states.join(format!("{}.{state}.json", self.child.id()))).unwrap();
+        let output =
+            Command::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/fake-tmux.sh"))
+                .args(["fixture-state", &self.child.id().to_string(), &state])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", self.root.join("home"))
+                .env("AGCTL_FAKE_TMUX_LOG", self.root.join("tmux.log"))
+                .env("AGCTL_FAKE_TMUX_REGISTRY", self.path.parent().unwrap())
+                .env("AGCTL_FAKE_TMUX_STATES", states)
+                .output()
+                .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture move: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
 fn setup(fixture: &mut Fixture, sessions: &[&Session], resolved: &Path) {
+    let unrelated = fixture.home().join(".claude/sessions/unrelated");
+    fs::create_dir_all(&unrelated).unwrap();
+    fs::write(unrelated.join("preserved.key"), b"nested unchanged key sentinel").unwrap();
+    fs::write(unrelated.join("preserved.txt"), b"unrelated registry sentinel").unwrap();
     let audit = fixture.audit_log_path();
     if !audit.exists() {
         fs::create_dir_all(audit.parent().unwrap()).unwrap();
@@ -171,7 +197,16 @@ fn setup(fixture: &mut Fixture, sessions: &[&Session], resolved: &Path) {
     fs::write(&panes, rows).unwrap();
     let bin = fixture.scratch("tmux-test");
     let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/fake-tmux.sh");
-    let screens = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/rc-screens");
+    let screens = fixture.scratch("rc-screens");
+    fs::create_dir_all(&screens).unwrap();
+    for entry in
+        fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/rc-screens")).unwrap()
+    {
+        let entry = entry.unwrap();
+        let mut bytes = b"RC_SCREEN_SENTINEL\n".to_vec();
+        bytes.extend(fs::read(entry.path()).unwrap());
+        fs::write(screens.join(entry.file_name()), bytes).unwrap();
+    }
     // The stand-in's SCREEN knob always names one file. This fixture wrapper
     // selects the synthetic panel/prompt by the registry state, never a real pane.
     let script = format!(
@@ -243,6 +278,15 @@ fn run_channel(
     stdout_terminal: bool,
     mut answer: impl FnMut(usize, &str) -> Reply,
 ) -> Run {
+    let registry = fixture.home().join(".claude/sessions");
+    let registry_before = session_tree(&registry);
+    let keys_before: BTreeMap<_, _> = registry_before
+        .keys()
+        .filter(|path| path.extension().is_some_and(|extension| extension == "key"))
+        .map(|path| (path.clone(), fs::read(registry.join(path)).unwrap()))
+        .collect();
+    let log_before = fs::read_to_string(fixture.scratch("tmux.log")).unwrap_or_default();
+    let forbidden = forbidden_output(fixture, &registry_before);
     let (mut master, slave, _) = pty();
     let mut command = fixture.raw();
     command.args(args).stdin(slave.try_clone().unwrap());
@@ -343,13 +387,145 @@ fn run_channel(
             break status;
         }
     };
-    Run {
+    let result = Run {
         output: common::Output {
             code: status.code(),
             stdout: String::from_utf8(out.join().unwrap()).unwrap(),
             stderr: String::from_utf8_lossy(&bytes).replace("\r\n", "\n"),
         },
         questions,
+    };
+    assert_registry_unchanged(fixture, &registry_before, &keys_before, &log_before);
+    assert_output_hygiene(fixture, &result, &forbidden);
+    result
+}
+
+fn assert_registry_unchanged(
+    fixture: &Fixture,
+    before: &BTreeMap<PathBuf, SessionSnapshot>,
+    keys: &BTreeMap<PathBuf, Vec<u8>>,
+    log_before: &str,
+) {
+    let registry = fixture.home().join(".claude/sessions");
+    let after = session_tree(&registry);
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "AC159: registry tree membership"
+    );
+    let log = fs::read_to_string(fixture.scratch("tmux.log")).unwrap_or_default();
+    let delta = log.strip_prefix(log_before).expect("fake log is append-only during each run");
+    let mut moved = BTreeMap::new();
+    for line in delta.lines().filter_map(|line| line.strip_prefix("move ")) {
+        let (pid, state) = line.split_once(' ').expect("logged fixture move");
+        let path = PathBuf::from(format!("{pid}.json"));
+        assert!(before.contains_key(&path), "fake may replace only an existing session");
+        moved.insert(path, fixture.scratch("tmux-states").join(format!("{pid}.{state}.json")));
+    }
+    for (path, original) in before {
+        if let Some(source) = moved.get(path) {
+            assert_eq!(
+                fs::read(registry.join(path)).unwrap(),
+                fs::read(source).unwrap(),
+                "AC159: only the final logged fixture state may replace {path:?}"
+            );
+        } else if path.as_os_str().is_empty() && !moved.is_empty() {
+            // Atomic replacements change the parent directory's size/mtime,
+            // never its mode or the membership checked above.
+            assert_eq!(original.mode, after[path].mode);
+            assert_eq!(original.sha256, after[path].sha256);
+        } else {
+            assert_eq!(original, &after[path], "AC159: unlogged registry change at {path:?}");
+        }
+    }
+    for (path, bytes) in keys {
+        assert_eq!(&fs::read(registry.join(path)).unwrap(), bytes, "AC159: key bytes at {path:?}");
+    }
+}
+
+fn forbidden_output(fixture: &Fixture, tree: &BTreeMap<PathBuf, SessionSnapshot>) -> Vec<String> {
+    let registry = fixture.home().join(".claude/sessions");
+    let mut forbidden = vec![
+        fixture.home().display().to_string(),
+        fixture.home().join("private-cwd").display().to_string(),
+        fixture.scratch("tmux-test").display().to_string(),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/fake-tmux.sh").display().to_string(),
+        fixture.scratch("private-tmux-socket").display().to_string(),
+        registry.display().to_string(),
+        "rc-screens".to_owned(),
+        "RC_SCREEN_SENTINEL".to_owned(),
+    ];
+    let panes = fs::read_to_string(fixture.scratch("tmux-panes")).unwrap_or_default();
+    for row in panes.lines() {
+        forbidden.extend(row.split_whitespace().take(3).map(str::to_owned));
+    }
+    for path in
+        tree.keys().filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+    {
+        let path = registry.join(path);
+        forbidden.push(path.display().to_string());
+        let Ok(document) = serde_json::from_slice::<Value>(&fs::read(path).unwrap()) else {
+            continue;
+        };
+        for key in ["sessionId", "bridgeSessionId", "name", "cwd", "tmux"] {
+            if let Some(value) = document[key].as_str().filter(|value| !value.is_empty()) {
+                forbidden.push(value.to_owned());
+            }
+        }
+        if let Some(pid) = document["pid"].as_u64() {
+            forbidden.push(pid.to_string());
+        }
+    }
+    forbidden.sort();
+    forbidden.dedup();
+    forbidden
+}
+
+fn log_events(run: &Run) -> String {
+    common::strip_ansi(&run.output.stderr)
+        .lines()
+        // Echo is disabled; strip only the human TTY prefix, never log fields.
+        .map(|line| line.rsplit("[y/N] ").next().unwrap_or(line))
+        .filter(|line| {
+            ["DEBUG", "INFO", "WARN", "ERROR", "TRACE"].iter().any(|level| line.contains(level))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn assert_output_hygiene(fixture: &Fixture, run: &Run, forbidden: &[String]) {
+    let events = log_events(run);
+    for value in forbidden {
+        assert!(!events.contains(value), "AC163: forbidden {value:?} in log events: {events}");
+    }
+    // Human-only stdout-terminal controls have no piped JSON. D7 exempts
+    // exactly the pre-existing top-level plan paths, no other field.
+    let documents: Vec<Value> = serde_json::Deserializer::from_str(&run.output.stdout)
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    let home = fixture.home().display().to_string();
+    let allowed = documents
+        .iter()
+        .map(|value| {
+            ["store_dir", "config_path"]
+                .iter()
+                .map(|key| value[*key].as_str().map_or(0, |path| path.matches(&home).count()))
+                .sum::<usize>()
+        })
+        .sum::<usize>();
+    assert_eq!(
+        run.output.stdout.matches(&home).count(),
+        allowed,
+        "D7: only plan paths contain HOME"
+    );
+    for mut value in documents {
+        value.as_object_mut().unwrap().remove("store_dir");
+        value.as_object_mut().unwrap().remove("config_path");
+        let text = value.to_string();
+        for value in forbidden {
+            assert!(!text.contains(value), "AC163: forbidden {value:?} in JSON: {text}");
+        }
     }
 }
 
@@ -490,13 +666,6 @@ fn ac149_restart_forward_and_undo_have_exact_groups_and_counts_only_output() {
             fixture.audit_log_path(),
         ];
         let hashes = watched.iter().map(|path| file_hash(path)).collect::<Vec<_>>();
-        let registry_before: BTreeMap<_, _> = fs::read_dir(session.path.parent().unwrap())
-            .unwrap()
-            .map(|entry| {
-                let entry = entry.unwrap();
-                (entry.file_name(), fs::read(entry.path()).unwrap())
-            })
-            .collect();
         let run = run(&fixture, &args, |_, _| Reply::Yes);
         assert_eq!(run.output.code(), 0, "{}{}", run.output.stdout, run.output.stderr);
         assert_eq!(run.output.stderr.matches("Remote Control automation was last verified on 2.1.281; this session runs 2.1.999").count(), 1);
@@ -527,23 +696,6 @@ fn ac149_restart_forward_and_undo_have_exact_groups_and_counts_only_output() {
             }
         }
         assert!(fs::read_to_string(fixture.audit_log_path()).unwrap().contains("config_write"));
-        let registry_after: BTreeMap<_, _> = fs::read_dir(session.path.parent().unwrap())
-            .unwrap()
-            .map(|entry| {
-                let entry = entry.unwrap();
-                (entry.file_name(), fs::read(entry.path()).unwrap())
-            })
-            .collect();
-        assert_eq!(
-            registry_before.keys().collect::<Vec<_>>(),
-            registry_after.keys().collect::<Vec<_>>()
-        );
-        for (name, before) in registry_before {
-            if registry_after[&name] != before {
-                assert_eq!(name, session.path.file_name().unwrap());
-                assert!(transport_log.contains(&format!("move {} ", session.child.id())));
-            }
-        }
         let outcome = doc(&run);
         assert_counts(&outcome);
         assert_eq!(outcome["remote_control"]["reconnected"], 1);
@@ -578,61 +730,9 @@ fn ac149_restart_forward_and_undo_have_exact_groups_and_counts_only_output() {
                 slash
             ]
         );
-        // AC157/D7: only the two pre-existing plan path members are exempt.
-        // Production JSON stays unchanged; no other member can acquire HOME.
-        let documents: Vec<Value> = serde_json::Deserializer::from_str(&run.output.stdout)
-            .into_iter()
-            .map(Result::unwrap)
-            .collect();
-        let home = fixture.home().display().to_string();
-        let allowed = documents
-            .iter()
-            .map(|value| {
-                ["store_dir", "config_path"]
-                    .iter()
-                    .map(|key| value[*key].as_str().map_or(0, |path| path.matches(&home).count()))
-                    .sum::<usize>()
-            })
-            .sum::<usize>();
-        assert_eq!(run.output.stdout.matches(&home).count(), allowed);
-        for mut value in documents {
-            value.as_object_mut().unwrap().remove("store_dir");
-            value.as_object_mut().unwrap().remove("config_path");
-            let text = value.to_string();
-            for forbidden in [
-                session.child.id().to_string(),
-                "%7".to_owned(),
-                "rc-e2e-7".to_owned(),
-                "private-session-7".to_owned(),
-                "session_private_bridge_7".to_owned(),
-                session.path.display().to_string(),
-                session.tty.display().to_string(),
-                fixture.scratch("tmux-test").display().to_string(),
-                "rc-screens".to_owned(),
-                fixture.scratch("private-tmux-socket").display().to_string(),
-                home.clone(),
-            ] {
-                assert!(!text.contains(&forbidden), "RC identity/path escaped: {forbidden}");
-            }
-        }
-        assert_eq!(fs::read(&session.key).unwrap(), b"unchanged key sentinel");
         assert_released(&fixture, &resolved);
-        let log_events = run
-            .output
-            .stderr
-            .lines()
-            // Echo is disabled on this synthetic TTY, so a log can follow a
-            // human prompt on the same line. Only that TTY prefix is exempt.
-            .map(|line| line.rsplit("[y/N] ").next().unwrap_or(line))
-            .filter(|line| line.contains("DEBUG") || line.contains("INFO") || line.contains("WARN"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for forbidden in
-            ["%7", "rc-e2e-7", "private-session-7", "session_private_bridge_7", "rc-screens"]
-        {
-            assert!(!log_events.contains(forbidden), "{log_events}");
-        }
-        assert_eq!(log_events.matches("Remote Control stage").count(), 2);
+        let events = log_events(&run);
+        assert_eq!(events.matches("Remote Control stage").count(), 2);
     }
 }
 

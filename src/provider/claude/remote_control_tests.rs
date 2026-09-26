@@ -495,6 +495,158 @@ mod stage_tests {
         }
     }
 
+    fn dynamic_group_failures(group: Group) {
+        let cases: BTreeMap<_, _> = [
+            ("foreground stopped", GroupResult::Skipped("stopped_or_dead")),
+            ("foreground other tty", GroupResult::Skipped("another_terminal")),
+            ("foreground copy mode", GroupResult::Skipped("copy_mode")),
+            ("foreground dead pane", GroupResult::Skipped("dead_pane")),
+            ("foreground synchronized", GroupResult::Skipped("synchronized")),
+            ("identity pid", GroupResult::Skipped("registry_unrecognized")),
+            ("identity session", GroupResult::Skipped("registry_unrecognized")),
+            ("identity pane", GroupResult::Skipped("pane_changed")),
+            (
+                "bridge",
+                if group.connecting() {
+                    GroupResult::AlreadyConnected
+                } else {
+                    GroupResult::Skipped("bridge_changed")
+                },
+            ),
+            ("readiness status", GroupResult::Expired),
+            ("readiness waiting", GroupResult::Expired),
+            ("readiness future", GroupResult::Expired),
+        ]
+        .into();
+        for (failure, expected) in cases {
+            let fixture = Fixture::new();
+            let ctx = context();
+            let mut rc = fixture.plan(&ctx);
+            let mut prompt = Script::yes(3);
+            assert!(rc.disconnect(&ctx, &mut prompt), "{group:?}: valid earlier groups");
+            assert_eq!(rc.counts.disconnected, 1);
+            assert_eq!(prompt.questions.len(), 2);
+            let prior_log = fixture.log();
+            assert_eq!(prior_log.matches("arg send-keys\n").count(), 2);
+            let session = &rc.sessions[0].session;
+            let mut document = fixture.document.clone();
+            if group == Group::Disconnect {
+                document["status"] = json!("waiting");
+                document["waitingFor"] = json!("dialog open");
+            } else if group.connecting() {
+                document["bridgeSessionId"] = serde_json::Value::Null;
+            }
+            // Opening has no preceding group in one cycle. Re-establish the
+            // synthetic bridge after the proved disconnect, then start a new
+            // opening; the other groups use their ordinary ready input shape.
+            fixture.save(&document);
+            let notice = cleanup::register_exit_notice(0, not_confirmed_warning);
+            let stage = Stage {
+                dir: &fixture.dir,
+                config: &fixture.config,
+                bin: &fixture.bin,
+                ctx: &ctx,
+                end: Instant::now() + Duration::from_secs(3),
+                notice: &notice,
+            };
+            assert_eq!(stage.foreground(session), Ok(()), "{group:?} {failure}: prior proof");
+            assert!(
+                observe(session, group, live_sessions::reread(&fixture.dir, &session.key)).is_ok()
+            );
+            let mut quiet = Quiet::default();
+            let ready = match live_sessions::reread(&fixture.dir, &session.key) {
+                Reread::State(state) => state,
+                other => panic!("expected ready registry, got {other:?}"),
+            };
+            let start = Instant::now();
+            assert!(!quiet.ready(&ready, group, start, i64::MAX));
+            assert!(quiet.ready(&ready, group, start + RC_QUIET, i64::MAX));
+            match failure {
+                "foreground stopped" => {
+                    let pid = rustix::process::Pid::from_raw(fixture.child.id() as i32).unwrap();
+                    rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
+                    let end = Instant::now() + Duration::from_secs(3);
+                    while proc::tty_foreground(fixture.child.id())
+                        .is_none_or(|proof| proof.holder != proc::Holder::Stopped)
+                    {
+                        assert!(Instant::now() < end, "owned child did not stop");
+                        std::thread::yield_now();
+                    }
+                }
+                "foreground other tty" => {
+                    let panes = fixture.root.path().join("panes");
+                    let row = fs::read_to_string(&panes).unwrap();
+                    let fields: Vec<_> = row.split_whitespace().collect();
+                    fs::write(&panes, format!("%7 {} /dev/null 0 0 0\n", fields[1])).unwrap();
+                }
+                "foreground copy mode" | "foreground dead pane" | "foreground synchronized" => {
+                    let panes = fixture.root.path().join("panes");
+                    let row = fs::read_to_string(&panes).unwrap();
+                    let flags = match failure {
+                        "foreground copy mode" => "1 0 0",
+                        "foreground dead pane" => "0 1 0",
+                        _ => "0 0 1",
+                    };
+                    let fields: Vec<_> = row.split_whitespace().collect();
+                    fs::write(
+                        &panes,
+                        format!("{} {} {} {flags}\n", fields[0], fields[1], fields[2]),
+                    )
+                    .unwrap();
+                }
+                "identity pid" => document["pid"] = json!(fixture.child.id() + 1),
+                "identity session" => document["sessionId"] = json!("replacement-session"),
+                "identity pane" => document["tmux"] = json!("name:@0.%8"),
+                "bridge" => document["bridgeSessionId"] = json!("replacement-bridge"),
+                "readiness status" => document["status"] = json!("busy"),
+                "readiness waiting" => document["waitingFor"] = json!("input needed"),
+                "readiness future" => document["statusUpdatedAt"] = json!(i64::MAX),
+                _ => unreachable!(),
+            }
+            fixture.save(&document);
+            let stage = Stage { end: Instant::now() + Duration::from_millis(1500), ..stage };
+            let before = fixture.log();
+            let result = stage.group(session, group, &mut prompt);
+            assert_eq!(result, expected, "{group:?} {failure}");
+            assert!(fixture.log().starts_with(&before));
+            assert!(
+                !fixture.log()[before.len()..].contains("arg send-keys\n"),
+                "{group:?} {failure}: the failing group must send nothing, even on restore"
+            );
+            assert_eq!(prompt.questions.len(), 2, "{group:?} {failure}: no fresh question");
+            let mut counts = Counts::default();
+            record_failure(&mut counts, &result, &mut prompt);
+            assert_eq!(
+                counts,
+                Counts {
+                    skipped: usize::from(matches!(expected, GroupResult::Skipped(_))),
+                    ..Counts::default()
+                },
+                "{group:?} {failure}: only a rejected check increments skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_control_opening_rechecks_dynamic_guards_after_successful_groups() {
+        dynamic_group_failures(Group::Opening);
+    }
+
+    #[test]
+    fn remote_control_c20_rechecks_dynamic_guards_after_successful_groups() {
+        dynamic_group_failures(Group::Disconnect);
+    }
+
+    #[test]
+    fn remote_control_reconnect_rechecks_dynamic_guards_after_successful_groups() {
+        dynamic_group_failures(Group::Reconnect);
+    }
+
+    #[test]
+    fn remote_control_restore_rechecks_dynamic_guards_after_successful_groups() {
+        dynamic_group_failures(Group::Restore);
+    }
+
     #[test]
     fn remote_control_preflight_checks_every_pane_before_input_and_preserves_version_note() {
         let fixture = Fixture::new();

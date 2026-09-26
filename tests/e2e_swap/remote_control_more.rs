@@ -498,6 +498,136 @@ fn ac173_ac174_restart_config_and_capture_guards_reject_even_with_yes_available(
 }
 
 #[test]
+fn ac163_ac174_restart_fault_output_is_counts_only_and_audit_neutral() {
+    let cases: BTreeMap<_, _> = [
+        ("control", (None, None)),
+        ("spawn", (Some("pane_unreadable"), Some("Spawn"))),
+        ("timeout", (Some("capture_failed"), Some("Timeout"))),
+        ("nonzero", (Some("capture_failed"), Some("Nonzero"))),
+        ("invalid", (Some("capture_invalid"), None)),
+        ("ambiguous", (Some("capture_ambiguous"), None)),
+        ("oversize", (Some("capture_too_large"), Some("TooLarge"))),
+    ]
+    .into();
+    for (case, (reason, transport_failure)) in cases {
+        let server = MockServer::start();
+        let (_p, _t) = live_profiles(&server);
+        let (mut fixture, resolved) = live_accounts(&server, common::fresh_at());
+        fixture.live_claude_json_js(&normal_config());
+        let session = Session::new(&fixture, 7);
+        setup(&mut fixture, &[&session], &resolved);
+        fixture.set("RUST_LOG", "agctl=debug");
+        match case {
+            "control" => {}
+            "spawn" => {
+                // Resolution succeeds; exec fails on the synthetic interpreter,
+                // so this exercises Failure::Spawn, not only Unavailable.
+                fs::write(
+                    fixture.scratch("tmux-test"),
+                    format!("#!{}\n", fixture.scratch("missing-interpreter").display()),
+                )
+                .unwrap();
+            }
+            "timeout" => {
+                let bin = fixture.scratch("tmux-test");
+                let script = fs::read_to_string(&bin).unwrap().replacen("#!/bin/sh\n", "#!/bin/sh\nif [ \"$1\" != capture-pane ]; then unset AGCTL_FAKE_TMUX_SLEEP; fi\n", 1);
+                fs::write(bin, script).unwrap();
+                fixture.set("AGCTL_FAKE_TMUX_SLEEP", "5");
+            }
+            "nonzero" => {
+                fixture.set("AGCTL_FAKE_TMUX_CAPTURE_EXIT", "9");
+            }
+            "invalid" | "ambiguous" => {
+                let name =
+                    if case == "invalid" { "capture_invalid.bin" } else { "capture_ambiguous.txt" };
+                fixture.set(
+                    "AGCTL_FAKE_TMUX_SCREEN",
+                    fixture.scratch("rc-screens").join(name).to_str().unwrap(),
+                );
+            }
+            "oversize" => {
+                fixture.set("AGCTL_FAKE_TMUX_CAPTURE_BYTES", "65537");
+            }
+            _ => unreachable!(),
+        }
+        let (baseline, _) = live_accounts(&server, common::fresh_at());
+        baseline.live_claude_json_js(&normal_config());
+        let receipt_count = |fixture: &Fixture| {
+            fs::read_to_string(fixture.audit_log_path()).unwrap_or_default().lines().count()
+        };
+        let baseline_before = receipt_count(&baseline);
+        let plain = run_channel(
+            &baseline,
+            &["claude", "use", "--live", EMAIL_T, "--json"],
+            true,
+            |_, _| {
+                if reason.is_some() { Reply::No } else { Reply::Yes }
+            },
+        );
+        assert_eq!(plain.output.code(), if reason.is_some() { 20 } else { 0 }, "{case}: baseline");
+        let expected_receipts = receipt_count(&baseline) - baseline_before;
+        let audit_before = receipt_count(&fixture);
+        let result = run(&fixture, &forward(), |_, _| Reply::Yes);
+        assert_eq!(
+            result.output.code(),
+            if reason.is_some() { 30 } else { 0 },
+            "{case}: {}{}",
+            result.output.stdout,
+            result.output.stderr
+        );
+        assert_eq!(
+            receipt_count(&fixture) - audit_before,
+            expected_receipts,
+            "{case}: AC163 no keystroke receipts, including refusal"
+        );
+        let counts = &doc(&result)["remote_control"];
+        assert_counts(&doc(&result));
+        let events = log_events(&result);
+        assert!(events.contains("DEBUG"), "{case}: capture actual debug events");
+        let stages: Vec<_> =
+            events.lines().filter(|line| line.contains("Remote Control stage")).collect();
+        assert_eq!(
+            stages.len(),
+            if reason.is_some() { 1 } else { 2 },
+            "{case}: exactly one info event per stage: {events}"
+        );
+        assert!(stages.iter().all(|line| line.contains("INFO")));
+        assert_eq!(
+            stages.iter().filter(|line| line.contains("stage=\"disconnect\"")).count(),
+            1,
+            "{case}: disconnect stage identity: {events}"
+        );
+        if let Some(reason) = reason {
+            assert!(result.output.stderr.contains(reason), "{case}: {events}");
+            assert_eq!(counts["skipped"], 1, "{case}");
+            assert_eq!(counts["not_disconnected"], 1, "{case}");
+            assert_eq!(sends(&fixture), 0, "{case}");
+        } else {
+            assert_eq!(counts["reconnected"], 1);
+            assert_eq!(sends(&fixture), 3);
+        }
+        if let Some(failure) = transport_failure {
+            assert!(
+                events.contains(&format!("Some({failure})")),
+                "{case}: closed transport reason: {events}"
+            );
+            if ["Spawn", "Timeout"].contains(&failure) {
+                assert_eq!(
+                    events
+                        .lines()
+                        .filter(|line| line.contains("WARN")
+                            && line.contains("tmux call did not complete"))
+                        .count(),
+                    1,
+                    "{case}: closed warning"
+                );
+            }
+        }
+        assert_released(&fixture, &resolved);
+    }
+}
+
+#[test]
 fn ac168_ac176_restart_sigint_during_an_open_question_never_sends_that_group() {
     for group in [1, 3] {
         let server = MockServer::start();
