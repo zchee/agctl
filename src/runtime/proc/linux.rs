@@ -30,13 +30,11 @@ use crate::runtime::coordinator::Cancel;
 
 /// Remote Control is a non-goal of `docs/plans/agctl-linux-support.md`.
 /// This reserved implementation site returns no foreground proof on Linux.
-#[cfg_attr(not(test), expect(dead_code, reason = "Remote Control stage wiring lands in S10"))]
 pub(super) fn tty_foreground(_pid: u32) -> Option<super::TtyForeground> {
     None
 }
 
 /// Fails closed until the Remote Control non-goal in the Linux plan is revisited.
-#[cfg_attr(not(test), expect(dead_code, reason = "Remote Control stage wiring lands in S10"))]
 pub(super) fn ancestor_of_self(_pid: u32) -> bool {
     true
 }

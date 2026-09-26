@@ -51,7 +51,6 @@ impl Holder {
 
 /// One kernel observation of a process and its controlling terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "Remote Control stage wiring lands in S10"))]
 pub struct TtyForeground {
     /// Runnable, stopped, or dead at the time of the observation.
     pub holder: Holder,
@@ -64,13 +63,11 @@ pub struct TtyForeground {
 }
 
 /// Reads a process's foreground-terminal identity; unknown is not permission to type.
-#[cfg_attr(not(test), expect(dead_code, reason = "Remote Control stage wiring lands in S10"))]
 pub fn tty_foreground(pid: u32) -> Option<TtyForeground> {
     platform::tty_foreground(pid)
 }
 
 /// Whether `pid` is an ancestor of this process; an unreadable walk fails closed.
-#[cfg_attr(not(test), expect(dead_code, reason = "Remote Control stage wiring lands in S10"))]
 pub fn ancestor_of_self(pid: u32) -> bool {
     platform::ancestor_of_self(pid)
 }

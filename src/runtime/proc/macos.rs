@@ -113,7 +113,6 @@ pub(in crate::runtime::proc) fn holder_from_status(status: u32) -> Holder {
 }
 
 /// Observes status, process group and terminal from the same kernel snapshot.
-#[cfg_attr(not(test), expect(dead_code, reason = "Remote Control stage wiring lands in S10"))]
 pub(super) fn tty_foreground(pid: u32) -> Option<TtyForeground> {
     let info = ffi::bsd_info(pid).ok()?;
     Some(TtyForeground {
@@ -125,7 +124,6 @@ pub(super) fn tty_foreground(pid: u32) -> Option<TtyForeground> {
 }
 
 /// Walks at most 64 parents; an unreadable or cyclic walk is not permission to type.
-#[cfg_attr(not(test), expect(dead_code, reason = "Remote Control stage wiring lands in S10"))]
 pub(super) fn ancestor_of_self(pid: u32) -> bool {
     let mut current = std::process::id();
     for _ in 0..64 {

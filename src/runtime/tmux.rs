@@ -3,11 +3,6 @@
 //! The existing process coordinator and standard library supply child ownership
 //! and bounded reads. Target validation and screen rejection are vendor-specific.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Remote Control stages consume this transport in S10")
-)]
-
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;

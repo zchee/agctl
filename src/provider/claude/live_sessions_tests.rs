@@ -13,6 +13,122 @@ fn live_scan(dir: &Path) -> Scan {
     scan(dir, |pid| proc::holder(pid, &cancel) != proc::Holder::Dead)
 }
 
+fn detailed_entry() -> serde_json::Value {
+    json!({"pid": std::process::id(), "sessionId": "private-session-id", "name": " test`\nname ",
+        "bridgeSessionId": "private-bridge-id", "tmux": "session:@2.%7", "version": "2.1.281",
+        "status": "idle", "statusUpdatedAt": 1})
+}
+
+#[test]
+fn detailed_scan_and_targeted_reread_keep_identity_opaque() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join(format!("{}.json", std::process::id()));
+    let mut entry = detailed_entry();
+    fs::write(&path, entry.to_string()).unwrap();
+    let result = scan_detailed(root.path(), |_| true);
+    assert_eq!(result.sessions.len(), 1);
+    let session = &result.sessions[0];
+    assert_eq!(session.name.as_deref(), Some("test'name"));
+    assert_eq!(session.pane.as_ref().unwrap().as_str(), "%7");
+    assert_eq!(format!("{:?}", session.key), "SessionKey(..)");
+    let Reread::State(state) = reread(root.path(), &session.key) else {
+        panic!("recognized state")
+    };
+    assert!(state.bridge_on && state.same_bridge);
+    assert_eq!(state.waiting_for, None);
+    entry["bridgeSessionId"] = json!("another-bridge");
+    fs::write(&path, entry.to_string()).unwrap();
+    let Reread::State(state) = reread(root.path(), &session.key) else {
+        panic!("recognized state")
+    };
+    assert!(state.bridge_on && !state.same_bridge);
+    entry["bridgeSessionId"] = serde_json::Value::Null;
+    fs::write(&path, entry.to_string()).unwrap();
+    assert!(matches!(
+        reread(root.path(), &session.key),
+        Reread::State(State { bridge_on: false, .. })
+    ));
+    entry["sessionId"] = json!("replacement");
+    fs::write(&path, entry.to_string()).unwrap();
+    assert_eq!(reread(root.path(), &session.key), Reread::Replaced);
+    fs::remove_file(&path).unwrap();
+    assert_eq!(reread(root.path(), &session.key), Reread::Gone);
+}
+
+#[test]
+fn detailed_schema_rejects_missing_types_unknown_states_and_explicit_null_waiting() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join(format!("{}.json", std::process::id()));
+    let entry = detailed_entry();
+    fs::write(&path, entry.to_string()).unwrap();
+    let scan = scan_detailed(root.path(), |_| true);
+    let key = &scan.sessions[0].key;
+    for field in
+        ["pid", "sessionId", "version", "status", "tmux", "statusUpdatedAt", "bridgeSessionId"]
+    {
+        for wrong in [None, Some(json!([])), Some(json!({}))] {
+            let mut bad = entry.clone();
+            if let Some(value) = wrong {
+                bad[field] = value;
+            } else {
+                bad.as_object_mut().unwrap().remove(field);
+            }
+            fs::write(&path, bad.to_string()).unwrap();
+            assert_eq!(reread(root.path(), key), Reread::Unrecognized, "{field}: {bad}");
+        }
+    }
+    for waiting in [json!(null), json!(false), json!(7), json!("new prompt")] {
+        let mut bad = entry.clone();
+        bad["waitingFor"] = waiting;
+        fs::write(&path, bad.to_string()).unwrap();
+        assert_eq!(reread(root.path(), key), Reread::Unrecognized, "{bad}");
+    }
+    for waiting in [
+        "input needed",
+        "permission prompt",
+        "dialog open",
+        "worker request",
+        "sandbox request",
+        "goal proposal",
+    ] {
+        let mut good = entry.clone();
+        good["waitingFor"] = json!(waiting);
+        fs::write(&path, good.to_string()).unwrap();
+        assert!(matches!(reread(root.path(), key), Reread::State(_)), "{waiting}");
+    }
+    for status in ["busy", "shell", "idle", "waiting"] {
+        let mut good = entry.clone();
+        good["status"] = json!(status);
+        fs::write(&path, good.to_string()).unwrap();
+        assert!(matches!(reread(root.path(), key), Reread::State(_)), "{status}");
+    }
+    let mut bad = entry;
+    bad["status"] = json!("unknown");
+    fs::write(&path, bad.to_string()).unwrap();
+    assert_eq!(reread(root.path(), key), Reread::Unrecognized);
+}
+
+#[test]
+fn detailed_scan_preserves_bad_candidates_and_bounded_file_guards() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join(format!("{}.json", std::process::id()));
+    let mut bad = detailed_entry();
+    bad["pid"] = json!("bad");
+    fs::write(&path, bad.to_string()).unwrap();
+    let detailed = scan_detailed(root.path(), |_| true);
+    assert_eq!(detailed.sessions.len(), 1, "bad detailed schema cannot silently authorize a swap");
+    assert!(detailed.sessions[0].state.is_none());
+    assert_eq!(reread(root.path(), &detailed.sessions[0].key), Reread::Unrecognized);
+    fs::write(&path, " ".repeat(MAX_BYTES as usize)).unwrap();
+    assert!(scan_detailed(root.path(), |_| true).sessions.is_empty());
+    fs::remove_file(&path).unwrap();
+    let target = root.path().join("target");
+    fs::write(&target, detailed_entry().to_string()).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    assert!(scan_detailed(root.path(), |_| true).sessions.is_empty());
+    assert_eq!(reread(root.path(), &detailed.sessions[0].key), Reread::Unrecognized);
+}
+
 #[test]
 fn live_sessions_missing_empty_and_unreadable() {
     let root = TempDir::new().expect("fixture root");
