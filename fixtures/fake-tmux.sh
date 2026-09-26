@@ -11,7 +11,8 @@
 # AGCTL_FAKE_TMUX_SET_AFTER_MS: reconnect delay, or never.
 # AGCTL_FAKE_TMUX_DROP_AFTER_MS: optional delay before dropping a reconnected bridge.
 # AGCTL_FAKE_TMUX_REBRIDGE_AFTER_MS: optional external reconnect after disconnect, before agctl reconnects.
-# Each delay can also name a file of pid/value rows for multi-session scenarios.
+# Only NULL_AFTER_MS and SET_AFTER_MS also accept a file of pid/value rows.
+# REBRIDGE_AFTER_MS and DROP_AFTER_MS accept only a plain delay value.
 # AGCTL_FAKE_TMUX_SCREEN: file of synthetic screen bytes (absent means zero bytes).
 # AGCTL_FAKE_TMUX_CAPTURE_EXIT: capture-only exit status.
 # AGCTL_FAKE_TMUX_CAPTURE_BYTES: fixed ASCII fixture byte count, including a screen sentinel.

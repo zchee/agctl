@@ -162,7 +162,7 @@ impl CaptureVerdict {
 }
 
 impl Capture {
-    pub(super) fn classify(self, keys: Keys) -> CaptureVerdict {
+    fn classify(self, keys: Keys) -> CaptureVerdict {
         let Ok(text) = std::str::from_utf8(&self.0) else { return CaptureVerdict::Invalid };
         if keys == Keys::Disconnect && !text.contains("Disconnect this session") {
             return CaptureVerdict::PanelAbsent;
