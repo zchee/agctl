@@ -208,11 +208,50 @@ fn ac7_a_lock_held_past_the_deadline_makes_the_second_process_busy() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn storage_mutex_status_compatibility_json_and_legacy_refresh() {
+    let mut keys = None;
+    for peer in [false, true] {
+        let server = MockServer::start();
+        let usage = usage_ok(&server);
+        let token = token_ok(&server, 28_800);
+        let fixture = expired_owned(&server);
+        let ns = fixture.ns_dir(ACCT, ORG);
+        let legacy = ns.join(".storage-write");
+        fs::write(&legacy, b"unchanged").expect("legacy fixture");
+        if peer {
+            fs::create_dir(ns.join(".storage-write.lock")).expect("peer fixture");
+        }
+        let output = fixture
+            .cmd()
+            .args(["claude", "status", "--json", "--refresh", "--account", EMAIL])
+            .output()
+            .expect("status");
+        assert_eq!(output.status.code(), Some(if peer { 2 } else { 0 }));
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8");
+        let row = only_row(&stdout);
+        let row_keys: Vec<String> = row.as_object().expect("row object").keys().cloned().collect();
+        if let Some(expected) = &keys {
+            assert_eq!(&row_keys, expected, "no new wire field for legacy or peer");
+        } else {
+            keys = Some(row_keys);
+        }
+        assert_eq!(row["state"], json!(if peer { "claude_session_detected" } else { "ok" }));
+        assert!(!stdout.contains("Legacy agctl artefact"), "doctor-only notice");
+        if peer {
+            assert!(stdout.contains(".storage-write.lock"), "{stdout}");
+        }
+        assert_eq!(token.calls(), usize::from(!peer));
+        assert_eq!(usage.calls(), usize::from(!peer));
+        assert_eq!(fs::read(&legacy).expect("legacy unchanged"), b"unchanged");
+    }
+}
+
+#[test]
 fn ac21_a_claude_lock_in_the_namespace_refuses_the_refresh() {
     // Plan AC21, invariant I11: agctl detects Claude Code's lock artefacts
     // and refuses. It never takes them, never removes them, and never writes
     // into a namespace that has one.
-    for artefact in [".oauth_refresh.lock", ".storage-write"] {
+    for artefact in [".oauth_refresh.lock", ".storage-write.lock"] {
         let server = MockServer::start();
         let usage = usage_ok(&server);
         let token = token_ok(&server, 28_800);

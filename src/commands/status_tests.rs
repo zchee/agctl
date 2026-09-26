@@ -791,8 +791,42 @@ fn ac49_a_response_with_no_windows_says_so_and_drives_exit_two() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn storage_mutex_status_compatibility() {
+    for peer in [false, true] {
+        let store = store();
+        let server = MockServer::start();
+        let usage = usage_ok(&server);
+        let token = token_ok(&server);
+        write_credential_file(&store, &blob("sk-ant-oat01-a", "sk-ant-ort01-a", expired_at()));
+        let ns = store.paths.namespace_dir(ACCT, ORG);
+        let legacy = ns.join(".storage-write");
+        fs::write(&legacy, b"unchanged").expect("legacy fixture");
+        if peer {
+            fs::create_dir(ns.join(".storage-write.lock")).expect("peer fixture");
+        }
+        let config = owned_config(&store);
+        let found = discover_with(&store, &config, &FakeReader::unlocked());
+        let rows = pass(&store, &server, found, Setup::new(&server));
+        let row = owned_row(&rows);
+        if peer {
+            assert!(
+                matches!(&row.state, AccountState::ClaudeSessionDetected { lock, .. } if lock == ".storage-write.lock")
+            );
+            token.assert_calls(0);
+            usage.assert_calls(0);
+        } else {
+            assert!(!row.state.is_failure(), "legacy alone is not busy: {:?}", row.state);
+            token.assert_calls(1);
+            usage.assert_calls(1);
+            assert!(!row.state.label().contains("Legacy agctl"));
+        }
+        assert_eq!(fs::read(&legacy).expect("legacy unchanged"), b"unchanged");
+    }
+}
+
+#[test]
 fn ac21_a_foreign_refresh_lock_refuses_the_refresh_and_leaves_it_alone() {
-    for artefact in [".oauth_refresh.lock", ".storage-write"] {
+    for artefact in [".oauth_refresh.lock", ".storage-write.lock"] {
         let store = store();
         let server = MockServer::start();
         let usage = usage_ok(&server);
@@ -2551,7 +2585,7 @@ fn a_migrated_items_plan_is_asked_in_phase_b_with_nothing_held() {
     let artefacts = [
         ns_dir.join(".oauth_refresh.lock"),
         store.paths.namespace_dir(ACCT, ORG).with_file_name(format!("{ORG}.lock")),
-        ns_dir.join(".storage-write"),
+        ns_dir.join(".storage-write.lock"),
     ];
     let lock = store.paths.lock_path(ACCT, ORG);
     let watched = artefacts.clone();

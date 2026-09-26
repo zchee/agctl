@@ -29,8 +29,11 @@ use crate::secret::ServiceEntry;
 /// Claude Code's primary refresh lock, inside the store directory (fact F17).
 pub const REFRESH_LOCK: &str = ".oauth_refresh.lock";
 
-/// Claude Code's read-modify-write guard (fact F37).
-pub const STORAGE_WRITE_LOCK: &str = ".storage-write";
+/// Claude Code's mutex directory: proper-lockfile appends `.lock` to the base (fact F47).
+pub const STORAGE_WRITE_LOCK: &str = ".storage-write.lock";
+
+/// An old agctl artefact, never a peer mutex or a removal/migration target.
+pub const LEGACY_STORAGE_WRITE_ARTEFACT: &str = ".storage-write";
 
 /// What somebody else is doing with a namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]

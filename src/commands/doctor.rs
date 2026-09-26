@@ -21,7 +21,7 @@
 //!    *or* be named by a held-lock record whose process is dead — see below;
 //! 2. it must not be in `.locks` — those are agctl's own locks, which are
 //!    never unlinked by anything (plan section 3.5);
-//! 3. its file name must be `.oauth_refresh.lock`, `.storage-write`, or a
+//! 3. its file name must be `.oauth_refresh.lock`, `.storage-write.lock`, or a
 //!    legacy `<namespace>.lock`;
 //! 4. it must be a **directory**, reached without following a symbolic link:
 //!    every Claude Code lock artefact is one, made by `mkdir` (fact F45). A
@@ -94,6 +94,7 @@ use crate::secret::ServiceEntry;
 use crate::secret::audit;
 use crate::secret::backend;
 use crate::secret::file_store;
+use crate::secret::foreign_activity::LEGACY_STORAGE_WRITE_ARTEFACT;
 use crate::secret::foreign_activity::REFRESH_LOCK;
 use crate::secret::foreign_activity::STORAGE_WRITE_LOCK;
 use crate::secret::held_locks;
@@ -527,7 +528,11 @@ fn held_locks_section(doctor: &Doctor<'_>) -> Vec<String> {
             continue;
         }
         for path in present {
-            if !backend::PEER_LOCK_REMOVAL {
+            if path.file_name().is_some_and(|name| name == LEGACY_STORAGE_WRITE_ARTEFACT) {
+                if let Some(notice) = legacy_storage_notice(path) {
+                    out.push(format!("    {notice}"));
+                }
+            } else if !backend::PEER_LOCK_REMOVAL {
                 let writer = if gone { "writer gone" } else { "writer not proved gone" };
                 out.push(format!(
                     "    {}  {writer}; {}",
@@ -696,6 +701,9 @@ fn namespace_section(
             Err(err) => out.push(format!("    stray tmp      could not be listed: {err}")),
         }
 
+        if let Some(notice) = legacy_storage_notice(&ns_dir.join(LEGACY_STORAGE_WRITE_ARTEFACT)) {
+            out.push(format!("    {notice}"));
+        }
         artefacts.extend(claude_artefacts(&ns_dir));
     }
 
@@ -745,6 +753,25 @@ fn namespace_section(
         ));
     }
     out
+}
+
+/// Reports old agctl storage artefacts without reading contents or following the leaf.
+fn legacy_storage_notice(path: &Path) -> Option<String> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    let kind = if meta.file_type().is_symlink() {
+        "symbolic link"
+    } else if meta.is_dir() {
+        "directory"
+    } else if meta.is_file() {
+        "regular file"
+    } else {
+        "other file type"
+    };
+    Some(format!(
+        "Legacy agctl artefact: `{}` (`{LEGACY_STORAGE_WRITE_ARTEFACT}`; {kind}); \
+         not a Claude Code mutex; left unchanged. agctl does not remove or migrate this artefact.",
+        path.display()
+    ))
 }
 
 /// The three artefacts a Claude Code session leaves for one namespace.
@@ -988,6 +1015,13 @@ pub fn remove_stale(
             "`{}` is one of agctl's own namespace locks. Those are never unlinked: `flock` \
              locks an inode, and a recreated lock file is a second inode two processes could \
              hold at once",
+            path.display()
+        )));
+    }
+    if path.file_name().is_some_and(|name| name == LEGACY_STORAGE_WRITE_ARTEFACT) {
+        return Err(refuse(format!(
+            "`{}` is a legacy agctl artefact, not a Claude Code mutex; removal and migration \
+             are unsupported",
             path.display()
         )));
     }

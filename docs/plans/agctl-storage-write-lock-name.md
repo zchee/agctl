@@ -1,7 +1,7 @@
 # agctl — Claude storage mutex name correction
 
 - **Version:** v1.2.
-- **Status:** pending approval — scoped critic APPROVE on v1.2 (reviewed SHA-256 `c29d512d5b13641e999040e7c23fcba2ffc0842640096c4045679a57d7e9ddcf`, snapshot `.omc/plans/snapshots/swl-v1.2.md`); zero blockers, zero should-fixes; user GO not given.
+- **Status:** landed — user GO given on the §10 decisions (D1 doctor-only, D2 synthetic-only, D3 Linux omitted, D4 signed local commit on `main` without push, D5 L1–L5 only); L1–L4 executed, six macOS gates passed, independent verifier ACCEPT (0 blockers); landing revision is the signed commit that carries this status line, on `main` after `809f3bf`. See §12.
 - **Mode:** RALPLAN-DR **DELIBERATE**.
 - **Baseline:** `main = b0328fc`; final plan path: `docs/plans/agctl-storage-write-lock-name.md`.
 - **Work item:** `agctl-storage-write-lock-name-4slm` (Claude storage mutex name mismatch).
@@ -13,19 +13,19 @@
 
 | Phase | Description | Status | Closing evidence / artifact |
 |---|---|---|---|
-| Planning | Draft, scoped critic, numbered user decisions | 🔶 in progress | This v1.2; critic APPROVE; user GO pending |
-| Correction | L1–L4, one executor working sequentially | 🔜 not started | Reviewed bounded diff and witnesses |
-| Certification | L5, independent verifier and approved delivery | 🔜 not started | Six macOS gates; accepted evidence; landing revision |
+| Planning | Draft, scoped critic, numbered user decisions | ✅ done | v1.2; critic APPROVE; user GO with D1–D5 recorded in `docs/plans/open-questions.md` |
+| Correction | L1–L4, one executor working sequentially | ✅ done | Bounded diff SHA-256 `3072118ab75f30099cfa0170a6f83a89c960a0ea869f303aadd8170fa673bc90`; witnesses AC225–AC227 |
+| Certification | L5, independent verifier and approved delivery | ✅ done | Six macOS gates exit 0; verifier ACCEPT; landing = the commit carrying this table |
 
 | Step | Lane / composition | Description | Status | Landing |
 |---|---|---|---|---|
-| L1 | Executor | Freeze baseline, inventories, and selected witness eligibility | 🔜 not started | None |
-| L2 | Same executor | Shared name, legacy reporting/refusal, exact-path tests | 🔜 not started | None |
-| L3 | Same executor | Bidirectional storage-only witnesses and regression inventory | 🔜 not started | None |
-| L4 | Same executor | Documentation and planted source pin | 🔜 not started | None |
-| L5 | Executor → independent verifier → lead | Closing gates, evidence acceptance, selected delivery | 🔜 not started | None |
+| L1 | Executor | Freeze baseline, inventories, and selected witness eligibility | ✅ done | Baseline `337633e` (1937 identities); synthetic-only per D2 |
+| L2 | Same executor | Shared name, legacy reporting/refusal, exact-path tests | ✅ done | `STORAGE_WRITE_LOCK` / `LEGACY_STORAGE_WRITE_ARTEFACT`; doctor-only legacy notice |
+| L3 | Same executor | Bidirectional storage-only witnesses and regression inventory | ✅ done | A/B witnesses PASS, wrong-name control `excluded == false`; 1954 identities (+17, −0) |
+| L4 | Same executor | Documentation and planted source pin | ✅ done | README D-073 hunks; F47/F58; `check_storage_mutex` with three plants |
+| L5 | Executor → independent verifier → lead | Closing gates, evidence acceptance, selected delivery | ✅ done | Gates 1–6 exit 0 (executor and verifier reruns); verifier ACCEPT; signed local commit on `main`, not pushed |
 
-**Stop point:** before L1. Next: scoped critic, then the user's explicit §10 decisions and GO.
+**Stop point:** after L5 delivery. Next: the user publishes `main`; Linux Phase 2 (`agctl-1y9.3`) may then take this landing as its baseline. The `namespace.rs:223` wording stays a docs-only follow-up.
 No new beads, per-step charters, or handoff ledgers. Use the existing work item only.
 Executor: `omc-configured-executor-4e63ea1e64dd`; independent verifier:
 `omc-configured-verifier-4e63ea1e64dd`; native named teammates, no model override.
@@ -528,3 +528,4 @@ recorded. No completion claim from this plan alone, and no self-approval by its 
   no blockers, no should-fixes; `.omc/drafts/swl-critic-verdict-v1.2.md`, reviewed 18:26:41 JST).
   This status line and changelog entry are the only edits since that hash; content unchanged. The
   plan stays `pending approval` until the user records the §10 decisions and gives GO.
+- **L5 landing record — 2026-09-26 23:13:43 JST (from `date` in the applying command):** user GO on §10 (D1 doctor-only notice/refusal; D2 synthetic macOS A/B/control accepted as agctl-only evidence, vendor not executed, no keychain read, no live HOME; D3 Debian gates omitted, Linux not rerun for this correction; D4 one signed correction+docs commit on `main`, no push, a recorded deviation from the branch+PR recommendation; D5 L1–L5 only). L1 baseline `337633e` (the plan's `b0328fc` literal was stale; the lead's unrelated `809f3bf` sits between baseline and landing and touches only `src/main.rs` and CI). Executor `omc-configured-executor-4e63ea1e64dd` ran L1–L4 and gates 1–6 (exit 0; nextest 1953 passed, 1 pre-existing ignored). Independent verifier `omc-configured-verifier-4e63ea1e64dd` reran the focused set (19/19), AC235 identity retention (1937 retained, +17, −0, five controls under bash/zsh/sh), the AC232 pin, a constant-revert mutation (witness A fails, wrong-name control passes with `excluded == false`) and gates 1–6 in order (exit 0); VERDICT ACCEPT, 0 blockers. Its first full nextest run failed one pre-existing `e2e_doctor` test because the verifier's TMPDIR carried a UUID-shaped segment; the rerun under the default temp environment passed and the failed evidence is retained. AC218–AC237 met; AC238/AC239 closed by this lead-staged commit. Bounded diff SHA-256 `3072118ab75f30099cfa0170a6f83a89c960a0ea869f303aadd8170fa673bc90`; frozen paths unchanged against `b0328fc`, `337633e` and `809f3bf`. Evidence in the session scratchpad (`swl-evidence/`, `swl-verify/`), not committed.

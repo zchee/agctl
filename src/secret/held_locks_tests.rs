@@ -178,6 +178,34 @@ fn read_all_refuses_a_record_larger_than_the_limit() {
 }
 
 #[test]
+fn storage_mutex_record_exact_paths() {
+    let store = store();
+    let root = store._dir.path();
+    let actual = root.join("actual");
+    fs::create_dir(&actual).expect("store");
+    let alias = root.join("alias");
+    std::os::unix::fs::symlink(&actual, &alias).expect("store alias");
+    for (name, other) in
+        [(".storage-write", ".storage-write.lock"), (".storage-write.lock", ".storage-write")]
+    {
+        let exact = actual.join(name);
+        let body = record_json(
+            5,
+            "live",
+            actual.to_str().expect("UTF-8"),
+            &[exact.to_str().expect("UTF-8")],
+        );
+        let file = write_record(&store, "exact.json", &body);
+        let record = read_all(&store.paths).pop().expect("record").record;
+        assert!(record.attests(&exact));
+        assert!(!record.attests(&actual.join(other)), "old and new never alias");
+        assert!(!record.attests(&root.join("different-parent").join(name)));
+        assert!(!record.attests(&alias.join(name)), "attestation never resolves a symlink");
+        assert_eq!(fs::read_to_string(&file).expect("record bytes"), body);
+    }
+}
+
+#[test]
 fn attests_compares_whole_paths_and_never_a_parent() {
     let store = store();
     write_record(

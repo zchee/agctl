@@ -160,6 +160,56 @@ fn ac73_remove_stale_refuses_an_outside_path_without_a_dead_record() {
 }
 
 #[test]
+fn storage_mutex_legacy_report_and_refusal_outside_record() {
+    let fixture = owned_store();
+    let live = fixture.live_store_dir();
+    let legacy = live.join(".storage-write");
+    let peer = live.join(".storage-write.lock");
+    fs::create_dir_all(&legacy).expect("legacy directory");
+    fs::create_dir(&peer).expect("peer directory");
+    age(&legacy);
+    age(&peer);
+    let record = write_record(&fixture, dead_pid(), &live, &[&legacy]);
+    let bytes = fs::read(&record).expect("record");
+    fixture
+        .cmd()
+        .args(["claude", "doctor", "--remove-stale", &peer.to_string_lossy(), "--yes"])
+        .assert()
+        .code(1)
+        .stderr(contains("is not inside"));
+    fixture
+        .cmd()
+        .args(["claude", "doctor", "--remove-stale", &legacy.to_string_lossy(), "--yes"])
+        .assert()
+        .code(1)
+        .stderr(contains("removal and migration are unsupported"));
+    let output = fixture.cmd().args(["claude", "doctor"]).output().expect("doctor");
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("UTF-8");
+    assert!(text.contains("Legacy agctl artefact"), "{text}");
+    assert!(!text.contains(&format!("--remove-stale {}", legacy.display())), "{text}");
+    assert_eq!(fs::read(&record).expect("unchanged record"), bytes);
+    assert!(legacy.is_dir() && peer.is_dir());
+}
+
+#[test]
+fn storage_mutex_record_exact_paths_corrected_sibling() {
+    let fixture = owned_store();
+    let leaked = leak(&fixture);
+    let sibling = fixture.live_store_dir().join(".storage-write.lock");
+    fs::create_dir(&sibling).expect("corrected peer");
+    age(&sibling);
+    write_record(&fixture, dead_pid(), &fixture.live_store_dir(), &[&sibling]);
+    fixture
+        .cmd()
+        .args(["claude", "doctor", "--remove-stale", &leaked.to_string_lossy(), "--yes"])
+        .assert()
+        .code(1)
+        .stderr(contains("is not inside"));
+    assert!(leaked.is_dir() && sibling.is_dir());
+}
+
+#[test]
 fn a_symlinked_held_locks_directory_authorises_no_removal() {
     // `agctl-dit`. After `1yj` the *writer* reaches `<namespace_root>/held-locks`
     // through an `O_NOFOLLOW` walk, and the reader still listed it by path — so

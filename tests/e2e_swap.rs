@@ -1026,7 +1026,9 @@ fn ac81_a_swap_touches_nothing_outside_the_namespace_root() {
     }
 
     // The live store's own artefacts, by path rather than by inspection.
-    for name in [".oauth_refresh.lock", ".storage-write", ".credentials.json"] {
+    for name in
+        [".oauth_refresh.lock", ".storage-write.lock", ".storage-write", ".credentials.json"]
+    {
         assert!(!live_store.join(name).exists(), "the live store must be untouched: {name}");
     }
     // Ruling OQ11's two namespace locks: both were taken, and both are under
@@ -1643,7 +1645,7 @@ fn ac68_a_fresh_refresh_lock_is_waited_out_with_nothing_held() {
 #[test]
 fn ac70_an_eexist_at_the_third_lock_restarts_without_waiting_inside_the_hold() {
     // Plan AC70, at the swap level rather than the lock module's. A fresh
-    // `.storage-write` — position 3 of the peer's nesting — makes every
+    // `.storage-write.lock` — position 3 of the peer's nesting — makes every
     // attempt fail *after* the first two locks are taken. The rule then
     // releases everything already held and returns to the lock-free path;
     // what it must never do is wait, sample or sleep while holding one.
@@ -4079,7 +4081,9 @@ fn a_swap_that_writes_the_refresh_back_touches_nothing_outside_the_namespace_roo
             root.display()
         );
     }
-    for name in [".oauth_refresh.lock", ".storage-write", ".credentials.json"] {
+    for name in
+        [".oauth_refresh.lock", ".storage-write.lock", ".storage-write", ".credentials.json"]
+    {
         assert!(!live_store.join(name).exists(), "the live store must be untouched: {name}");
     }
     live_item_never_written(&fixture);

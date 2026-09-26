@@ -16,7 +16,10 @@
 //! its `stale` window as abandoned (fact F45). A credential-store hold is
 //! **three** such directories, in the peer's own nesting (facts F46, F58):
 //! the primary refresh lock inside the store directory, the legacy lock
-//! beside its *resolved* spelling, and `.storage-write` innermost.
+//! beside its *resolved* spelling, and `.storage-write.lock` innermost.
+//! The storage caller supplies base `.storage-write`; proper-lockfile appends
+//! `.lock` (F47). agctl's former unsuffixed directory did not exclude those
+//! credential-store mutations (F58).
 //!
 //! Two properties make holding three of a peer's locks survivable, and both
 //! are structural rather than hoped for:
@@ -27,7 +30,7 @@
 //!   path but a guaranteed failure for the peer, so an `EEXIST` at any of the
 //!   three positions releases everything already held and restarts from the
 //!   lock-free probe instead of waiting (architect N-1).
-//! - **`.storage-write` is taken with one non-blocking `mkdir`.** Fact F47's
+//! - **`.storage-write.lock` is taken with one non-blocking `mkdir`.** Fact F47's
 //!   own retry ladder is a ten-step, ~7.5 s affair; importing it into the hold
 //!   would blow the budget on its own. One attempt, `retries: 0`, and a
 //!   restart on failure.
@@ -218,7 +221,7 @@ pub const REFRESH_PROFILE: LockProfile = LockProfile {
     hold_budget: HOLD_BUDGET,
 };
 
-/// `.storage-write` (fact F47), restored to the held set by the corrected
+/// `.storage-write.lock` (fact F47), restored to the held set by the corrected
 /// F58 and taken with a single non-blocking `mkdir`.
 pub const STORAGE_WRITE_PROFILE: LockProfile = LockProfile {
     stale: Duration::from_secs(15),
@@ -434,7 +437,7 @@ impl std::fmt::Debug for LockSlot<'_> {
 /// relative to an already-opened directory.
 ///
 /// A trait, not three functions, for one reason: acceptance criterion AC62
-/// asserts that `.storage-write` is attempted **once** and that no wait happens
+/// asserts that `.storage-write.lock` is attempted **once** and that no wait happens
 /// while anything is held, and both are claims about the *sequence* of
 /// operations. A spy that records the sequence can check them; no
 /// after-the-fact inspection of the filesystem can.
@@ -524,7 +527,7 @@ fn modified(stat: &rustix::fs::Stat) -> Option<SystemTime> {
 /// Which of a hold's two directories one artefact lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Which {
-    /// Inside the store directory: the primary lock and `.storage-write`.
+    /// Inside the store directory: the primary lock and `.storage-write.lock`.
     Store,
     /// Beside it, in the store directory's parent: the legacy lock.
     Parent,
@@ -1155,10 +1158,10 @@ struct LockPlan {
 /// The three directories, in the peer's own nesting.
 ///
 /// Primary first, then the legacy lock beside the store directory, then
-/// `.storage-write` innermost (facts F46 and the corrected F58). The order is
-/// the peer's, not a preference: taking `.storage-write` first would be a
+/// `.storage-write.lock` innermost (facts F46 and the corrected F58). The order is
+/// the peer's, not a preference: taking `.storage-write.lock` first would be a
 /// genuine ABBA deadlock against a session whose own nesting is refresh body →
-/// persist → `.storage-write`.
+/// persist → `.storage-write.lock`.
 ///
 /// The legacy lock's name comes from the **opened chain** — the store
 /// directory's own component as the `O_NOFOLLOW` walk accepted it, placed in
@@ -1487,7 +1490,7 @@ enum TakeFailure {
 /// `mkdir`s the three in order, recording each one's modification time.
 ///
 /// Every attempt is a single non-blocking `mkdir` — including
-/// `.storage-write`, whose profile carries `retries: 0` precisely so that
+/// `.storage-write.lock`, whose profile carries `retries: 0` precisely so that
 /// none of fact F47's ten-step ladder enters the hold.
 ///
 /// A directory whose modification time cannot be read immediately after its

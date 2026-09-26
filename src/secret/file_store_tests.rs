@@ -787,7 +787,7 @@ fn remove_dir_under_root_refuses_a_non_empty_directory() {
     // Never a recursive delete: a lock directory with something in it is not
     // a lapsed lock, so `ENOTEMPTY` is reported rather than worked around.
     let store = store();
-    let lock = plant_lock_dir(&store, ".storage-write");
+    let lock = plant_lock_dir(&store, ".storage-write.lock");
     std::fs::write(lock.join("holder.json"), b"{}").expect("writable");
 
     let err = remove_dir_under_root(&store.paths, &lock)
@@ -795,6 +795,19 @@ fn remove_dir_under_root_refuses_a_non_empty_directory() {
 
     assert!(matches!(err, FileStoreError::NotEmpty(_)), "got {err:?}");
     assert!(lock.join("holder.json").exists(), "and its contents are untouched");
+}
+
+#[test]
+fn storage_mutex_symlink_and_anomaly_nonempty_legacy() {
+    let store = store();
+    let legacy = plant_lock_dir(&store, ".storage-write");
+    let contents = legacy.join("keep");
+    std::fs::write(&contents, b"unchanged").expect("legacy contents");
+    assert!(matches!(
+        remove_dir_under_root(&store.paths, &legacy),
+        Err(FileStoreError::NotEmpty(_))
+    ));
+    assert_eq!(std::fs::read(&contents).expect("contents retained"), b"unchanged");
 }
 
 #[test]

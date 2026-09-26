@@ -287,7 +287,7 @@ store.** It is fenced accordingly. The path must:
 1. spell a location under `<config-dir>/claude/`, or be named by a held-lock record whose
    process is gone (the one exception, below);
 2. not be in `.locks/`: those are agctl's own locks, which nothing ever unlinks;
-3. be named `.oauth_refresh.lock`, `.storage-write`, or a legacy `<namespace>.lock`;
+3. be named `.oauth_refresh.lock`, `.storage-write.lock`, or a legacy `<namespace>.lock`;
 4. be a **directory**, reached without following a symbolic link. Claude Code takes every
    one of its locks with `mkdir` and releases it with `rmdir`, so a directory is the only
    shape a lapsed lock has. A regular file at one of those names was written by something
@@ -301,6 +301,11 @@ store.** It is fenced accordingly. The path must:
 
 Anything else is refused, including a path that satisfies six of the seven. The command
 takes about twelve seconds because of step 6.
+
+The unsuffixed `.storage-write` is a **legacy agctl artefact, not a Claude Code mutex**.
+`doctor` reports its type without reading its contents and leaves it unchanged; agctl does
+not remove, rename or migrate it, even with `--yes` or a dead writer's held-lock record.
+It is not a busy/peer-lock signal, and `status` and `watch` add no legacy notice.
 
 The exception to step 1 is the only way `--remove-stale` reaches outside
 `<config-dir>/claude/`. When agctl takes Claude Code's locks itself, it records what it is
@@ -751,7 +756,7 @@ across a network request or a prompt, and the two are never held together.
 `use --undo`, one lock when an isolated session is seeded, and the session directory you
 name with `--claude-config-dir`.** Against the live store (`~/.claude`, or
 `CLAUDE_CONFIG_DIR`) a live swap creates and removes Claude Code's three credential-store
-lock artefacts (`.oauth_refresh.lock` and `.storage-write` inside the resolved store, and
+lock artefacts (`.oauth_refresh.lock` and `.storage-write.lock` inside the resolved store, and
 the legacy `<store>.lock` beside it) and writes the keychain item. It never writes or
 removes a credential file there. Its config step then writes exactly three things: the
 lock beside the configuration file (`~/.claude.json.lock`), a backup in Claude Code's

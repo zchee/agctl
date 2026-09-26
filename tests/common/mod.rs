@@ -234,7 +234,7 @@ impl Fixture {
         [
             ns_dir.join(".oauth_refresh.lock"),
             self.config_dir().join("claude").join(acct).join(format!("{org}.lock")),
-            ns_dir.join(".storage-write"),
+            ns_dir.join(".storage-write.lock"),
         ]
     }
 
@@ -289,7 +289,7 @@ impl Fixture {
         [
             resolved.join(".oauth_refresh.lock"),
             PathBuf::from(legacy),
-            resolved.join(".storage-write"),
+            resolved.join(".storage-write.lock"),
         ]
     }
 

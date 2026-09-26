@@ -18,6 +18,29 @@ fn owned<'a>(export: &'a str, canonical: Option<&'a str>) -> OwnedMeta<'a> {
 }
 
 #[test]
+fn storage_mutex_foreign_detection() {
+    for (legacy, peer) in [(false, true), (true, false), (true, true)] {
+        let (_dir, ns_dir) = namespace();
+        if legacy {
+            std::fs::create_dir(ns_dir.join(LEGACY_STORAGE_WRITE_ARTEFACT))
+                .expect("legacy fixture");
+        }
+        if peer {
+            std::fs::create_dir(ns_dir.join(".storage-write.lock")).expect("peer fixture");
+        }
+        let reader = FakeReader::unlocked();
+        let activity = detect(&ns_dir, &owned("aaaaaaaa", None), &[], &reader);
+        if peer {
+            assert!(matches!(activity, ForeignActivity::ClaudeLock { name, .. }
+                if name == ".storage-write.lock"));
+        } else {
+            assert_eq!(activity, ForeignActivity::None);
+        }
+        assert!(reader.reads().is_empty());
+    }
+}
+
+#[test]
 fn a_clean_namespace_has_no_activity() {
     let (_dir, ns_dir) = namespace();
     let reader = FakeReader::unlocked();

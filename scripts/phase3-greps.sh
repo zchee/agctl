@@ -527,6 +527,41 @@ check_remove_set() {
     return "$bad"
 }
 
+# AC232: the vendor appends .lock to its storage base. Only the named legacy
+# constant may retain the bare literal, and it must never reach peer planning.
+check_storage_mutex() {
+    local root=$1 hits text file count bad=0
+    hits=$(code_hits "$root" '"\.storage-write"') || scan_failed check_storage_mutex
+    count=$(printf '%s\n' "$hits" | grep -c . || true)
+    file=${hits%%:*}
+    text=$(printf '%s\n' "$hits" | cut -d: -f3-)
+    if [[ $count -ne 1 || $file != src/secret/foreign_activity.rs ||
+          $text != 'pub const LEGACY_STORAGE_WRITE_ARTEFACT: &str = ".storage-write";' ]]; then
+        printf '  only LEGACY_STORAGE_WRITE_ARTEFACT may spell the unsuffixed literal, exactly once:\n%s\n' "$hits"
+        bad=1
+    fi
+    hits=$(code_hits "$root" '"\.storage-write\.lock"') || scan_failed check_storage_mutex
+    count=$(printf '%s\n' "$hits" | grep -c . || true)
+    file=${hits%%:*}
+    text=$(printf '%s\n' "$hits" | cut -d: -f3-)
+    if [[ $count -ne 1 || $file != src/secret/foreign_activity.rs ||
+          $text != 'pub const STORAGE_WRITE_LOCK: &str = ".storage-write.lock";' ]]; then
+        printf '  STORAGE_WRITE_LOCK must name the corrected mutex exactly once:\n%s\n' "$hits"
+        bad=1
+    fi
+    hits=$(scoped_code_hits "$root" '\bLEGACY_STORAGE_WRITE_ARTEFACT\b' \
+        src/secret/foreign_activity.rs src/secret/claude_lock.rs) || scan_failed check_storage_mutex
+    count=$(printf '%s\n' "$hits" | grep -c . || true)
+    # scoped_code_hits visits these files singly, so rg emits line:text here.
+    text=$(printf '%s\n' "$hits" | cut -d: -f2-)
+    if [[ $count -ne 1 ||
+          $text != 'pub const LEGACY_STORAGE_WRITE_ARTEFACT: &str = ".storage-write";' ]]; then
+        printf '  legacy storage artefacts must not enter detection or acquisition planning:\n%s\n' "$hits"
+        bad=1
+    fi
+    return "$bad"
+}
+
 check_codex_home() {
     local hits count
     hits=$(code_hits "$1" '"CODEX_HOME"') || scan_failed check_codex_home
@@ -1603,7 +1638,19 @@ plant_platform_cfg_macro() { plant_line "$1" 'const _LINUX_PLANT: bool = cfg!(ta
 plant_proc_paths() { plant_line "$1" 'const _LINUX_PLANT: &str = "/proc/self/stat";'; }
 plant_proc_paths_fmt() { plant_line "$1" $'const _LINUX_PLANT: &str =\n    "/proc";'; }
 
-CHECKS=(platform_cfg proc_paths unwrap remove_set codex_home sentinels jwt bearer removal_helpers exposed codex_bin codex_env
+plant_storage_mutex_reverted() {
+    perl -pi -e 's/(pub const STORAGE_WRITE_LOCK: &str = ")\.storage-write\.lock(";)/${1}.storage-write$2/' \
+        "$1/src/secret/foreign_activity.rs"
+}
+plant_storage_mutex_extra_literal() {
+    plant_line "$1" 'const _STORAGE_PLANT: &str = ".storage-write";' src/secret/foreign_activity.rs
+}
+plant_storage_mutex_legacy_candidate() {
+    perl -pi -e 's/ns_dir\.join\(STORAGE_WRITE_LOCK\)/ns_dir.join(LEGACY_STORAGE_WRITE_ARTEFACT)/' \
+        "$1/src/secret/foreign_activity.rs"
+}
+
+CHECKS=(storage_mutex platform_cfg proc_paths unwrap remove_set codex_home sentinels jwt bearer removal_helpers exposed codex_bin codex_env
     exposure_count auth_json account_header toml locked_read marker_mutators stop_policy
     codex_debug_assert state_path codex_flock wham_usage codex_usage_url codex_timeouts codex_redirects codex_decoded_cap credits_state
     auth_host codex_token_url oauth_cancelled oauth_refresh_callers consent_callers refresh_usage_cache receipt_type
@@ -1613,6 +1660,9 @@ CHECKS=(platform_cfg proc_paths unwrap remove_set codex_home sentinels jwt beare
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
+    "storage_mutex plant_storage_mutex_reverted"
+    "storage_mutex plant_storage_mutex_extra_literal"
+    "storage_mutex plant_storage_mutex_legacy_candidate"
     "platform_cfg plant_platform_cfg"
     "platform_cfg plant_platform_cfg_fmt"
     "platform_cfg plant_platform_cfg_macro"

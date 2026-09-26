@@ -643,6 +643,331 @@ fn stale_age() -> Duration {
 // AC62 — the acquire truth table
 // ---------------------------------------------------------------------------
 
+// A source-derived fresh-lock model, not a general proper-lockfile implementation.
+// No fitting proper-lockfile crate exists; std channels and the existing filesystem
+// primitives keep this test-only model independent of agctl's lock-name constant.
+struct StorageOnly<'a> {
+    anchor: &'a LockAnchor,
+    artefact: Artefact,
+    acquired: Instant,
+    released: bool,
+}
+
+impl<'a> StorageOnly<'a> {
+    fn take(anchor: &'a LockAnchor, wrong_name: bool) -> Self {
+        let [_, _, storage] = plan(anchor);
+        let mut artefact = storage.artefact;
+        if wrong_name {
+            artefact.name = OsString::from(".storage-write");
+            artefact.path = anchor.store_dir().join(&artefact.name);
+        }
+        let acquired = Instant::now();
+        RealFs.mkdir(anchor.in_store(&artefact.name, &artefact.path)).expect("storage-only mkdir");
+        Self { anchor, artefact, acquired, released: false }
+    }
+
+    fn release(mut self) -> (Instant, Duration) {
+        RealFs
+            .rmdir(self.anchor.in_store(&self.artefact.name, &self.artefact.path))
+            .expect("storage-only rmdir");
+        self.released = true;
+        let released = Instant::now();
+        (released, released.duration_since(self.acquired))
+    }
+}
+
+impl Drop for StorageOnly<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = RealFs.rmdir(self.anchor.in_store(&self.artefact.name, &self.artefact.path));
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StoragePeerEvent {
+    Ready,
+    Attempt { at: Instant, acquired: bool },
+    Mutated(Instant),
+}
+
+/// Models only fresh EEXIST/retry/unlink semantics from Wjr, never a vendor process.
+fn storage_peer(
+    store: &Path,
+    events: &std::sync::mpsc::Sender<StoragePeerEvent>,
+    stop: &std::sync::mpsc::Receiver<()>,
+) -> std::io::Result<bool> {
+    struct PeerDirectory(PathBuf);
+    impl Drop for PeerDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+    let mut lock_name = store.join(".storage-write").into_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let send = |event| events.send(event).map_err(std::io::Error::other);
+    send(StoragePeerEvent::Ready)?;
+    for attempt in 0..=10 {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "peer deadline"));
+        }
+        match fs::create_dir(&lock_path) {
+            Ok(()) => {
+                let directory = PeerDirectory(lock_path.clone());
+                send(StoragePeerEvent::Attempt { at: Instant::now(), acquired: true })?;
+                fs::remove_file(store.join("synthetic-credentials"))?;
+                send(StoragePeerEvent::Mutated(Instant::now()))?;
+                drop(directory);
+                return Ok(true);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                send(StoragePeerEvent::Attempt { at: Instant::now(), acquired: false })?;
+            }
+            Err(err) => return Err(err),
+        }
+        if attempt < 10 {
+            let delay = Duration::from_millis((100_u64 << attempt).min(1000));
+            match stop.recv_timeout(delay.min(deadline.saturating_duration_since(Instant::now()))) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(false),
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn storage_witness(wrong_name: bool, cancel_peer: bool) {
+    let fixture = Fixture::new();
+    let anchor = fixture.anchor();
+    let credential = fixture.store.join("synthetic-credentials");
+    fs::write(&credential, b"synthetic").expect("fixture credential");
+    let origin = Instant::now();
+    std::thread::scope(|scope| {
+        // Drop runs before the scoped join on every assertion/error exit.
+        let hold = StorageOnly::take(&anchor, wrong_name);
+        let acquired = hold.acquired;
+        let path = hold.artefact.path.clone();
+        let hold_target = acquired + Duration::from_millis(1000);
+        let peer_deadline = Instant::now() + Duration::from_secs(12);
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        assert!(credential.exists());
+        assert!(!fixture.primary.exists() && !fixture.legacy.exists());
+        let store = &fixture.store;
+        let peer = scope.spawn(move || storage_peer(store, &events_tx, &stop_rx));
+        let ready = events_rx.recv_timeout(hold_target.saturating_duration_since(Instant::now()));
+        assert!(matches!(ready, Ok(StoragePeerEvent::Ready)), "peer readiness: {ready:?}");
+        let attempted =
+            events_rx.recv_timeout(hold_target.saturating_duration_since(Instant::now()));
+        let Ok(StoragePeerEvent::Attempt { at: attempted_at, acquired: peer_acquired }) = attempted
+        else {
+            panic!("a real mkdir attempt must overlap the hold: {attempted:?}")
+        };
+        assert!(path.is_dir() && attempted_at >= acquired);
+        let excluded = !peer_acquired && credential.exists();
+        assert_eq!(excluded, !wrong_name, "the control must expose missing exclusion");
+        let mutation = if wrong_name {
+            let event =
+                events_rx.recv_timeout(hold_target.saturating_duration_since(Instant::now()));
+            let Ok(StoragePeerEvent::Mutated(at)) = event else {
+                panic!("control mutation: {event:?}")
+            };
+            assert!(!credential.exists());
+            // Completion, not merely a mutation event, must precede old-name release.
+            assert!(peer.join().expect("peer joined").expect("peer operation"));
+            Some(at)
+        } else {
+            assert!(credential.exists(), "credential intact through observed contention");
+            if cancel_peer {
+                drop(stop_tx);
+                assert!(!peer.join().expect("peer joined").expect("cancelled peer"));
+                assert!(credential.exists());
+            } else {
+                // The join occurs below after the storage primitive is released.
+                let (released, elapsed) = hold.release();
+                assert!(elapsed <= HOLD_BUDGET, "hold_ms={}", elapsed.as_millis());
+                let mutated = loop {
+                    let event = events_rx
+                        .recv_timeout(peer_deadline.saturating_duration_since(Instant::now()))
+                        .expect("separate 12 s peer deadline");
+                    if let StoragePeerEvent::Mutated(at) = event {
+                        break at;
+                    }
+                };
+                assert!(peer.join().expect("peer joined").expect("peer operation"));
+                assert!(mutated >= released, "mutation must follow release");
+                assert!(Instant::now() <= peer_deadline);
+                println!(
+                    "agctl-only; vendor not executed; A excluded=true path={} acquired_us={} attempt_us={} release_us={} mutation_us={} hold_ms={} primary_absent=true legacy_absent=true cleanup=true",
+                    path.display(),
+                    acquired.duration_since(origin).as_micros(),
+                    attempted_at.duration_since(origin).as_micros(),
+                    released.duration_since(origin).as_micros(),
+                    mutated.duration_since(origin).as_micros(),
+                    elapsed.as_millis()
+                );
+                assert!(!path.exists() && !fixture.storage.exists());
+                return;
+            }
+            None
+        };
+        let (released, elapsed) = hold.release();
+        assert!(elapsed <= HOLD_BUDGET, "hold_ms={}", elapsed.as_millis());
+        assert!(mutation.is_none_or(|at| at < released));
+        assert!(Instant::now() <= peer_deadline);
+        println!(
+            "agctl-only; vendor not executed; control={wrong_name} cancelled={cancel_peer} excluded={excluded} path={} acquired_us={} attempt_us={} release_us={} mutation_us={:?} hold_ms={} primary_absent=true legacy_absent=true cleanup=true",
+            path.display(),
+            acquired.duration_since(origin).as_micros(),
+            attempted_at.duration_since(origin).as_micros(),
+            released.duration_since(origin).as_micros(),
+            mutation.map(|at| at.duration_since(origin).as_micros()),
+            elapsed.as_millis()
+        );
+        assert!(!path.exists() && !fixture.storage.exists());
+    });
+    assert!(!fixture.primary.exists() && !fixture.legacy.exists());
+    assert!(fixture.records().is_empty());
+}
+
+#[test]
+fn storage_mutex_peer_exclusion_agctl_holds() {
+    storage_witness(false, false);
+}
+
+#[test]
+fn storage_mutex_wrong_name_control() {
+    storage_witness(true, false);
+}
+
+#[test]
+fn storage_mutex_peer_exclusion_peer_holds() {
+    let fixture = Fixture::new();
+    let credential = fixture.store.join("synthetic-credentials");
+    fs::write(&credential, b"synthetic").expect("fixture credential");
+    let mut peer_name = fixture.store.join(".storage-write").into_os_string();
+    peer_name.push(".lock");
+    let peer_path = PathBuf::from(peer_name);
+    let origin = Instant::now();
+    std::thread::scope(|scope| {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let peer = scope.spawn(move || {
+            fs::create_dir(&peer_path).expect("independent peer mkdir");
+            ready_tx.send(()).expect("ready receiver");
+            let release = release_rx.recv_timeout(Duration::from_secs(12));
+            fs::remove_dir(&peer_path).expect("fixture-owned peer cleanup");
+            assert!(release.is_ok(), "peer deadline or caller failure: {release:?}");
+        });
+        ready_rx.recv_timeout(Duration::from_secs(12)).expect("peer ready");
+        let holders = FakeHolders::none_stopped();
+        let clock = fixture.fake_clock();
+        let seams = fixture.seams(&clock, &holders);
+        let start = Instant::now();
+        let acquired = fixture.acquire(&seams, &Cancel::new(), &Fault::none()).expect("acquire");
+        let elapsed = start.elapsed();
+        assert!(matches!(acquired.outcome, AcquireOutcome::Busy { .. }));
+        assert!(elapsed <= HOLD_BUDGET, "busy_ms={}", elapsed.as_millis());
+        let round = [
+            Op::Mkdir(fixture.primary.clone(), true),
+            Op::Mkdir(fixture.legacy.clone(), true),
+            Op::Mkdir(fixture.storage.clone(), false),
+            Op::Rmdir(fixture.legacy.clone()),
+            Op::Rmdir(fixture.primary.clone()),
+        ];
+        assert_eq!(
+            fixture.timeline.ops(),
+            (0..4).flat_map(|_| round.iter().cloned()).collect::<Vec<_>>(),
+            "one storage attempt per round; prefix released before restart"
+        );
+        assert!(!fixture.timeline.slept_while_holding() && clock.slept().is_empty());
+        assert!(fixture.records().is_empty());
+        assert!(!fixture.primary.exists() && !fixture.legacy.exists());
+        assert_eq!(fs::read(&credential).expect("no write"), b"synthetic");
+        release_tx.send(()).expect("peer release");
+        peer.join().expect("peer joined");
+        println!(
+            "agctl-only; vendor not executed; B excluded=true busy_ms={} rounds=4 hold_ms={} cleanup=true",
+            elapsed.as_millis(),
+            origin.elapsed().as_millis()
+        );
+    });
+    assert!(origin.elapsed() <= Duration::from_secs(12));
+    let acquired = fixture
+        .acquire(&Seams::real(Clock::system()), &Cancel::new(), &Fault::none())
+        .expect("fresh acquisition");
+    let AcquireOutcome::Held(hold) = acquired.outcome else { panic!("fixture peer gone") };
+    drop(hold);
+    assert!(fixture.all().iter().all(|path| !path.exists()));
+    assert!(fixture.records().is_empty());
+}
+
+#[test]
+fn storage_mutex_bound_and_cleanup() {
+    storage_witness(false, false);
+    storage_witness(true, false);
+    storage_witness(false, true);
+    let fixture = Fixture::new();
+    let anchor = fixture.anchor();
+    let start = Instant::now();
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _hold = StorageOnly::take(&anchor, false);
+        panic!("exercise unwinding cleanup");
+    }));
+    assert!(failed.is_err());
+    assert!(!fixture.storage.exists());
+    assert!(start.elapsed() <= HOLD_BUDGET);
+    let (events_tx, _events_rx) = std::sync::mpsc::channel();
+    let (_stop_tx, stop_rx) = std::sync::mpsc::channel();
+    assert_eq!(
+        storage_peer(&fixture.store, &events_tx, &stop_rx)
+            .expect_err("missing synthetic credential")
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert!(!fixture.storage.exists(), "peer drops its directory on an I/O error");
+    println!(
+        "agctl-only; vendor not executed; unwind_and_peer_error hold_ms={} cleanup=true",
+        start.elapsed().as_millis()
+    );
+}
+
+#[test]
+fn storage_mutex_shared_name_and_order() {
+    let fixture = Fixture::new();
+    let anchor = fixture.anchor();
+    let plans = plan(&anchor);
+    assert_eq!(plans[0].artefact.name, ".oauth_refresh.lock");
+    assert_eq!(plans[1].artefact.name, "org.lock");
+    assert_eq!(plans[2].artefact.name, ".storage-write.lock");
+    assert_eq!(plans[2].profile.stale, Duration::from_secs(15));
+    assert_eq!(plans[2].profile.retries, 0);
+    assert_eq!(plans[2].profile.hold_budget, Duration::from_millis(3000));
+    let holders = FakeHolders::none_stopped();
+    let seams = Seams { fs: fixture.fs.clone(), holders: &holders, clock: Clock::system() };
+    let acquired = fixture.acquire(&seams, &Cancel::new(), &Fault::none()).expect("acquire");
+    let AcquireOutcome::Held(hold) = acquired.outcome else { panic!("expected hold") };
+    let record = fixture.records().pop().expect("held record").record;
+    assert_eq!(record.paths, hold.paths());
+    assert!(record.attests(&fixture.store.join(".storage-write.lock")));
+    assert!(!record.attests(&fixture.store.join(".storage-write")));
+    drop(hold);
+    assert_eq!(
+        fixture.timeline.ops(),
+        vec![
+            Op::Mkdir(fixture.primary.clone(), true),
+            Op::Mkdir(fixture.legacy.clone(), true),
+            Op::Mkdir(fixture.storage.clone(), true),
+            Op::Rmdir(fixture.storage.clone()),
+            Op::Rmdir(fixture.legacy.clone()),
+            Op::Rmdir(fixture.primary.clone()),
+        ]
+    );
+    assert!(fixture.records().is_empty());
+}
+
 #[test]
 fn acquire_creates_all_three_in_the_peers_nesting() {
     let fixture = Fixture::new();
@@ -656,7 +981,11 @@ fn acquire_creates_all_three_in_the_peers_nesting() {
     let AcquireOutcome::Held(hold) = acquired.outcome else { panic!("expected a hold") };
     assert_eq!(hold.store_dir(), fixture.store, "the hold knows what it is about");
     assert_eq!(hold.tree(), Tree::Agctl, "and which tree it is in (invariant I11′)");
-    assert_eq!(hold.paths(), fixture.all().to_vec(), "primary, legacy, `.storage-write` innermost");
+    assert_eq!(
+        hold.paths(),
+        fixture.all().to_vec(),
+        "primary, legacy, `.storage-write.lock` innermost"
+    );
     for path in fixture.all() {
         assert!(
             path.is_dir(),
@@ -738,7 +1067,7 @@ fn releasing_runs_in_reverse_order() {
 
 #[test]
 fn storage_write_is_one_non_blocking_attempt_per_round() {
-    // Plan AC62: `.storage-write`'s profile carries `retries: 0` precisely so
+    // Plan AC62: `.storage-write.lock`'s profile carries `retries: 0` precisely so
     // that none of fact F47's ten-step, ~7.5 s ladder enters the hold. A
     // second attempt, or any wait, would show up in the timeline.
     let fixture = Fixture::new();
@@ -767,7 +1096,7 @@ fn storage_write_is_one_non_blocking_attempt_per_round() {
     assert_eq!(
         fixture.timeline.mkdir_attempts(&fixture.storage),
         rounds,
-        "exactly one `.storage-write` attempt per round, never a retry inside one"
+        "exactly one `.storage-write.lock` attempt per round, never a retry inside one"
     );
     assert!(clock.slept().is_empty(), "and no wait at all: the primary was free");
     assert!(!fixture.timeline.slept_while_holding());
@@ -832,7 +1161,7 @@ fn an_eexist_at_each_position_releases_everything_and_restarts() {
     );
     assert!(!fixture.timeline.slept_while_holding());
 
-    // Position 3: `.storage-write`, the innermost.
+    // Position 3: `.storage-write.lock`, the innermost.
     let fixture = Fixture::new();
     fixture.plant(&fixture.storage, Duration::from_secs(1));
     let clock = fixture.fake_clock();
@@ -1199,7 +1528,7 @@ fn the_real_holder_check_never_claims_a_sweep_it_did_not_finish() {
 
 #[test]
 fn each_profile_has_its_own_staleness_window() {
-    // Fact F47: `.storage-write` is stale at 15 s, not 60 s. Borrowing the
+    // Fact F47: `.storage-write.lock` is stale at 15 s, not 60 s. Borrowing the
     // wrong window for the wrong lock is what `LockProfile` exists to stop.
     let fixture = Fixture::new();
     fixture.plant(&fixture.storage, Duration::from_secs(20));
@@ -2604,7 +2933,7 @@ fn a_break_survives_a_cancellation_at_the_top_of_a_restart_iteration() {
     // Cancelled while the break rule is unwinding, not during a wait: the run
     // then survives to the restart and dies at the top of the loop.
     fixture.fs.cancel_after_rmdir(&fixture.legacy, cancel.clone());
-    // And a peer holds `.storage-write`, which is what forces the restart.
+    // And a peer holds `.storage-write.lock`, which is what forces the restart.
     fixture.fs.plant_before_mkdir(&fixture.storage);
 
     let clock = fixture.fake_clock();
@@ -2622,7 +2951,7 @@ fn a_break_survives_a_cancellation_at_the_top_of_a_restart_iteration() {
     let ops = fixture.timeline.ops();
     assert!(
         ops.contains(&Op::Mkdir(fixture.storage.clone(), false)),
-        "the peer held `.storage-write`, so the take failed there: {ops:?}"
+        "the peer held `.storage-write.lock`, so the take failed there: {ops:?}"
     );
     assert_eq!(
         ops.last(),

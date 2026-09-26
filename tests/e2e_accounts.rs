@@ -48,6 +48,25 @@ fn registry(fixture: &Fixture) -> Value {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn storage_mutex_legacy_report_and_refusal_account() {
+    let fixture = owned_store();
+    let legacy = fixture.ns_dir(ACCT, ORG).join(".storage-write");
+    fs::write(&legacy, b"unchanged").expect("legacy fixture");
+    let output = fixture.cmd().args(["claude", "doctor"]).output().expect("doctor");
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("UTF-8");
+    assert!(text.contains("Legacy agctl artefact"), "{text}");
+    assert!(text.contains("regular file"), "{text}");
+    assert!(!text.contains(&format!("--remove-stale {}", legacy.display())), "{text}");
+    fixture
+        .cmd()
+        .args(["claude", "doctor", "--remove-stale", &legacy.to_string_lossy(), "--yes"])
+        .assert()
+        .code(1);
+    assert_eq!(fs::read(&legacy).expect("legacy unchanged"), b"unchanged");
+}
+
+#[test]
 fn ac26_remove_without_delete_secret_leaves_the_credential_on_disk() {
     // Plan AC26: forgetting an account and destroying its refresh token are
     // different requests, and only the second one is irreversible.
@@ -402,7 +421,7 @@ fn ac45_doctor_remove_stale_refuses_everything_it_should() {
     // A regular file at an artefact's name. Claude Code makes its locks with
     // `mkdir` (fact F45), so this was written by something else: it is
     // reported as anomalous and never removed (`agctl-nz5`, AC73).
-    let anomalous = ns_dir.join(".storage-write");
+    let anomalous = ns_dir.join(".storage-write.lock");
     fs::write(&anomalous, "{}").expect("writable");
     age(&anomalous);
     fixture

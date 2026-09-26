@@ -259,6 +259,168 @@ fn plant_file_artefact(store: &Store, org: &str, name: &str, age: Duration) -> P
 // ---------------------------------------------------------------------------
 
 #[test]
+fn storage_mutex_legacy_report_and_refusal() {
+    for kind in ["directory", "regular file", "symbolic link", "other file type"] {
+        for age in [Duration::ZERO, Duration::from_secs(120)] {
+            let store = store();
+            record_owned(&store, ORG, None);
+            let ns = store.ns_dir(ORG);
+            fs::create_dir_all(&ns).expect("namespace");
+            let path = ns.join(LEGACY_STORAGE_WRITE_ARTEFACT);
+            let target = store.home.join("untouched");
+            fs::write(&target, b"unchanged").expect("target");
+            match kind {
+                "directory" => {
+                    fs::create_dir(&path).expect("legacy directory");
+                    fs::write(path.join("keep"), b"unchanged").expect("nonempty legacy");
+                }
+                "regular file" => fs::write(&path, b"unchanged").expect("legacy file"),
+                "symbolic link" => symlink(&target, &path),
+                _ => {
+                    // rustix's mkfifoat is unavailable on Apple platforms.
+                    assert!(
+                        std::process::Command::new("/usr/bin/mkfifo")
+                            .arg(&path)
+                            .status()
+                            .expect("mkfifo fixture")
+                            .success()
+                    );
+                }
+            }
+            backdate(&path, age);
+            let before = fs::symlink_metadata(&path).expect("metadata");
+            let mut io = Recorder::default();
+            let config = AgctlConfig::load(&store.paths).expect("config");
+            let text = namespace_section(&store.doctor(), &config, &mut io).join("\n");
+            assert!(text.contains("Legacy agctl artefact"), "{text}");
+            assert!(text.contains(kind), "{text}");
+            assert!(text.contains("not a Claude Code mutex; left unchanged"), "{text}");
+            assert!(text.contains("no Claude Code lock artefacts"), "{text}");
+            assert!(!text.contains("--remove-stale"), "{text}");
+            assert!(io.text().is_empty(), "legacy is never sampled as a peer");
+            assert!(claude_artefacts(&ns).is_empty());
+            for yes in [false, true] {
+                let err = remove_stale(&store.doctor(), &path, yes, &mut io)
+                    .expect_err("immutable legacy");
+                let expected = if backend::PEER_LOCK_REMOVAL {
+                    "removal and migration are unsupported"
+                } else {
+                    backend::STALE_REMOVAL_UNSUPPORTED
+                };
+                assert!(err.to_string().contains(expected), "{err}");
+            }
+            let after = fs::symlink_metadata(&path).expect("legacy remains");
+            assert_eq!(before.file_type(), after.file_type());
+            assert_eq!(before.modified().expect("mtime"), after.modified().expect("mtime"));
+            assert_eq!(fs::read(&target).expect("target unchanged"), b"unchanged");
+            assert!(!ns.join(STORAGE_WRITE_LOCK).exists(), "no migration");
+            fs::create_dir(ns.join(STORAGE_WRITE_LOCK)).expect("peer alongside legacy");
+            assert_eq!(claude_artefacts(&ns).len(), 1, "both names mean one peer");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn storage_mutex_legacy_report_and_refusal_dead_record() {
+    let store = store();
+    let live = store.live_dir();
+    let path = live.join(LEGACY_STORAGE_WRITE_ARTEFACT);
+    fs::create_dir_all(&path).expect("outside legacy");
+    backdate(&path, Duration::from_secs(120));
+    let record = plant_record(&store, dead_pid(), &live, &[&path]);
+    let bytes = fs::read(&record).expect("record bytes");
+    let text = held_locks_section(&store.doctor()).join("\n");
+    assert!(text.contains("Legacy agctl artefact"), "{text}");
+    assert!(!text.contains("--remove-stale"), "{text}");
+    let mut io = Recorder::default();
+    let err = remove_stale(&store.doctor(), &path, true, &mut io)
+        .expect_err("dead record is no override");
+    assert!(err.to_string().contains("removal and migration are unsupported"), "{err}");
+    assert!(io.text().is_empty(), "refusal precedes stale sampling");
+    assert!(path.is_dir());
+    assert_eq!(fs::read(&record).expect("unchanged record"), bytes);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn storage_mutex_symlink_and_anomaly() {
+    for kind in ["regular", "symlink", "nonempty"] {
+        let store = store();
+        let ns = store.ns_dir(ORG);
+        fs::create_dir_all(&ns).expect("namespace");
+        let peer = ns.join(STORAGE_WRITE_LOCK);
+        let target = store.home.join("target");
+        fs::create_dir(&target).expect("target");
+        let expected = match kind {
+            "regular" => {
+                fs::write(&peer, b"unchanged").expect("anomalous file");
+                "anomalous"
+            }
+            "symlink" => {
+                symlink(&target, &peer);
+                "symbolic link"
+            }
+            _ => {
+                fs::create_dir(&peer).expect("nonempty peer");
+                fs::write(peer.join("keep"), b"unchanged").expect("contents");
+                "has something in it"
+            }
+        };
+        backdate(&peer, Duration::from_secs(120));
+        let mut io = Recorder::default();
+        let err = remove_stale(&store.doctor(), &peer, true, &mut io).expect_err("refused shape");
+        assert!(err.to_string().contains(expected), "{err}");
+        assert!(fs::symlink_metadata(&peer).is_ok());
+        assert!(target.is_dir());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn storage_mutex_doctor_authority() {
+    assert_eq!(STALE_MIN_AGE, Duration::from_secs(60));
+    assert_eq!(STALE_SAMPLE_INTERVAL, Duration::from_secs(12));
+    let store = store();
+    let outside = store.live_dir().join(STORAGE_WRITE_LOCK);
+    fs::create_dir_all(&outside).expect("outside peer");
+    backdate(&outside, Duration::from_secs(120));
+    let mut io = Recorder::default();
+    assert!(
+        remove_stale(&store.doctor(), &outside, true, &mut io)
+            .expect_err("no authority")
+            .to_string()
+            .contains("not inside")
+    );
+    plant_record(
+        &store,
+        dead_pid(),
+        &store.live_dir(),
+        &[&store.live_dir().join(LEGACY_STORAGE_WRITE_ARTEFACT)],
+    );
+    assert!(
+        remove_stale(&store.doctor(), &outside, true, &mut io)
+            .expect_err("old record does not attest peer")
+            .to_string()
+            .contains("not inside")
+    );
+    plant_record(&store, dead_pid(), &store.live_dir(), &[&outside]);
+    remove_stale(&store.doctor(), &outside, true, &mut io)
+        .expect("exact dead record authorizes stale peer");
+    assert!(!outside.exists());
+    let young = plant_artefact(&store, ORG, STORAGE_WRITE_LOCK, Duration::from_secs(20));
+    assert!(
+        remove_stale(&store.doctor(), &young, true, &mut io)
+            .expect_err("doctor stays more conservative than storage")
+            .to_string()
+            .contains("staleness threshold")
+    );
+    backdate(&young, Duration::from_secs(120));
+    remove_stale(&store.doctor(), &young, true, &mut io).expect("owned namespace stale peer");
+    assert!(!young.exists());
+}
+
+#[test]
 fn the_report_covers_the_store_the_keychain_and_the_accounts() {
     let store = store();
     write_credential_file(&store, ORG, &blob("sk-ant-oat01-owned", now_ms() + 3_600_000));
@@ -472,7 +634,7 @@ fn remove_stale_accepts_the_storage_write_guard_and_the_legacy_lock() {
     let storage = plant_artefact(&store, ORG, STORAGE_WRITE_LOCK, Duration::from_secs(120));
     let mut io = Recorder::default();
     remove_stale(&store.doctor(), &storage, true, &mut io)
-        .expect("`.storage-write` is an artefact");
+        .expect("`.storage-write.lock` is an artefact");
     assert!(!storage.exists());
 
     // The legacy lock sits beside the namespace, named after it (fact F17).
@@ -948,7 +1110,8 @@ fn a_bare_dot_lock_is_not_a_legacy_lock_name() {
     // `.lock` is something else, and something else is not removable.
     assert!(is_artefact_name(Path::new("/store/claude/acct/org.lock")));
     assert!(is_artefact_name(Path::new("/store/claude/acct/org/.oauth_refresh.lock")));
-    assert!(is_artefact_name(Path::new("/store/claude/acct/org/.storage-write")));
+    assert!(is_artefact_name(Path::new("/store/claude/acct/org/.storage-write.lock")));
+    assert!(!is_artefact_name(Path::new("/store/claude/acct/org/.storage-write")));
     assert!(!is_artefact_name(Path::new("/store/claude/acct/org/.lock")));
     assert!(!is_artefact_name(Path::new("/store/claude/acct/org/.credentials.json")));
     assert!(!is_artefact_name(Path::new("/store/claude")));

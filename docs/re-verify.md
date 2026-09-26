@@ -253,7 +253,7 @@ a blocker until the affected agctl code is re-read against the new shape.
 | F44 | The read transport and its four constants. | `rg -a -o 'var [A-Za-z0-9_$]+=2000,[A-Za-z0-9_$]+=4032[^;]{0,80}' "$CC"` | `var p=2000,H=4032,K=44,W=36` |
 | F45 | `proper-lockfile` mechanics, and that **every lock artefact is a directory** (`mkdir`/`rmdir`). | `rg -a -c 'ELOCKED' "$CC"`; `rg -a -o '.{0,240}ELOCKED.{0,240}' "$CC"` | `11`; acquire is `r.fs.mkdir(i,…)`, heartbeat is `stat` → mtime drift → `ECOMPROMISED` → else `utimes` |
 | F46 | Two locks, in order: primary `.oauth_refresh.lock`, then the legacy `<realpath(dir)>.lock`. | `rg -a -c '\.oauth_refresh\.lock' "$CC"`; `rg -a -o '.{0,400}\.oauth_refresh\.lock.{0,400}' "$CC"` | `2`; `realpath:!1,stale:60000,update:5000` (same line §4 checks) |
-| F47 | `.storage-write`'s options and its `AsyncLocalStorage` re-entrancy guard. | `rg -a -o '.{0,260}\.storage-write.{0,260}' "$CC"` | 2 hits; `realpath:!1`, `retries:{retries:10,minTimeout:100,maxTimeout:1000}`, `stale:15000`, behind `if(_.getStore())return e()` |
+| F47 | The storage mutex directory is `.storage-write.lock`: the caller passes base `.storage-write` without `lockfilePath`; proper-lockfile appends `.lock`. Its options and `AsyncLocalStorage` re-entrancy guard are unchanged. | `rg -a -o '.{0,260}\.storage-write.{0,260}' "$CC"` | 2 hits; `realpath:!1`, `retries:{retries:10,minTimeout:100,maxTimeout:1000}`, `stale:15000`, behind `if(_.getStore())return e()` |
 | F48 | Change detection at the head of every refresh check, whose **stat-error** branch is the live keychain-backed case. | `rg -a -c 'Dge\(' "$CC"`; `rg -a -o '.{0,260}Dge\(.{0,260}' "$CC"` | `6` (two are an unrelated auto-memory predicate); the body ends `catch{await eH(e,n)}` |
 | F49 | `probeCredentials` exists on the file store and **not** on the keychain store. | `rg -a -c 'probeCredentials' "$CC"` | `3` — file store returns `dev:ino:size:mtimeNs`; the keychain store object defines none |
 | F50 | `.claude.json` has its own lock, and a documented refusal to fall back while a live holder has it. | ``rg -a -o 'Config lock[^`"]{0,60}' "$CC"`` | `Config lock still held by a live process after retries…See gh-73364`, `Config lock compromised:`, `Config lock release failed:` |
@@ -261,8 +261,34 @@ a blocker until the affected agctl code is re-read against the new shape.
 | F54 | A broken lock makes the victim **stand down before its POST** — the load-bearing half of the break-rule safety argument. | `rg -a -c 'isCompromised' "$CC"`; `rg -a -o 'lock_compromised_pre_post.{0,160}' "$CC"` | `6`; the pre-POST check returning `"lock_compromised"`, and a `…_lock_compromised_post_post` sibling |
 | F55 | The victim only learns at its next heartbeat, so it is outside every lock for up to `update` = 5 s after a break. | `rg -a -o '[a-zA-Z./_]* lock compromised \(likely process suspend or slow fs\)' "$CC"` | `jobs/.order lock compromised (…)` and `pins.json lock compromised (…)`, 2 hits each |
 | F56 | `--mcp-config` and `.mcp.json` both exist. | `rg -a -c -- '--mcp-config' "$CC"`; `rg -a -c '\.mcp\.json' "$CC"` | `32`; `67` |
-| F58 | The peer's credential-store writes run **inside** `.storage-write` — which is why agctl's re-read/compare/write is a `mutate()`, not a bare `update()`. | `rg -a -o '\$Pn\(async\(\)=>\{.{0,320}' "$CC" \| grep update` | the closure ending `return s===o?{success:!0}:await e.update(s,a)` — `update` **inside** `$Pn` |
+| F58 | Credential-store mutations run **inside** `.storage-write.lock`; agctl's re-read/compare/write remains a `mutate()`, not a bare `update()`, but its former unsuffixed lock did not provide this exclusion. | `rg -a -o '\$Pn\(async\(\)=>\{.{0,320}' "$CC" \| grep update` | the closure ending `return s===o?{success:!0}:await e.update(s,a)` — `update` **inside** `$Pn` |
 | F59 | `--mcp-config` is repeatable and has **no** environment-variable equivalent, which is why `claude env` must print an alias rather than an assignment. | `rg -a -o '.{0,150}"--mcp-config".{0,200}' "$CC"`; `rg -a -o 'CLAUDE_[A-Z_]*MCP[A-Z_]*' "$CC" \| sort -u \| wc -l` | `"--mcp-config":(e)=>t.mcpConfig.push(e)` and the `flatMap` re-emit; `18` variables, **none** carrying a config path |
+
+**F47/F58 current-artifact clarification (macOS 2.1.283).** In
+`8f8d028:cli.unpack.js`, `ne`/`Ne` at 117195–117207 append `.lock` and mkdir that
+result. `Wjr` at 118543–118578 supplies base `.storage-write`, `realpath:false`, no
+`lockfilePath`, retries 10 / 100–1000 ms, stale 15000 ms, and a re-entrancy guard;
+118582–118605 places the read/compare/update mutation inside it. The inherited
+factor=2 and randomize=false at 116919–116950 give ten scheduled retry delays:
+100, 200, 400, 800 and six × 1000 ms, totaling **7500 ms**. This is not a wall-time
+ceiling and is separate from F53's primary-refresh 4000–8000 ms. The derived storage
+heartbeat of 7500 ms is not a measured heartbeat.
+
+agctl uses the corrected shared mutex name with unchanged primary → canonical legacy →
+storage ordering, zero storage retries per round, and a 3000 ms hold budget. The old
+`.storage-write` is only an immutable legacy agctl artefact, reported by `doctor`, never
+an alias, peer candidate or migration/removal target. Exact held-record paths do not
+alias old and new names; the existing macOS authority checks, 60 s minimum age and
+12 s sampling remain in force. Linux peer removal remains unsupported.
+
+The `storage_mutex_` sibling tests use the production descriptor-relative storage
+primitive against an independently suffixed synthetic peer, plus production full-acquire
+contention and an explicit wrong-name control. Their proof level is **agctl-only; vendor
+not executed**: no real macOS vendor exclusion claim, keychain access or live HOME is
+part of this correction. **Linux not rerun for this correction.** The historical commands,
+counts, traces and pre-correction inventory in §7.2 U3 remain evidence of that earlier
+revision, not claims about the corrected tree. Linux Phase 2 and its operator checkpoint
+still require separate authorization.
 
 **F42.** The argv branch is the one to watch: it puts the credential on a command line, where
 any process can read it from `ps`. agctl never reaches it — its payloads are far below 4032
