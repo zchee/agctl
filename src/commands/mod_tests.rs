@@ -177,8 +177,8 @@ fn remote_control_tty_adapter_never_routes_prose_to_stdout() {
         .split("fn attest_terminal")
         .next()
         .unwrap();
-    assert!(adapter.contains("eprintln!"));
-    assert!(adapter.contains("eprint!"));
+    assert!(adapter.contains("writeln!(std::io::stderr()"));
+    assert!(adapter.contains("write!(stderr"));
     assert!(!adapter.contains("stdout"));
     let _ = AttestedTty;
 }

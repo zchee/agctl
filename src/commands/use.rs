@@ -94,12 +94,14 @@
 
 use std::ffi::OsString;
 use std::fs::File;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
 use crate::cli::UseArgs;
+use crate::commands::AttestedTty;
 use crate::commands::Prompt;
 use crate::commands::Tty;
 use crate::commands::export;
@@ -127,6 +129,8 @@ use crate::provider::claude::namespace;
 use crate::provider::claude::namespace::EnvView;
 use crate::provider::claude::oauth::OauthError;
 use crate::provider::claude::oauth::Profile;
+use crate::provider::claude::remote_control;
+use crate::provider::claude::remote_control::RemoteControl;
 use crate::provider::claude::swap;
 use crate::provider::claude::swap::IdentityGap;
 use crate::provider::claude::swap::ItemChange;
@@ -138,6 +142,7 @@ use crate::runtime::coordinator::Cancel;
 use crate::runtime::coordinator::PassCtx;
 use crate::runtime::fault::Fault;
 use crate::runtime::proc;
+use crate::runtime::signals;
 use crate::secret::KeychainReader;
 use crate::secret::audit;
 use crate::secret::audit::AuditEntry;
@@ -184,6 +189,30 @@ const SWAP_DEADLINE: Duration = Duration::from_secs(120);
 /// whatever [`export::prepare`], [`export::exec_command`], [`run_undo`] or
 /// [`isolate::forget_session`] return otherwise.
 pub fn run(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Result<i32, AppError> {
+    if args.restart_remote_control {
+        let reason = if !cfg!(target_os = "macos") {
+            Some("remote_control_unsupported_platform")
+        } else if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+            Some("remote_control_needs_tty")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            AttestedTty.tell(&format!(
+                "refused: --restart-remote-control requires macOS and terminal stdin and stderr ({reason}); nothing was written"
+            ));
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "kind": "outcome", "outcome": "refused", "reason": reason,
+                        "remote_control": remote_control::Counts::default(), "warnings": [],
+                    })
+                );
+            }
+            return Ok(crate::cli::swap_exit::RC_NOT_DISCONNECTED);
+        }
+    }
     if args.live {
         return run_live(config_dir, args, cancel);
     }
@@ -260,6 +289,8 @@ struct Report {
     /// step belongs — a namespace target, and every other outcome that wrote
     /// nothing.
     config: Option<ConfigReport>,
+    /// Counts only; present in output solely for the opt-in flag.
+    remote_control: Option<remote_control::Counts>,
 }
 
 impl Report {
@@ -276,6 +307,7 @@ impl Report {
             warnings: Vec::new(),
             note: Some(note),
             config: None,
+            remote_control: None,
         }
     }
 
@@ -304,6 +336,7 @@ impl Report {
             warnings: Vec::new(),
             note: Some(note),
             config: None,
+            remote_control: None,
         }
     }
 }
@@ -413,7 +446,7 @@ fn run_live(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
                          whose credentials are in it or where the displaced one should go"
                     ),
                 );
-                emit(&report, args.json)?;
+                emit(&report, args.json, args.restart_remote_control)?;
                 return Ok(report.outcome.exit_code());
             };
             (Which::Namespace, inherited, Some(store))
@@ -444,7 +477,7 @@ fn run_live(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
         undone: None,
     };
     let report = swap_in(&swap, &incoming, store.as_ref(), args);
-    emit(&report, args.json)?;
+    emit(&report, args.json, args.restart_remote_control)?;
     Ok(report.outcome.exit_code())
 }
 
@@ -695,6 +728,16 @@ fn swap_in(
 ) -> Report {
     let mut pass = Pass::default();
     let mut report = swap_phases(swap, incoming, store, args, &mut pass);
+    signals::defer_to_exit();
+    if let Some(remote) = &mut pass.remote {
+        let action = remote_control::action(&report.outcome, report.config.as_ref());
+        remote.finish(swap.ctx, &mut AttestedTty, action);
+        for warning in remote_control::warnings(&remote.counts, action) {
+            AttestedTty.tell(&format!("warning: {warning}"));
+            pass.warnings.push(warning);
+        }
+        report.remote_control = Some(remote.counts.clone());
+    }
     report.target = pass.target;
     report.warnings = pass.warnings;
     report
@@ -708,6 +751,8 @@ fn swap_in(
 /// item is derived; the warnings are pushed where they are discovered.
 #[derive(Default)]
 struct Pass {
+    /// Disconnect state outlives the namespace guards local to swap_phases.
+    remote: Option<RemoteControl>,
     /// Which keychain item this was for, spelled as the audit log spells it.
     target: Option<String>,
     /// Facts that are not refusals — today, refusal **B**'s degraded warning.
@@ -767,10 +812,21 @@ fn swap_phases(
     pass.warnings.push(BACKEND_NOTE.to_owned());
     eprintln!("note: {BACKEND_NOTE}");
     let remote = if which == Which::Live {
-        live_sessions::scan(&namespace::sessions_dir(env), |pid| {
-            proc::holder(pid, ctx.cancel()) != proc::Holder::Dead
-        })
+        let dir = namespace::sessions_dir(env);
+        let alive = |pid| proc::holder(pid, ctx.cancel()) != proc::Holder::Dead;
+        if args.restart_remote_control {
+            let detailed = live_sessions::scan_detailed(&dir, alive);
+            let hint = detailed.hint.clone();
+            let plan = RemoteControl::new(detailed, dir, namespace::global_config_path(env), ctx);
+            pass.remote = Some(plan);
+            hint
+        } else {
+            live_sessions::scan(&dir, alive)
+        }
     } else {
+        if args.restart_remote_control {
+            eprintln!("note: --restart-remote-control does not act on a namespace target");
+        }
         live_sessions::Scan::NoRegistry
     };
     if let Some(text) = live_sessions::unreadable_note(&remote) {
@@ -956,6 +1012,7 @@ fn swap_phases(
             warnings: Vec::new(),
             note: Some("that account's credential is already the one this store holds".to_owned()),
             config: None,
+            remote_control: None,
         };
         // A namespace target has no `.claude.json` of its own: `config: null`.
         return if which == Which::Live { catch_up(&catching_up, pass, report) } else { report };
@@ -1194,9 +1251,24 @@ fn swap_phases(
             config_path.as_deref(),
         );
     }
+    let mut remote_clause = live_sessions::consent_clause(
+        pass.remote.as_ref().map_or(&remote, |plan| &plan.hint),
+        SWAP_DEADLINE.as_secs(),
+    )
+    .unwrap_or_default();
+    if let Some(plan) = &pass.remote {
+        for note in plan.version_notes() {
+            eprintln!("note: {note}");
+        }
+        if let Some(clause) = plan.consent_clause(Instant::now()) {
+            remote_clause.push_str(&clause);
+        }
+    }
+    let prompt: &mut dyn Prompt =
+        if args.restart_remote_control { &mut AttestedTty } else { &mut Tty };
     if !args.yes
         && let Some(report) = confirm(
-            &mut Tty,
+            prompt,
             &store_dir,
             incoming.record,
             &from_digest8,
@@ -1204,7 +1276,7 @@ fn swap_phases(
             &service,
             direction,
             config_path.as_deref().map(|path| claude_json::shown_path(path, &env.home)).as_deref(),
-            live_sessions::consent_clause(&remote, SWAP_DEADLINE.as_secs()).as_deref(),
+            (!remote_clause.is_empty()).then_some(remote_clause.as_str()),
         )
     {
         return report;
@@ -1216,8 +1288,9 @@ fn swap_phases(
     let now = now_ms();
     // Whether step 13 refreshed the incoming credential and could not save the
     // result anywhere, for the one refusal that can still follow (review F2).
-    let mut refresh_unsaved = false;
-    if incoming_credentials.access_expired(now, REFRESH_MARGIN_MS) {
+    let needs_refresh = incoming_credentials.access_expired(now, REFRESH_MARGIN_MS);
+    let derived_from = incoming_credentials.digests();
+    if needs_refresh {
         // Every other refresh in this crate saves its result where it read it
         // (`status::under_namespace_lock`, `status::refresh_in_place`), and
         // this one must too or the incoming account is left holding a refresh
@@ -1245,7 +1318,6 @@ fn swap_phases(
                 ),
             );
         }
-        let derived_from = incoming_credentials.digests();
         // A live reversal reads P from its namespace's adopted copy
         // (`agctl-cf1i` option A), and the refreshed pair is saved back there
         // below (S24a-R1). Everything that would stop that save and can be
@@ -1266,6 +1338,25 @@ fn swap_phases(
                 ),
             );
         }
+    } else if matches!(
+        incoming_credentials.to_keychain_stdin_line(&account, &service),
+        Err(KeychainWriteError::LineTooLong { .. })
+    ) {
+        return Report::refused(Refusal::LineTooLong, &service, line_too_long_note());
+    }
+
+    // 12b follows every pre-POST refusal (13a). Namespace locks are held,
+    // but no adoption, POST, keychain write, or config write has happened.
+    if let Some(remote) = &mut pass.remote
+        && !remote.disconnect(ctx, prompt)
+    {
+        return Report::refused(Refusal::RemoteControlNotDisconnected, &service,
+            "Remote Control did not disconnect in every eligible session; nothing was written. If a status panel remains open, press Escape there.".to_owned());
+    }
+
+    // 13b: only a successful disconnect stage can reach the refresh POST.
+    let mut refresh_unsaved = false;
+    if needs_refresh {
         if let Err(report) = refresh_incoming(&mut incoming_credentials, ctx, &service, now) {
             return *report;
         }
@@ -1464,7 +1555,8 @@ fn swap_phases(
             Direction::Reverse => Recovery::Live { id },
         };
         tell_config(pass, env, config, recovery);
-        tell_remote_control(pass, &remote, &report.outcome);
+        let hinted = pass.remote.as_ref().map_or(&remote, |plan| &plan.hint).clone();
+        tell_remote_control(pass, &hinted, &report.outcome);
     }
     report
 }
@@ -1524,6 +1616,9 @@ struct CatchUp<'a> {
 /// no audit descriptor of the pass's own. The outcome stays `already_active`
 /// and exit 0 whatever the step did; the step's report becomes `config`.
 fn catch_up(c: &CatchUp<'_>, pass: &mut Pass, mut report: Report) -> Report {
+    if c.args.restart_remote_control {
+        eprintln!("note: --restart-remote-control does not act on a catch-up");
+    }
     let config_path = namespace::global_config_path(c.env);
     let shown = claude_json::shown_path(&config_path, &c.env.home);
     let log_path = audit::log_path(c.paths);
@@ -1545,7 +1640,11 @@ fn catch_up(c: &CatchUp<'_>, pass: &mut Pass, mut report: Report) -> Report {
             if let Some(clause) = live_sessions::consent_clause(c.remote, SWAP_DEADLINE.as_secs()) {
                 question.push_str(&clause);
             }
-            Tty.confirm(&question).unwrap_or(false)
+            if c.args.restart_remote_control {
+                AttestedTty.confirm(&question).unwrap_or(false)
+            } else {
+                Tty.confirm(&question).unwrap_or(false)
+            }
         },
         |check, profile| claude_json::catch_up_write(check, c.env, profile, c.ctx),
     );
@@ -2073,6 +2172,7 @@ fn already_active(service: &str, active8: Option<String>, note: String) -> Repor
         warnings: Vec::new(),
         note: Some(note),
         config: None,
+        remote_control: None,
     }
 }
 
@@ -2247,6 +2347,7 @@ fn phase_c(
         warnings: Vec::new(),
         note: Some(note),
         config: None,
+        remote_control: None,
     };
 
     let clock = Clock::system();
@@ -2468,6 +2569,7 @@ fn phase_c(
                 }
             )),
             config: None,
+            remote_control: None,
         };
     }
 
@@ -2620,6 +2722,7 @@ fn phase_c(
         // Set by `swap_phases`' config step, which runs only once this hold
         // has been dropped.
         config: None,
+        remote_control: None,
     }
 }
 
@@ -3052,7 +3155,8 @@ fn emit_plan(
 #[expect(
     clippy::too_many_arguments,
     reason = "the question names every fact the operator is consenting to, and the live \
-              target's configuration file is the eighth and its Remote Control hint the ninth"
+              target's configuration file is the eighth and its Remote Control hint or \
+              supervised-input disclosure the ninth"
 )]
 fn confirm(
     prompt: &mut dyn Prompt,
@@ -3100,6 +3204,7 @@ fn cancelled(service: &str, note: String) -> Report {
         warnings: Vec::new(),
         note: Some(note),
         config: None,
+        remote_control: None,
     }
 }
 
@@ -3814,7 +3919,8 @@ fn now_ms() -> i64 {
 ///
 /// Neither form carries token material: the digests are eight-character
 /// prefixes, and nothing here reproduces a blob (plan AC74).
-fn emit(report: &Report, as_json: bool) -> Result<(), AppError> {
+fn emit(report: &Report, as_json: bool, with_remote_control: bool) -> Result<(), AppError> {
+    signals::defer_to_exit();
     if as_json {
         let mut doc = serde_json::json!({
             // Beside `emit_plan`'s `"kind": "plan"`, so a consumer reading the
@@ -3867,13 +3973,22 @@ fn emit(report: &Report, as_json: bool) -> Result<(), AppError> {
                 None => doc["refusal"] = serde_json::json!(refusal.letter()),
             }
         }
+        if with_remote_control {
+            doc["remote_control"] =
+                serde_json::json!(report.remote_control.clone().unwrap_or_default());
+            if matches!(report.outcome, Outcome::Refused(Refusal::RemoteControlNotDisconnected))
+                && let Some(object) = doc.as_object_mut()
+            {
+                object.remove("refusal");
+            }
+        }
         let text = serde_json::to_string_pretty(&doc)
             .map_err(|err| AppError::Config(format!("could not render the swap as JSON: {err}")))?;
         println!("{text}");
         return Ok(());
     }
 
-    let mut out = Tty;
+    let out: &mut dyn Prompt = if with_remote_control { &mut AttestedTty } else { &mut Tty };
     if matches!(report.outcome, Outcome::Applied) {
         // S13-3's clause only when the configuration file was rewritten: that is
         // what running sessions reload within a second (V13).
@@ -4147,7 +4262,7 @@ fn run_undo(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Resul
         undone: reversal.undone.as_ref(),
     };
     let report = swap_in(&swap, &incoming, reversal.store.as_ref(), args);
-    emit(&report, args.json)?;
+    emit(&report, args.json, args.restart_remote_control)?;
     Ok(report.outcome.exit_code())
 }
 

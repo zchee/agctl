@@ -274,7 +274,6 @@ pub struct DetailedScan {
 
 /// Reads the same bounded registry without losing identities needed by the stages.
 /// Invalid detailed fields remain candidates so the stage rejects rather than ignores them.
-#[cfg_attr(not(test), expect(dead_code, reason = "S11 selects the detailed scan for the new flag"))]
 pub fn scan_detailed(dir: &Path, alive: impl Fn(u32) -> bool) -> DetailedScan {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,

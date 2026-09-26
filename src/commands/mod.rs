@@ -21,7 +21,6 @@ pub mod watch;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::os::fd::AsFd;
-use std::os::fd::AsRawFd;
 use std::time::Instant;
 
 use crate::error::AppError;
@@ -66,7 +65,6 @@ pub trait Prompt {
 
 /// A complete answer is distinct from EOF, cancellation, or a partial line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "S11 selects the real attestation adapter"))]
 pub enum Attestation {
     /// Exactly `y` followed by a terminal line terminator.
     Yes,
@@ -77,12 +75,12 @@ pub enum Attestation {
 }
 
 /// Remote Control's human channel: all prose and questions go to stderr's TTY.
-#[cfg_attr(not(test), expect(dead_code, reason = "S11 selects this adapter for the new flag"))]
 pub struct AttestedTty;
 
 impl Prompt for AttestedTty {
     fn tell(&mut self, message: &str) {
-        eprintln!("{message}");
+        // Losing the human channel must not change a completed swap's outcome.
+        let _ = writeln!(std::io::stderr(), "{message}");
     }
 
     fn can_ask(&self) -> bool {
@@ -93,10 +91,9 @@ impl Prompt for AttestedTty {
         if !self.can_ask() {
             return Ok(false);
         }
-        eprint!("{question} [y/N] ");
-        std::io::stderr().flush().map_err(|source| AppError::Io {
-            context: "could not write the confirmation prompt".to_owned(),
-            source,
+        let mut stderr = std::io::stderr();
+        write!(stderr, "{question} [y/N] ").and_then(|()| stderr.flush()).map_err(|source| {
+            AppError::Io { context: "could not write the confirmation prompt".to_owned(), source }
         })?;
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer).map_err(|source| AppError::Io {
@@ -111,7 +108,6 @@ impl Prompt for AttestedTty {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "S11 selects the real attestation adapter"))]
 fn attest_terminal(
     input: &impl AsFd,
     output: &mut (impl AsFd + Write),
@@ -119,8 +115,6 @@ fn attest_terminal(
     deadline: Instant,
     cancel: &Cancel,
 ) -> Attestation {
-    use rustix::event::PollFd;
-    use rustix::event::PollFlags;
     use rustix::termios::QueueSelector;
     let end = Instant::now()
         .checked_add(crate::provider::claude::remote_control::RC_ATTEST_TIMEOUT)
@@ -136,7 +130,7 @@ fn attest_terminal(
     }
     let mut answer = Vec::with_capacity(2);
     let mut too_long = false;
-    let mut select_fallback = false;
+    let mut readiness = crate::runtime::tty::Readiness::default();
     loop {
         let now = Instant::now();
         if cancel.is_cancelled() || now >= end {
@@ -145,45 +139,8 @@ fn attest_terminal(
         let wait = end
             .saturating_duration_since(now)
             .min(crate::provider::claude::remote_control::RC_POLL);
-        let timeout =
-            rustix::event::Timespec::try_from(wait).expect("a subsecond poll bound fits Timespec");
-        let mut fds = [PollFd::new(input, PollFlags::IN)];
-        let polled =
-            if select_fallback { Ok(1) } else { rustix::event::poll(&mut fds, Some(&timeout)) };
-        let ready = match polled {
-            Ok(0) => false,
-            Ok(_) if select_fallback || fds[0].revents().contains(PollFlags::NVAL) => {
-                select_fallback = true;
-                if cancel.is_cancelled() || Instant::now() >= end {
-                    return Attestation::NotObtained;
-                }
-                // The failing poll may itself have waited. Do not give its
-                // fallback another full interval before observing cancellation.
-                let remaining = wait.saturating_sub(now.elapsed());
-                if remaining.is_zero() {
-                    continue;
-                }
-                let timeout = rustix::event::Timespec::try_from(remaining)
-                    .expect("the remaining poll interval fits Timespec");
-                let raw = input.as_fd().as_raw_fd();
-                let Some(nfds) = raw.checked_add(1) else { return Attestation::NotObtained };
-                let mut readfds = vec![
-                    rustix::event::FdSetElement::default();
-                    rustix::event::fd_set_num_elements(1, nfds)
-                ];
-                rustix::event::fd_set_insert(&mut readfds, raw);
-                // SAFETY: input owns the sole inserted open descriptor throughout
-                // select; the set is sized by rustix for this exact highest fd.
-                match unsafe {
-                    rustix::event::select(nfds, Some(&mut readfds), None, None, Some(&timeout))
-                } {
-                    Ok(count) => count > 0,
-                    Err(rustix::io::Errno::INTR) => false,
-                    Err(_) => return Attestation::NotObtained,
-                }
-            }
-            Ok(_) => fds[0].revents().intersects(PollFlags::IN | PollFlags::HUP),
-            Err(rustix::io::Errno::INTR) => false,
+        let ready = match readiness.wait_readable(input.as_fd(), wait) {
+            Ok(ready) => ready,
             Err(_) => return Attestation::NotObtained,
         };
         if cancel.is_cancelled() || Instant::now() >= end {

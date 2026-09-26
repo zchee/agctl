@@ -12,6 +12,38 @@ use std::sync::atomic::Ordering;
 use super::*;
 
 #[test]
+fn exit_notice_is_counted_once_and_scoped_to_its_stage() {
+    let mut output = Vec::new();
+    write_exit_notices(&mut output);
+    assert!(output.is_empty(), "no active stage means no signal notice");
+    let notice = register_exit_notice(1, |count| format!("unconfirmed: {count}"));
+    notice.begin();
+    notice.confirmed();
+    write_exit_notices(&mut output);
+    assert_eq!(output, b"unconfirmed: 1\n");
+    write_exit_notices(&mut output);
+    assert_eq!(output, b"unconfirmed: 1\n", "a signal cannot emit it twice");
+    drop(notice);
+    let finished = register_exit_notice(9, |count| format!("unconfirmed: {count}"));
+    drop(finished);
+    output.clear();
+    write_exit_notices(&mut output);
+    assert!(output.is_empty(), "a normally ended stage withdraws its token");
+}
+
+#[test]
+fn exit_notice_never_waits_for_the_command_threads_registry_lock() {
+    let _notice = register_exit_notice(1, |count| format!("unconfirmed: {count}"));
+    let held = registry();
+    let mut output = Vec::new();
+    write_exit_notices(&mut output);
+    assert!(output.is_empty());
+    drop(held);
+    write_exit_notices(&mut output);
+    assert_eq!(output, b"unconfirmed: 1\n");
+}
+
+#[test]
 fn emergency_removes_a_registered_temporary_file() {
     let dir = tempfile::tempdir().expect("creating a temporary directory should succeed");
     let path = dir.path().join(".credentials.json.tmp.0123abcd");

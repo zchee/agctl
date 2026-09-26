@@ -7,7 +7,7 @@
 //! *stopped* before it will break a lock (plan section 3.8 condition 2). All
 //! three need facts the standard library does not offer.
 //!
-//! # Why this module holds the crate's only `unsafe`
+//! # Why this module owns the process-info ABI calls
 //!
 //! Phase 1 answered the state and start-time questions by running the
 //! system's process lister and parsing one line. Decision **D-022** retires
@@ -304,7 +304,7 @@ pub(in crate::runtime::proc) fn signalable(pid: u32) -> bool {
     matches!(rustix::process::test_kill_process(pid), Ok(()))
 }
 
-/// The three `libproc` calls, and the only `unsafe` in the crate.
+/// The three `libproc` calls, with their unsafety contained inside this module.
 ///
 /// Every function here is a safe wrapper that owns its buffer, passes that
 /// buffer's own length as the size argument, and turns every failure into

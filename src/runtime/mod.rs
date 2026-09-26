@@ -18,3 +18,4 @@ pub mod log_writer;
 pub mod proc;
 pub mod signals;
 pub mod tmux;
+pub mod tty;

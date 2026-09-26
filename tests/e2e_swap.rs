@@ -22,6 +22,9 @@
 
 mod common;
 
+#[path = "e2e_swap/remote_control.rs"]
+mod rc_restart;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;

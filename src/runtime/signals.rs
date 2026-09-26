@@ -124,6 +124,7 @@ pub fn install(cancel: Cancel) -> io::Result<()> {
             // already sees an exit in progress (see [`defer_to_exit`]).
             EXITING.store(true, Ordering::SeqCst);
             cancel.cancel();
+            cleanup::write_exit_notices(&mut io::stderr());
             // Before emergency cleanup, not after: cleanup releases lock
             // directories, and a `security(1)` child still writing under
             // one of them must be gone first.

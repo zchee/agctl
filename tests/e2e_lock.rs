@@ -173,35 +173,50 @@ fn the_grep_can_fail() {
     assert!("Command::new(\"ps\")".contains("Command::new(\"ps\")"));
 }
 
+fn unsafe_boundary_holds(path: &Path, source: &str) -> bool {
+    let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.contains("unsafe fn") {
+        return false;
+    }
+    let count = source.matches("unsafe ").count();
+    count == 0
+        || (["runtime/proc/macos.rs", "runtime/tty.rs"]
+            .iter()
+            .any(|allowed| path.ends_with(allowed))
+            && source.matches("// SAFETY:").count() >= count)
+}
+
 #[test]
-fn the_only_unsafe_in_the_crate_is_the_libproc_wrapper() {
-    // Decision D-022 brought the crate its first `unsafe`. It is confined to
-    // one private module inside `runtime/proc/macos.rs`, every call carries a
-    // `// SAFETY:` comment, and no other module gains any.
-    let mut unsafe_files: Vec<(PathBuf, usize)> = Vec::new();
+fn unsafe_boundary_rejects_a_third_file_commands_and_unsafe_functions() {
+    let block = "// SAFETY: a live borrowed descriptor.\nunsafe { checked_call() }";
+    assert!(unsafe_boundary_holds(Path::new("src/runtime/tty.rs"), block));
+    assert!(!unsafe_boundary_holds(Path::new("src/runtime/another.rs"), block));
+    assert!(!unsafe_boundary_holds(Path::new("src/commands/mod.rs"), block));
+    assert!(!unsafe_boundary_holds(Path::new("src/runtime/tty.rs"), "unsafe { unchecked_call() }"));
+    assert!(!unsafe_boundary_holds(
+        Path::new("src/runtime/tty.rs"),
+        "// SAFETY: comment.\npub unsafe fn escaping() {}"
+    ));
+}
+
+#[test]
+fn unsafe_is_confined_to_libproc_and_terminal_readiness_with_safe_interfaces() {
+    let mut found = Vec::new();
     for path in production_sources() {
         let source = std::fs::read_to_string(&path).expect("a readable source file");
-        let count = source.matches("unsafe ").count();
-        if count > 0 {
-            unsafe_files.push((path, count));
+        assert!(
+            unsafe_boundary_holds(&path, &source),
+            "unsafe boundary violated: {}",
+            path.display()
+        );
+        if source.contains("unsafe ") {
+            found.push(path);
         }
     }
-    let names: Vec<String> =
-        unsafe_files.iter().map(|(path, count)| format!("{}:{count}", path.display())).collect();
-    assert_eq!(unsafe_files.len(), 1, "exactly one file has any `unsafe`: {names:?}");
-    let (path, count) = &unsafe_files[0];
-    assert!(
-        path.ends_with("runtime/proc/macos.rs"),
-        "and it is the libproc wrapper, not {}",
-        path.display()
-    );
-
-    let source = std::fs::read_to_string(path).expect("readable");
-    let safety = source.matches("// SAFETY:").count();
-    assert!(
-        safety >= *count,
-        "every `unsafe` carries a `// SAFETY:` comment: {count} blocks, {safety} comments"
-    );
+    assert_eq!(found.len(), 2, "exactly the two ABI boundaries: {found:?}");
+    for expected in ["runtime/proc/macos.rs", "runtime/tty.rs"] {
+        assert!(found.iter().any(|path| path.ends_with(expected)), "missing {expected}: {found:?}");
+    }
 }
 
 #[test]

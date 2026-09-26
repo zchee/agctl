@@ -10,6 +10,7 @@
 # AGCTL_FAKE_TMUX_NULL_AFTER_MS: disconnect delay, or never.
 # AGCTL_FAKE_TMUX_SET_AFTER_MS: reconnect delay, or never.
 # AGCTL_FAKE_TMUX_DROP_AFTER_MS: optional delay before dropping a reconnected bridge.
+# AGCTL_FAKE_TMUX_REBRIDGE_AFTER_MS: optional external reconnect after disconnect, before agctl reconnects.
 # Each delay can also name a file of pid/value rows for multi-session scenarios.
 # AGCTL_FAKE_TMUX_SCREEN: file of synthetic screen bytes (absent means zero bytes).
 # AGCTL_FAKE_TMUX_CAPTURE_EXIT: capture-only exit status.
@@ -98,6 +99,11 @@ if [ -f "$delay" ]; then delay=$(awk -v pid="$pid" '$1 == pid {print $2; exit}' 
     copy="$registry/.$pid.$$.json"
     cp "$states/$pid.$state.json" "$copy" && mv "$copy" "$registry/$pid.json" || exit 5
     [ -z "${AGCTL_FAKE_TMUX_LOG:-}" ] || printf 'move %s %s\n' "$pid" "$state" >> "$AGCTL_FAKE_TMUX_LOG"
+    if [ "$state" = disconnected ] && [ -n "${AGCTL_FAKE_TMUX_REBRIDGE_AFTER_MS:-}" ]; then
+        perl -e 'select undef, undef, undef, $ARGV[0] / 1000' "$AGCTL_FAKE_TMUX_REBRIDGE_AFTER_MS"
+        cp "$states/$pid.reconnected.json" "$copy" && mv "$copy" "$registry/$pid.json" || exit 5
+        [ -z "${AGCTL_FAKE_TMUX_LOG:-}" ] || printf 'move %s reconnected\n' "$pid" >> "$AGCTL_FAKE_TMUX_LOG"
+    fi
     if [ "$state" = reconnected ] && [ -n "${AGCTL_FAKE_TMUX_DROP_AFTER_MS:-}" ]; then
         perl -e 'select undef, undef, undef, $ARGV[0] / 1000' "$AGCTL_FAKE_TMUX_DROP_AFTER_MS"
         cp "$states/$pid.disconnected.json" "$copy" && mv "$copy" "$registry/$pid.json" || exit 5

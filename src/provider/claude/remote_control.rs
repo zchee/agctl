@@ -1,8 +1,6 @@
 //! Supervised Remote Control disconnect/reconnect. Observations only reject;
 //! a fresh operator attestation is the sole authority for each input group.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "S11 wires the stages into the swap"))]
-
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -24,8 +22,11 @@ use crate::provider::claude::live_sessions::State;
 use crate::provider::claude::oauth::PROFILE_TIMEOUT;
 use crate::provider::claude::oauth::TOKEN_TIMEOUT;
 use crate::provider::claude::swap::Outcome;
+use crate::runtime::cleanup;
+use crate::runtime::cleanup::ExitNotice;
 use crate::runtime::coordinator::PassCtx;
 use crate::runtime::proc;
+use crate::runtime::signals;
 use crate::runtime::tmux;
 use crate::runtime::tmux::CaptureVerdict;
 use crate::runtime::tmux::Keys;
@@ -128,6 +129,13 @@ pub fn action(outcome: &Outcome, config: Option<&ConfigReport>) -> Action {
     }
 }
 
+/// Shared by outcome warnings and the signal thread's counts-only notice.
+pub fn not_confirmed_warning(count: usize) -> String {
+    format!(
+        "Remote Control was not confirmed reconnected in {count} session(s); run /remote-control there manually."
+    )
+}
+
 /// Failure prose is computed only from the exported counts and the recovery action.
 pub fn warnings(counts: &Counts, action: Action) -> Vec<String> {
     let mut result = Vec::new();
@@ -135,7 +143,7 @@ pub fn warnings(counts: &Counts, action: Action) -> Vec<String> {
         result.push(format!("Remote Control did not disconnect in {} session(s); no swap was made. If a status panel remains open, press Escape there.", counts.not_disconnected));
     }
     if counts.not_confirmed != 0 {
-        result.push(format!("Remote Control was not confirmed reconnected in {} session(s); run /remote-control there manually.", counts.not_confirmed));
+        result.push(not_confirmed_warning(counts.not_confirmed));
     }
     if counts.skipped != 0 {
         result.push(format!(
@@ -366,6 +374,7 @@ struct Stage<'a> {
     bin: &'a Path,
     ctx: &'a PassCtx,
     end: Instant,
+    notice: &'a ExitNotice,
 }
 impl Stage<'_> {
     fn running(&self) -> bool {
@@ -446,6 +455,9 @@ impl Stage<'_> {
         }
         if !self.running() {
             return GroupResult::Unattested(Attestation::NotObtained);
+        }
+        if group == Group::Opening {
+            self.notice.begin();
         }
         match tmux::send(self.bin, pane, group.keys(), self.ctx, self.end) {
             Ok(()) => GroupResult::Sent,
@@ -565,7 +577,9 @@ impl RemoteControl {
     /// All-session preflight, then one disconnect sequence each. False forbids the swap.
     pub fn disconnect(&mut self, ctx: &PassCtx, prompt: &mut dyn Prompt) -> bool {
         let started = Instant::now();
-        let success = self.disconnect_inner(ctx, prompt);
+        let notice = cleanup::register_exit_notice(0, not_confirmed_warning);
+        let success = self.disconnect_inner(ctx, prompt, &notice);
+        signals::defer_to_exit();
         self.counts.not_disconnected = self
             .counts
             .eligible
@@ -575,7 +589,12 @@ impl RemoteControl {
         success
     }
 
-    fn disconnect_inner(&mut self, ctx: &PassCtx, prompt: &mut dyn Prompt) -> bool {
+    fn disconnect_inner(
+        &mut self,
+        ctx: &PassCtx,
+        prompt: &mut dyn Prompt,
+        notice: &ExitNotice,
+    ) -> bool {
         if self.sessions.is_empty() {
             return true;
         }
@@ -588,7 +607,7 @@ impl RemoteControl {
             return false;
         };
         self.bin = Some(bin.clone());
-        let stage = Stage { dir: &self.dir, config: &self.config, bin: &bin, ctx, end };
+        let stage = Stage { dir: &self.dir, config: &self.config, bin: &bin, ctx, end, notice };
         let mut panes = BTreeMap::new();
         for item in &self.sessions {
             if let Some(pane) = &item.session.pane {
@@ -671,6 +690,7 @@ impl RemoteControl {
                 GroupResult::Gone => {
                     item.gone = true;
                     self.counts.gone += 1;
+                    notice.confirmed();
                 }
                 other => {
                     record_failure(&mut self.counts, &other, prompt);
@@ -689,6 +709,7 @@ impl RemoteControl {
                     Reread::Gone => {
                         item.gone = true;
                         self.counts.gone += 1;
+                        notice.confirmed();
                     }
                     Reread::State(state) if !state.bridge_on => {
                         item.disconnected = true;
@@ -717,10 +738,12 @@ impl RemoteControl {
             return;
         }
         let started = Instant::now();
-        self.finish_inner(ctx, prompt, action, started);
+        let notice = cleanup::register_exit_notice(self.counts.disconnected, not_confirmed_warning);
+        self.finish_inner(ctx, prompt, action, started, &notice);
+        signals::defer_to_exit();
         tracing::info!(stage = if action == Action::Restore { "restore" } else { "reconnect" }, counts = ?self.counts, elapsed_ms = started.elapsed().as_millis(), "Remote Control stage");
         if ctx.cancel().is_cancelled() {
-            prompt.tell(&format!("Remote Control was not confirmed reconnected in {} session(s); run /remote-control there manually.", self.counts.not_confirmed));
+            prompt.tell(&not_confirmed_warning(self.counts.not_confirmed));
         }
     }
 
@@ -730,6 +753,7 @@ impl RemoteControl {
         prompt: &mut dyn Prompt,
         action: Action,
         started: Instant,
+        notice: &ExitNotice,
     ) {
         if !matches!(action, Action::Reconnect | Action::Restore) || ctx.cancel().is_cancelled() {
             self.counts.not_confirmed = self.counts.disconnected;
@@ -746,65 +770,88 @@ impl RemoteControl {
                 RC_RECONNECT_SETTLE.min(end.saturating_duration_since(Instant::now())),
             );
         }
-        let stage = Stage { dir: &self.dir, config: &self.config, bin, ctx, end };
+        let stage = Stage { dir: &self.dir, config: &self.config, bin, ctx, end, notice };
         let group = if action == Action::Restore { Group::Restore } else { Group::Reconnect };
-        let mut pending = Vec::new();
-        for (index, item) in self.sessions.iter().enumerate().filter(|(_, item)| item.disconnected)
-        {
-            if !stage.running() {
-                self.counts.not_confirmed += 1;
-                continue;
-            }
-            match stage.group(&item.session, group, prompt) {
-                GroupResult::Sent => pending.push((index, Instant::now(), None)),
-                GroupResult::AlreadyConnected => self.counts.already_connected += 1,
-                GroupResult::Gone => self.counts.gone += 1,
-                other => {
-                    record_failure(&mut self.counts, &other, prompt);
-                    self.counts.not_confirmed += 1;
-                }
-            }
-        }
-        // All sessions are polled together. A slow second human answer does not
-        // restart the first session's own confirmation window.
-        while !pending.is_empty() {
-            let now = Instant::now();
-            pending.retain_mut(|(index, sent, first_on)| {
+        std::thread::scope(|scope| {
+            let mut pending = Vec::new();
+            for item in self.sessions.iter().filter(|item| item.disconnected) {
                 if !stage.running() {
                     self.counts.not_confirmed += 1;
-                    return false;
+                    continue;
                 }
-                match live_sessions::reread(&self.dir, &self.sessions[*index].session.key) {
-                    Reread::State(state) if state.bridge_on => {
-                        let since = *first_on.get_or_insert(now);
-                        if now.saturating_duration_since(since) >= RC_RECONNECT_CONFIRM
-                            && now.saturating_duration_since(*sent) >= RC_RECONNECT_CONFIRM
-                        {
-                            if action == Action::Restore {
-                                self.counts.restored += 1;
-                            } else {
-                                self.counts.reconnected += 1;
+                match stage.group(&item.session, group, prompt) {
+                    GroupResult::Sent => {
+                        let stage = &stage;
+                        let session = &item.session;
+                        // Start observing this bridge immediately after its own
+                        // send, including while the next human question is open.
+                        // These workers only reread files; they never type or log.
+                        match std::thread::Builder::new().spawn_scoped(scope, move || {
+                            let mut first_on = None;
+                            while stage.running() {
+                                let read = live_sessions::reread(stage.dir, &session.key);
+                                let now = Instant::now();
+                                if !stage.running() {
+                                    return false;
+                                }
+                                match read {
+                                    Reread::State(state) if state.bridge_on => {
+                                        let since = *first_on.get_or_insert(now);
+                                        if now.saturating_duration_since(since)
+                                            >= RC_RECONNECT_CONFIRM
+                                        {
+                                            stage.notice.confirmed();
+                                            return true;
+                                        }
+                                    }
+                                    Reread::State(_) if first_on.is_none() => {}
+                                    Reread::State(_)
+                                    | Reread::Gone
+                                    | Reread::Replaced
+                                    | Reread::Unrecognized => return false,
+                                }
+                                stage.ctx.cancel().wait_timeout(
+                                    RC_POLL
+                                        .min(stage.end.saturating_duration_since(Instant::now())),
+                                );
                             }
-                            return false;
+                            false
+                        }) {
+                            Ok(worker) => pending.push(worker),
+                            Err(_) => self.counts.not_confirmed += 1,
                         }
                     }
-                    Reread::State(_) if first_on.is_none() => {}
-                    Reread::State(_) | Reread::Gone | Reread::Replaced | Reread::Unrecognized => {
+                    GroupResult::AlreadyConnected => {
+                        self.counts.already_connected += 1;
+                        notice.confirmed();
+                    }
+                    GroupResult::Gone => {
+                        self.counts.gone += 1;
+                        notice.confirmed();
+                    }
+                    other => {
+                        record_failure(&mut self.counts, &other, prompt);
                         self.counts.not_confirmed += 1;
-                        return false;
                     }
                 }
-                true
-            });
-            if !pending.is_empty() {
-                ctx.cancel()
-                    .wait_timeout(RC_POLL.min(end.saturating_duration_since(Instant::now())));
             }
-        }
+            for worker in pending {
+                if worker.join().unwrap_or(false) {
+                    if action == Action::Restore {
+                        self.counts.restored += 1;
+                    } else {
+                        self.counts.reconnected += 1;
+                    }
+                } else {
+                    self.counts.not_confirmed += 1;
+                }
+            }
+        });
     }
 }
 
 fn record_failure(counts: &mut Counts, result: &GroupResult, prompt: &mut dyn Prompt) {
+    signals::defer_to_exit();
     match result {
         GroupResult::Skipped(reason) => {
             counts.skipped += 1;

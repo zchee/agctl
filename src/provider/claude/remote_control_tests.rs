@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use std::collections::VecDeque;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -5,6 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use serde_json::json;
 
 use super::*;
+#[cfg(target_os = "macos")]
 use crate::error::AppError;
 use crate::runtime::coordinator::Cancel;
 use crate::runtime::tmux::Pane;
@@ -229,6 +231,7 @@ fn remote_control_outcome_table_and_integer_warnings_cover_every_variant() {
     assert!(warnings(&Counts::default(), Action::None).is_empty());
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Default)]
 struct Script {
     answers: VecDeque<Attestation>,
@@ -236,11 +239,13 @@ struct Script {
     notes: Vec<String>,
     change: Option<Box<dyn FnMut()>>,
 }
+#[cfg(target_os = "macos")]
 impl Script {
     fn yes(n: usize) -> Self {
         Self { answers: std::iter::repeat_n(Attestation::Yes, n).collect(), ..Self::default() }
     }
 }
+#[cfg(target_os = "macos")]
 impl Prompt for Script {
     fn tell(&mut self, message: &str) {
         self.notes.push(message.to_owned());
@@ -456,6 +461,7 @@ mod stage_tests {
                     bin: &fixture.bin,
                     ctx: &ctx,
                     end: Instant::now() + Duration::from_secs(5),
+                    notice: &cleanup::register_exit_notice(0, not_confirmed_warning),
                 };
                 let result = stage.group(session, group, &mut prompt);
                 assert_ne!(result, GroupResult::Sent, "{group:?} {failure}");
@@ -626,6 +632,7 @@ mod stage_tests {
             bin: &fixture.bin,
             ctx: &ctx,
             end: ctx.deadline(),
+            notice: &cleanup::register_exit_notice(0, not_confirmed_warning),
         };
         for group in [Group::Reconnect, Group::Restore] {
             assert_eq!(

@@ -374,6 +374,8 @@ fn run(
         if ctx.cancel().is_cancelled() || started >= deadline {
             return Err(Failure::Timeout);
         }
+        let spawning = crate::runtime::cleanup::begin_spawn_unless_cancelled(ctx.cancel())
+            .ok_or(Failure::Timeout)?;
         let mut command = Command::new(bin);
         command.args(args).env_clear();
         for name in ["PATH", "HOME", "TMUX", "TMUX_TMPDIR"] {
@@ -394,6 +396,7 @@ fn run(
             .map_err(|_| Failure::Spawn)?;
         let stdout = child.stdout.take().ok_or(Failure::Invalid)?;
         let token = ctx.register_child(child);
+        drop(spawning);
         let limit = if subcommand == "capture-pane" { CAPTURE_LIMIT } else { 256 };
         let (tx, rx) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
@@ -418,6 +421,7 @@ fn run(
         }
         Ok(bytes)
     })();
+    crate::runtime::signals::defer_to_exit();
     let failure = result.as_ref().err().copied();
     if matches!(failure, Some(Failure::Spawn | Failure::Timeout)) {
         tracing::warn!(?failure, "tmux call did not complete");
