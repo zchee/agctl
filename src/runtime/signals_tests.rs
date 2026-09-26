@@ -62,6 +62,13 @@ fn install_succeeds_and_leaves_the_cancel_flag_untouched() {
 /// A short budget, so the escalation tests do not each take half a second.
 const TEST_BUDGET: Duration = Duration::from_millis(40);
 
+/// The budget for the tests that hand a child out on a later poll. They check
+/// what the signal path does with that child, so the budget has to outlast
+/// the polls before it: on a loaded CI runner each 5ms poll sleep overshot
+/// enough that three of them outlasted `TEST_BUDGET`, and the wait ended
+/// before the child was ever handed out.
+const LATE_CHILD_BUDGET: Duration = Duration::from_secs(1);
+
 /// A fake process table: which process id currently carries which start time.
 /// A missing id is a process that has exited and been reaped.
 type Table = Rc<RefCell<BTreeMap<u32, String>>>;
@@ -74,10 +81,20 @@ fn child(pid: u32, start: &str) -> ChildEntry {
     ChildEntry { pid, start_time: start.to_owned() }
 }
 
-/// Runs [`terminate_with`] against `table`, handing out `batches` one per
-/// `take`, and returns every `(pid, signal)` sent. `on_send` lets a test make
-/// the fake process react to a signal.
+/// Runs [`terminate_with`] against `table` with the short [`TEST_BUDGET`],
+/// handing out `batches` one per `take`, and returns every `(pid, signal)`
+/// sent. `on_send` lets a test make the fake process react to a signal.
 fn run(
+    table: &Table,
+    batches: Vec<Vec<ChildEntry>>,
+    on_send: impl Fn(&Table, u32, Signal),
+) -> Vec<(u32, i32)> {
+    run_with(TEST_BUDGET, table, batches, on_send)
+}
+
+/// [`run`] with the budget chosen by the test.
+fn run_with(
+    budget: Duration,
     table: &Table,
     batches: Vec<Vec<ChildEntry>>,
     on_send: impl Fn(&Table, u32, Signal),
@@ -85,7 +102,7 @@ fn run(
     let batches = RefCell::new(batches.into_iter());
     let sent = RefCell::new(Vec::new());
     terminate_with(
-        TEST_BUDGET,
+        budget,
         || batches.borrow_mut().next().unwrap_or_default(),
         || false,
         |entry| table.borrow().get(&entry.pid) == Some(&entry.start_time),
@@ -160,8 +177,12 @@ fn a_pid_recycled_during_the_wait_is_not_sigkilled() {
 
 #[test]
 fn a_child_registered_while_waiting_is_signalled_too() {
+    // The second child arrives on the second poll, and both ignore SIGTERM,
+    // so the budget has to run out for the SIGKILL sweep — but not before
+    // that second poll.
     let processes = table(&[(100, "A"), (200, "C")]);
-    let sent = run(&processes, vec![vec![child(100, "A")], vec![child(200, "C")]], ignores_term);
+    let batches = vec![vec![child(100, "A")], vec![child(200, "C")]];
+    let sent = run_with(LATE_CHILD_BUDGET, &processes, batches, ignores_term);
     let kill = Signal::KILL.as_raw();
     assert_eq!(sent, [(100, SIGTERM), (200, SIGTERM), (100, kill), (200, kill)]);
 }
@@ -197,7 +218,7 @@ fn a_child_registered_while_its_spawn_was_in_flight_is_signalled() {
     let takes = Cell::new(0_u32);
     let sent = RefCell::new(Vec::new());
     terminate_with(
-        TEST_BUDGET,
+        LATE_CHILD_BUDGET,
         || {
             let round = takes.replace(takes.get() + 1);
             if round == 3 { vec![child(100, "A")] } else { Vec::new() }
