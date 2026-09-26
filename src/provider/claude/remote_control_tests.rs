@@ -40,6 +40,31 @@ fn remote_control_no_pane_session_keeps_the_nonautomation_hint() {
 }
 
 #[test]
+fn remote_control_readme_preserves_the_exact_residual_and_operator_boundary() {
+    let readme = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
+    let text = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        text.contains(RESIDUAL),
+        "the active consent disclosure must also reach README readers"
+    );
+    for required in [
+        "fresh operator attestation is the sole authorizer",
+        "**only reject**",
+        "remote_control_needs_tty",
+        "remote_control_unsupported_platform",
+        "press Escape",
+        "declining it leaves manual recovery",
+        "changed status panel is not detected from the version alone",
+        "bridge liveness, not verified account ownership or retained history",
+    ] {
+        assert!(text.contains(required), "README lost {required}");
+    }
+    let agents = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/AGENTS.md"));
+    assert!(agents.contains("AC167"));
+    assert!(agents.contains("RC_LAST_VERIFIED_VERSION"));
+}
+
+#[test]
 fn remote_control_versions_use_only_three_checked_ascii_components() {
     let cases: BTreeMap<_, _> = [
         ("2.1.280", Some((2, 1, 280))),

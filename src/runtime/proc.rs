@@ -26,6 +26,10 @@ use macos as platform;
 /// The exact, case-sensitive process name of a matching Claude peer.
 pub const CLAUDE_PROCESS_NAME: &str = "claude";
 
+/// Whether this platform implements [`tty_foreground`] and [`ancestor_of_self`] (D2).
+/// The command refuses an unsupported platform before checking its own TTY.
+pub const REMOTE_CONTROL_SUPPORTED: bool = cfg!(target_os = "macos");
+
 /// What is known about a process another file claims to be held by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Holder {

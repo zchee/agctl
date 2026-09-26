@@ -1,7 +1,7 @@
-//! Read-only Remote Control hints from Claude Code's session registry.
+//! Read-only Remote Control observations from Claude Code's session registry.
 //!
-//! The registry does not identify a session's credential store. These are
-//! possibilities to disclose, never evidence for refusing or targeting a swap.
+//! The registry does not identify a session's credential store. Plain scans
+//! provide hints; detailed checks may reject input, never independently authorize it.
 
 use std::collections::BTreeMap;
 use std::fs;

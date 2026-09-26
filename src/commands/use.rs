@@ -190,7 +190,7 @@ const SWAP_DEADLINE: Duration = Duration::from_secs(120);
 /// [`isolate::forget_session`] return otherwise.
 pub fn run(config_dir: Option<&Path>, args: &UseArgs, cancel: &Cancel) -> Result<i32, AppError> {
     if args.restart_remote_control {
-        let reason = if !cfg!(target_os = "macos") {
+        let reason = if !proc::REMOTE_CONTROL_SUPPORTED {
             Some("remote_control_unsupported_platform")
         } else if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
             Some("remote_control_needs_tty")

@@ -459,6 +459,64 @@ uses this store. To keep a session's claude.ai history: answer `n`, run `/remote
 in that session and disconnect, re-run the swap, then run `/remote-control` again. Do not
 leave the question open while disconnecting: it counts against the swap's limit.
 
+**Supervised tmux restart (macOS).** `--restart-remote-control` automates that sequence
+for live-store sessions whose registry entries name tmux panes:
+
+```sh
+agctl claude use --live work --restart-remote-control --json
+agctl claude use --undo --restart-remote-control --json
+```
+
+Both stdin and stderr must be terminals; stdout may be a JSON pipe. `--yes` conflicts
+with this flag, and the initial swap consent never substitutes for a fresh per-pane
+answer. Immediately before **each** input group, attest that the session uses this live
+store, its **complete** input is empty, and its editor is not in vim mode. Only a complete
+line exactly `y` authorizes that group. Pending input is flushed before each question.
+Questions and pane labels go to stderr, never JSON stdout.
+
+agctl types `/remote-control Enter`, waits for the expected panel, then types
+`Up Up Enter` in one tmux invocation. Every eligible pane must disconnect before any
+refresh POST or swap write; otherwise exit `30` means no swap was made. The whole
+stage has at most 30 seconds, including per-pane questions, and may have less time after
+earlier work. A failed attempt is not retried. If a status panel remains open after a
+refusal, press Escape there. Sessions without a validated pane retain the manual hint.
+
+After an applied swap and its config rewrite, agctl waits an empirical 25 seconds,
+asks afresh, and types `/remote-control Enter` once per disconnected session. Each
+bridge must then remain observed connected for 25 seconds. If the swap did not change
+the item, restoration also requires fresh attestation; declining it leaves manual
+recovery to you. A reconnect or restore failure keeps the original swap exit code and
+reports counts and a manual-recovery warning. If the configuration was not updated or
+the item outcome is unknown, agctl types nothing: follow the reported recovery before
+running `/remote-control` manually. An interrupt during a restart stage emits a counts-only
+recovery note and keeps the signal exit code (`130` for SIGINT), without an outcome document.
+
+This flag acts only on the live target, not a namespace-target undo or an already-active
+configuration catch-up. Linux refuses it before discovery with
+`remote_control_unsupported_platform`; missing terminal channels refuse with
+`remote_control_needs_tty`. Config and screen checks **only reject**. They do not
+independently verify live-store provenance, effective editor mode, or complete buffer
+emptiness; fresh operator attestation is the sole authorizer. A visible draft, stash,
+mode indicator, conflicting dialog, ambiguous capture, or unknown configuration sends
+no input.
+
+A wrong attestation can put /remote-control into a draft as model text, or Enter into a
+prompt that opened after the registry's last write. Mode/settings changes not yet landed,
+concurrent typing, misattested live-store provenance, rebinding and command collisions
+remain possible. A screen check cannot exclude typing or a render change before delivery;
+custom keybindings or command collisions can change what the keys do. The reconnect wait
+is empirical, and a connected bridge does not prove the intended account or retained history.
+
+The candidate version floor and provisional last-verified value are `2.1.281`, pending
+the operator's AC167 release check. Older or unparseable versions reject input. Newer
+versions warn and proceed: a changed status panel is not detected from the version alone.
+Re-run the live account-and-history check on every Claude Code version bump; stable bridge
+liveness alone is not success. `--json` adds `remote_control` only when this flag is given,
+with eleven integer counts: `eligible`, `disconnected`, `reconnected`, `restored`,
+`not_disconnected`, `not_confirmed`, `skipped`, `gone`, `already_connected`, `not_attested`,
+and `attestation_declined`. Failure warnings are generated from those counts. `reconnected`
+and `restored` describe bridge liveness, not verified account ownership or retained history.
+
 **When `~/.claude.json` was not rewritten.** The config step never changes the swap's
 outcome. If it does not land (Claude Code held its config lock, the file changed under
 agctl's lock, the profile request failed) the swap still exits 0. `--json` reports the step
@@ -970,7 +1028,7 @@ carries one of the two, never both.
 | `17` | `discarded` | the item changed, or the hold ran out of time; nothing was written |
 | `18` | `unknown` | the write timed out and could not be verified; re-run `status` |
 | `19` | `failed` | `security(1)` refused the write; the item is untouched |
-| `20` | `cancelled` | the prompt was declined, or there was no terminal and no `--yes` |
+| `20` | `cancelled` | the initial prompt was declined, or there was no terminal and no `--yes` without the restart flag |
 | `21` | `needs_refresh` | the incoming credential expired in a migrated store; run `status` |
 | `22` | `reason: "audit_refused"` | the audit log cannot be appended to |
 | `23` | `reason: "live_unreachable"` | the live store's path is missing or a dangling link |
@@ -978,6 +1036,13 @@ carries one of the two, never both.
 | `27` | `reason: "live_undo_foreign_login"` | another account took the live item |
 | `29` | `reason: "profile_unavailable"` | the server could not be asked whose credential it is |
 | `29` | `reason: "live_token_expired"` | the live token expired; send Claude Code one message |
+| `30` | `reason: "remote_control_not_disconnected"` | not every eligible session disconnected; nothing was written |
+| `30` | `reason: "remote_control_needs_tty"` | the restart flag needs terminal stdin and stderr; no store was read or written |
+| `30` | `reason: "remote_control_unsupported_platform"` | the restart flag is macOS-only; refused before the TTY check or discovery |
+
+The exit-30 documents carry no `refusal` member. Initial swap-consent decline is still
+exit `20`; a failed per-pane disconnect attestation is exit `30`. Reconnect/restore
+attestation failures preserve the original swap outcome and exit code.
 
 An applied swap or undo whose `~/.claude.json` rewrite did not land still exits `0`: the
 swap applied, `config` says what did not, and `warnings` too unless the file is missing. On
