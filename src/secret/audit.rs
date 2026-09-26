@@ -453,6 +453,8 @@ pub enum HolderEvidence {
     StoppedClaudePresent,
     /// Every same-user `claude` process was readable and none was stopped.
     NoStoppedClaude,
+    /// Peer visibility is unproved; modification times cannot authorize removal.
+    Unreadable,
     /// The check could not be made, or could not be made completely.
     None,
 }
@@ -494,6 +496,8 @@ pub enum BreakReason {
     /// A same-user `claude` process is stopped, so the break was abandoned
     /// whether or not that process is the holder.
     HolderStopped,
+    /// Peer visibility could not be established, so removal is unsupported.
+    HolderUnreadable,
 }
 
 /// The record of one break decision (plan section 3.8).
@@ -1036,7 +1040,8 @@ fn state_at(dir: BorrowedFd<'_>, name: &str) -> LogState {
             FileType::Symlink => {
                 LogState::Refused("a symbolic link, which agctl will not append through".to_owned())
             }
-            FileType::RegularFile => match u32::from(stat.st_mode) & 0o7777 {
+            // st_mode is u16 on macOS and u32 on Linux; the mask bounds the final cast.
+            FileType::RegularFile => match (u64::from(stat.st_mode) & 0o7777) as u32 {
                 FILE_MODE => LogState::Present,
                 other => LogState::WrongMode(other),
             },

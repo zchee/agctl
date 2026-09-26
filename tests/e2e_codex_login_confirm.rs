@@ -1,4 +1,4 @@
-#![cfg(feature = "testing")]
+#![cfg(all(feature = "testing", target_os = "macos"))]
 
 //! `agctl codex login` over an account agctl already owns (plan AC107).
 //!

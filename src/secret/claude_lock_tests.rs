@@ -473,7 +473,14 @@ impl Fixture {
     /// elsewhere under the temporary root instead of creating it in place.
     fn build(tree: Tree, through_link: bool) -> Self {
         let root = tempfile::tempdir().expect("a temporary directory");
+        #[cfg(target_os = "macos")]
         let paths = Paths::with_config_dir(root.path().join("config"));
+        #[cfg(target_os = "linux")]
+        let paths = {
+            let alias = root.path().join("root-alias");
+            std::os::unix::fs::symlink(root.path(), &alias).expect("explicit alternate spelling");
+            Paths::with_config_dir(alias.join("config"))
+        };
         paths.ensure_dirs().expect("the agctl store should be creatable");
         let env = EnvView::with_home(root.path().to_path_buf());
         let store = match tree {
@@ -1167,6 +1174,7 @@ fn the_public_rule_runs_against_the_real_clock_and_filesystem() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn the_real_holder_check_never_claims_a_sweep_it_did_not_finish() {
     // The mapping spike V12 asked for, at the boundary where it is decided:
@@ -1329,6 +1337,79 @@ fn unavailable_evidence_continues_on_modification_times_alone() {
     assert_eq!(outcome.decision, Decision::Broken);
     let record = outcome.record.expect("audited");
     assert_eq!(record.holder_evidence, HolderEvidence3::None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unknown_evidence_keeps_stale_lock() {
+    struct SweepHolders(Result<Vec<(u32, proc::Holder)>, proc::ProcError>);
+    impl HolderEvidence for SweepHolders {
+        fn stopped_claude_present(&self) -> HolderEvidence3 {
+            ProcHolders::from_sweep(self.0.clone())
+        }
+    }
+
+    let cases = [
+        Err(proc::ProcError::Listing("fixture read refused".to_owned())),
+        Err(proc::ProcError::Incomplete { unreadable: 1 }),
+        Ok(Vec::new()),
+        Ok(vec![(42, proc::Holder::Alive)]),
+    ];
+    for sweep in cases {
+        let fixture = Fixture::new();
+        fixture.plant(&fixture.primary, stale_age());
+        let credential = fixture.store.join("credential-sentinel");
+        fs::write(&credential, "unchanged synthetic bytes").expect("fixture sentinel");
+        let clock = fixture.fake_clock();
+        let holders = SweepHolders(sweep);
+        assert_eq!(holders.stopped_claude_present(), HolderEvidence3::Unreadable);
+        let before = fs::metadata(&fixture.primary).expect("lock").modified().expect("mtime");
+        let outcome = run_rule(&fixture, &clock, &holders, &Fault::none());
+        assert_eq!(outcome.decision, Decision::Abandoned(Reason::HolderUnreadable));
+        let record = outcome.record.expect("refusal evidence");
+        assert_eq!(record.holder_evidence, HolderEvidence3::Unreadable);
+        assert!(record.sample_b.is_none() && record.sample_c.is_none());
+        assert!(clock.slept().is_empty());
+        assert!(fixture.timeline.ops().is_empty(), "zero mkdir/rmdir calls");
+        assert!(fixture.primary.is_dir());
+        assert_eq!(
+            fs::metadata(&fixture.primary).expect("intact lock").modified().expect("mtime"),
+            before
+        );
+
+        let seams = fixture.seams(&clock, &holders);
+        let result = fixture.acquire(&seams, &Cancel::new(), &Fault::none());
+        let mut writes = Vec::new();
+        if let Ok(Acquisition { outcome: AcquireOutcome::Held(_hold), .. }) = &result {
+            writes.push(credential.clone());
+            fs::write(&credential, "must never be installed").expect("held write");
+        }
+        let failure = result.expect_err("unreadable holder is terminal, never a retry");
+        assert!(matches!(failure.error, LockError::HolderUnreadable));
+        assert!(failure.error.to_string().contains("no stopped peer visible by exact name"));
+        assert_eq!(
+            failure.break_record.expect("refusal is retained").reason,
+            Some(Reason::HolderUnreadable)
+        );
+        assert!(writes.is_empty(), "zero writes in the mutation recorder");
+        assert!(fixture.timeline.ops().is_empty(), "no retry, sampling wait or removal");
+        assert!(fixture.records().is_empty(), "no held record was created");
+        assert_eq!(
+            fs::read_to_string(&credential).expect("unchanged sentinel"),
+            "unchanged synthetic bytes"
+        );
+    }
+
+    let fixture = Fixture::new();
+    let clock = fixture.fake_clock();
+    let holders = SweepHolders(Ok(Vec::new()));
+    let seams = fixture.seams(&clock, &holders);
+    let acquired =
+        fixture.acquire(&seams, &Cancel::new(), &Fault::none()).expect("fresh acquisition");
+    let AcquireOutcome::Held(hold) = acquired.outcome else { panic!("fresh store must be usable") };
+    assert!(fixture.all().iter().all(|path| path.is_dir()));
+    drop(hold);
+    assert!(fixture.all().iter().all(|path| !path.exists()), "own release remains allowed");
 }
 
 #[test]
@@ -2045,6 +2126,8 @@ fn a_symlink_where_a_lock_should_be_is_never_removed() {
     fs::create_dir(&target).expect("creatable");
     let link = dir.path().join(REFRESH_LOCK);
     std::os::unix::fs::symlink(&target, &link).expect("linkable");
+    #[cfg(target_os = "linux")]
+    set_mtime(&target, SystemTime::UNIX_EPOCH + Duration::from_secs(1));
     let fd = dir_fd(dir.path());
     let at = LockSlot { dir: fd.as_fd(), name: OsStr::new(REFRESH_LOCK), shown: &link };
 

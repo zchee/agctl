@@ -42,6 +42,7 @@
 )]
 
 pub mod audit;
+pub mod backend;
 pub mod claude_lock;
 pub mod config_lock;
 pub mod file_store;
@@ -72,7 +73,7 @@ pub const CLAUDE_SERVICE_PREFIX: &str = "Claude Code-credentials";
 pub const SWITCHER_SERVICE_PREFIX: &str = "claude-switcher:";
 
 /// Selects the keychain backend under the `testing` feature.
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", target_os = "macos"))]
 pub const KEYCHAIN_BACKEND_ENV: &str = "AGCTL_KEYCHAIN_BACKEND";
 
 /// Overrides the `security(1)` binary under the `testing` feature.
@@ -133,6 +134,8 @@ pub trait KeychainReader {
 /// What the keychain preflight found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeychainStatus {
+    /// This platform does not provide the keychain transport.
+    Unsupported,
     /// Readable.
     Unlocked,
     /// Present but locked; the user must unlock it.
@@ -159,6 +162,9 @@ pub struct ServiceEntry {
 /// Why a keychain read failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KeychainError {
+    /// This platform does not provide the keychain transport.
+    #[error("unsupported on this platform")]
+    Unsupported,
     /// The keychain is locked.
     #[error("keychain locked")]
     Locked,
@@ -187,12 +193,13 @@ impl KeychainError {
     /// answered by falling back to the plaintext file, because that is how
     /// two processes end up holding one refresh chain.
     pub fn is_transient(&self) -> bool {
-        !matches!(self, Self::Spawn(_))
+        !matches!(self, Self::Spawn(_) | Self::Unsupported)
     }
 
     /// The class this error reports to the user through [`AppError`].
     pub fn class(&self) -> KeychainClass {
         match self {
+            Self::Unsupported => KeychainClass::Other(backend::UNSUPPORTED.to_owned()),
             Self::Locked => KeychainClass::Locked,
             Self::Timeout(_) => KeychainClass::Timeout,
             Self::Spawn(reason) => KeychainClass::Other(reason.clone()),
@@ -324,6 +331,7 @@ impl KeychainReader for DisabledReader {
 /// reach it by accident — as one did, from a unit test one line away from a
 /// keychain write. The write side refuses the same way
 /// (`keychain_write::security_bin`).
+#[cfg(target_os = "macos")]
 pub fn default_reader(ctx: &PassCtx) -> Box<dyn KeychainReader + Send + Sync> {
     #[cfg(feature = "testing")]
     if std::env::var(KEYCHAIN_BACKEND_ENV).is_ok_and(|value| value == "none") {
@@ -338,6 +346,32 @@ pub fn default_reader(ctx: &PassCtx) -> Box<dyn KeychainReader + Send + Sync> {
     let bin = std::path::PathBuf::from(SECURITY_BIN);
 
     Box::new(security_cli::SecurityCli::new(bin, current_account(), ctx.clone()))
+}
+
+/// A platform-refusing reader; no environment variable can enable a transport.
+#[cfg(target_os = "linux")]
+pub fn default_reader(ctx: &PassCtx) -> Box<dyn KeychainReader + Send + Sync> {
+    Box::new(security_cli::SecurityCli::new(std::path::PathBuf::new(), String::new(), ctx.clone()))
+}
+
+/// Selects the concrete reader without exposing a Linux backend override.
+#[cfg(target_os = "macos")]
+fn configured_security_reader(ctx: PassCtx) -> Option<security_cli::SecurityCli> {
+    #[cfg(feature = "testing")]
+    if std::env::var(KEYCHAIN_BACKEND_ENV).is_ok_and(|value| value == "none") {
+        return None;
+    }
+    #[cfg(feature = "testing")]
+    let bin = std::env::var_os(SECURITY_BIN_ENV).map(std::path::PathBuf::from)?;
+    #[cfg(not(feature = "testing"))]
+    let bin = std::path::PathBuf::from(SECURITY_BIN);
+    Some(security_cli::SecurityCli::new(bin, current_account(), ctx))
+}
+
+/// Preserves a concrete reader whose operations explicitly refuse the platform.
+#[cfg(target_os = "linux")]
+fn configured_security_reader(ctx: PassCtx) -> Option<security_cli::SecurityCli> {
+    Some(security_cli::SecurityCli::new(std::path::PathBuf::new(), String::new(), ctx))
 }
 
 /// The `acct` attribute Claude Code stores its items under: `$USER`.

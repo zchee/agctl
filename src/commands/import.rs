@@ -120,6 +120,9 @@ pub fn run_with(import: &Import<'_>) -> Result<Vec<String>, AppError> {
 /// Plans an import of per-configuration-directory keychain items.
 fn keychain_plan(import: &Import<'_>, existing: &AgctlConfig) -> Result<ImportPlan, AppError> {
     match import.reader.preflight() {
+        KeychainStatus::Unsupported => {
+            return Err(AppError::Config(crate::secret::backend::UNSUPPORTED.to_owned()));
+        }
         KeychainStatus::Unlocked => {}
         KeychainStatus::Locked => {
             return Err(AppError::Config(

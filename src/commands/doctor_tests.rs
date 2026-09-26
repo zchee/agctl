@@ -189,6 +189,7 @@ fn backdate(path: &Path, age: Duration) {
 }
 
 /// Moves a modification time to *now*, which is what a heartbeat looks like.
+#[cfg(target_os = "macos")]
 fn beat(path: &Path) {
     backdate(path, Duration::ZERO);
 }
@@ -200,6 +201,7 @@ fn beat(path: &Path) {
 /// F45). Phase 1's fixture wrote a regular file, which is why AC45 passed
 /// against a `doctor` that could not have removed a real artefact at all
 /// (`agctl-nz5`, premortem PM13′).
+#[cfg(target_os = "macos")]
 fn plant_artefact(store: &Store, org: &str, name: &str, age: Duration) -> PathBuf {
     let ns_dir = store.ns_dir(org);
     fs::create_dir_all(&ns_dir).expect("the namespace directory should be creatable");
@@ -276,6 +278,7 @@ fn the_report_names_the_lock_holder_and_whether_it_is_alive() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn the_report_names_a_recycled_pid_rather_than_the_process_now_using_it() {
     // The reason the body carries a start time at all: pid 1 exists on every
@@ -321,6 +324,7 @@ fn the_report_lists_pending_writes_and_stray_temporaries() {
     assert!(text.contains("token material at rest"), "the stray file's risk is stated:\n{text}");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn the_report_samples_an_artefact_twice_and_offers_the_removal() {
     let store = store();
@@ -409,6 +413,7 @@ fn the_report_flags_a_namespace_a_session_has_migrated() {
 // --remove-stale — the accept case
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_removes_a_lapsed_artefact_after_stating_the_risk() {
     let store = store();
@@ -428,6 +433,7 @@ fn remove_stale_removes_a_lapsed_artefact_after_stating_the_risk() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_accepts_the_storage_write_guard_and_the_legacy_lock() {
     let store = store();
@@ -453,6 +459,7 @@ fn remove_stale_accepts_the_storage_write_guard_and_the_legacy_lock() {
 // --remove-stale — the refusal matrix (invariant I11)
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_an_artefact_younger_than_the_threshold() {
     let store = store();
@@ -467,6 +474,7 @@ fn remove_stale_refuses_an_artefact_younger_than_the_threshold() {
     assert!(artefact.exists(), "and is still there");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_an_artefact_whose_holder_is_still_beating() {
     // The two-sample rule (fact F36): a modification time that moves between
@@ -493,6 +501,7 @@ fn remove_stale_refuses_an_artefact_whose_holder_is_still_beating() {
     assert!(artefact.exists(), "the artefact survives");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_without_yes() {
     let store = store();
@@ -511,6 +520,7 @@ fn remove_stale_refuses_without_yes() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_a_path_outside_the_namespace_root() {
     let store = store();
@@ -526,6 +536,7 @@ fn remove_stale_refuses_a_path_outside_the_namespace_root() {
     assert!(outside.exists(), "the live store's lock is untouched");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_a_name_that_is_not_an_artefact() {
     let store = store();
@@ -542,6 +553,7 @@ fn remove_stale_refuses_a_name_that_is_not_an_artefact() {
     assert!(credentials.exists(), "the credential file is untouched");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_agctls_own_namespace_lock() {
     // The lock file is never unlinked by anything, including this: `flock`
@@ -570,6 +582,7 @@ fn remove_stale_refuses_agctls_own_namespace_lock() {
     assert!(lock_path.exists());
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_a_symbolic_link() {
     let store = store();
@@ -587,6 +600,7 @@ fn remove_stale_refuses_a_symbolic_link() {
     assert!(target.exists(), "and so is what it pointed at");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_removes_the_directory_claude_code_actually_makes() {
     // `agctl-nz5`, the first half of AC73. This test asserted the opposite
@@ -607,6 +621,7 @@ fn remove_stale_removes_the_directory_claude_code_actually_makes() {
     assert!(io.text().contains("Removed `"), "{}", io.text());
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_a_regular_file_at_an_artefact_name() {
     // Claude Code never writes a file at one of those names, so a file there
@@ -625,6 +640,7 @@ fn remove_stale_refuses_a_regular_file_at_an_artefact_name() {
     assert!(file.exists(), "the file is still there");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_an_artefact_directory_with_something_in_it() {
     // A lapsed lock is an empty directory; one holding a file is either in use
@@ -679,6 +695,7 @@ fn plant_record(store: &Store, pid: u32, store_dir: &Path, held: &[&Path]) -> Pa
 }
 
 /// A lock directory in a store agctl does not own, aged past the threshold.
+#[cfg(target_os = "macos")]
 fn plant_leak(store: &Store) -> (PathBuf, PathBuf) {
     let live = store.home.join(".claude");
     let leaked = live.join(REFRESH_LOCK);
@@ -687,6 +704,7 @@ fn plant_leak(store: &Store) -> (PathBuf, PathBuf) {
     (live, leaked)
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_removes_an_outside_path_a_dead_record_names() {
     // The second half of AC73, and the only recovery command premortem PM9
@@ -710,6 +728,7 @@ fn remove_stale_removes_an_outside_path_a_dead_record_names() {
     assert!(text.contains("is outside"), "{text}");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_an_outside_path_whose_record_is_still_held() {
     // A live pid means the lock is held, not leaked. This process is the
@@ -726,6 +745,7 @@ fn remove_stale_refuses_an_outside_path_whose_record_is_still_held() {
     assert!(leaked.exists(), "the lock directory survives");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_an_outside_path_no_record_names() {
     // The record vouches for the paths it lists and for nothing else: a
@@ -745,6 +765,7 @@ fn remove_stale_refuses_an_outside_path_no_record_names() {
     assert!(sibling.exists(), "and nothing outside the root was removed");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_an_outside_path_with_no_records_at_all() {
     // The default on every machine that has never held a Claude Code lock.
@@ -759,6 +780,7 @@ fn remove_stale_refuses_an_outside_path_with_no_records_at_all() {
     assert!(leaked.exists());
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_an_attested_path_reached_through_a_symbolic_link() {
     // The record vouches for a path, not for the way the filesystem resolves
@@ -811,6 +833,7 @@ fn the_report_calls_a_regular_file_at_an_artefact_name_anomalous() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn the_report_names_a_leaked_held_lock_and_the_command_that_clears_it() {
     // Plan section 3.9 row 2, the `doctor` half: the record is the only
@@ -862,6 +885,7 @@ fn the_report_says_none_when_nothing_is_held() {
     assert!(io.text().contains("held locks\n  none"), "{}", io.text());
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_something_that_is_not_there() {
     let store = store();
@@ -945,6 +969,7 @@ fn the_foreign_section_says_none_when_there_is_nothing_foreign() {
 ///
 /// This stands in for `~/.claude/.oauth_refresh.lock` — the file a live Claude
 /// Code session is holding, and the one invariant I11 exists to protect.
+#[cfg(target_os = "macos")]
 fn plant_outside(at: &Path) -> PathBuf {
     fs::create_dir_all(at).expect("the outside directory should be creatable");
     let path = at.join(REFRESH_LOCK);
@@ -953,6 +978,7 @@ fn plant_outside(at: &Path) -> PathBuf {
     path
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_a_symlinked_organization_component() {
     // `<root>/<acct>/<org>/.oauth_refresh.lock` spells a location under the
@@ -978,6 +1004,7 @@ fn remove_stale_refuses_a_symlinked_organization_component() {
     assert!(victim.exists(), "the live session's lock is untouched: {}", victim.display());
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_stale_refuses_a_symlinked_account_component() {
     // The same attack one level up: `<acct>` is the link, so the artefact's
@@ -999,6 +1026,7 @@ fn remove_stale_refuses_a_symlinked_account_component() {
     assert!(victim.exists(), "the file the link pointed at is untouched");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn the_report_prints_a_legacy_lock_command_that_remove_stale_accepts() {
     // The legacy lock is named after the *resolved* namespace (fact F17), and

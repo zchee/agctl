@@ -1,4 +1,4 @@
-#![cfg(feature = "testing")]
+#![cfg(all(feature = "testing", target_os = "macos"))]
 
 //! `doctor --remove-stale` outside agctl's own namespace root (plan AC73,
 //! section 3.9 row 2), driven through the real binary.

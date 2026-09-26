@@ -169,6 +169,7 @@ fn accounts_remove_refuses_an_id_it_does_not_know() {
         .stderr(contains("nobody@example.com"));
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn doctor_remove_stale_refuses_a_path_outside_the_store() {
     // Invariant I11, from outside the process: the live store's own lock is

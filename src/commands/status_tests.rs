@@ -83,7 +83,14 @@ fn store() -> Store {
     let dir = TempDir::new().expect("a temporary directory should be creatable");
     let home = dir.path().join("home");
     fs::create_dir_all(&home).expect("the fake home should be creatable");
+    #[cfg(target_os = "macos")]
     let paths = Arc::new(Paths::with_config_dir(dir.path().join("config")));
+    #[cfg(target_os = "linux")]
+    let paths = {
+        let alias = dir.path().join("root-alias");
+        std::os::unix::fs::symlink(dir.path(), &alias).expect("explicit alternate spelling");
+        Arc::new(Paths::with_config_dir(alias.join("config")))
+    };
     paths.ensure_dirs().expect("the store directories should be creatable");
     Store { _dir: dir, home, paths }
 }

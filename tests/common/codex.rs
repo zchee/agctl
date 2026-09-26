@@ -314,6 +314,7 @@ impl CodexFixture {
         // any keychain call (`secret::default_reader`) — never neither, which
         // would leave a real `security(1)` reachable.
         match (backend_none, &security_bin) {
+            (false, None) if cfg!(target_os = "linux") => {}
             (true, None) => {}
             (false, Some(bin)) => assert!(
                 bin.starts_with(self.root()),

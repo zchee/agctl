@@ -148,7 +148,7 @@ fn the_grep_can_fail() {
 #[test]
 fn the_only_unsafe_in_the_crate_is_the_libproc_wrapper() {
     // Decision D-022 brought the crate its first `unsafe`. It is confined to
-    // one private module inside `runtime/proc.rs`, every call carries a
+    // one private module inside `runtime/proc/macos.rs`, every call carries a
     // `// SAFETY:` comment, and no other module gains any.
     let mut unsafe_files: Vec<(PathBuf, usize)> = Vec::new();
     for path in production_sources() {
@@ -163,7 +163,7 @@ fn the_only_unsafe_in_the_crate_is_the_libproc_wrapper() {
     assert_eq!(unsafe_files.len(), 1, "exactly one file has any `unsafe`: {names:?}");
     let (path, count) = &unsafe_files[0];
     assert!(
-        path.ends_with("runtime/proc.rs"),
+        path.ends_with("runtime/proc/macos.rs"),
         "and it is the libproc wrapper, not {}",
         path.display()
     );
@@ -228,10 +228,16 @@ fn the_built_binary_carries_no_process_lister_and_no_argument_api() {
     // the only one `doctor` reaches today — `proc_listpids` and `proc_name`
     // are reached solely from `claude_processes`, whose caller is the break
     // rule, whose caller arrives in W4a. When it does, this list grows.
+    #[cfg(target_os = "macos")]
     assert!(
         contains_bytes(&binary, b"proc_pidinfo"),
         "the process state comes from libproc, in-process"
     );
+    #[cfg(target_os = "linux")]
+    {
+        assert!(contains_bytes(&binary, b"/proc"), "the process state comes from procfs");
+        assert!(!contains_bytes(&binary, b"proc_pidinfo"), "no Apple FFI in the Linux artifact");
+    }
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {

@@ -41,6 +41,7 @@ use codex::Needle;
 use codex::Stream;
 use codex::audit_log;
 use codex::jwt;
+#[cfg(target_os = "macos")]
 use codex::keyring_account;
 use codex::write_0600;
 use serde_json::Value;
@@ -63,6 +64,7 @@ const MEMBER_NEEDLE: &str = "agctl-test-codex-ak-0004";
 
 /// The sentinel planted as a `codex-switcher:` keychain service, which the
 /// report counts and never names (plan AC108).
+#[cfg(target_os = "macos")]
 const SWITCHER_NEEDLE: &str = "agctl-test-codex-email-0009";
 
 /// The needles no stream and no document of a `doctor` run may carry.
@@ -139,6 +141,7 @@ fn live_home(fixture: &CodexFixture) -> PathBuf {
 
 /// Seeds the Codex write log with one `login_keychain_gained` line per
 /// account, as a refused `agctl codex login` would have written it.
+#[cfg(target_os = "macos")]
 fn gained_lines(fixture: &CodexFixture, accounts: &[&str]) {
     let text: String = accounts
         .iter()
@@ -220,6 +223,7 @@ fn auth_document() -> Value {
 /// `Fixture::dump` writes `acct="example"` for every item; a `Codex Auth`
 /// item's account is the home hash, and matching it is the whole of plan
 /// AC95's `auto` case, so the listing is written here instead.
+#[cfg(target_os = "macos")]
 fn keychain_listing(fixture: &CodexFixture, items: &[(&str, &str)]) {
     let mut text = String::from(
         "keychain: \"/Users/example/Library/Keychains/login.keychain-db\"\nversion: 512\n",
@@ -286,6 +290,7 @@ fn manifest(dir: &Path) -> Vec<String> {
 
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "macos")]
 #[test]
 fn the_report_names_every_item_and_validates_against_the_schema() {
     // Plan AC108, in one run: a planted `multi-auth/` and a `codex-switcher:`
@@ -789,6 +794,7 @@ fn a_run_changes_nothing_and_creates_nothing() {
     assert!(table.contains("owned namespaces\n  none"), "{table}");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn a_codex_auth_item_agctl_cannot_explain_gets_no_command_in_any_stream() {
     // The plan's scope (section 3.3, ledger #186): a `Codex Auth` item that
@@ -816,6 +822,7 @@ fn a_codex_auth_item_agctl_cannot_explain_gets_no_command_in_any_stream() {
     assert!(!rendered.contains("delete-generic-password"), "{rendered}");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn a_keychain_account_agctl_did_not_write_never_reaches_a_command() {
     // Review S35 C1, end to end. The `acct` attribute of a keychain item is

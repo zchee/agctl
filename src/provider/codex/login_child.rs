@@ -282,7 +282,11 @@ pub fn acquire_scratch_lock(
 /// # Errors
 ///
 /// The clause naming what is wrong, ready to be read after the root's path.
-fn root_verdict(st_uid: u32, st_mode: u32, expected_uid: u32) -> Result<(), String> {
+fn root_verdict(
+    st_uid: u32,
+    st_mode: rustix::fs::RawMode,
+    expected_uid: u32,
+) -> Result<(), String> {
     if st_uid != expected_uid {
         return Err("is owned by another user".to_owned());
     }
@@ -348,7 +352,7 @@ pub fn open_scratch_root(root: &Path) -> Result<OwnedFd, LoginChildError> {
         reason: format!("cannot be inspected ({errno})"),
     })?;
 
-    if let Err(reason) = root_verdict(stat.st_uid, u32::from(stat.st_mode), geteuid().as_raw()) {
+    if let Err(reason) = root_verdict(stat.st_uid, stat.st_mode, geteuid().as_raw()) {
         return Err(LoginChildError::ScratchRoot { path: root.to_path_buf(), reason });
     }
     Ok(dir)
@@ -408,15 +412,15 @@ fn report(out: &mut dyn Write, path: &Path, what: &str, errno: Errno) {
 ///
 /// A same-uid child can `chmod 000` a directory it created, which would leave
 /// its contents behind. The owner may always change the mode, so on `EACCES`
-/// the mode is reset with `fchmodat(AT_SYMLINK_NOFOLLOW)` — which acts on a
-/// link itself rather than its target, so a swap between the `statat` and here
-/// cannot redirect it — and the open is tried once more.
+/// the entry's mode is reset without following a link and the open is tried
+/// once more. The platform primitive never changes the target behind a
+/// substituted link.
 fn open_subdir(dir: &OwnedFd, name: &std::ffi::CStr) -> Option<OwnedFd> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     match rustix::fs::openat(dir, name, flags, Mode::empty()) {
         Ok(child) => Some(child),
         Err(Errno::ACCESS) => {
-            rustix::fs::chmodat(dir, name, Mode::RWXU, AtFlags::SYMLINK_NOFOLLOW).ok()?;
+            crate::runtime::proc::make_dir_searchable(dir, name).ok()?;
             rustix::fs::openat(dir, name, flags, Mode::empty()).ok()
         }
         Err(_) => None,

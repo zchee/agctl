@@ -151,6 +151,7 @@ impl Fixture {
         // `login` prints the URL either way; opening a window on the
         // developer's desktop from a test run is not acceptable.
         fixture.set("AGCTL_NO_BROWSER", "1");
+        #[cfg(target_os = "macos")]
         fixture.set("AGCTL_KEYCHAIN_BACKEND", "none");
         // Pinned rather than inherited: `current_account()` reads `USER` and
         // falls back to `LOGNAME`, and both must name the account the fake
@@ -796,6 +797,10 @@ impl Fixture {
     ///
     /// Panics when neither variable is set.
     fn assert_keychain_seam(&self) {
+        if cfg!(target_os = "linux") {
+            // Linux has no keychain transport or backend-selector seam.
+            return;
+        }
         let wired = |key: &str| self.env.iter().any(|(name, _)| name == key);
         assert!(
             wired("AGCTL_SECURITY_BIN") || wired("AGCTL_KEYCHAIN_BACKEND"),

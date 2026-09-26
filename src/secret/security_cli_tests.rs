@@ -67,7 +67,7 @@ fn the_dump_parser_returns_nothing_for_empty_or_unrelated_output() {
     assert!(parse_dump("security: SecKeychainCopyDefault failed\n").is_empty());
 }
 
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", target_os = "macos"))]
 mod against_the_fake_script {
     use std::time::Duration;
     use std::time::Instant;
@@ -393,6 +393,33 @@ mod against_the_fake_script {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_security_transport_refuses_before_spawn() {
+    let dir = tempfile::tempdir().expect("sentinel transport");
+    let executable = dir.path().join("security");
+    let invoked = dir.path().join("invoked");
+    std::fs::write(&executable, format!("#!/bin/sh\nprintf invoked > '{}'\n", invoked.display()))
+        .expect("sentinel script");
+    std::fs::set_permissions(&executable, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("executable sentinel");
+    let ctx = PassCtx::standalone(
+        crate::runtime::coordinator::Cancel::new(),
+        std::time::Instant::now() + Duration::from_secs(5),
+    );
+    let reader = SecurityCli::new(executable, "fixture".to_owned(), ctx.clone());
+    for args in argv_shapes() {
+        assert!(matches!(reader.run(&args, READ_TIMEOUT), Err(KeychainError::Unsupported)));
+    }
+    for reader in [&reader as &dyn KeychainReader, crate::secret::default_reader(&ctx).as_ref()] {
+        assert_eq!(reader.preflight(), KeychainStatus::Unsupported);
+        assert_eq!(reader.list_services("anything"), Err(KeychainError::Unsupported));
+        assert_eq!(reader.read("anything"), Err(KeychainError::Unsupported));
+    }
+    assert!(!invoked.exists(), "no transport invocation");
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 fn the_crate_builds_exactly_the_four_argv_shapes_section_93_lists() {
     // Plan section 9.3's argv-construction assertion, both halves at once. It

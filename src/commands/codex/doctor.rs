@@ -550,6 +550,7 @@ fn namespace_sections(
             let (artefacts, credentials_present) = artefacts(&dir);
             let marker = marker_section(paths, owned.user(), owned.acct());
             let mut notes = Vec::new();
+            let lock = lock_section(paths, owned.user(), owned.acct(), cancel, &mut notes);
             if artefacts.iter().any(|line| line.starts_with("stray tmp")) {
                 notes.push(
                     "`accounts refresh --resend` is refused while a stray temporary file is there"
@@ -562,7 +563,7 @@ fn namespace_sections(
                 path: dir.display().to_string(),
                 credentials_present,
                 refresh_policy: policy_word(&record.kind),
-                lock: lock_section(paths, owned.user(), owned.acct(), cancel),
+                lock,
                 artefacts,
                 marker,
                 notes,
@@ -632,22 +633,26 @@ fn artefacts(dir: &Path) -> (Vec<String>, bool) {
 }
 
 /// Who holds agctl's own lock for this namespace, when anybody does.
-fn lock_section(paths: &Paths, user: &str, acct: &str, cancel: &Cancel) -> Option<LockSection> {
+fn lock_section(
+    paths: &Paths,
+    user: &str,
+    acct: &str,
+    cancel: &Cancel,
+    notes: &mut Vec<String>,
+) -> Option<LockSection> {
     let path = paths.codex_lock_path(user, acct).ok()?;
     let body = namespace_lock::read_body(&path)?;
     // A recycled process id is the failure this comparison exists for: the pid
     // may be in use again by something unrelated, and naming it as the holder
     // sends a user after the wrong process.
-    let recycled = body
-        .pid_start_time
-        .as_ref()
-        .is_some_and(|recorded| proc::start_time(body.pid, cancel).as_ref() != Some(recorded));
-    let holder = if recycled {
-        "dead (pid recycled)"
-    } else if proc::holder(body.pid, cancel) == proc::Holder::Dead {
-        "dead (holder gone)"
-    } else {
-        "held"
+    let holder = match proc::record_holder(body.pid, body.pid_start_time.as_deref(), cancel) {
+        proc::RecordHolder::Unknown => {
+            notes.push("namespace lock: unknown holder identity".to_owned());
+            return None;
+        }
+        proc::RecordHolder::Recycled => "dead (pid recycled)",
+        proc::RecordHolder::Known(proc::Holder::Dead) => "dead (holder gone)",
+        proc::RecordHolder::Known(proc::Holder::Alive | proc::Holder::Stopped) => "held",
     };
     Some(LockSection { pid: body.pid, acquired_at: body.acquired_at, holder })
 }

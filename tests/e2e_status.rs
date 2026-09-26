@@ -16,12 +16,15 @@
 mod common;
 
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 use common::ACCT;
 use common::EMAIL;
 use common::Fixture;
+#[cfg(target_os = "macos")]
 use common::LIVE_SERVICE;
+#[cfg(target_os = "macos")]
 use common::OLD_BLOB;
 use common::ORG;
 use common::USAGE_BODY;
@@ -307,6 +310,7 @@ fn token_ok(server: &MockServer) -> Mock<'_> {
     })
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac5_an_expired_live_credential_costs_no_request() {
     // Plan AC5, decision D-001: the live entry belongs to Claude Code, which
@@ -427,6 +431,7 @@ fn ac8_a_rate_limit_is_honoured_past_the_end_of_the_process() {
     fixture.assert_keychain_read_only();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac31_a_hanging_security_times_out_and_owned_rows_still_refresh() {
     // Plan AC31, invariant I12: `security(1)` is killed at its budget, the
@@ -488,6 +493,7 @@ fn ac31_a_hanging_security_times_out_and_owned_rows_still_refresh() {
     fixture.assert_keychain_read_only();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac32_a_locked_keychain_stops_keychain_rows_and_not_owned_ones() {
     // Plan AC32, fact F34: preflight exit 36 means locked. The live row can
@@ -525,6 +531,7 @@ fn ac32_a_locked_keychain_stops_keychain_rows_and_not_owned_ones() {
     fixture.assert_keychain_read_only();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac34_a_migrated_namespace_is_read_from_the_keychain_and_never_written() {
     // Plan AC34, fact F35: a Claude Code session has moved this namespace's
@@ -581,6 +588,7 @@ fn ac34_a_migrated_namespace_is_read_from_the_keychain_and_never_written() {
     fixture.assert_keychain_read_only();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac34_a_locked_keychain_read_never_falls_back_to_the_file() {
     // Plan AC34's second clause and invariant I10: for a keychain-backed row
@@ -630,6 +638,7 @@ fn ac34_a_locked_keychain_read_never_falls_back_to_the_file() {
     fixture.assert_keychain_read_only();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac39_a_config_dir_blob_without_an_identity_is_identity_unknown() {
     // Plan AC39, invariant I13: identity comes from the credential, never
@@ -690,6 +699,7 @@ fn ac39_a_config_dir_blob_without_an_identity_is_identity_unknown() {
     fixture.assert_keychain_read_only();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac42_a_keychain_item_naming_the_live_directory_is_a_hidden_sibling() {
     // Plan AC42, facts F41 and F6: `~/.claude` is a symlink, and a keychain
@@ -744,6 +754,7 @@ fn ac42_a_keychain_item_naming_the_live_directory_is_a_hidden_sibling() {
     fixture.assert_keychain_read_only();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac42_an_identical_blob_under_a_second_name_folds_into_the_live_row() {
     // The other half of plan AC42: same directory, *same* credentials, so the
@@ -770,6 +781,7 @@ fn ac42_an_identical_blob_under_a_second_name_folds_into_the_live_row() {
     fixture.assert_keychain_read_only();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac43_a_hanging_security_cannot_hold_the_pass_open() {
     // Plan AC43, design S1': every child is owned by the coordinator and
@@ -872,13 +884,16 @@ fn ac48_an_unavailable_flock_stops_the_refresh() {
 
 /// A second owned account, so "absent elsewhere" is a claim about a choice
 /// and not about the only other row in the table.
+#[cfg(target_os = "macos")]
 const STRANGER_ACCT: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 
 /// Its organization.
+#[cfg(target_os = "macos")]
 const STRANGER_ORG: &str = "ffffffff-0000-4111-8222-333333333333";
 
 /// A live keychain item and two owned namespaces: one the live account's
 /// twin, one a stranger.
+#[cfg(target_os = "macos")]
 fn twin_fixture(server: &MockServer) -> Fixture {
     usage_ok(server);
 
@@ -915,6 +930,7 @@ fn twin_fixture(server: &MockServer) -> Fixture {
     fixture
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn b90_the_table_marks_only_the_owned_row_that_is_the_live_account() {
     // `agctl-p3-login-live-identity-warning-b90` (status marks the Owned
@@ -943,6 +959,7 @@ fn b90_the_table_marks_only_the_owned_row_that_is_the_live_account() {
     fixture.assert_keychain_read_only();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn b90_the_json_report_names_the_live_twin_and_leaves_every_other_row_null() {
     let server = MockServer::start();
@@ -995,6 +1012,7 @@ fn b90_the_json_report_names_the_live_twin_and_leaves_every_other_row_null() {
 /// second one could not be told from the first in rendered table text. With
 /// one, the claim is a row *count* — two rows without the flag, one with it —
 /// which needs no per-row identification at all.
+#[cfg(target_os = "macos")]
 fn one_identity_fixture(server: &MockServer) -> Fixture {
     usage_ok(server);
 
@@ -1016,10 +1034,12 @@ fn one_identity_fixture(server: &MockServer) -> Fixture {
 
 /// The rendered rows naming `EMAIL`, which under this fixture is every data
 /// row and no heading or rule.
+#[cfg(target_os = "macos")]
 fn account_lines(stdout: &str) -> Vec<&str> {
     stdout.lines().filter(|line| line.contains(EMAIL)).collect()
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn xq8_by_identity_renders_one_row_where_the_default_table_renders_two() {
     // `agctl-xq8`: the symptom is one address on two rows. Without the
@@ -1049,6 +1069,7 @@ fn xq8_by_identity_renders_one_row_where_the_default_table_renders_two() {
     fixture.assert_keychain_read_only();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn xq8_the_flag_does_not_change_the_json_report_at_all() {
     // The document keeps one object per credential source under the flag as
@@ -1093,6 +1114,7 @@ fn xq8_the_flag_does_not_change_the_json_report_at_all() {
 /// How long a test waits for the plan GET once the POST has been seen: well
 /// under the fault's own 10 s `PAUSE_BUDGET`, so a GET that only comes after
 /// the pause gives up times this wait out instead of arriving inside it.
+#[cfg(target_os = "macos")]
 const PAUSED_BUDGET: Duration = Duration::from_secs(5);
 
 /// A hand-built blob with no plan at all — neither `subscriptionType` nor
@@ -1260,6 +1282,7 @@ fn an_unmapped_organization_is_asked_again_at_each_refresh() {
     assert_eq!(blob["claudeAiOauth"]["rateLimitTier"], json!("default_claude_max_5x"));
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn a_migrated_items_plan_is_asked_before_the_hold_and_written_with_the_refresh() {
     // Ruling B6 on the migrated path, from outside the process. The GET runs

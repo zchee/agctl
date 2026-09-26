@@ -1,4 +1,4 @@
-#![cfg(feature = "testing")]
+#![cfg(all(feature = "testing", target_os = "macos"))]
 
 //! `claude use --live` through the real binary (plan section 3.4, W4a).
 //!

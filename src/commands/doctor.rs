@@ -92,6 +92,7 @@ use crate::secret::KeychainReader;
 use crate::secret::KeychainStatus;
 use crate::secret::ServiceEntry;
 use crate::secret::audit;
+use crate::secret::backend;
 use crate::secret::file_store;
 use crate::secret::foreign_activity::REFRESH_LOCK;
 use crate::secret::foreign_activity::STORAGE_WRITE_LOCK;
@@ -124,7 +125,9 @@ pub const LEGACY_LOCK_SUFFIX: &str = ".lock";
 /// command will not remove, and [`AppError`] for a store that cannot be read.
 pub fn run(config_dir: Option<&Path>, args: &DoctorArgs, cancel: &Cancel) -> Result<(), AppError> {
     let paths = Paths::resolve(config_dir)?;
-    paths.ensure_dirs()?;
+    if backend::PEER_LOCK_REMOVAL || args.remove_stale.is_none() {
+        paths.ensure_dirs()?;
+    }
     let env = EnvView::from_process();
     let doctor =
         Doctor { paths: &paths, env: &env, cancel, sample_interval: STALE_SAMPLE_INTERVAL };
@@ -401,6 +404,7 @@ fn foreign_section(env: &EnvView, found: &discovery::Discovery) -> Vec<String> {
 /// `Unavailable("…")` is a Rust value, not an explanation.
 fn preflight(status: &KeychainStatus) -> String {
     match status {
+        KeychainStatus::Unsupported => backend::UNSUPPORTED.to_owned(),
         KeychainStatus::Unlocked => "unlocked".to_owned(),
         KeychainStatus::Locked => {
             "locked — unlock the login keychain and run this again".to_owned()
@@ -462,14 +466,8 @@ fn lock_section(paths: &Paths, cancel: &Cancel) -> Vec<String> {
                 // for: the pid may well be in use again by something entirely
                 // unrelated, and reporting that as the lock holder would send
                 // a user after the wrong process.
-                let recycled = body.pid_start_time.as_ref().is_some_and(|recorded| {
-                    proc::start_time(body.pid, cancel).as_ref() != Some(recorded)
-                });
-                let state = if recycled {
-                    "dead (pid recycled)"
-                } else {
-                    proc::holder(body.pid, cancel).label()
-                };
+                let state =
+                    proc::record_holder(body.pid, body.pid_start_time.as_deref(), cancel).label();
                 out.push(format!(
                     "  {name}  pid {} ({state}), taken {}",
                     body.pid, body.acquired_at
@@ -503,7 +501,11 @@ fn held_locks_section(doctor: &Doctor<'_>) -> Vec<String> {
 
     for held in &records {
         let pid = held.record.agctl_pid;
-        let state = proc::holder(pid, doctor.cancel);
+        let state = if backend::PEER_LOCK_REMOVAL {
+            proc::holder(pid, doctor.cancel).label()
+        } else {
+            proc::record_holder(pid, held.record.agctl_start_time.as_deref(), doctor.cancel).label()
+        };
         // The same question `--remove-stale` asks, so the report cannot offer a
         // removal the command would refuse — or withhold one it would allow: a
         // recycled process id is alive without being the writer.
@@ -511,7 +513,7 @@ fn held_locks_section(doctor: &Doctor<'_>) -> Vec<String> {
         out.push(format!(
             "  {}  pid {pid} ({}), {}, taken {}",
             held.file.display(),
-            state.label(),
+            state,
             held.record.tree.label(),
             held.record.taken_at
         ));
@@ -525,7 +527,14 @@ fn held_locks_section(doctor: &Doctor<'_>) -> Vec<String> {
             continue;
         }
         for path in present {
-            if gone {
+            if !backend::PEER_LOCK_REMOVAL {
+                let writer = if gone { "writer gone" } else { "writer not proved gone" };
+                out.push(format!(
+                    "    {}  {writer}; {}",
+                    path.display(),
+                    backend::STALE_REMOVAL_UNSUPPORTED
+                ));
+            } else if gone {
                 out.push(format!(
                     "    {}  leaked — `doctor --remove-stale {} --yes` removes it",
                     path.display(),
@@ -726,7 +735,9 @@ fn namespace_section(
             artefact.path.display(),
             artefact.age.as_secs(),
             if holder_alive { "alive (heartbeat seen)" } else { "not beating" },
-            if holder_alive {
+            if !backend::PEER_LOCK_REMOVAL {
+                format!("; {}", backend::STALE_REMOVAL_UNSUPPORTED)
+            } else if holder_alive {
                 String::new()
             } else {
                 format!("; `doctor --remove-stale {} --yes` removes it", artefact.path.display())
@@ -962,6 +973,9 @@ pub fn remove_stale(
     yes: bool,
     io: &mut dyn Prompt,
 ) -> Result<(), AppError> {
+    if !backend::PEER_LOCK_REMOVAL {
+        return Err(AppError::Config(backend::STALE_REMOVAL_UNSUPPORTED.to_owned()));
+    }
     // `Config`, not `Refused`: a refusal here renders no table, and the exit
     // contract reserves 2 for a run that produced output with a degraded row
     // in it. A `--remove-stale` that removed nothing produced nothing, so it

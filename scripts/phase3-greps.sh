@@ -649,6 +649,20 @@ check_exposure_count() {
     return 1
 }
 
+# Linux plan §7.2: platform selection and procfs paths stay at their boundaries.
+# Test siblings are excluded by code_hits; fake_security.rs is the one source fixture.
+check_platform_cfg() {
+    check_helper_callers "$1" '\btarget_os\s*=' 'target_os selection' \
+        src/runtime/proc.rs src/secret/mod.rs src/secret/backend.rs \
+        src/secret/keychain_write.rs src/provider/codex/login_backend.rs \
+        src/secret/fake_security.rs
+}
+
+check_proc_paths() {
+    check_helper_callers "$1" '"/proc(?:/|")' 'a procfs path literal' \
+        src/runtime/proc/linux.rs src/secret/fake_security.rs
+}
+
 check_auth_json() {
     check_helper_callers "$1" 'auth\.json' '`auth.json`' "${AUTH_JSON_ALLOWED[@]}"
 }
@@ -1583,7 +1597,13 @@ plant_sessions_dir_caller_fmt() { plant_line "$1" $'fn _rc_plant(e: &EnvView) {\
 plant_bridge_id_escape() { plant_line "$1" 'fn _rc_plant(e: Entry) { tracing::debug!(id = e.bridge_session_id); }'; }
 plant_bridge_id_escape_fmt() { plant_line "$1" $'struct RcPlant {\n    bridge_session_id: String,\n}'; }
 
-CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers exposed codex_bin codex_env
+plant_platform_cfg() { plant_line "$1" '#[cfg(target_os = "linux")] fn _linux_plant() {}'; }
+plant_platform_cfg_fmt() { plant_line "$1" $'#[cfg(\n    target_os = "linux"\n)]\nfn _linux_plant() {}'; }
+plant_platform_cfg_macro() { plant_line "$1" 'const _LINUX_PLANT: bool = cfg!(target_os = "linux");'; }
+plant_proc_paths() { plant_line "$1" 'const _LINUX_PLANT: &str = "/proc/self/stat";'; }
+plant_proc_paths_fmt() { plant_line "$1" $'const _LINUX_PLANT: &str =\n    "/proc";'; }
+
+CHECKS=(platform_cfg proc_paths unwrap remove_set codex_home sentinels jwt bearer removal_helpers exposed codex_bin codex_env
     exposure_count auth_json account_header toml locked_read marker_mutators stop_policy
     codex_debug_assert state_path codex_flock wham_usage codex_usage_url codex_timeouts codex_redirects codex_decoded_cap credits_state
     auth_host codex_token_url oauth_cancelled oauth_refresh_callers consent_callers refresh_usage_cache receipt_type
@@ -1593,6 +1613,11 @@ CHECKS=(unwrap remove_set codex_home sentinels jwt bearer removal_helpers expose
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
+    "platform_cfg plant_platform_cfg"
+    "platform_cfg plant_platform_cfg_fmt"
+    "platform_cfg plant_platform_cfg_macro"
+    "proc_paths plant_proc_paths"
+    "proc_paths plant_proc_paths_fmt"
     "unwrap plant_unwrap"
     "unwrap plant_unwrap_fmt"
     "remove_set plant_remove_set"

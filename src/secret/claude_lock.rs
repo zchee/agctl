@@ -254,6 +254,11 @@ pub struct LockSubject<'a> {
 /// Why a lock could not be taken, held or trusted.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LockError {
+    /// Visibility of store-sharing peers is unproved; no stale directory may be removed.
+    #[error(
+        "holder unreadable: no stopped peer visible by exact name; peer visibility is unproved"
+    )]
+    HolderUnreadable,
     /// **Refusal A**: a lock agctl holds had its modification time moved
     /// under it, so the protocol has already been violated and nothing may be
     /// written.
@@ -778,17 +783,15 @@ pub trait HolderEvidence: Send + Sync {
 /// (decision D-022).
 pub struct ProcHolders;
 
+impl ProcHolders {
+    fn from_sweep(sweep: Result<Vec<(u32, proc::Holder)>, proc::ProcError>) -> HolderEvidence3 {
+        crate::secret::backend::holder_evidence(sweep)
+    }
+}
+
 impl HolderEvidence for ProcHolders {
     fn stopped_claude_present(&self) -> HolderEvidence3 {
-        match proc::claude_processes() {
-            // An unreadable process table, or one process of ours that could
-            // not be classified, is "I do not know" — never "none found".
-            Err(_) => HolderEvidence3::None,
-            Ok(found) if found.iter().any(|(_, state)| *state == proc::Holder::Stopped) => {
-                HolderEvidence3::StoppedClaudePresent
-            }
-            Ok(_) => HolderEvidence3::NoStoppedClaude,
-        }
+        Self::from_sweep(proc::claude_processes())
     }
 
     fn stopped_pids(&self) -> Vec<u32> {
@@ -1318,6 +1321,12 @@ pub fn acquire_with(
                 // Gone, either way: carry on to the mkdirs.
                 Decision::Broken => broken = Some(lock.artefact.clone()),
                 Decision::Abandoned(Reason::Vanished) => {}
+                Decision::Abandoned(Reason::HolderUnreadable) => {
+                    return Err(AcquireFailure {
+                        error: LockError::HolderUnreadable,
+                        break_record,
+                    });
+                }
                 Decision::Abandoned(Reason::HolderStopped) => {
                     return Ok(busy(false, seams.holders.stopped_pids(), break_record));
                 }
@@ -1712,6 +1721,9 @@ pub fn resolve_stale_with(
 
     // --- Holder evidence ------------------------------------------------
     record.holder_evidence = seams.holders.stopped_claude_present();
+    if record.holder_evidence == HolderEvidence3::Unreadable {
+        return abandoned(record, Reason::HolderUnreadable);
+    }
     if record.holder_evidence == HolderEvidence3::StoppedClaudePresent {
         return abandoned(record, Reason::HolderStopped);
     }

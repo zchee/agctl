@@ -30,8 +30,10 @@ mod common;
 mod codex;
 
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Output;
@@ -39,7 +41,9 @@ use std::process::Output;
 use codex::CodexFixture;
 use codex::Needle;
 use codex::Stream;
+#[cfg(target_os = "macos")]
 use codex::audit_outcomes;
+#[cfg(target_os = "macos")]
 use codex::namespace;
 use codex::stderr;
 use serde_json::Value;
@@ -258,6 +262,7 @@ fn login(fixture: &CodexFixture, name: &str) -> Output {
 /// the install to happen a second time therefore removes the record first,
 /// which is the same state AC105's crash window leaves: a namespace with
 /// nothing claiming it, which `login` adopts.
+#[cfg(target_os = "macos")]
 fn drop_the_record(fixture: &CodexFixture, name: &str) {
     let output = checked(
         fixture,
@@ -272,17 +277,20 @@ fn drop_the_record(fixture: &CodexFixture, name: &str) {
 }
 
 /// The scratch root, which must be empty after every run.
+#[cfg(target_os = "macos")]
 fn scratch_root(fixture: &CodexFixture) -> PathBuf {
     fixture.inner().config_dir().join("codex").join(".scratch")
 }
 
 /// Every scratch home left behind.
+#[cfg(target_os = "macos")]
 fn scratch_leaves(fixture: &CodexFixture) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(scratch_root(fixture)) else { return Vec::new() };
     entries.flatten().map(|entry| entry.path()).collect()
 }
 
 /// The fake `codex`'s log.
+#[cfg(target_os = "macos")]
 fn codex_log(fixture: &CodexFixture) -> String {
     fs::read_to_string(fixture.codex_log_path()).expect("the fake logged its run")
 }
@@ -290,6 +298,7 @@ fn codex_log(fixture: &CodexFixture) -> String {
 /// A directory OUTSIDE the scratch that the fake links to from inside its
 /// residue (order C3). A cleanup that followed a link inside the scratch home
 /// would reach it; the file inside must survive every login byte-identical.
+#[cfg(target_os = "macos")]
 fn sentinel(fixture: &mut CodexFixture) -> PathBuf {
     let dir = fixture.root().join("sentinel");
     fs::create_dir_all(&dir).expect("mkdir");
@@ -298,6 +307,7 @@ fn sentinel(fixture: &mut CodexFixture) -> PathBuf {
     dir
 }
 
+#[cfg(target_os = "macos")]
 fn assert_sentinel_untouched(dir: &Path, name: &str) {
     assert_eq!(
         fs::read(dir.join("keep.txt"))
@@ -308,6 +318,7 @@ fn assert_sentinel_untouched(dir: &Path, name: &str) {
 }
 
 /// Asserts a refusal installed nothing and left no scratch home.
+#[cfg(target_os = "macos")]
 fn assert_nothing_installed(fixture: &CodexFixture, name: &str) {
     assert!(
         !namespace(fixture, USER, ACCT).join("auth.json").exists(),
@@ -316,6 +327,7 @@ fn assert_nothing_installed(fixture: &CodexFixture, name: &str) {
     assert!(scratch_leaves(fixture).is_empty(), "{name}: the scratch home is removed");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_a_login_that_leaves_a_normal_logins_residue_installs() {
     // Fact F81 / ledger #310. The fake's default run leaves the measured
@@ -348,6 +360,7 @@ fn ac105_a_login_that_leaves_a_normal_logins_residue_installs() {
     assert!(scratch_leaves(&fixture).is_empty(), "the scratch home is removed on success");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_the_install_is_a_copy_not_a_rename() {
     // Architect M5: the namespace receives the verified bytes written through
@@ -363,6 +376,7 @@ fn ac105_the_install_is_a_copy_not_a_rename() {
     assert_ne!(after, before, "the install copies; it does not move the fake's document");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_the_child_sees_exactly_the_allowlist_and_no_decoy() {
     // Decision D-037. The fake records its environment by NAME, and values for
@@ -415,6 +429,7 @@ fn ac105_the_child_sees_exactly_the_allowlist_and_no_decoy() {
     assert_eq!(log.matches("KACHE_").count(), 0, "no KACHE_ name appears anywhere in the record");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_the_lowercase_proxy_names_reach_the_child_and_nothing_else_new() {
     // D-037's list names the uppercase proxy variables only, and a machine
@@ -471,6 +486,7 @@ fn ac105_the_lowercase_proxy_names_reach_the_child_and_nothing_else_new() {
     assert!(dropped.is_empty(), "the four cost the child a name it had before: {dropped:?}");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_the_child_runs_in_its_scratch_home_and_is_given_it() {
     // Order A4: the child's working directory is its scratch home, so no
@@ -498,6 +514,7 @@ fn ac105_the_child_runs_in_its_scratch_home_and_is_given_it() {
     assert_eq!(cwd.file_name(), Path::new(home).file_name(), "the same leaf `CODEX_HOME` names");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_the_child_gets_the_measured_argv() {
     // S28 / fact F95 measured `codex -c '<override>' login`. The override is a
@@ -515,6 +532,7 @@ fn ac105_the_child_gets_the_measured_argv() {
     assert_eq!(argv, ["-c", "cli_auth_credentials_store=\"file\"", "login"]);
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_a_child_that_fails_installs_nothing_and_leaves_no_scratch() {
     let (mut fixture, _doc) = armed();
@@ -525,6 +543,7 @@ fn ac105_a_child_that_fails_installs_nothing_and_leaves_no_scratch() {
     assert_nothing_installed(&fixture, "child-fails");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_an_apikey_login_is_refused_because_it_has_no_usage_source() {
     let mut fixture = CodexFixture::new();
@@ -537,6 +556,7 @@ fn ac105_an_apikey_login_is_refused_because_it_has_no_usage_source() {
     assert_nothing_installed(&fixture, "apikey");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_a_child_that_starts_a_daemon_is_refused() {
     let (mut fixture, _doc) = armed();
@@ -550,6 +570,7 @@ fn ac105_a_child_that_starts_a_daemon_is_refused() {
     assert_sentinel_untouched(&sentinel, "daemon");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_a_child_that_leaves_a_held_lock_is_refused() {
     // The other half of the residue test: an unheld lock installs, a HELD one
@@ -569,6 +590,7 @@ fn ac105_a_child_that_leaves_a_held_lock_is_refused() {
     assert_nothing_installed(&fixture, "held-lock");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_keychain_a_normal_login_takes_exactly_two_listings_and_installs() {
     // AC105: "the fake `security` log shows two `dump-keychain` invocations
@@ -585,6 +607,7 @@ fn ac105_keychain_a_normal_login_takes_exactly_two_listings_and_installs() {
     assert!(namespace(&fixture, USER, ACCT).join("auth.json").exists(), "and it installed");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_keychain_a_child_that_creates_a_codex_auth_item_is_refused() {
     // Fact F95: the `-c` override is outranked by legacy-managed layers, so the
@@ -622,6 +645,7 @@ fn ac105_keychain_a_child_that_creates_a_codex_auth_item_is_refused() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_keychain_an_item_a_child_gained_is_named_only_in_agctls_spelling() {
     // The write-side guard on a credential path: what the second listing
@@ -652,6 +676,7 @@ fn ac105_keychain_an_item_a_child_gained_is_named_only_in_agctls_spelling() {
     assert_nothing_installed(&fixture, "keychain-gain-hostile");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_keychain_a_second_listing_that_fails_is_a_refusal() {
     // Order A3: an unreadable second listing refuses — it never reads as
@@ -680,6 +705,7 @@ fn ac105_keychain_a_second_listing_that_fails_is_a_refusal() {
 /// has PROOF that agctl is held at `pause_codex_login_before_install` — between
 /// `verify_login` and `install`. Delete the pause, or rename it, and the marker
 /// never appears: the swapper fails loudly instead of racing the install.
+#[cfg(target_os = "macos")]
 fn run_paused_before_install(
     fixture: &CodexFixture,
     name: &str,
@@ -722,6 +748,7 @@ fn run_paused_before_install(
 /// install copies the bytes that were verified. Mutant: install re-reads
 /// `<scratch>/auth.json` — each mode below goes red on its own (the symlink one
 /// because the no-follow read refuses it outright).
+#[cfg(target_os = "macos")]
 fn assert_swap_after_verification_is_ignored(mode: &str) {
     let (fixture, doc) = armed();
     let other = fixture.root().join("other.json");
@@ -771,21 +798,25 @@ fn assert_swap_after_verification_is_ignored(mode: &str) {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac126_a_scratch_document_swapped_for_a_symlink_never_lands() {
     assert_swap_after_verification_is_ignored("symlink");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac126_a_scratch_document_replaced_by_another_file_never_lands() {
     assert_swap_after_verification_is_ignored("replace");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac126_a_scratch_document_rewritten_in_place_never_lands() {
     assert_swap_after_verification_is_ignored("inplace");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac126_a_failed_install_rename_leaves_the_previous_grant_byte_identical() {
     // `codex_install_rename_fail` is the install's own fault name. Install
@@ -808,6 +839,7 @@ fn ac126_a_failed_install_rename_leaves_the_previous_grant_byte_identical() {
     assert!(scratch_leaves(&fixture).is_empty(), "and the scratch home is removed");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_a_login_audits_an_install_and_then_an_overwrite() {
     // The source-reading rule that pins "every receipt reaches
@@ -867,6 +899,7 @@ fn a1_a_symlinked_scratch_root_is_refused_and_nothing_behind_it_is_swept() {
 }
 
 /// The `keychain_account` of every line the Codex write log holds.
+#[cfg(target_os = "macos")]
 fn audit_keychain_accounts(fixture: &CodexFixture) -> Vec<String> {
     let log = fixture.inner().config_dir().join("codex").join("writes.jsonl");
     let Ok(text) = fs::read_to_string(&log) else { return Vec::new() };
@@ -878,6 +911,7 @@ fn audit_keychain_accounts(fixture: &CodexFixture) -> Vec<String> {
 
 /// Writes a same-identity `auth.json` into the live home, so the F82 notice
 /// ("this home already holds that account") prints — the re-login case.
+#[cfg(target_os = "macos")]
 fn live_home_holds_the_same_account(fixture: &CodexFixture) {
     let live = fixture.inner().home().join(".codex");
     fs::create_dir_all(&live).expect("mkdir");
@@ -887,6 +921,7 @@ fn live_home_holds_the_same_account(fixture: &CodexFixture) {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn c1_a_closed_stdout_never_decides_whether_the_credential_is_removed() {
     // Order C1 / reviewer probe P-ABORT. `println!` panics when stdout is a
@@ -937,6 +972,7 @@ fn c1_a_closed_stdout_never_decides_whether_the_credential_is_removed() {
 /// install's refresh-state reset fails and agctl logs its `warn!` — the
 /// tracing event that sits inside the window between the child's write and the
 /// post-install unlink.
+#[cfg(target_os = "macos")]
 fn block_the_refresh_marker(fixture: &CodexFixture) {
     let marker = fixture
         .inner()
@@ -948,6 +984,7 @@ fn block_the_refresh_marker(fixture: &CodexFixture) {
     fs::write(marker.join("occupied"), b"x").expect("make it non-empty");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn e1_a_closed_stderr_never_decides_whether_the_credential_is_removed() {
     // Order E1 / reviewer probe P-STDERR-real. The tracing subscriber reports a
@@ -994,6 +1031,7 @@ fn e1_a_closed_stderr_never_decides_whether_the_credential_is_removed() {
 /// only because the child ran — and a SIGTERM there proves the registration is
 /// live, not merely present: the signal handler (`signals.rs`) runs the
 /// emergency cleanup and removes it, with nothing installed.
+#[cfg(target_os = "macos")]
 #[test]
 fn ac105_a_sigterm_while_paused_before_install_removes_the_registered_scratch_document() {
     let (mut fixture, _doc) = armed();
@@ -1053,6 +1091,7 @@ fn ac105_a_sigterm_while_paused_before_install_removes_the_registered_scratch_do
 /// resets its refresh marker — `install` calls `reset_for_login` under the
 /// guard (S30), which S36 proves end to end with a real 401 fixture rather than
 /// by reading the unit test alone.
+#[cfg(target_os = "macos")]
 #[test]
 fn ac126_a_relogin_over_a_terminal_namespace_resets_its_refresh_state() {
     let (fixture, _doc) = armed();
@@ -1092,6 +1131,7 @@ fn ac126_a_relogin_over_a_terminal_namespace_resets_its_refresh_state() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn an_odd_lock_the_child_named_is_reported_without_its_name_reaching_stderr() {
     // Review S37-b1b F2, from the reviewer's own probe. `is_lock_name` is
@@ -1110,6 +1150,7 @@ fn an_odd_lock_the_child_named_is_reported_without_its_name_reaching_stderr() {
     assert!(text.contains("unnameable lock file"), "and it is counted: {text}");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn an_odd_lock_named_the_way_agctl_writes_one_is_still_named() {
     // The positive control the reviewer asked for: the GREEN direction must

@@ -1,4 +1,4 @@
-#![cfg(feature = "testing")]
+#![cfg(all(feature = "testing", target_os = "macos"))]
 
 //! `agctl claude import --from keychain`, driven through the real binary.
 //!

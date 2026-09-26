@@ -96,6 +96,13 @@ struct Env {
 fn env() -> Env {
     let dir = TempDir::new().expect("a temporary directory should be creatable");
     let home = dir.path().join("home");
+    #[cfg(target_os = "linux")]
+    let home = {
+        std::fs::create_dir(&home).expect("real fixture home");
+        let alias = dir.path().join("home-alias");
+        std::os::unix::fs::symlink(&home, &alias).expect("explicit alternate spelling");
+        alias
+    };
     let live_dir = home.join(".claude");
     std::fs::create_dir_all(&live_dir).expect("the fake live config dir should be creatable");
     Env { _dir: dir, home, live_dir }

@@ -33,6 +33,8 @@
 # Usage: scripts/phase3-structural.sh
 #
 # Environment:
+#   AGCTL_GATE_DEV_CONFIG  optional dev/test Cargo config; when unset, Cargo's
+#                     normal defaults apply. Never used for release builds.
 #   CARGO_TARGET_DIR  shared across clauses and runs; defaults to a directory
 #                     under $TMPDIR so the snapshot never builds into ./target.
 #
@@ -122,8 +124,12 @@ phase3_drop() {
 # before any compiler message (an ambient RUSTFLAGS the toolchain rejects, a
 # registry that cannot be reached) has no diagnostic to print otherwise.
 cargo_check() {
-    local status=0
-    cargo check --all-features --message-format=json --manifest-path "$1/Cargo.toml" \
+    local status=0 config_args=()
+    if [[ -n ${AGCTL_GATE_DEV_CONFIG:-} ]]; then
+        [[ -f $AGCTL_GATE_DEV_CONFIG ]] || phase3_die "dev Cargo config is missing: $AGCTL_GATE_DEV_CONFIG"
+        config_args=(--config "$AGCTL_GATE_DEV_CONFIG")
+    fi
+    cargo "${config_args[@]}" check --all-features --message-format=json --manifest-path "$1/Cargo.toml" \
         >"$2" 2>"$2.stderr" || status=$?
     return "$status"
 }

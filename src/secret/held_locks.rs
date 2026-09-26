@@ -81,9 +81,9 @@ pub struct HeldLockRecord {
     /// one that wrote the record.
     ///
     /// `None` when it could not be read, and `None` in a record written by a
-    /// build that predates the field: both mean "unknown", and an unknown start
-    /// time falls back to the process id alone, which is weaker but is what
-    /// phase 1 had. Filled from [`proc::self_start_time`].
+    /// build that predates the field. macOS retains its legacy PID-only
+    /// fallback; Linux treats a missing or incompatible identity as unknown.
+    /// Filled from [`proc::self_start_time`].
     #[serde(default)]
     pub agctl_start_time: Option<String>,
     /// Which tree they are in.
@@ -100,25 +100,22 @@ impl HeldLockRecord {
     /// Whether the process that wrote this record is gone, so the directories
     /// it names are a leak rather than a live hold.
     ///
-    /// Two ways to be gone, and the second is why the start time is recorded at
+    /// macOS retains two ways to be gone, and the second is why the start time is recorded at
     /// all: the process id no longer exists (or is a zombie, which has already
     /// exited), **or** it exists and started at a different moment, which means
     /// the kernel handed the id to somebody else. Without the second test an
     /// unrelated long-lived process inheriting the id would block recovery from
     /// a real leak for as long as it ran.
     ///
-    /// Both start times must be readable for a mismatch to count. An unknown
+    /// Linux first validates the record's boot, PID namespace and real UID.
+    /// Only a same-domain kill-zero ESRCH proves its writer gone; zombies,
+    /// mismatches and failed reads do not. This never permits peer-lock removal.
+    ///
+    /// Both start times must be readable for a macOS mismatch to count. An unknown
     /// one is not evidence of anything, and reading it as one would turn every
     /// record written by an older build into a permitted removal.
     pub fn writer_is_gone(&self, cancel: &Cancel) -> bool {
-        if proc::holder(self.agctl_pid, cancel) == proc::Holder::Dead {
-            return true;
-        }
-        let Some(recorded) = self.agctl_start_time.as_deref() else { return false };
-        match proc::start_time(self.agctl_pid, cancel) {
-            Some(now) => now != recorded,
-            None => false,
-        }
+        proc::writer_is_gone(self.agctl_pid, self.agctl_start_time.as_deref(), cancel)
     }
 
     /// Whether this record vouches for `path`.

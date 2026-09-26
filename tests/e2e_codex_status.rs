@@ -539,6 +539,7 @@ fn usage_mock(server: &MockServer, status: u16) -> httpmock::Mock<'_> {
 /// The fake `security`'s cumulative `dump-keychain` call count (plan AC109
 /// fold-in, fix loop 1): no log at all reads as zero, the same as a fixture
 /// that never wired the keychain.
+#[cfg(target_os = "macos")]
 fn dump_count(fixture: &CodexFixture) -> usize {
     fs::read_to_string(fixture.security_log_path())
         .map(|text| text.lines().filter(|line| line.starts_with("dump-keychain")).count())
@@ -1042,6 +1043,7 @@ fn ac95_the_live_home_is_read_from_the_environment_and_only_when_it_is_there() {
     assert_eq!(usage.calls(), 1, "the live home's credential was read and used");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac109_status_dumps_the_keychain_only_under_store_mode_auto() {
     // AC109 fold-in (review C3, fix loop 1): this file wires no keychain

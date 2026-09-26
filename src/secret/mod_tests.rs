@@ -172,13 +172,14 @@ fn current_account_is_a_string_even_with_nothing_set() {
     assert!(!account.contains('\0'));
 }
 
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", target_os = "macos"))]
 #[test]
 fn the_test_only_environment_variable_names_are_the_documented_ones() {
     assert_eq!(KEYCHAIN_BACKEND_ENV, "AGCTL_KEYCHAIN_BACKEND");
     assert_eq!(SECURITY_BIN_ENV, "AGCTL_SECURITY_BIN");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn default_reader_builds_without_touching_the_keychain() {
     // Constructing a reader must not run `security(1)`: discovery decides

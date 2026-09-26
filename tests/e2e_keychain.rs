@@ -1,4 +1,4 @@
-#![cfg(feature = "testing")]
+#![cfg(all(feature = "testing", target_os = "macos"))]
 
 //! What the suite is allowed to do to a keychain, stated as assertions over
 //! the fake `security(1)`'s own log.

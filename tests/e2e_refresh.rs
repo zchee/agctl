@@ -16,6 +16,7 @@
 mod common;
 
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 use std::process::Child;
 use std::time::Duration;
@@ -23,6 +24,7 @@ use std::time::Duration;
 use common::ACCT;
 use common::EMAIL;
 use common::Fixture;
+#[cfg(target_os = "macos")]
 use common::LIVE_SERVICE;
 use common::ORG;
 use common::USAGE_BODY;
@@ -97,6 +99,7 @@ fn only_row(stdout: &str) -> Value {
 /// emits an `unclaimed` row for the same item, and `--account` matches it too
 /// because the blob names the same address. The row under test is the one the
 /// registry owns.
+#[cfg(target_os = "macos")]
 fn owned_row(stdout: &str) -> Value {
     let document: Value = serde_json::from_str(stdout)
         .unwrap_or_else(|err| panic!("stdout should be one JSON document: {err}\n{stdout}"));
@@ -582,6 +585,7 @@ fn ac33g_a_pending_whose_file_was_removed_is_discarded() {
     assert!(fixture.namespace_entries(ACCT, ORG).is_empty(), "both files were destroyed");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac33h_a_migrated_namespace_discards_its_pending() {
     // A Claude Code session took the namespace over while the pending write
@@ -678,6 +682,7 @@ fn ac48_the_lock_body_names_the_process_holding_it() {
 /// item and deletes the file. The item is registered as a write target with
 /// the stand-in, because a write it was not told about must not silently
 /// succeed.
+#[cfg(target_os = "macos")]
 fn migrated_owned(server: &MockServer, expires_at_ms: i64) -> (Fixture, String) {
     let mut fixture = Fixture::new();
     fixture.with_keychain().endpoints(&server.base_url());
@@ -695,6 +700,7 @@ fn migrated_owned(server: &MockServer, expires_at_ms: i64) -> (Fixture, String) 
 }
 
 /// How many times the stand-in was asked to read one service's password.
+#[cfg(target_os = "macos")]
 fn finds_for(fixture: &Fixture, service: &str) -> usize {
     let suffix = format!("-s {service}");
     fixture
@@ -716,6 +722,7 @@ fn finds_for(fixture: &Fixture, service: &str) -> usize {
 /// Panics when the log holds no read of `service`, or when two reads of it
 /// disagree about the account: either means the fixture is not modelling one
 /// keychain item any more.
+#[cfg(target_os = "macos")]
 fn read_account(fixture: &Fixture, service: &str) -> String {
     let suffix = format!("-s {service}");
     let accounts: Vec<String> = fixture
@@ -736,6 +743,7 @@ fn read_account(fixture: &Fixture, service: &str) -> String {
 }
 
 /// Every write the stand-in recorded, redacted as it logs them.
+#[cfg(target_os = "macos")]
 fn writes(fixture: &Fixture) -> Vec<String> {
     fixture
         .security_log()
@@ -745,6 +753,7 @@ fn writes(fixture: &Fixture) -> Vec<String> {
 }
 
 /// Runs one pass and hands back its stdout.
+#[cfg(target_os = "macos")]
 fn json_pass(fixture: &Fixture, extra: &[&str]) -> String {
     let mut command = fixture.cmd();
     command.args(["claude", "status", "--json", "--refresh", "--account", EMAIL]);
@@ -754,6 +763,7 @@ fn json_pass(fixture: &Fixture, extra: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("stdout is UTF-8")
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac65_a_migrated_namespace_refreshes_its_own_keychain_item_in_place() {
     // Plan AC65, decision D-015. One read of the item before the POST, one
@@ -963,6 +973,7 @@ fn ac65_a_migrated_namespace_refreshes_its_own_keychain_item_in_place() {
     assert!(!log.contains("sk-ant-"), "and no line carries token material: {log}");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac65_a_peer_refresh_before_the_post_is_adopted_and_costs_no_grant() {
     // The window between discovery reading the item and this pass POSTing to
@@ -1048,6 +1059,7 @@ fn ac65_a_peer_refresh_before_the_post_is_adopted_and_costs_no_grant() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac65_an_invalid_grant_after_a_peer_refresh_adopts_rather_than_asking_for_a_login() {
     // The residual window the check above cannot close: the peer wrote while
@@ -1128,6 +1140,7 @@ fn ac65_an_invalid_grant_after_a_peer_refresh_adopts_rather_than_asking_for_a_lo
     assert!(!fixture.audit_log_path().exists(), "a failed POST records no discarded refresh");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac65_a_refusal_after_the_post_records_the_discarded_refresh() {
     // Plan section 3.9's partial-state contract, for the row it did not have:
@@ -1175,6 +1188,7 @@ fn ac65_a_refusal_after_the_post_records_the_discarded_refresh() {
     assert!(!log.contains("sk-ant-"), "with no token material: {log}");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac65_the_hold_creates_three_locks_and_a_changed_item_discards_the_refresh() {
     // Two claims in one run, because one fault produces both.
@@ -1274,6 +1288,7 @@ fn ac65_the_hold_creates_three_locks_and_a_changed_item_discards_the_refresh() {
     assert_eq!(named, expected, "in the order the peer's own nesting takes them: {body}");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac66_a_fresh_migrated_namespace_is_no_longer_terminal() {
     // Plan AC66: `migrated to keychain` used to end the row. It no longer
@@ -1311,6 +1326,7 @@ fn ac66_a_fresh_migrated_namespace_is_no_longer_terminal() {
     fixture.assert_keychain_read_only();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac65_an_item_under_the_canonical_spelling_is_never_refreshed() {
     // Invariant I1′. Discovery looks for both spellings of a namespace
@@ -1371,6 +1387,7 @@ fn ac65_an_item_under_the_canonical_spelling_is_never_refreshed() {
     fixture.assert_keychain_read_only();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac65_a_contended_store_reports_busy_and_writes_nothing() {
     // Plan section 3.4's `busy`. `lock_contended` makes every attempt at the
@@ -1425,6 +1442,7 @@ fn ac65_a_contended_store_reports_busy_and_writes_nothing() {
     fixture.assert_keychain_read_only();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac65_a_blob_over_the_stdin_limit_spawns_no_write() {
     // Refusal D, invariant I15. Fact F42's line is bounded at 4 032 bytes

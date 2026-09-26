@@ -61,6 +61,7 @@ fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 /// A stand-in that prints `stderr` and exits `code`, reading stdin first.
+#[cfg(target_os = "macos")]
 fn exiting(dir: &Path, name: &str, code: i32, stderr: &str) -> PathBuf {
     let body = if stderr.is_empty() {
         format!("cat > /dev/null\nexit {code}")
@@ -319,6 +320,7 @@ fn line_text_refuses_a_name_that_would_break_out_of_its_quotes() {
 // The outcomes
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "macos")]
 #[test]
 fn a_write_puts_the_line_on_stdin_and_nothing_in_argv() {
     // Plan AC59's core assertion, made against a stand-in that records both
@@ -415,6 +417,7 @@ fn a_line_built_for_another_item_is_refused_before_any_child_exists() {
     assert!(!marker.exists(), "no child may be spawned for a mismatched line");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn every_security_outcome_maps_to_the_documented_error() {
     // Plan AC60. Exit 0 is the success above; the rest is this table, and it
@@ -534,6 +537,7 @@ fn every_security_outcome_maps_to_the_documented_error() {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn a_child_that_never_answers_is_a_transient_timeout() {
     let dir = TempDir::new().expect("a temporary directory");
@@ -550,6 +554,7 @@ fn a_child_that_never_answers_is_a_transient_timeout() {
     assert!(started.elapsed() < Duration::from_secs(5), "the child must be killed, not waited on");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn a_missing_binary_is_a_permanent_spawn_failure() {
     let dir = TempDir::new().expect("a temporary directory");
@@ -564,6 +569,21 @@ fn a_missing_binary_is_a_permanent_spawn_failure() {
     assert!(!got.is_transient(), "a missing binary does not appear on a retry");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_write_transport_refuses_before_spawn() {
+    let dir = TempDir::new().expect("scratch transport");
+    let invoked = dir.path().join("invoked");
+    let bin = stub(dir.path(), "security", &format!("touch '{}'", invoked.display()));
+    let target = WriteTarget::live(&EnvView::with_home(dir.path().to_path_buf())).expect("target");
+    let line = line_for(ACCOUNT, target.service());
+    let result = write_item_through(&bin, &target, ACCOUNT, line, &ctx());
+    assert!(matches!(result, Err(KeychainWriteError::Unsupported)));
+    assert!(matches!(security_bin(), Err(KeychainWriteError::Unsupported)));
+    assert!(!invoked.exists(), "no child invocation");
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 fn the_transport_binary_is_resolved_without_being_told() {
     // Referenced rather than called: calling it would resolve
@@ -601,7 +621,7 @@ fn the_transport_binary_is_resolved_without_being_told() {
 // The fake
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", target_os = "macos"))]
 mod against_the_fake_script {
     use super::*;
     use crate::secret::KeychainReader;

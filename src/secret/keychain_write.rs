@@ -224,6 +224,9 @@ fn is_sha8(value: &str) -> bool {
 /// exists.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KeychainWriteError {
+    /// This platform does not provide the keychain transport.
+    #[error("unsupported on this platform")]
+    Unsupported,
     /// The line exceeds [`SECURITY_STDIN_LIMIT`]. Nothing was spawned.
     #[error("the keychain line is {len} bytes, over the {limit}-byte `security -i` limit")]
     LineTooLong {
@@ -288,7 +291,8 @@ impl KeychainWriteError {
     /// [`KeychainError::is_transient`]: crate::secret::KeychainError::is_transient
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::LineTooLong { .. }
+            Self::Unsupported
+            | Self::LineTooLong { .. }
             | Self::TargetMismatch { .. }
             | Self::Unquotable { .. }
             | Self::Spawn(_) => false,
@@ -477,7 +481,7 @@ fn quotable(field: &'static str, value: &str) -> Result<(), KeychainWriteError> 
 ///
 /// `test` as well as `testing`, so the assertion runs in a plain unit-test
 /// build too; neither spelling reaches a release artifact.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(all(target_os = "macos", any(test, feature = "testing")))]
 pub fn argv_shapes() -> Vec<Vec<&'static str>> {
     vec![WRITE_ARGV.to_vec()]
 }
@@ -490,6 +494,9 @@ pub fn argv_shapes() -> Vec<Vec<&'static str>> {
 /// is deliberately narrower, not wider.
 #[cfg(not(feature = "testing"))]
 fn security_bin() -> Result<PathBuf, KeychainWriteError> {
+    if !crate::secret::backend::KEYCHAIN_TRANSPORT {
+        return Err(KeychainWriteError::Unsupported);
+    }
     Ok(PathBuf::from(SECURITY_BIN))
 }
 
@@ -507,6 +514,9 @@ fn security_bin() -> Result<PathBuf, KeychainWriteError> {
 /// keeps the feature out of a shipped artifact.
 #[cfg(feature = "testing")]
 fn security_bin() -> Result<PathBuf, KeychainWriteError> {
+    if !crate::secret::backend::KEYCHAIN_TRANSPORT {
+        return Err(KeychainWriteError::Unsupported);
+    }
     std::env::var_os(crate::secret::SECURITY_BIN_ENV).map(PathBuf::from).ok_or_else(|| {
         KeychainWriteError::Spawn(format!(
             "`{}` is unset in a `testing` build, so there is no write transport; \
@@ -530,6 +540,9 @@ fn run_write(
     line: &KeychainStdinLine,
     ctx: &PassCtx,
 ) -> Result<RunOutput, KeychainWriteError> {
+    if !crate::secret::backend::KEYCHAIN_TRANSPORT {
+        return Err(KeychainWriteError::Unsupported);
+    }
     // `keychain_write_hang` (plan AC74): the write child never answers, so
     // the pass kills it at `WRITE_TIMEOUT` and the outcome of the write is
     // undetermined — the one path that produces `unknown` rather than

@@ -237,6 +237,7 @@ fn ac40_relocate_refuses_when_the_target_is_occupied() {
 // AC47 — forget and unforget
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac47_forget_hides_a_service_without_ever_reading_it_again() {
     // Plan AC47: `forget` is a display decision, recorded in agctl's own
@@ -297,6 +298,7 @@ fn ac47_forget_hides_a_service_without_ever_reading_it_again() {
 // AC45 — doctor
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac45_doctor_reports_every_part_of_the_store() {
     // Plan AC45: one report that names what is on this machine — the
@@ -359,6 +361,7 @@ fn ac45_doctor_reports_every_part_of_the_store() {
     fixture.assert_keychain_read_only();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac45_doctor_remove_stale_refuses_everything_it_should() {
     // Invariant I11, the four refusals. Each of them is a path somebody could
@@ -436,6 +439,7 @@ fn ac45_doctor_remove_stale_refuses_everything_it_should() {
     assert!(fixture.credentials_path(ACCT, ORG).exists());
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac45_doctor_remove_stale_removes_a_lapsed_artefact_after_two_samples() {
     // The one deletion invariant I11 allows, and the two-sample check that
@@ -474,6 +478,7 @@ fn ac45_doctor_remove_stale_removes_a_lapsed_artefact_after_two_samples() {
 ///
 /// Through `touch(1)` rather than a crate: setting an mtime is the whole of
 /// what is needed, and `/usr/bin/touch` is on every machine this runs on.
+#[cfg(target_os = "macos")]
 fn age(path: &std::path::Path) {
     let status = std::process::Command::new("/usr/bin/touch")
         .args(["-t", "202601010000.00"])

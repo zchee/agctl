@@ -180,6 +180,9 @@ fn live_row(
     env: &EnvView,
 ) -> AccountRow {
     let resolved = match preflight {
+        KeychainStatus::Unsupported => {
+            Resolved::Transient(crate::secret::backend::UNSUPPORTED.to_owned())
+        }
         KeychainStatus::Unlocked => location::from_keychain(reader, service),
         // Not even attempted: a preflight that says the keychain is not
         // readable makes the read a certain prompt or a certain failure, and
@@ -275,6 +278,9 @@ fn record_row(
         }),
         AccountKind::ConfigDirReadOnly { service, shares_live_dir, .. } => {
             let resolved = match preflight {
+                KeychainStatus::Unsupported => {
+                    Resolved::Transient(crate::secret::backend::UNSUPPORTED.to_owned())
+                }
                 KeychainStatus::Unlocked => location::from_keychain(reader, service),
                 KeychainStatus::Locked => Resolved::Locked,
                 KeychainStatus::Timeout => Resolved::Transient("keychain timed out".to_owned()),
@@ -323,8 +329,13 @@ fn record_row(
                 if matches!(preflight, KeychainStatus::Unlocked) { listing } else { &[] };
             let activity = foreign_activity::detect(&ns_dir, &owned, probe_listing, reader);
 
-            let mut note = (!matches!(preflight, KeychainStatus::Unlocked))
-                .then(|| MIGRATION_PROBE_SKIPPED.to_owned());
+            let mut note = (!matches!(preflight, KeychainStatus::Unlocked)).then(|| {
+                if matches!(preflight, KeychainStatus::Unsupported) {
+                    crate::secret::backend::UNSUPPORTED.to_owned()
+                } else {
+                    MIGRATION_PROBE_SKIPPED.to_owned()
+                }
+            });
 
             let (credentials, state, source) = match &activity {
                 ForeignActivity::MigratedToKeychain { service } => {
@@ -364,7 +375,11 @@ fn record_row(
             };
 
             if note.is_some() && credentials.is_none() {
-                note = Some(format!("{MIGRATION_PROBE_SKIPPED} (migration unknown)"));
+                note = Some(if matches!(preflight, KeychainStatus::Unsupported) {
+                    crate::secret::backend::UNSUPPORTED.to_owned()
+                } else {
+                    format!("{MIGRATION_PROBE_SKIPPED} (migration unknown)")
+                });
             }
 
             Some(AccountRow {
@@ -536,6 +551,9 @@ fn read_only_state(credentials: Option<&Credentials>, preflight: &KeychainStatus
             } else {
                 AccountState::Ok
             }
+        }
+        (None, KeychainStatus::Unsupported) => {
+            AccountState::Error(crate::secret::backend::UNSUPPORTED.to_owned())
         }
         (None, KeychainStatus::Locked) => AccountState::KeychainLocked { detail: String::new() },
         (None, KeychainStatus::Timeout) => AccountState::KeychainTimeout,

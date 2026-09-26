@@ -208,6 +208,7 @@ fn attests_compares_whole_paths_and_never_a_parent() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn a_record_whose_process_is_gone_is_a_leak() {
     // The question `--remove-stale`'s attested branch asks. A reaped child is
@@ -226,6 +227,7 @@ fn a_record_whose_process_is_gone_is_a_leak() {
     assert!(record.writer_is_gone(&Cancel::new()), "a reaped process is holding nothing");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn a_live_process_that_did_not_write_the_record_is_gone_too() {
     // Plan review P2-2, and the reason the start time is recorded at all: a
@@ -257,6 +259,43 @@ fn a_live_process_that_did_not_write_the_record_is_gone_too() {
     let found = read_all(&second.paths);
     let record = &found.first().expect("one record").record;
     assert!(!record.writer_is_gone(&cancel), "a live writer is holding, not leaking");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_held_record_requires_same_domain_esrch_without_rewriting() {
+    let store = store();
+    let cancel = Cancel::new();
+    let mut child =
+        std::process::Command::new("/bin/sleep").arg("600").spawn().expect("owned child");
+    let pid = child.id();
+    let identity = proc::start_time(pid, &cancel).expect("child identity");
+    let mut record = HeldLockRecord {
+        agctl_pid: pid,
+        agctl_start_time: Some(identity),
+        tree: Tree::Agctl,
+        store_dir: PathBuf::from("/fixture"),
+        paths: vec![PathBuf::from("/fixture/peer.lock")],
+        taken_at: "fixture".to_owned(),
+    };
+    assert!(!record.writer_is_gone(&cancel));
+    child.kill().expect("kill child");
+    child.wait().expect("reap child");
+    assert!(record.writer_is_gone(&cancel));
+    for identity in
+        [None, Some("2026-09-22T00:00:00Z".to_owned()), Some("linux-v2:unknown".to_owned())]
+    {
+        record.agctl_start_time = identity;
+        let text = serde_json::to_string(&record).expect("record JSON");
+        let path = write_record(&store, "record.json", &text);
+        let read = read_all(&store.paths);
+        assert_eq!(read.len(), 1);
+        assert!(
+            !read[0].record.writer_is_gone(&cancel),
+            "ESRCH is not enough for an incompatible record"
+        );
+        assert_eq!(fs::read_to_string(path).expect("retained record"), text);
+    }
 }
 
 #[test]

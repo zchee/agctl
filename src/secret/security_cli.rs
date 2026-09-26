@@ -104,6 +104,9 @@ impl SecurityCli {
 
     /// Runs one `security` subcommand and collects its output.
     fn run(&self, args: &[&str], budget: Duration) -> Result<RunOutput, KeychainError> {
+        if !crate::secret::backend::KEYCHAIN_TRANSPORT {
+            return Err(KeychainError::Unsupported);
+        }
         let mut child = Command::new(&self.bin)
             .args(args)
             .stdin(Stdio::null())
@@ -208,6 +211,9 @@ pub fn argv_shapes() -> Vec<Vec<&'static str>> {
 
 impl KeychainReader for SecurityCli {
     fn preflight(&self) -> KeychainStatus {
+        if !crate::secret::backend::KEYCHAIN_TRANSPORT {
+            return KeychainStatus::Unsupported;
+        }
         match self.run(&PREFLIGHT_ARGV, READ_TIMEOUT) {
             Ok(output) if output.code == Some(0) => KeychainStatus::Unlocked,
             Ok(output) if output.code == Some(EXIT_LOCKED) => KeychainStatus::Locked,
@@ -395,16 +401,6 @@ impl SecurityCli {
     /// Mirrors `secret::default_reader`, but hands back the concrete type so
     /// [`SecurityCli::list_services_uncached`] is reachable.
     pub fn from_env(ctx: PassCtx) -> Option<Self> {
-        #[cfg(feature = "testing")]
-        if std::env::var(crate::secret::KEYCHAIN_BACKEND_ENV).is_ok_and(|value| value == "none") {
-            return None;
-        }
-
-        #[cfg(feature = "testing")]
-        let bin = std::env::var_os(crate::secret::SECURITY_BIN_ENV).map(PathBuf::from)?;
-        #[cfg(not(feature = "testing"))]
-        let bin = PathBuf::from(crate::secret::SECURITY_BIN);
-
-        Some(Self::new(bin, crate::secret::current_account(), ctx))
+        crate::secret::configured_security_reader(ctx)
     }
 }

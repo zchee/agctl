@@ -512,6 +512,7 @@ fn write_listing(fixture: &CodexFixture, account: &str) {
     fs::write(fixture.keychain_dump_path(), text).expect("the listing is writable");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ac95_an_auto_home_whose_item_is_listed_is_not_read() {
     // AC95's fourth rule through the binary (fact F94): under `auto` the
