@@ -162,8 +162,11 @@ impl CaptureVerdict {
 }
 
 impl Capture {
-    pub(super) fn classify(self) -> CaptureVerdict {
+    pub(super) fn classify(self, keys: Keys) -> CaptureVerdict {
         let Ok(text) = std::str::from_utf8(&self.0) else { return CaptureVerdict::Invalid };
+        if keys == Keys::Disconnect && !text.contains("Disconnect this session") {
+            return CaptureVerdict::PanelAbsent;
+        }
         let lines: Vec<&str> = text.lines().collect();
         let options: Vec<&str> = lines
             .iter()
@@ -335,19 +338,7 @@ pub fn capture(
         ctx,
         deadline,
     ) {
-        Ok(bytes) => {
-            if std::str::from_utf8(&bytes).is_err() {
-                return CaptureVerdict::Invalid;
-            }
-            if keys == Keys::Disconnect
-                && !bytes
-                    .windows(b"Disconnect this session".len())
-                    .any(|window| window == b"Disconnect this session")
-            {
-                return CaptureVerdict::PanelAbsent;
-            }
-            Capture(bytes).classify()
-        }
+        Ok(bytes) => Capture(bytes).classify(keys),
         Err(Failure::TooLarge) => CaptureVerdict::TooLarge,
         Err(
             Failure::Unavailable

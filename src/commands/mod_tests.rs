@@ -3,22 +3,7 @@ use std::io::Read;
 use std::time::Duration;
 
 use super::*;
-
-fn pty() -> (File, File) {
-    let master =
-        rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
-            .unwrap();
-    rustix::pty::grantpt(&master).unwrap();
-    rustix::pty::unlockpt(&master).unwrap();
-    let name = rustix::pty::ptsname(&master, Vec::new()).unwrap();
-    let slave = rustix::fs::open(
-        name.as_c_str(),
-        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY,
-        rustix::fs::Mode::empty(),
-    )
-    .unwrap();
-    (File::from(master), File::from(slave))
-}
+use crate::runtime::tty::tests::pty;
 
 fn wait_question(master: &mut File) {
     let end = Instant::now() + Duration::from_secs(3);

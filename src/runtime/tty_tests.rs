@@ -5,7 +5,7 @@ use std::os::fd::AsFd;
 
 use super::*;
 
-fn pty() -> (File, File) {
+pub(crate) fn pty() -> (File, File) {
     let master =
         rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
             .unwrap();

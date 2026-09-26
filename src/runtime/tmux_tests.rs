@@ -133,23 +133,51 @@ fn synthetic_screen_rejections_never_supply_authorization() {
     ]
     .into();
     for (file, expected) in cases {
-        assert_eq!(Capture(fs::read(screens().join(file)).unwrap()).classify(), expected, "{file}");
+        assert_eq!(
+            Capture(fs::read(screens().join(file)).unwrap()).classify(Keys::RemoteControl),
+            expected,
+            "{file}"
+        );
         assert!(!expected.reason().is_empty());
     }
     for mode in ["INSERT", "NORMAL", "REPLACE", "other mode"] {
         let text = format!("transcript\n❯\n────────\n-- {mode} --\n");
-        assert_eq!(Capture(text.into_bytes()).classify(), CaptureVerdict::ModeVisible);
+        assert_eq!(
+            Capture(text.into_bytes()).classify(Keys::RemoteControl),
+            CaptureVerdict::ModeVisible
+        );
     }
-    assert_eq!(Capture(b"transcript\n".to_vec()).classify(), CaptureVerdict::Ambiguous);
-    assert_eq!(Capture(Vec::new()).classify(), CaptureVerdict::Ambiguous);
     assert_eq!(
-        Capture("transcript\n❯\n  continuation draft\n────\n".as_bytes().to_vec()).classify(),
+        Capture(b"transcript\n".to_vec()).classify(Keys::RemoteControl),
+        CaptureVerdict::Ambiguous
+    );
+    assert_eq!(Capture(Vec::new()).classify(Keys::RemoteControl), CaptureVerdict::Ambiguous);
+    assert_eq!(
+        Capture("transcript\n❯\n  continuation draft\n────\n".as_bytes().to_vec())
+            .classify(Keys::RemoteControl),
         CaptureVerdict::DraftVisible
     );
     let text = fs::read_to_string(screens().join("c20-panel.txt"))
         .unwrap()
         .replace("Show QR code", "Hide QR code");
-    assert_eq!(Capture(text.into_bytes()).classify(), CaptureVerdict::NoRejection);
+    assert_eq!(
+        Capture(text.into_bytes()).classify(Keys::RemoteControl),
+        CaptureVerdict::NoRejection
+    );
+}
+
+#[test]
+fn capture_invalid_utf8_precedes_panel_rejection_for_both_key_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = fake(
+        dir.path(),
+        &[("AGCTL_FAKE_TMUX_SCREEN", screens().join("capture_invalid.bin").display().to_string())],
+    );
+    let pane = Pane::parse("%7").unwrap();
+    let ctx = context();
+    for keys in [Keys::Disconnect, Keys::RemoteControl] {
+        assert_eq!(capture(&bin, &pane, keys, &ctx, ctx.deadline()), CaptureVerdict::Invalid);
+    }
 }
 
 #[test]
