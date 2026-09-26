@@ -259,9 +259,21 @@ fn linux_record_identity_guard() {
 struct OwnChild(Child);
 
 impl OwnChild {
+    /// Spawns `path`, a copy of `/bin/sh`, parked in `read` on a pipe the
+    /// parent never writes to, so it keeps whatever name it was started under
+    /// until it is signalled.
+    ///
+    /// Not a copy of `/bin/sleep`: on Ubuntu 26.04 that is the uutils
+    /// multi-call binary, which dispatches on `argv[0]` and exits with
+    /// `unknown program 'claude'` when run under the launcher's name. dash,
+    /// the `/bin/sh` of Debian and Ubuntu, behaves the same under any name.
     fn spawn(path: &Path, traced: bool) -> Self {
         let mut command = Command::new(path);
-        command.arg("600").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        command
+            .args(["-c", "read _"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         if traced {
             // SAFETY: the child callback calls only ptrace and errno; it neither
             // allocates nor takes locks between fork and exec.
@@ -306,8 +318,8 @@ impl Drop for OwnChild {
 fn linux_process_lifecycle() {
     let scratch = tempfile::tempdir().expect("isolated launchers");
     let version = scratch.path().join("2.1.282");
-    let base = scratch.path().join("sleep");
-    fs::copy("/bin/sleep", &base).expect("copy system sleep");
+    let base = scratch.path().join("sh");
+    fs::copy("/bin/sh", &base).expect("copy system sh");
     fs::hard_link(&base, &version).expect("same-inode version name");
     let launcher = scratch.path().join("claude");
     symlink(&version, &launcher).expect("same-inode claude launcher");
