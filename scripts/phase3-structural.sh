@@ -67,9 +67,12 @@ phase3_snapshot() {
     # stored.
     local suspect
     suspect=$(cd "$root" && git ls-files -mo --exclude-standard | while IFS= read -r path; do
-        case $path in fixtures/*) continue ;; esac
+        # A leading `(` on each pattern: bash 3.2, the /bin/bash macOS ships, finds
+        # the end of a `$( )` by balancing parentheses and otherwise rejects the
+        # `case` inside this substitution as a syntax error.
+        case $path in (fixtures/*) continue ;; esac
         case ${path##*/} in
-            auth.json | .credentials.json | *.pending | *.pending.meta | *.tmp.* | *.pem | *.key)
+            (auth.json | .credentials.json | *.pending | *.pending.meta | *.tmp.* | *.pem | *.key)
                 printf '%s\n' "$path"
                 ;;
         esac
