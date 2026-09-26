@@ -1,0 +1,146 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-26.04
+          - xcode-27
+    name: fmt/(${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo fmt --check
+
+  clippy:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-26.04
+          - xcode-27
+    name: clippy/(${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-26.04
+          - xcode-27
+    name: test/(${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: cargo nextest run --locked --all-features
+
+  # Feeds the codecov badge in README.md. Uploads authenticate with GitHub OIDC,
+  # which a pull request from a fork cannot mint, so those fall back to the
+  # tokenless upload Codecov allows for forks of public repositories.
+  #
+  # One test stays with the uninstrumented `test` job. It asserts the 143 the
+  # signal thread exits with while `main` races it with its own exit code, and
+  # the profile dump an instrumented binary runs on exit delays the signal
+  # thread enough for `main` to win.
+  coverage:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup component add llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,nextest
+      - run: >-
+          cargo llvm-cov nextest --locked --all-features --codecov --output-path codecov.json
+          -E 'not test(ac27_sigterm_during_a_held_refresh_exits_143_and_releases_the_lock)'
+      - uses: codecov/codecov-action@v7
+        with:
+          use_oidc: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          files: codecov.json
+          fail_ci_if_error: true
+
+  # The three script gates from AGENTS.md, release-gate.sh last. Both images ship
+  # jq; neither ships ripgrep, and Homebrew is off PATH on the Ubuntu image, so
+  # each OS installs its own prerequisites.
+  release-gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-26.04
+          - xcode-27
+    name: release-gate/(${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux gate tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ripgrep jq
+      - name: Install macOS gate tools
+        if: runner.os == 'macOS'
+        run: brew install ripgrep jq
+      - name: Check source and structural invariants
+        env:
+          AGCTL_GATE_DEV_CONFIG: ${{ runner.temp }}/agctl-gate.toml
+          CARGO_TARGET_DIR: ${{ runner.temp }}/agctl-phase3-target
+          GIT_AUTHOR_NAME: gate
+          GIT_AUTHOR_EMAIL: gate@localhost
+          GIT_COMMITTER_NAME: gate
+          GIT_COMMITTER_EMAIL: gate@localhost
+        run: |
+          printf '[profile.dev]\nincremental = false\n[profile.test]\nincremental = false\n' >| "$AGCTL_GATE_DEV_CONFIG"
+          scripts/phase3-greps.sh
+          scripts/phase3-structural.sh
+      - run: scripts/release-gate.sh
+
+  # The only context the ruleset requires. A skipped job reports "Success" to a
+  # required check, so this must run even when a dependency failed.
+  conclusion:
+    needs:
+      - fmt
+      - clippy
+      - test
+      - coverage
+      - release-gate
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - run: jq --exit-status 'all(.[]; .result == "success")' <<<"$NEEDS"
+        env:
+          NEEDS: ${{ toJson(needs) }}
