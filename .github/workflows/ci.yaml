@@ -84,9 +84,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,nextest
-      - run: >-
-          cargo llvm-cov nextest --locked --all-features --codecov --output-path codecov.json
-          -E 'not test(ac27_sigterm_during_a_held_refresh_exits_143_and_releases_the_lock)'
+      - run: cargo llvm-cov nextest --locked --all-features --codecov --output-path codecov.json
       - uses: codecov/codecov-action@v7
         with:
           use_oidc: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}

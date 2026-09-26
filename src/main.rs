@@ -47,7 +47,14 @@ fn main() {
         process::exit(error::EXIT_FATAL);
     }
 
-    match dispatch(&cli, &cancel) {
+    let outcome = dispatch(&cli, &cancel);
+    // A signal-driven exit belongs to the signal thread, which ends the
+    // process with `128 + signo` once its cleanup is done. A command that was
+    // cancelled by that signal returns here first, and exiting with its own
+    // status would race that thread: an instrumented build's atexit profile
+    // write delays its `process::exit` long enough for this one to win.
+    signals::defer_to_exit();
+    match outcome {
         Ok(code) => process::exit(code),
         Err(err) => {
             eprintln!("agctl: {err}");
