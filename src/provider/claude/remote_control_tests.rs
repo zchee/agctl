@@ -321,10 +321,7 @@ mod stage_tests {
     impl Fixture {
         fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
-            let master = rustix::pty::openpt(
-                rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY,
-            )
-            .unwrap();
+            let master = crate::runtime::tty::tests::open_master();
             rustix::pty::grantpt(&master).unwrap();
             rustix::pty::unlockpt(&master).unwrap();
             let name = rustix::pty::ptsname(&master, Vec::new()).unwrap();

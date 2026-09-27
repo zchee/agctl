@@ -2,13 +2,26 @@ use std::fs::File;
 use std::io::Read;
 use std::io::Write;
 use std::os::fd::AsFd;
+use std::os::fd::OwnedFd;
 
 use super::*;
 
+// macOS 27.2 was seen to fail this open with errno -6, XNU's kernel-internal
+// EREDRIVEOPEN, while another PTY was opened or closed. The kernel has then
+// already retried for about 0.4 s; no measured open failed more than twice
+// in a row. Every other error is a real failure.
+pub(crate) fn open_master() -> OwnedFd {
+    let flags = rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY;
+    (0..4)
+        .find_map(|_| match rustix::pty::openpt(flags) {
+            Err(error) if error.raw_os_error() == -6 => None,
+            opened => Some(opened.unwrap()),
+        })
+        .expect("openpt: errno -6 on each of 4 attempts")
+}
+
 pub(crate) fn pty() -> (File, File) {
-    let master =
-        rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
-            .unwrap();
+    let master = open_master();
     rustix::pty::grantpt(&master).unwrap();
     rustix::pty::unlockpt(&master).unwrap();
     let name = rustix::pty::ptsname(&master, Vec::new()).unwrap();

@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::Read;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -24,10 +25,22 @@ fn normal_config() -> Value {
     document
 }
 
+// macOS 27.2 was seen to fail this open with errno -6, XNU's kernel-internal
+// EREDRIVEOPEN, while another PTY was opened or closed. The kernel has then
+// already retried for about 0.4 s; no measured open failed more than twice
+// in a row. Every other error is a real failure.
+fn open_master() -> OwnedFd {
+    let flags = rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY;
+    (0..4)
+        .find_map(|_| match rustix::pty::openpt(flags) {
+            Err(error) if error.raw_os_error() == -6 => None,
+            opened => Some(opened.unwrap()),
+        })
+        .expect("openpt: errno -6 on each of 4 attempts")
+}
+
 fn pty() -> (File, File, PathBuf) {
-    let master =
-        rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
-            .unwrap();
+    let master = open_master();
     rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC).unwrap();
     rustix::pty::grantpt(&master).unwrap();
     rustix::pty::unlockpt(&master).unwrap();
