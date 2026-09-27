@@ -506,34 +506,78 @@ fn log_events(run: &Run) -> String {
 #[test]
 fn restart_log_hygiene_keeps_identity_fields_but_not_timestamps() {
     let stamp = "2026-09-26T22:39:14.317280Z";
-    let fixture = Fixture::new();
-    let clean = Run {
-        output: common::Output {
-            code: Some(0),
-            stdout: String::new(),
-            stderr: format!("question [y/N] {stamp} DEBUG agctl::runtime::tmux: tmux call\n"),
-        },
-        questions: Vec::new(),
-    };
+    let clean =
+        captured("", &format!("question [y/N] {stamp} DEBUG agctl::runtime::tmux: tmux call\n"));
     assert_eq!(log_events(&clean), "DEBUG agctl::runtime::tmux: tmux call");
-    assert_output_hygiene(&fixture, &clean, &["3172".to_owned()]);
+    assert!(leaks(stamp, "2026"), "an unstripped stamp fails the check below");
+    assert_output_hygiene(&Fixture::new(), &clean, &["2026".to_owned()]);
     for prefix in [format!("{stamp} "), String::new()] {
-        let with_identity = Run {
-            output: common::Output {
-                code: Some(0),
-                stdout: String::new(),
-                stderr: format!("{prefix}WARN agctl::runtime::tmux: pid=3172\n"),
-            },
-            questions: Vec::new(),
-        };
+        let with_identity = captured("", &format!("{prefix}WARN agctl::runtime::tmux: pid=3172\n"));
         assert_eq!(log_events(&with_identity), "WARN agctl::runtime::tmux: pid=3172");
     }
+}
+
+// An all-digit value is a pid, which the OS picks per run. Its digits also
+// occur inside unrelated hex digests, so it leaks only as a whole token.
+fn leaks(text: &str, value: &str) -> bool {
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        text.split(|c: char| !c.is_ascii_alphanumeric()).any(|token| token == value)
+    } else {
+        text.contains(value)
+    }
+}
+
+fn captured(stdout: &str, stderr: &str) -> Run {
+    Run {
+        output: common::Output {
+            code: Some(0),
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+        },
+        questions: Vec::new(),
+    }
+}
+
+#[test]
+fn restart_output_hygiene_compares_a_pid_as_a_whole_token() {
+    // PR #6 run 36289983531: pid 31704 met the `from` digest of this plan.
+    let plan = r#"{"kind":"plan","direction":"forward","to":{"digest8":"36f527ce"},"service":"Claude Code-credentials","account":"incoming@example.com","from":{"digest8":"a9231704"}}"#;
+    for pid in ["31704", "9231704", "704", "527", "36"] {
+        assert!(!leaks(plan, pid), "{pid} is part of a digest, never a pid");
+    }
+    for text in [
+        r#"{"pid":31704}"#,
+        r#"{"path":"sessions/31704.json"}"#,
+        "WARN agctl::runtime::tmux: pid=31704",
+        "pane %7 31704 /dev/ttys012",
+        "session_31704",
+        "31704",
+    ] {
+        assert!(leaks(text, "31704"), "{text}");
+    }
+    assert!(leaks("name=rc-e2e-71", "rc-e2e-7"), "every other value stays a substring");
+    let digest_event = "DEBUG agctl::commands::use: digest8=a9231704";
+    assert_output_hygiene(&Fixture::new(), &captured(plan, digest_event), &["31704".to_owned()]);
+}
+
+#[test]
+#[should_panic(expected = "AC163: forbidden \"31704\" in JSON")]
+fn restart_output_hygiene_rejects_a_pid_member_in_json() {
+    let outcome = r#"{"kind":"outcome","remote_control":{"pid":31704}}"#;
+    assert_output_hygiene(&Fixture::new(), &captured(outcome, ""), &["31704".to_owned()]);
+}
+
+#[test]
+#[should_panic(expected = "AC163: forbidden \"31704\" in log events")]
+fn restart_output_hygiene_rejects_a_pid_field_in_log_events() {
+    let event = "WARN agctl::runtime::tmux: pid=31704\n";
+    assert_output_hygiene(&Fixture::new(), &captured("", event), &["31704".to_owned()]);
 }
 
 fn assert_output_hygiene(fixture: &Fixture, run: &Run, forbidden: &[String]) {
     let events = log_events(run);
     for value in forbidden {
-        assert!(!events.contains(value), "AC163: forbidden {value:?} in log events: {events}");
+        assert!(!leaks(&events, value), "AC163: forbidden {value:?} in log events: {events}");
     }
     // Human-only stdout-terminal controls have no piped JSON. D7 exempts
     // exactly the pre-existing top-level plan paths, no other field.
@@ -561,7 +605,7 @@ fn assert_output_hygiene(fixture: &Fixture, run: &Run, forbidden: &[String]) {
         value.as_object_mut().unwrap().remove("config_path");
         let text = value.to_string();
         for value in forbidden {
-            assert!(!text.contains(value), "AC163: forbidden {value:?} in JSON: {text}");
+            assert!(!leaks(&text, value), "AC163: forbidden {value:?} in JSON: {text}");
         }
     }
 }
