@@ -1,0 +1,5 @@
+# The coverage job uploads one report per runner. Without this, Codecov reports
+# from the first one alone and misses every line only the other runner executes.
+codecov:
+  notify:
+    after_n_builds: 2

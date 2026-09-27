@@ -67,12 +67,19 @@ jobs:
   # which a pull request from a fork cannot mint, so those fall back to the
   # tokenless upload Codecov allows for forks of public repositories.
   #
-  # One test stays with the uninstrumented `test` job. It asserts the 143 the
-  # signal thread exits with while `main` races it with its own exit code, and
-  # the profile dump an instrumented binary runs on exit delays the signal
-  # thread enough for `main` to win.
+  # Both runners upload, and Codecov merges the reports of one commit. Some
+  # e2e suites compile only on macOS and some only on Linux, so neither
+  # runner alone executes all of the source. codecov.yaml holds the status
+  # until both reports arrive.
   coverage:
-    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-26.04
+          - xcode-27
+    name: coverage/(${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions:
       contents: read
