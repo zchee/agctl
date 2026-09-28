@@ -133,8 +133,10 @@ jobs:
           scripts/phase3-structural.sh
       - run: scripts/release-gate.sh
 
-  # The only context the ruleset requires. A skipped job reports "Success" to a
-  # required check, so this must run even when a dependency failed.
+  # One verdict for the whole run: it fails when any job did. The ruleset
+  # requires the fmt, clippy and test contexts on both runners, not this one.
+  # A skipped job reports "Success" to a required check, so this runs even
+  # when a dependency failed and stays safe to require later.
   conclusion:
     needs:
       - fmt
