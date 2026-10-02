@@ -186,16 +186,12 @@ pub struct ExitNotice {
 impl ExitNotice {
     /// Includes one new input sequence, before its send can be in flight.
     pub fn begin(&self) {
-        let _ = self.count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-            Some(count.saturating_add(1))
-        });
+        self.count.update(Ordering::SeqCst, Ordering::SeqCst, |count| count.saturating_add(1));
     }
 
     /// Removes a session whose reconnection or disappearance was confirmed.
     pub fn confirmed(&self) {
-        let _ = self.count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-            Some(count.saturating_sub(1))
-        });
+        self.count.update(Ordering::SeqCst, Ordering::SeqCst, |count| count.saturating_sub(1));
     }
 }
 
