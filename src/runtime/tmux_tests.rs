@@ -130,6 +130,8 @@ fn synthetic_screen_rejections_never_supply_authorization() {
         ("capture_invalid.bin", CaptureVerdict::Invalid),
         ("empty-prompt.txt", CaptureVerdict::NoRejection),
         ("c20-panel.txt", CaptureVerdict::NoRejection),
+        ("echoed-prompts.txt", CaptureVerdict::NoRejection),
+        ("echoed-prompts-draft.txt", CaptureVerdict::DraftVisible),
     ]
     .into();
     for (file, expected) in cases {
@@ -141,7 +143,7 @@ fn synthetic_screen_rejections_never_supply_authorization() {
         assert!(!expected.reason().is_empty());
     }
     for mode in ["INSERT", "NORMAL", "REPLACE", "other mode"] {
-        let text = format!("transcript\n❯\n────────\n-- {mode} --\n");
+        let text = format!("transcript\n❯\u{a0}\n────────\n-- {mode} --\n");
         assert_eq!(
             Capture(text.into_bytes()).classify(Keys::RemoteControl),
             CaptureVerdict::ModeVisible
@@ -153,7 +155,7 @@ fn synthetic_screen_rejections_never_supply_authorization() {
     );
     assert_eq!(Capture(Vec::new()).classify(Keys::RemoteControl), CaptureVerdict::Ambiguous);
     assert_eq!(
-        Capture("transcript\n❯\n  continuation draft\n────\n".as_bytes().to_vec())
+        Capture("transcript\n❯\u{a0}\n  continuation draft\n────\n".as_bytes().to_vec())
             .classify(Keys::RemoteControl),
         CaptureVerdict::DraftVisible
     );
@@ -164,6 +166,96 @@ fn synthetic_screen_rejections_never_supply_authorization() {
         Capture(text.into_bytes()).classify(Keys::RemoteControl),
         CaptureVerdict::NoRejection
     );
+}
+
+#[test]
+fn an_echoed_prompt_is_transcript_and_only_the_input_line_holds_a_draft() {
+    let classify = |text: &str, keys| Capture(text.as_bytes().to_vec()).classify(keys);
+    let echoed = fs::read_to_string(screens().join("echoed-prompts.txt")).unwrap();
+    assert_eq!(echoed.matches("❯ ").count(), 3, "three echoed prompts, U+0020 after the pointer");
+    assert_eq!(echoed.matches("❯\u{a0}").count(), 1, "one input line, U+00A0 after the pointer");
+    let input = "❯\u{a0}\n";
+
+    let cases: BTreeMap<_, _> = [
+        ("echoes above an empty input line", echoed.clone(), CaptureVerdict::NoRejection),
+        (
+            "echoes above a continuation draft",
+            echoed.replace(input, "❯\u{a0}\n  second line\n"),
+            CaptureVerdict::DraftVisible,
+        ),
+        (
+            "echoes and no input line, as under a covering panel",
+            echoed.replace(input, "   Settings  Status   Config\n"),
+            CaptureVerdict::Ambiguous,
+        ),
+        (
+            "an input line spelled with U+0020 is not recognized, so nothing is accepted",
+            echoed.replace(input, "❯ \n"),
+            CaptureVerdict::Ambiguous,
+        ),
+        (
+            "a draft spelled with U+0020 is not recognized either and still does not pass",
+            echoed.replace(input, "❯ half-typed text\n"),
+            CaptureVerdict::Ambiguous,
+        ),
+        (
+            "an echo below the input line does not hide the draft above it",
+            echoed.replace(input, "❯\u{a0}half-typed text\n❯ later echo\n"),
+            CaptureVerdict::DraftVisible,
+        ),
+        (
+            "a bare pointer with no separator is not the input line",
+            "transcript\n❯\n────────\n? for shortcuts\n".to_owned(),
+            CaptureVerdict::Ambiguous,
+        ),
+        (
+            "an indented pointer row is printed output, not the input line",
+            echoed.replace(input, "  ❯\u{a0}\n"),
+            CaptureVerdict::Ambiguous,
+        ),
+        (
+            "an indented pointer row above the input line changes nothing",
+            echoed.replace("❯ marker two", "  ❯\u{a0}"),
+            CaptureVerdict::NoRejection,
+        ),
+        (
+            "an indented pointer row does not stand in for a bash-mode input line that holds text",
+            echoed.replace("❯ marker two", "  ❯\u{a0}").replace(input, "!\u{a0}ls -la\n"),
+            CaptureVerdict::Ambiguous,
+        ),
+        (
+            "two input lines cannot both be the input",
+            echoed.replace("❯ marker two", "❯\u{a0}"),
+            CaptureVerdict::Ambiguous,
+        ),
+        (
+            "only non-whitespace after the separator is a draft",
+            echoed.replace(input, "❯\u{a0} \u{a0}\n"),
+            CaptureVerdict::NoRejection,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, text, expected)| (name, (text, expected)))
+    .collect();
+    for (name, (text, expected)) in &cases {
+        assert_eq!(classify(text, Keys::RemoteControl), *expected, "{name}");
+    }
+
+    // The panel replaces the input line; the echoed prompts above it stay on screen.
+    let panel = fs::read_to_string(screens().join("c20-panel.txt")).unwrap();
+    let transcript = echoed.split("❯\u{a0}").next().unwrap();
+    let under_panel = format!("{transcript}{panel}");
+    for keys in [Keys::RemoteControl, Keys::Disconnect] {
+        assert_eq!(classify(&under_panel, keys), CaptureVerdict::NoRejection, "{keys:?}");
+        // A draft that spells an option label is still a draft, with or without the panel's own row.
+        for text in [
+            format!("{under_panel}❯\u{a0}Continue\n"),
+            under_panel.replace("❯ Continue", "❯\u{a0}Continue"),
+        ] {
+            assert_eq!(classify(&text, keys), CaptureVerdict::DraftVisible, "{keys:?}");
+        }
+    }
+    assert_eq!(classify(&echoed, Keys::Disconnect), CaptureVerdict::PanelAbsent);
 }
 
 #[test]

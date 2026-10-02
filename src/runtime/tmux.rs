@@ -123,7 +123,7 @@ pub(crate) struct Capture(Vec<u8>);
 pub enum CaptureVerdict {
     /// The screen supplied no rejection clue; fresh attestation is still required.
     NoRejection,
-    /// Visible input text, including a continuation.
+    /// Visible text on the input line or its continuation; an echoed earlier prompt is transcript.
     DraftVisible,
     /// A visible stash banner.
     StashVisible,
@@ -133,7 +133,7 @@ pub enum CaptureVerdict {
     DialogConflict,
     /// The disconnect group has no visible expected panel.
     PanelAbsent,
-    /// Missing or viewport-clipped input without a recognized dialog.
+    /// Missing or viewport-clipped input without a recognized dialog, or more than one input line.
     Ambiguous,
     /// Spawn, timeout or nonzero exit.
     Failed,
@@ -181,12 +181,15 @@ impl Capture {
             || options == ["Disconnect this session", "Hide QR code", "Continue"];
         let mut pointer = None;
         for (index, line) in lines.iter().enumerate() {
-            if let Some(tail) = line.trim_start().strip_prefix('❯') {
-                if panel && options.contains(&tail.trim()) {
-                    continue;
-                }
-                if !tail.trim().is_empty() {
+            // Claude Code draws the input line as `❯` + U+00A0 at the left edge. An echoed
+            // earlier prompt and a focused panel option are `❯` + U+0020: transcript, not
+            // input. With no input line and no verified panel the screen is ambiguous.
+            if let Some(input) = line.strip_prefix("❯\u{a0}") {
+                if !input.trim().is_empty() {
                     return CaptureVerdict::DraftVisible;
+                }
+                if pointer.is_some() {
+                    return CaptureVerdict::Ambiguous;
                 }
                 pointer = Some(index);
                 // Continuations belong to the input until its closing border or

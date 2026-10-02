@@ -1,0 +1,28 @@
+
+ ▐▛███▛█   Claude Code v2.1.287
+▝▜██████▀  Synthetic model · Synthetic plan
+ ▝▝   ▝▝   /tmp/synthetic
+
+
+❯ /rename synthetic-session
+  ⎿  Session renamed to: synthetic-session
+
+❯ marker one
+
+⏺ Received "marker one".
+
+✻ Cogitated for 5s
+
+❯ marker two
+
+⏺ Received "marker two".
+
+✻ Brewed for 2s
+
+
+                                                                   1234 tokens
+────────────────────────────────────────────────────────── synthetic-session ─
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  [synthetic status] | Model: synthetic | ctx:[#---------]10%
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
