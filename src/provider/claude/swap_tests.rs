@@ -108,7 +108,7 @@ fn the_cli_exit_table_is_total_and_has_no_duplicate_or_reserved_value() {
         assert!(!seen.contains(&code), "{name} reuses exit code {code}");
         seen.push(code);
     }
-    assert_eq!(seen.len(), 17, "every code in the block is listed in ALL");
+    assert_eq!(seen.len(), 18, "every code in the block is listed in ALL");
 
     // The table itself, spelled out. Counting the entries proved only that
     // there were as many of them as expected: a renumbering, or a name moved onto another
@@ -135,6 +135,7 @@ fn the_cli_exit_table_is_total_and_has_no_duplicate_or_reserved_value() {
             ("live_item_absent", 24),
             ("live_undo_item_changed", 27),
             ("identity_unavailable", 29),
+            ("remote_control_not_disconnected", 30),
         ],
         "each name keeps its own number, and S23b's retired 25, 26 and 28 are not reused"
     );
@@ -165,6 +166,7 @@ fn all_outcomes() -> Vec<Outcome> {
         Outcome::Refused(Refusal::LiveUnreachable),
         Outcome::Refused(Refusal::LiveItemAbsent),
         Outcome::Refused(Refusal::AuditRefused),
+        Outcome::Refused(Refusal::RemoteControlNotDisconnected),
         Outcome::Refused(Refusal::IdentityUnavailable(IdentityGap::ProfileUnavailable)),
         Outcome::Refused(Refusal::IdentityUnavailable(IdentityGap::TokenExpired)),
         Outcome::Refused(Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin)),
@@ -451,6 +453,13 @@ fn the_live_refusals_carry_the_letter_code_and_phase_w4b_fixed_for_each() {
             Phase::A,
         ),
         (Refusal::AuditRefused, None, Some("audit_refused"), swap_exit::AUDIT_REFUSED, Phase::B),
+        (
+            Refusal::RemoteControlNotDisconnected,
+            None,
+            Some("remote_control_not_disconnected"),
+            swap_exit::RC_NOT_DISCONNECTED,
+            Phase::B,
+        ),
         // S24: whose credential the live item holds. Both decided in Phase A,
         // right after the item read; the unavailable identity carries one of
         // two reasons under one fresh code, and the foreign login keeps 27 with
@@ -556,9 +565,13 @@ fn the_live_refusals_are_decided_before_the_locks_and_in_the_contracts_order() {
     assert!(foreign < at(Refusal::LineTooLong));
     assert!(at(Refusal::LiveItemAbsent) < at(Refusal::LineTooLong));
     assert!(at(Refusal::LineTooLong) < at(Refusal::AuditRefused));
-    assert!(at(Refusal::AuditRefused) < at(Refusal::CannotAdopt(adopt::Refusal::NewerCopy)));
+    assert_eq!(at(Refusal::AuditRefused) + 1, at(Refusal::RemoteControlNotDisconnected));
+    assert_eq!(
+        at(Refusal::RemoteControlNotDisconnected) + 1,
+        at(Refusal::CannotAdopt(adopt::Refusal::NewerCopy))
+    );
     assert!(at(Refusal::CannotAdopt(adopt::Refusal::NewerCopy)) < at(Refusal::CompromisedHold));
-    assert_eq!(DECISION_ORDER.len(), 11, "every refusal the driver can raise is in the table");
+    assert_eq!(DECISION_ORDER.len(), 12, "every refusal the driver can raise is in the table");
 }
 
 #[test]

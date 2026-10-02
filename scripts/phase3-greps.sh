@@ -16,6 +16,11 @@
 # count — and `src` without the `*_tests.rs` siblings. Every check whose
 # pattern can begin a line is also proven against a plant in that shape.
 #
+# S12 adds the Remote Control restart pins: tmux_bin, fake_tmux_prefix,
+# tmux_spawn, tmux_no_shell, rc_no_write, messaging_socket, rc_no_signal,
+# rc_budget_env and capture_no_output. Each has a planted counterexample;
+# the capture compiler plants additionally prohibit Debug/Serialize escapes.
+#
 # The base baselines, landed by S29a; later steps append their own checks:
 #
 #   unwrap        `.unwrap()` on a code line                          → none
@@ -1323,11 +1328,113 @@ check_bridge_id_escape() {
     check_helper_callers "$1" 'bridge_session_id' 'the private bridge id' src/provider/claude/live_sessions.rs
 }
 
+# Remote Control restart (S12): closed transport, read-only stages, and private captures.
+check_tmux_bin() {
+    check_helper_callers "$1" '\bAGCTL_TMUX_BIN\b' 'AGCTL_TMUX_BIN' src/runtime/tmux.rs
+}
+
+check_fake_tmux_prefix() {
+    local root=$1 hits count file line prev
+    hits=$(code_hits "$root" 'AGCTL_FAKE_TMUX_') || scan_failed check_fake_tmux_prefix
+    count=$(printf '%s\n' "$hits" | sed '/^$/d' | wc -l | tr -d ' ')
+    if [[ $count -ne 1 ]]; then
+        printf '  `AGCTL_FAKE_TMUX_` is spelled %s time(s), not once:\n%s\n' "$count" "$hits"
+        return 1
+    fi
+    file=${hits%%:*}
+    line=${hits#*:}
+    line=${line%%:*}
+    prev=$(sed -n "$((line - 1))p" "$root/$file")
+    if [[ $file != src/runtime/tmux.rs ]] || ! [[ $prev =~ ^[[:space:]]*\#\[cfg\(feature\ =\ \"testing\"\)\][[:space:]]*$ ]]; then
+        printf '  the fake tmux prefix must be in tmux.rs directly below its testing cfg\n'
+        return 1
+    fi
+}
+
+check_tmux_spawn() {
+    local hits other count
+    hits=$(scoped_code_hits "$1" 'Command::new' src/runtime/tmux.rs) || scan_failed check_tmux_spawn
+    other=$(scoped_code_hits "$1" 'Command::new' src/provider/claude/remote_control.rs) || scan_failed check_tmux_spawn
+    count=$(printf '%s\n' "$hits" | grep -oF 'Command::new' | wc -l | tr -d ' ') || count=0
+    if [[ $count -ne 1 || -n $other ]]; then
+        printf '  tmux.rs must own exactly one spawn and remote_control.rs none:\n%s\n%s\n' "$hits" "$other"
+        return 1
+    fi
+}
+
+check_tmux_no_shell() {
+    local hits
+    hits=$(scoped_code_hits "$1" '"sh"|"-c"|/bin/|\bbash\b' src/runtime/tmux.rs src/provider/claude/remote_control.rs) || scan_failed check_tmux_no_shell
+    [[ -z $hits ]] && return 0
+    printf '  Remote Control reaches a shell rather than closed argv:\n%s' "$hits"
+    return 1
+}
+
+check_rc_no_write() {
+    local hits
+    # D11: the write half of live_sessions_readonly; tmux_spawn owns spawning.
+    hits=$(scoped_code_hits "$1" 'fs::write|OpenOptions|create_dir|remove_|rename\(|set_permissions|File::create|fs::copy|hard_link|symlink\(' src/runtime/tmux.rs src/provider/claude/remote_control.rs) || scan_failed check_rc_no_write
+    [[ -z $hits ]] && return 0
+    printf '  a Remote Control module names a filesystem mutation:\n%s' "$hits"
+    return 1
+}
+
+check_messaging_socket() {
+    local hits
+    hits=$(code_hits "$1" 'messagingSocketPath|messaging_socket') || scan_failed check_messaging_socket
+    [[ -z $hits ]] && return 0
+    printf '  a module names the unsupported messaging socket:\n%s' "$hits"
+    return 1
+}
+
+check_rc_no_signal() {
+    local hits
+    hits=$(scoped_code_hits "$1" 'kill_process|Signal::|libc::kill|send_signal' src/runtime/tmux.rs src/provider/claude/remote_control.rs) || scan_failed check_rc_no_signal
+    [[ -z $hits ]] && return 0
+    printf '  a Remote Control module signals a process:\n%s' "$hits"
+    return 1
+}
+
+check_rc_budget_env() {
+    check_helper_callers "$1" '\bAGCTL_RC_BUDGET_MS\b' 'AGCTL_RC_BUDGET_MS' src/provider/claude/remote_control.rs
+}
+
+check_capture_no_output() {
+    local hits
+    hits=$(scoped_code_hits "$1" '\bCapture\b.*(?:print|format!|write!|tracing::|serde)|(?:print|format!|write!|tracing::|serde).*\bCapture\b' src/runtime/tmux.rs) || scan_failed check_capture_no_output
+    [[ -z $hits ]] && return 0
+    printf '  an opaque capture appears beside an output operation:\n%s' "$hits"
+    return 1
+}
+
 # Each plant_<name> <root> adds exactly one violation of its check.
 PLANT_FILE=src/main.rs
 # plant_line <root> <line> [file]: appends one line to <file> (default the
 # plant file) under <root>.
 plant_line() { printf '\n%s\n' "$2" >>"$1/${3:-$PLANT_FILE}"; }
+
+# S12 plants exercise each new check; D11 proves both write sites and all spawn counts.
+plant_tmux_bin() { plant_line "$1" 'const _PHASE3_PLANT: &str = "AGCTL_TMUX_BIN";'; }
+plant_fake_tmux_prefix() { plant_line "$1" 'const _PHASE3_PLANT: &str = "AGCTL_FAKE_TMUX_";'; }
+plant_fake_tmux_cfg_commented() {
+    perl -0pi -e 's/#\[cfg\(feature = "testing"\)\](\nconst FAKE_PREFIX)/\/\/ #[cfg(feature = "testing")]$1/' "$1/src/runtime/tmux.rs"
+}
+plant_tmux_spawn_second() {
+    plant_line "$1" 'fn _phase3_plant() { let _ = std::process::Command::new("x"); }' src/runtime/tmux.rs
+}
+plant_tmux_spawn_remote() {
+    plant_line "$1" 'fn _phase3_plant() { let _ = std::process::Command::new("x"); }' src/provider/claude/remote_control.rs
+}
+plant_tmux_spawn_removed() {
+    perl -pi -e 's/Command::new/Command::default/g' "$1/src/runtime/tmux.rs"
+}
+plant_tmux_shell() { plant_line "$1" 'const _PHASE3_PLANT: &str = "sh";' src/runtime/tmux.rs; }
+plant_rc_write_tmux() { plant_line "$1" 'fn _phase3_plant() { let _ = std::fs::write("x", b"x"); }' src/runtime/tmux.rs; }
+plant_rc_write_stage() { plant_line "$1" 'fn _phase3_plant() { let _ = std::fs::write("x", b"x"); }' src/provider/claude/remote_control.rs; }
+plant_messaging_socket() { plant_line "$1" 'const _PHASE3_PLANT: &str = "messagingSocketPath";'; }
+plant_rc_signal() { plant_line "$1" 'fn _phase3_plant() { let _ = Signal::TERM; }' src/provider/claude/remote_control.rs; }
+plant_rc_budget_env() { plant_line "$1" 'const _PHASE3_PLANT: &str = "AGCTL_RC_BUDGET_MS";'; }
+plant_capture_output() { plant_line "$1" 'fn _phase3_plant(cap: Capture) { println!("{:?}", cap); }' src/runtime/tmux.rs; }
 
 # Inline plants: the match follows code on the same line.
 plant_unwrap() { plant_line "$1" 'fn _phase3_plant() { let _ = Some(1).unwrap(); }'; }
@@ -1656,7 +1763,8 @@ CHECKS=(storage_mutex platform_cfg proc_paths unwrap remove_set codex_home senti
     auth_host codex_token_url oauth_cancelled oauth_refresh_callers consent_callers refresh_usage_cache receipt_type
     receipt_destructure refresh_drivers refresh_client post_permit permit_mint permit_mint_count daemon_pid_names watch_no_post usage_client_new
     fake_prefix receipt_check reached_audit codex_no_password_lookup codex_keyring_listing_callers
-    live_sessions_readonly sessions_key sessions_dir_callers bridge_id_escape)
+    live_sessions_readonly sessions_key sessions_dir_callers bridge_id_escape
+    tmux_bin fake_tmux_prefix tmux_spawn tmux_no_shell rc_no_write messaging_socket rc_no_signal rc_budget_env capture_no_output)
 
 # "<check> <plant>" pairs: every plant must make its check fail.
 PLANTS=(
@@ -1775,6 +1883,19 @@ PLANTS=(
     "sessions_dir_callers plant_sessions_dir_caller_fmt"
     "bridge_id_escape plant_bridge_id_escape"
     "bridge_id_escape plant_bridge_id_escape_fmt"
+    "tmux_bin plant_tmux_bin"
+    "fake_tmux_prefix plant_fake_tmux_prefix"
+    "fake_tmux_prefix plant_fake_tmux_cfg_commented"
+    "tmux_spawn plant_tmux_spawn_second"
+    "tmux_spawn plant_tmux_spawn_remote"
+    "tmux_spawn plant_tmux_spawn_removed"
+    "tmux_no_shell plant_tmux_shell"
+    "rc_no_write plant_rc_write_tmux"
+    "rc_no_write plant_rc_write_stage"
+    "messaging_socket plant_messaging_socket"
+    "rc_no_signal plant_rc_signal"
+    "rc_budget_env plant_rc_budget_env"
+    "capture_no_output plant_capture_output"
 )
 
 main() {

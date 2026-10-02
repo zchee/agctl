@@ -345,6 +345,27 @@ main() {
         "fn _phase3_plant(o: crate::provider::codex::proof::OwnedRecord<'_>, c: &crate::provider::codex::refresh::RefreshCtx<'_>) { let _ = crate::provider::codex::refresh::run(o, crate::provider::codex::refresh::SendMode::Proactive, c); }" \
         "refresh::run without a PostPermit"
 
+    # S12: Remote Control's closed inputs and non-printing capture boundary.
+    local remote=src/provider/claude/remote_control.rs
+    clause 15 "$remote" E0618 \
+        'fn _phase3_rc_keys() { let _ = crate::runtime::tmux::Keys::RemoteControl(String::new()); }' \
+        "Keys cannot carry caller-supplied text"
+    clause 16 "$remote" E0451 \
+        'fn _phase3_rc_pane() { let _ = crate::runtime::tmux::Pane { 0: String::from("%7") }; }' \
+        "Pane cannot be constructed without validation"
+    clause 17 "$remote" E0277 \
+        'fn _phase3_rc_key(key: crate::provider::claude::live_sessions::SessionKey) { let _ = format!("{}", key); }' \
+        "SessionKey has no Display"
+    clause 18 "$remote" E0277 \
+        'fn _phase3_rc_capture_debug() { let cap: crate::runtime::tmux::Capture = unreachable!(); let _ = format!("{:?}", cap); }' \
+        "Capture cannot be formatted with Debug"
+    clause 19 "$remote" E0277 \
+        'fn _phase3_rc_capture_trace() { let cap: crate::runtime::tmux::Capture = unreachable!(); let _ = tracing::field::debug(&cap); }' \
+        "Capture cannot enter a tracing field (the ? sigil expansion)"
+    clause 20 "$remote" E0277 \
+        'fn _phase3_rc_capture_serialize() { let cap: crate::runtime::tmux::Capture = unreachable!(); let _ = serde_json::to_string(&cap); }' \
+        "Capture cannot be serialized"
+
     if [[ $FAILED -gt 0 ]]; then
         phase3_die "$FAILED clause(s) failed"
     fi

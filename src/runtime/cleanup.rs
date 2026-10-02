@@ -36,11 +36,14 @@
 //! is no caller left to handle an error; a path that is already gone is the
 //! outcome we wanted anyway.
 
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::TryLockError;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -67,6 +70,11 @@ pub struct ChildEntry {
     pub start_time: String,
 }
 
+struct CountNotice {
+    count: Arc<AtomicUsize>,
+    render: fn(usize) -> String,
+}
+
 /// The registry contents.
 ///
 /// Every critical section on this lock is a push, a `retain` or a
@@ -78,15 +86,22 @@ struct Registry {
     tmp_paths: Vec<(CleanupToken, PathBuf)>,
     restores: Vec<(CleanupToken, RestoreFn)>,
     children: Vec<(CleanupToken, ChildEntry)>,
+    notices: Vec<(CleanupToken, CountNotice)>,
 }
 
 impl Registry {
     const fn new() -> Self {
-        Self { next_id: 0, tmp_paths: Vec::new(), restores: Vec::new(), children: Vec::new() }
+        Self {
+            next_id: 0,
+            tmp_paths: Vec::new(),
+            restores: Vec::new(),
+            children: Vec::new(),
+            notices: Vec::new(),
+        }
     }
 
     fn len(&self) -> usize {
-        self.tmp_paths.len() + self.restores.len() + self.children.len()
+        self.tmp_paths.len() + self.restores.len() + self.children.len() + self.notices.len()
     }
 
     fn next_token(&mut self) -> CleanupToken {
@@ -157,7 +172,59 @@ pub fn unregister(token: CleanupToken) -> bool {
     reg.tmp_paths.retain(|(entry, _)| *entry != token);
     reg.restores.retain(|(entry, _)| *entry != token);
     reg.children.retain(|(entry, _)| *entry != token);
+    reg.notices.retain(|(entry, _)| *entry != token);
     before != reg.len()
+}
+
+/// A stage-scoped, counts-only notice for the terminating signal thread.
+#[derive(Debug)]
+pub struct ExitNotice {
+    token: CleanupToken,
+    count: Arc<AtomicUsize>,
+}
+
+impl ExitNotice {
+    /// Includes one new input sequence, before its send can be in flight.
+    pub fn begin(&self) {
+        self.count.update(Ordering::SeqCst, Ordering::SeqCst, |count| count.saturating_add(1));
+    }
+
+    /// Removes a session whose reconnection or disappearance was confirmed.
+    pub fn confirmed(&self) {
+        self.count.update(Ordering::SeqCst, Ordering::SeqCst, |count| count.saturating_sub(1));
+    }
+}
+
+impl Drop for ExitNotice {
+    fn drop(&mut self) {
+        unregister(self.token);
+    }
+}
+
+/// Registers a counts-only renderer for the lifetime of one active stage.
+/// The callback owns no provider state; the runtime never depends on a provider.
+pub fn register_exit_notice(count: usize, render: fn(usize) -> String) -> ExitNotice {
+    let count = Arc::new(AtomicUsize::new(count));
+    let mut reg = registry();
+    let token = reg.next_token();
+    reg.notices.push((token, CountNotice { count: Arc::clone(&count), render }));
+    ExitNotice { token, count }
+}
+
+/// Prints active notices once, without waiting for a lock held by the command thread.
+/// Output errors are ignored on the terminating signal path.
+pub fn write_exit_notices(output: &mut impl Write) {
+    let notices = {
+        let mut reg = match REGISTRY.try_lock() {
+            Ok(reg) => reg,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        std::mem::take(&mut reg.notices)
+    };
+    for (_, notice) in notices {
+        let _ = writeln!(output, "{}", (notice.render)(notice.count.load(Ordering::SeqCst)));
+    }
 }
 
 /// How many spawns are between their cancellation check and their child's

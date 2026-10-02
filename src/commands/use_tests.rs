@@ -22,6 +22,7 @@ fn args(id: Option<&str>) -> UseArgs {
     UseArgs {
         id: id.map(str::to_owned),
         live: false,
+        restart_remote_control: false,
         new_only: false,
         undo: false,
         forget: None,

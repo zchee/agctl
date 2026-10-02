@@ -21,6 +21,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use clap::ArgGroup;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
@@ -52,6 +53,7 @@ pub const WATCH_INTERVAL_FLOOR: Duration = Duration::from_secs(60);
 /// | 10–21 | plan section 3.4's refusals and outcomes |
 /// | 22–24 | the live store's own three, added by W4b |
 /// | 27, 29 | the live item's identity (S23b, S24); 25, 26, 28 retired, never reused |
+/// | 30 | --restart-remote-control could not disconnect every eligible session, had no TTY to attest at, or is unsupported on this platform; nothing written |
 ///
 /// Refusal **B** — a secure-storage backend is active or of unknown kind — is
 /// deliberately **not** here: decision D-020 degraded it to a warning line
@@ -114,7 +116,9 @@ pub mod swap_exit {
     /// and **no** `refusal` member.
     pub const WRITE_FAILED: i32 = 19;
     /// Nobody agreed to the swap: the confirmation was declined, or there was
-    /// no terminal to ask at and `--yes` was not given.
+    /// no terminal to ask at and `--yes` was not given (without
+    /// `--restart-remote-control`, which refuses with 30 and
+    /// `remote_control_needs_tty` instead).
     ///
     /// **Not** refusal **F**, which it used to share. **F** means *the
     /// outgoing credential cannot be adopted, so the swap would lose it* — a
@@ -201,8 +205,14 @@ pub mod swap_exit {
     /// them change meaning.
     pub const IDENTITY_UNAVAILABLE: i32 = 29;
 
+    /// Remote Control could not be disconnected before a live swap.
+    ///
+    /// Before Phase A, the same code carries `remote_control_needs_tty` or
+    /// `remote_control_unsupported_platform`, with no `refusal` member.
+    pub const RC_NOT_DISCONNECTED: i32 = 30;
+
     /// Every code above, for the exhaustiveness and uniqueness tests.
-    pub const ALL: [(&str, i32); 17] = [
+    pub const ALL: [(&str, i32); 18] = [
         ("refused_a", REFUSED_A),
         ("refused_c", REFUSED_C),
         ("refused_d", REFUSED_D),
@@ -220,6 +230,7 @@ pub mod swap_exit {
         ("live_item_absent", LIVE_ITEM_ABSENT),
         ("live_undo_item_changed", LIVE_UNDO_ITEM_CHANGED),
         ("identity_unavailable", IDENTITY_UNAVAILABLE),
+        ("remote_control_not_disconnected", RC_NOT_DISCONNECTED),
     ];
 }
 
@@ -557,6 +568,7 @@ pub enum Shell {
 /// [--no-mcp] [--yes] [--json]`, `use --undo [--yes]`, and `use --forget <id>
 /// [--yes]`.
 #[derive(Debug, Args)]
+#[command(group(ArgGroup::new("live_pass").args(["live", "undo"])))]
 pub struct UseArgs {
     /// Account selector: the same syntax `accounts remove` accepts.
     #[arg(value_name = "ID", conflicts_with_all = ["undo", "forget"])]
@@ -566,6 +578,12 @@ pub struct UseArgs {
     /// isolated session (decision D-018).
     #[arg(long, conflicts_with_all = ["new_only", "undo", "forget"])]
     pub live: bool,
+
+    /// Before a live swap, disconnect Remote Control in each running Claude
+    /// Code session that has it on and runs in a tmux pane, and start it again
+    /// there after the swap, so the claude.ai conversation carries over.
+    #[arg(long, requires = "live_pass", conflicts_with_all = ["forget", "yes"])]
+    pub restart_remote_control: bool,
 
     /// Accepted as a synonym for the default (isolated-session) behaviour.
     #[arg(long)]

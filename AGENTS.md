@@ -23,7 +23,10 @@ touches credentials on disk (`security_cli.rs` reads the keychain and never writ
 `file_store.rs` writes the 0600 store, `namespace_lock.rs` and `foreign_activity.rs` decide
 whether writing is allowed at all) and is shared by both providers; `usage/` parses and
 caches responses; `runtime/` carries the pass coordinator, cancellation, child-process
-cleanup and the fault-injection seam; and `render/` plus `tui/` are the two presentations,
+cleanup and the fault-injection seam; `runtime/tmux.rs` confines tmux argv and capture
+bytes, `runtime/tty.rs` owns bounded terminal readiness, and
+`provider/claude/remote_control.rs` owns the operator-attested restart stages; and
+`render/` plus `tui/` are the two presentations,
 table/JSON and the `watch` UI, each with a Codex row renderer alongside Claude's. The
 `testing` feature compiles every test seam — both providers' endpoint overrides, the fake
 keychain and fake `codex` stand-ins, the fault-injection switch — and must never reach a
@@ -39,7 +42,11 @@ the planted file and line), and `scripts/phase3-version-gate.sh` (AC99 — build
 writing nothing, while still reading a version-1 one; it builds no Codex binary and reads no
 installed `codex`).
 
-On each Claude Code version bump, re-run the route-A′ checklist `.omc/handoffs/rc-hint-a-prime-check.md`: the session registry schema and bridge behaviour are Claude Code internals, and the Remote Control hint degrades silently if they change.
+On each Claude Code version bump, have the operator re-run the route-A′ checklist
+`.omc/handoffs/rc-hint-a-prime-check.md` and AC167 (the supervised restart check), record
+the result, then bump `RC_LAST_VERIFIED_VERSION`. The session registry schema, panel
+keys and bridge behaviour are Claude Code internals; a newer version's warning is not
+verification of the intended account or retained history.
 
 ## Run cargo through direnv
 

@@ -163,6 +163,9 @@ pub enum Refusal {
     /// the CLI refusal, `doctor`'s `audit log` row and this carry one
     /// sentence. Namespace swaps keep W4a's behaviour.
     AuditRefused,
+    /// Remote Control did not stop in every eligible session before the swap.
+    /// Decided under agctl's namespace locks, before any write or refresh POST.
+    RemoteControlNotDisconnected,
     /// Nothing can say whose credential the live item holds, so the swap does
     /// not guess (S24).
     ///
@@ -221,6 +224,7 @@ impl Refusal {
             | Self::LiveUnreachable
             | Self::LiveItemAbsent
             | Self::AuditRefused
+            | Self::RemoteControlNotDisconnected
             | Self::IdentityUnavailable(_)
             | Self::LiveUndoItemChanged(_) => None,
         }
@@ -243,6 +247,7 @@ impl Refusal {
             Self::LiveUnreachable => Some("live_unreachable"),
             Self::LiveItemAbsent => Some("live_item_absent"),
             Self::AuditRefused => Some("audit_refused"),
+            Self::RemoteControlNotDisconnected => Some("remote_control_not_disconnected"),
             Self::IdentityUnavailable(IdentityGap::ProfileUnavailable) => {
                 Some("profile_unavailable")
             }
@@ -266,6 +271,7 @@ impl Refusal {
             Self::CannotAdopt(_) => swap_exit::REFUSED_F,
             Self::NotOwned => swap_exit::PRECONDITION,
             Self::AuditRefused => swap_exit::AUDIT_REFUSED,
+            Self::RemoteControlNotDisconnected => swap_exit::RC_NOT_DISCONNECTED,
             Self::LiveUnreachable => swap_exit::LIVE_UNREACHABLE,
             Self::LiveItemAbsent => swap_exit::LIVE_ITEM_ABSENT,
             Self::IdentityUnavailable(_) => swap_exit::IDENTITY_UNAVAILABLE,
@@ -313,7 +319,7 @@ impl Refusal {
             // when an expired live token sends the identity resolution to a log
             // that is refused or cannot be read; the later of the two is what
             // this names, as for `LineTooLong`.
-            Self::AuditRefused => Phase::B,
+            Self::AuditRefused | Self::RemoteControlNotDisconnected => Phase::B,
             // The adoption runs under the namespace locks in Phase B, which
             // is where its refusal is decided (ruling OQ2, condition (c)).
             Self::CannotAdopt(_) => Phase::B,
@@ -343,7 +349,7 @@ impl Refusal {
 /// item read and so after `LiveItemAbsent`: [`Refusal::IdentityUnavailable`]
 /// in both directions, then — a reversal only, from the identity just
 /// resolved — [`Refusal::LiveUndoItemChanged`].
-pub const DECISION_ORDER: [Refusal; 11] = [
+pub const DECISION_ORDER: [Refusal; 12] = [
     Refusal::NotOwned,
     Refusal::LiveNamespaceEnv,
     Refusal::LiveUnreachable,
@@ -353,6 +359,7 @@ pub const DECISION_ORDER: [Refusal; 11] = [
     Refusal::LiveUndoItemChanged(ItemChange::ForeignLogin),
     Refusal::LineTooLong,
     Refusal::AuditRefused,
+    Refusal::RemoteControlNotDisconnected,
     Refusal::CannotAdopt(adopt::Refusal::NewerCopy),
     Refusal::CompromisedHold,
 ];

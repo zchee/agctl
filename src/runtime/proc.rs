@@ -26,6 +26,10 @@ use macos as platform;
 /// The exact, case-sensitive process name of a matching Claude peer.
 pub const CLAUDE_PROCESS_NAME: &str = "claude";
 
+/// Whether this platform implements [`tty_foreground`] and [`ancestor_of_self`] (D2).
+/// The command refuses an unsupported platform before checking its own TTY.
+pub const REMOTE_CONTROL_SUPPORTED: bool = cfg!(target_os = "macos");
+
 /// What is known about a process another file claims to be held by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Holder {
@@ -47,6 +51,29 @@ impl Holder {
             Self::Dead => "dead",
         }
     }
+}
+
+/// One kernel observation of a process and its controlling terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TtyForeground {
+    /// Runnable, stopped, or dead at the time of the observation.
+    pub holder: Holder,
+    /// The process's group.
+    pub pgid: u32,
+    /// Its controlling terminal's foreground group.
+    pub tpgid: u32,
+    /// The terminal's device number, retaining the kernel's full width.
+    pub tdev: u32,
+}
+
+/// Reads a process's foreground-terminal identity; unknown is not permission to type.
+pub fn tty_foreground(pid: u32) -> Option<TtyForeground> {
+    platform::tty_foreground(pid)
+}
+
+/// Whether `pid` is an ancestor of this process; an unreadable walk fails closed.
+pub fn ancestor_of_self(pid: u32) -> bool {
+    platform::ancestor_of_self(pid)
 }
 
 /// Why the process table could not be read.

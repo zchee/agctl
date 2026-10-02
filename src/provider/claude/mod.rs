@@ -27,6 +27,7 @@ pub mod discovery;
 pub mod live_sessions;
 pub mod namespace;
 pub mod oauth;
+pub mod remote_control;
 pub mod swap;
 pub mod usage;
 

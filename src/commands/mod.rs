@@ -20,8 +20,11 @@ pub mod watch;
 
 use std::io::IsTerminal;
 use std::io::Write;
+use std::os::fd::AsFd;
+use std::time::Instant;
 
 use crate::error::AppError;
+use crate::runtime::coordinator::Cancel;
 
 /// The one thing `accounts` and `doctor` need a human for.
 ///
@@ -53,10 +56,131 @@ pub trait Prompt {
     /// not have a namespace removed out from under it because nobody was
     /// there to say no.
     fn confirm(&mut self, question: &str) -> Result<bool, AppError>;
+
+    /// Obtains fresh, bounded per-input-group consent. Other prompt adapters cannot authorize it.
+    fn attest(&mut self, _question: &str, _deadline: Instant, _cancel: &Cancel) -> Attestation {
+        Attestation::NotObtained
+    }
+}
+
+/// A complete answer is distinct from EOF, cancellation, or a partial line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attestation {
+    /// Exactly `y` followed by a terminal line terminator.
+    Yes,
+    /// A complete line other than `y`.
+    Declined,
+    /// No complete answer was obtained before the deadline.
+    NotObtained,
+}
+
+/// Remote Control's human channel: all prose and questions go to stderr's TTY.
+pub struct AttestedTty;
+
+impl Prompt for AttestedTty {
+    fn tell(&mut self, message: &str) {
+        // Losing the human channel must not change a completed swap's outcome.
+        let _ = writeln!(std::io::stderr(), "{message}");
+    }
+
+    fn can_ask(&self) -> bool {
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+    }
+
+    fn confirm(&mut self, question: &str) -> Result<bool, AppError> {
+        if !self.can_ask() {
+            return Ok(false);
+        }
+        let mut stderr = std::io::stderr();
+        write!(stderr, "{question} [y/N] ").and_then(|()| stderr.flush()).map_err(|source| {
+            AppError::Io { context: "could not write the confirmation prompt".to_owned(), source }
+        })?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).map_err(|source| AppError::Io {
+            context: "could not read the confirmation".to_owned(),
+            source,
+        })?;
+        Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    }
+
+    fn attest(&mut self, question: &str, deadline: Instant, cancel: &Cancel) -> Attestation {
+        attest_terminal(&std::io::stdin(), &mut std::io::stderr(), question, deadline, cancel)
+    }
+}
+
+fn attest_terminal(
+    input: &impl AsFd,
+    output: &mut (impl AsFd + Write),
+    question: &str,
+    deadline: Instant,
+    cancel: &Cancel,
+) -> Attestation {
+    use rustix::termios::QueueSelector;
+    let end = Instant::now()
+        .checked_add(crate::provider::claude::remote_control::RC_ATTEST_TIMEOUT)
+        .map_or(deadline, |end| end.min(deadline));
+    if cancel.is_cancelled()
+        || Instant::now() >= end
+        || !rustix::termios::isatty(input)
+        || !rustix::termios::isatty(&*output)
+        || rustix::termios::tcflush(input, QueueSelector::IFlush).is_err()
+        || write!(output, "{question} ").and_then(|()| output.flush()).is_err()
+    {
+        return Attestation::NotObtained;
+    }
+    let mut answer = Vec::with_capacity(2);
+    let mut too_long = false;
+    let mut readiness = crate::runtime::tty::Readiness::default();
+    loop {
+        let now = Instant::now();
+        if cancel.is_cancelled() || now >= end {
+            return Attestation::NotObtained;
+        }
+        let wait = end
+            .saturating_duration_since(now)
+            .min(crate::provider::claude::remote_control::RC_POLL);
+        let ready = match readiness.wait_readable(input.as_fd(), wait) {
+            Ok(ready) => ready,
+            Err(_) => return Attestation::NotObtained,
+        };
+        if cancel.is_cancelled() || Instant::now() >= end {
+            return Attestation::NotObtained;
+        }
+        if !ready {
+            continue;
+        }
+        let mut byte = [0_u8; 1];
+        match rustix::io::read(input, &mut byte) {
+            Ok(0) => return Attestation::NotObtained,
+            Ok(_) => {
+                if cancel.is_cancelled() || Instant::now() >= end {
+                    return Attestation::NotObtained;
+                }
+                if byte[0] == b'\n' {
+                    return if !too_long && (answer == b"y" || answer == b"y\r") {
+                        Attestation::Yes
+                    } else {
+                        Attestation::Declined
+                    };
+                }
+                if answer.len() < 2 {
+                    answer.push(byte[0]);
+                } else {
+                    too_long = true;
+                }
+            }
+            Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => continue,
+            Err(_) => return Attestation::NotObtained,
+        }
+    }
 }
 
 /// The real terminal.
 pub struct Tty;
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;
 
 impl Prompt for Tty {
     fn tell(&mut self, message: &str) {

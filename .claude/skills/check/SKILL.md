@@ -76,6 +76,8 @@ cannot, so they are not listed). **The seam names, every one of which must be ab
 | `AGCTL_CLAUDE_PROFILE_URL` | `src/provider/claude/oauth.rs` (the live swap's profile GET) |
 | `AGCTL_NO_BROWSER` | `src/commands/login.rs` |
 | `AGCTL_SWAP_DEADLINE_MS` | `src/commands/use.rs` (Remote Control hint S2b: expired-pass regression seam) |
+| `AGCTL_TMUX_BIN` | `src/runtime/tmux.rs` (Remote Control S12: synthetic tmux transport) |
+| `AGCTL_RC_BUDGET_MS` | `src/provider/claude/remote_control.rs` (Remote Control S12: stage-budget override) |
 | `AGCTL_CODEX_BIN` | `src/provider/codex/login_child.rs` (phase 3; listed from S29b, which introduces the name — the module that reads it lands at S34, and `scripts/phase3-greps.sh` pins it to that one file) |
 | `AGCTL_CODEX_USAGE_URL` | `src/provider/codex/usage.rs` (phase 3, S31; `scripts/phase3-greps.sh` pins it to that one file) |
 | `AGCTL_CODEX_TOKEN_URL` | `src/provider/codex/oauth.rs` (phase 3, S32; `scripts/phase3-greps.sh` pins it to that one file) |
@@ -106,18 +108,20 @@ deliberately outside the array, for two different reasons. `AGCTL_LOCK_CHILD_ROL
 `AGCTL_LOCK_CHILD_DIR` live only in a `#[cfg(test)]` sibling and are covered more strongly by
 `tests/e2e_lock.rs`; `AGCTL_E2E_MARKER` is set on a child by a test and the crate never reads
 it — none of the three shows up in a `src`-only sweep at all, since all three live in
-`*_tests.rs` files. Eleven more are dead code in every binary this crate ships (the
-`AGCTL_FAKE_SECURITY_*` family and `AGCTL_FAKE_CODEX_`, added since `e6c00e9`; see below for
-why): `rg -o --no-filename 'AGCTL_[A-Z0-9_]+' src --glob '!*_tests.rs' | sort -u | wc -l`
-finds **28** distinct names outside `*_tests.rs`, of which 4 are the production list above
-and 13 are in the `seams` array, leaving **11** genuinely outside both by that measure. The
+`*_tests.rs` files. Twelve more names are outside the artifact lists (the
+`AGCTL_FAKE_SECURITY_*` family and the `AGCTL_FAKE_CODEX_` / `AGCTL_FAKE_TMUX_` prefixes;
+see below): `rg -o --no-filename 'AGCTL_[A-Z0-9_]+' src --glob '!*_tests.rs' | sort -u | wc -l`
+finds **31** distinct names outside `*_tests.rs`, of which 4 are the production list above
+and 15 are in the `seams` array, leaving **12** outside both by that measure. The
 script says so in its own comments; do not "tidy" any of them in.
 
 `AGCTL_FAKE_CODEX_` is outside the array for a different reason: it is only ever a
 `starts_with` argument, so no build carries it as a string at all and an artifact grep
 could not fail for it. `scripts/phase3-greps.sh` guards it with a source rule,
 `fake_prefix`, that pins the single spelling and the `#[cfg(feature = "testing")]`
-directly above it. The drop check's prefix has a second guard of the same shape,
+directly above it. Remote Control's `AGCTL_FAKE_TMUX_` allowlist prefix has the parallel
+`fake_tmux_prefix` source pin; its stand-in script and knobs are never compiled into the
+crate. The drop check's prefix has a second guard of the same shape,
 `receipt_check`, **as well as** its entry in the array above.
 
 ## The documentation gates

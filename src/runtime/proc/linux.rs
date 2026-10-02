@@ -28,6 +28,17 @@ use super::classification::state_holder;
 use super::sweep;
 use crate::runtime::coordinator::Cancel;
 
+/// Remote Control is a non-goal of `docs/plans/agctl-linux-support.md`.
+/// This reserved implementation site returns no foreground proof on Linux.
+pub(super) fn tty_foreground(_pid: u32) -> Option<super::TtyForeground> {
+    None
+}
+
+/// Fails closed until the Remote Control non-goal in the Linux plan is revisited.
+pub(super) fn ancestor_of_self(_pid: u32) -> bool {
+    true
+}
+
 const STAT_LIMIT: u64 = 4096;
 const STATUS_LIMIT: u64 = 65536;
 const SYSTEM_STAT_LIMIT: u64 = 1024 * 1024;

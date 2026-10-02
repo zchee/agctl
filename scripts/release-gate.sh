@@ -157,6 +157,9 @@ seams=(
 	AGCTL_CLAUDE_PROFILE_URL
 	# S2b: the expired-pass deadline pin must never reach a release.
 	AGCTL_SWAP_DEADLINE_MS
+	# S12: the fake tmux executable and shortened RC stage budgets are test-only.
+	AGCTL_TMUX_BIN
+	AGCTL_RC_BUDGET_MS
 	# No knob name of the `security(1)` stand-in is listed. It is embedded
 	# (`include_str!` in `src/secret/fake_security.rs`, `testing` only) for
 	# the UNIT tests alone: its one reader is called from unit tests only,
